@@ -325,7 +325,7 @@ fn tagged(prefix: &str, id: &str) -> String {
     format!("{prefix}-{}", sanitize_tag(id))
 }
 
-fn sanitize_tag(raw: &str) -> String {
+pub(crate) fn sanitize_tag(raw: &str) -> String {
     raw.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
@@ -1410,6 +1410,79 @@ pub fn validate_chain_nodes(
     Ok(hops)
 }
 
+/// T-13: transition-order validation for user-built chains, one call over
+/// every chain the apply path is about to plan. The core walk must stay
+/// sing-box → xray → sing-box — the bridge shape every xray hop gives the
+/// walk — so an xray hop never sits directly beside another non-standard
+/// core hop, at most one extra-core hop exists per chain, and an autoselector
+/// slot never returns (store.rs `chain_hop_rejection` refuses them at slot
+/// insert; this re-checks what reaches this layer as defense-in-depth).
+/// Pure: touches no config, sidecar, or OS state.
+pub fn validate_chain_transition_order(chains: &[(&str, &[ChainHop])]) -> Result<(), EngineError> {
+    for (name, hops) in chains {
+        for pair in hops.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            let pattern = match (earlier.kind, later.kind) {
+                (ChainHopKind::Xray, ChainHopKind::Xray) => Some("two consecutive xray hops"),
+                (ChainHopKind::Xray, ChainHopKind::Extra | ChainHopKind::Custom) => {
+                    Some("an xray hop followed by an extra/custom hop")
+                }
+                (ChainHopKind::Extra | ChainHopKind::Custom, ChainHopKind::Xray) => {
+                    Some("an extra/custom hop directly ahead of an xray hop")
+                }
+                _ => None,
+            };
+            let Some(pattern) = pattern else {
+                continue;
+            };
+            return Err(EngineError::ChainViolation {
+                name: (*name).to_string(),
+                detail: format!(
+                    "{} → {}: {pattern} — chain hop sequence must stay sing-box → xray → sing-box",
+                    earlier.label, later.label
+                ),
+            });
+        }
+        let extra_positions: Vec<&str> = hops
+            .iter()
+            .filter(|hop| hop.kind == ChainHopKind::Extra)
+            .map(|hop| hop.label.as_str())
+            .collect();
+        if extra_positions.len() > 1 {
+            return Err(EngineError::ChainViolation {
+                name: (*name).to_string(),
+                detail: format!(
+                    "{} — at most one extracore hop per chain",
+                    extra_positions.join(" + ")
+                ),
+            });
+        }
+        for hop in hops.iter() {
+            if hop.kind != ChainHopKind::Standard {
+                continue;
+            }
+            let Some(node) = hop.node.as_ref() else {
+                continue;
+            };
+            let autoselector = node
+                .get("type")
+                .or_else(|| node.get("protocol"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|marker| marker.trim().eq_ignore_ascii_case("autoselector"));
+            if autoselector {
+                return Err(EngineError::ChainViolation {
+                    name: (*name).to_string(),
+                    detail: format!(
+                        "{} is an autoselector hop — chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)",
+                        hop.label
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn xray_ingress_tag(id: &str) -> String {
     format!("x-in-{}", sanitize_tag(id))
 }
@@ -1901,6 +1974,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     let main_ids: HashSet<&str> = main_rows.iter().map(|row| row.id.as_str()).collect();
     let by_id: HashMap<&str, &ProxyConfig> =
         configs.iter().map(|row| (row.id.as_str(), row)).collect();
+    let mut chain_transitions: Vec<(&str, Vec<ChainHop>)> = Vec::new();
     for config in configs {
         if !is_chain_protocol(&config.protocol) {
             continue;
@@ -1909,6 +1983,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         let hops = validate_chain_nodes(&config.name, &params, &|id| {
             by_id.get(id).map(|row| row.protocol.clone())
         })?;
+        chain_transitions.push((config.name.as_str(), hops.clone()));
         for (index, hop) in hops.iter().enumerate() {
             if let Some(id) = hop.ref_id.as_deref() {
                 if !main_ids.contains(id) {
@@ -1956,6 +2031,12 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             }
         }
     }
+
+    let chain_views: Vec<(&str, &[ChainHop])> = chain_transitions
+        .iter()
+        .map(|(name, hops)| (*name, hops.as_slice()))
+        .collect();
+    validate_chain_transition_order(&chain_views)?;
 
     let taken_ports: HashSet<u16> = configs
         .iter()
@@ -2176,9 +2257,14 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
     generate_with_presets(configs, &HashMap::new())
 }
 
-pub fn generate_with_presets(
+/// T-12 variant: like `generate_with_presets`, but staged `.srs` rule sets are
+/// resolvable by name (absolute file paths, cached beside the app). Preset
+/// rules carrying `rule_set` references fail loud when a name is not in the
+/// map or its file vanished from disk — never skip, never substitute.
+pub fn generate_with_rule_sets(
     configs: &[ProxyConfig],
     presets: &HashMap<String, Vec<serde_json::Value>>,
+    rule_set_files: &HashMap<String, PathBuf>,
 ) -> Result<GeneratedConfig, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
@@ -2208,7 +2294,76 @@ pub fn generate_with_presets(
         .map(|row| row.port)
         .collect();
     let bridges = assign_bridge_ports(&keys, &taken_ports)?;
-    build_main_config(configs, &bridges, presets)
+    build_main_config(configs, &bridges, presets, rule_set_files)
+}
+
+/// Test-only alias of `generate_with_rule_sets` with no staged rule sets: any
+/// preset carrying `rule_set` references fails loud — the "unstaged sets fail
+/// loud" contract T-11 promised in its help text. Production code calls
+/// `generate_with_rule_sets` with the actual staged map.
+#[cfg(test)]
+pub fn generate_with_presets(
+    configs: &[ProxyConfig],
+    presets: &HashMap<String, Vec<serde_json::Value>>,
+) -> Result<GeneratedConfig, EngineError> {
+    generate_with_rule_sets(configs, presets, &HashMap::new())
+}
+
+/// Per-config-build rule-set staging state: the staged name→file map synced
+/// from the store, plus the entries accumulated for `route.rule_set`. One
+/// instance per config build, shared across every preset's rules so identical
+/// references stay deduped.
+struct RuleSetStage<'a> {
+    files: &'a HashMap<String, PathBuf>,
+    tags: HashMap<String, String>,
+    entries: Vec<serde_json::Value>,
+}
+
+impl<'a> RuleSetStage<'a> {
+    fn new(files: &'a HashMap<String, PathBuf>) -> Self {
+        Self {
+            files,
+            tags: HashMap::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Resolves `name` to the `rs-<sanitized>` tag, emitting its
+    /// `route.rule_set` entry on first use. Missing staged file at configgen →
+    /// loud detail naming the set and the path: never skip, never substitute.
+    fn resolve(&mut self, name: &str, rule_index: usize) -> Result<String, String> {
+        if let Some(tag) = self.tags.get(name) {
+            return Ok(tag.clone());
+        }
+        let path = match self.files.get(name) {
+            Some(path) => path.clone(),
+            None => crate::store::staged_rule_set_path(&crate::store::rule_set_file_name(name)),
+        };
+        if !path.is_file() {
+            return Err(format!(
+                "rule {rule_index}: field \"rule_set\" names staged set \"{name}\" whose staged file is missing: {} — re-download it under Rule sets",
+                path.display()
+            ));
+        }
+        let tag = format!("rs-{}", sanitize_tag(name));
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.get("tag").and_then(serde_json::Value::as_str) == Some(tag.as_str()))
+        {
+            return Err(format!(
+                "rule {rule_index}: staged set \"{name}\" sanitizes to tag \"{tag}\" that another staged set already uses — rename one"
+            ));
+        }
+        self.entries.push(serde_json::json!({
+            "type": "local",
+            "tag": tag,
+            "format": "binary",
+            "path": path.display().to_string(),
+        }));
+        self.tags.insert(name.to_string(), tag.clone());
+        Ok(tag)
+    }
 }
 
 fn preset_rules_for(
@@ -2216,6 +2371,7 @@ fn preset_rules_for(
     serving_tag: &str,
     inbound_tag: &str,
     presets: &HashMap<String, Vec<serde_json::Value>>,
+    staged: &mut RuleSetStage,
 ) -> Result<Vec<serde_json::Value>, EngineError> {
     let bad = |detail: String| EngineError::BadPreset {
         name: config.name.clone(),
@@ -2231,41 +2387,30 @@ fn preset_rules_for(
     };
     let mut out = Vec::with_capacity(stored.len());
     for (index, rule) in stored.iter().enumerate() {
-        let obj = rule
-            .as_object()
-            .ok_or_else(|| bad(format!("rule {index}: must be a JSON object")))?;
-        let action = obj
-            .get("action")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| bad(format!("rule {index}: field \"action\" is required")))?;
-
-        if action == "warp" || action == "warp-bypass" {
-            return Err(bad(format!(
-                "rule {index}: action \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
-            )));
-        }
-        if !crate::preset::VALID_PRESET_ACTIONS.contains(&action) {
-            return Err(bad(format!(
-                "rule {index}: field \"action\" must be one of {}",
-                crate::preset::VALID_PRESET_ACTIONS.join(", ")
-            )));
-        }
-
-        let route_like = action == "route" || action == "proxy";
-        if route_like {
-            if let Some(outbound) = obj.get("outbound") {
-                if !outbound.is_string() {
-                    return Err(bad(format!(
-                        "rule {index}: field \"outbound\" must be a string"
-                    )));
-                }
-            }
-        } else if obj.contains_key("outbound") {
-            return Err(bad(format!(
-                "rule {index}: field \"outbound\" needs action \"route\""
-            )));
-        }
+        let checked = crate::preset::check_preset_rule(index, rule)
+            .map_err(|failure| bad(format!("rule {}: {}", failure.index, failure.detail)))?;
+        let obj = checked.obj;
+        let action = checked.action;
+        let route_like = crate::preset::action_carries_outbound(action);
         let mut merged = obj.clone();
+        // Rule names are an authoring artifact (Throne shares per-rule
+        // labels); they stay out of the generated config.
+        merged.remove("name");
+
+        // T-12: references fold from staged names to `rs-*` tags during the
+        // merge — `route.rule_set` entries carry the absolute staged paths,
+        // rules reference the tags.
+        if let Some(serde_json::Value::Array(names)) = merged.get("rule_set") {
+            let mut tags = Vec::with_capacity(names.len());
+            for name in names {
+                let name = name.as_str().ok_or_else(|| {
+                    bad("rule's \"rule_set\" must be a list of staged set names".to_string())
+                })?;
+                let tag = staged.resolve(name, index).map_err(bad)?;
+                tags.push(serde_json::Value::String(tag));
+            }
+            merged.insert("rule_set".to_string(), serde_json::Value::Array(tags));
+        }
 
         merged.insert(
             "action".to_string(),
@@ -2929,6 +3074,26 @@ fn apply_transport(
         params.insert("transport".to_string(), serde_json::Value::Object(body));
     }
     Ok(())
+}
+
+/// Whether the stored params declare multiplex — the exact params-key rule
+/// [`apply_mux`] consumes, so UI/health consumers cannot drift from what the
+/// generated config really says. Gated by the `mux` key: only a string value
+/// counts, a trimmed `"on"` (any ASCII case) enables the row, `"off"` keeps it
+/// disabled, blank or non-string values declare nothing, and any other
+/// spelling fails config generation in `apply_mux`. Malformed or non-object
+/// JSON — which `params_object` balks at — never declares.
+pub fn params_declare_mux(params_raw: &str) -> bool {
+    let Ok(serde_json::Value::Object(params)) =
+        serde_json::from_str::<serde_json::Value>(params_raw)
+    else {
+        return false;
+    };
+    let Some(serde_json::Value::String(mode)) = params.get("mux") else {
+        return false;
+    };
+    let mode = mode.trim();
+    !mode.is_empty() && mode.eq_ignore_ascii_case("on")
 }
 
 fn apply_mux(
@@ -4096,6 +4261,7 @@ fn build_main_config(
     configs: &[ProxyConfig],
     bridges: &HashMap<String, u16>,
     presets: &HashMap<String, Vec<serde_json::Value>>,
+    rule_set_files: &HashMap<String, PathBuf>,
 ) -> Result<GeneratedConfig, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
@@ -4104,6 +4270,7 @@ fn build_main_config(
     let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(configs.len() + 1);
     let mut endpoints = Vec::new();
     let mut rules = Vec::with_capacity(configs.len());
+    let mut staged = RuleSetStage::new(rule_set_files);
 
     for config in configs {
         let in_tag = inbound_tag(&config.id);
@@ -4125,7 +4292,9 @@ fn build_main_config(
                 "listen_port": config.port,
             }));
 
-            for preset_rule in preset_rules_for(config, &built.serving_tag, &in_tag, presets)? {
+            for preset_rule in
+                preset_rules_for(config, &built.serving_tag, &in_tag, presets, &mut staged)?
+            {
                 rules.push(preset_rule);
             }
             rules.push(serde_json::json!({
@@ -4148,7 +4317,7 @@ fn build_main_config(
             "listen_port": config.port,
         }));
 
-        for preset_rule in preset_rules_for(config, &out_tag, &in_tag, presets)? {
+        for preset_rule in preset_rules_for(config, &out_tag, &in_tag, presets, &mut staged)? {
             rules.push(preset_rule);
         }
         rules.push(serde_json::json!({
@@ -4159,12 +4328,27 @@ fn build_main_config(
     }
     outbounds.push(serde_json::json!({"type": "direct", "tag": "direct"}));
 
+    let mut route = serde_json::Map::new();
+    route.insert("rules".to_string(), serde_json::Value::Array(rules));
+    route.insert(
+        "final".to_string(),
+        serde_json::Value::String("direct".to_string()),
+    );
+    // T-12: only when a preset rule references staged sets, `route.rule_set`
+    // appears — local entries only, paths pointing at the staging location.
+    if !staged.entries.is_empty() {
+        route.insert(
+            "rule_set".to_string(),
+            serde_json::Value::Array(staged.entries.clone()),
+        );
+    }
+
     let document = serde_json::json!({
         "log": {"level": "warn"},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "endpoints": endpoints,
-        "route": {"rules": rules, "final": "direct"},
+        "route": route,
     });
     validate_structure(&document)?;
     Ok(GeneratedConfig {
@@ -4277,9 +4461,18 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
                     return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
                 }
             }
-            Some("direct") | Some("reject") => {
+            Some("route-options") => {
+                if let Some(outbound) = outbound {
+                    if !exits.contains(outbound) {
+                        return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
+                    }
+                }
+            }
+            Some("direct") | Some("reject") | Some("sniff") | Some("resolve") => {
                 if outbound.is_some() {
-                    return Err(invalid("rule with direct/reject action carries outbound"));
+                    return Err(invalid(
+                        "rule with direct/reject/sniff/resolve action carries outbound",
+                    ));
                 }
             }
             Some("block") => {
@@ -4314,6 +4507,12 @@ pub trait EngineBackend {
 
     fn is_running(&self) -> bool;
 
+    /// OS pid of the spawned sidecar, when this backend owns one. `None` = not
+    /// running, or a backend that never spawns a child.
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
     fn poll_exit(&mut self) -> Option<String>;
 
     fn drain_log_lines(&mut self) -> Vec<String> {
@@ -4337,7 +4536,7 @@ pub fn engine_binary_file_name() -> String {
     }
 }
 
-fn current_app_dir() -> Option<PathBuf> {
+pub(crate) fn current_app_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
@@ -5589,6 +5788,10 @@ impl EngineBackend for RealEngineBackend {
         self.child.is_some()
     }
 
+    fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.id())
+    }
+
     fn poll_exit(&mut self) -> Option<String> {
         let status = match self.child.as_mut()?.try_wait() {
             Ok(Some(status)) => status,
@@ -5651,6 +5854,9 @@ struct FakeState {
     fail_start: Option<String>,
     exited: Option<String>,
     pending_logs: Vec<String>,
+
+    /// T-30: the pid the fake shard pretends to have spawned.
+    pid: Option<u32>,
 }
 
 #[cfg(test)]
@@ -5690,11 +5896,17 @@ impl FakeHandle {
     pub fn inject_crash(&self, cause: &str) {
         let mut state = self.state.borrow_mut();
         state.running = false;
+        state.pid = None;
         state.exited = Some(cause.to_string());
     }
 
     pub fn emit_log(&self, line: &str) {
         self.state.borrow_mut().pending_logs.push(line.to_string());
+    }
+
+    /// T-30: PRETEND this shard's child runs with `pid` (`None` = no child).
+    pub fn set_pid(&self, pid: Option<u32>) {
+        self.state.borrow_mut().pid = pid;
     }
 }
 
@@ -5746,10 +5958,15 @@ impl EngineBackend for FakeEngineBackend {
     fn stop(&mut self) {
         let mut state = self.state.borrow_mut();
         state.running = false;
+        state.pid = None;
     }
 
     fn is_running(&self) -> bool {
         self.state.borrow().running
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.state.borrow().pid
     }
 
     fn poll_exit(&mut self) -> Option<String> {
@@ -5793,6 +6010,11 @@ pub struct EngineController {
     served_extra: Vec<Option<String>>,
 
     preset_rules: HashMap<String, Vec<serde_json::Value>>,
+
+    /// T-12 staged `.srs` name → absolute staged file path, synced from the
+    /// store like `preset_rules`; config generation resolves references
+    /// against it and fails loud on missing files.
+    rule_set_files: HashMap<String, PathBuf>,
     active: Vec<ProxyConfig>,
     status: EngineStatus,
     last_error: Option<String>,
@@ -5870,6 +6092,7 @@ impl EngineController {
             served: [None, None, None],
             served_extra: vec![None],
             preset_rules: HashMap::new(),
+            rule_set_files: HashMap::new(),
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -5940,6 +6163,7 @@ impl EngineController {
             served: [None, None, None],
             served_extra: vec![None],
             preset_rules: HashMap::new(),
+            rule_set_files: HashMap::new(),
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -5989,6 +6213,12 @@ impl EngineController {
 
     pub fn set_preset_rules(&mut self, presets: HashMap<String, Vec<serde_json::Value>>) {
         self.preset_rules = presets;
+    }
+
+    /// T-12: staged rule-set name → file path map, re-derived at sync time so
+    /// a moved app folder re-points at the right staged files.
+    pub fn set_rule_set_files(&mut self, files: HashMap<String, PathBuf>) {
+        self.rule_set_files = files;
     }
 
     #[cfg(test)]
@@ -6626,18 +6856,23 @@ impl EngineController {
             Some(json) => Some(json),
             None if plan.main_rows.is_empty() => None,
             None => Some(
-                build_main_config(&plan.main_rows, &plan_bridges, &self.preset_rules)
-                    .inspect_err(|error| {
-                        self.last_error = Some(error.to_string());
-                    })?
-                    .json,
+                build_main_config(
+                    &plan.main_rows,
+                    &plan_bridges,
+                    &self.preset_rules,
+                    &self.rule_set_files,
+                )
+                .inspect_err(|error| {
+                    self.last_error = Some(error.to_string());
+                })?
+                .json,
             ),
         };
         let mut fork_gen: Option<String> = match replacement(OwningCore::Fork) {
             Some(json) => Some(json),
             None if plan.fork_rows.is_empty() => None,
             None => Some(
-                generate_with_presets(&plan.fork_rows, &self.preset_rules)
+                generate_with_rule_sets(&plan.fork_rows, &self.preset_rules, &self.rule_set_files)
                     .inspect_err(|error| {
                         self.last_error = Some(error.to_string());
                     })?
@@ -7129,6 +7364,33 @@ impl EngineController {
         self.last_error = Some(format!("engine crashed ({cause})"));
         self.pending_crash = Some(Self::crash_detail(&crashes));
         crashes
+    }
+
+    /// T-30: `(shard label, pid)` per shard slot, named exactly like
+    /// [`Self::poll_shards`] — "stock", "fork", "xray", "extra-<row id>" (or
+    /// "extra-<slot>" when no row names it). `None` = that shard has no live
+    /// child. The caller only ever sees pids this controller spawned; nothing
+    /// here enumerates foreign processes.
+    pub fn shard_processes(&self) -> Vec<(String, Option<u32>)> {
+        let mut out = vec![
+            ("stock".to_string(), self.backend.process_id()),
+            ("fork".to_string(), self.fork_backend.process_id()),
+            ("xray".to_string(), self.xray_backend.process_id()),
+        ];
+        let extra_ids: Vec<String> = self
+            .active
+            .iter()
+            .filter(|row| is_extra_core_protocol(&row.protocol))
+            .map(|row| row.id.clone())
+            .collect();
+        for (index, slot) in self.extra_backends.iter().enumerate() {
+            let shard = extra_ids
+                .get(index)
+                .map(|id| format!("extra-{id}"))
+                .unwrap_or_else(|| format!("extra-{index}"));
+            out.push((shard, slot.process_id()));
+        }
+        out
     }
 
     pub fn crash_detail(crashes: &[(String, String)]) -> String {
@@ -9843,6 +10105,290 @@ mod tests {
         }
     }
 
+    fn t63_hop(kind: ChainHopKind, label: &str) -> ChainHop {
+        ChainHop {
+            kind,
+            ref_id: None,
+            node: None,
+            label: label.to_string(),
+        }
+    }
+
+    fn t63_ordering_rejected(name: &str, hops: &[ChainHop]) -> String {
+        let chains = [(name, hops)];
+        let error = validate_chain_transition_order(&chains).expect_err("ordering fails");
+        assert!(matches!(error, EngineError::ChainViolation { .. }));
+        let text = error.to_string();
+        assert!(text.contains(CHAIN_EGRESS_RULE), "family wrap: {text}");
+        assert!(text.contains(name), "names chain: {text}");
+        assert!(
+            text.contains("chain hop sequence must stay sing-box → xray → sing-box"),
+            "pattern phrase: {text}"
+        );
+        text
+    }
+
+    #[test]
+    fn t63_transition_order_accepts_sing_xray_sing() {
+        let cases: Vec<(&str, Vec<ChainHop>)> = vec![
+            (
+                "SingXray",
+                vec![
+                    t63_hop(ChainHopKind::Standard, "node 1"),
+                    t63_hop(ChainHopKind::Xray, "node 2"),
+                ],
+            ),
+            (
+                "SingSingXray",
+                vec![
+                    t63_hop(ChainHopKind::Standard, "node 1"),
+                    t63_hop(ChainHopKind::Standard, "node 2"),
+                    t63_hop(ChainHopKind::Xray, "node 3"),
+                ],
+            ),
+            ("XrayOnly", vec![t63_hop(ChainHopKind::Xray, "node 1")]),
+            (
+                "AllSing",
+                vec![
+                    t63_hop(ChainHopKind::Standard, "node 1"),
+                    t63_hop(ChainHopKind::Standard, "node 2"),
+                ],
+            ),
+        ];
+        let views: Vec<(&str, &[ChainHop])> = cases
+            .iter()
+            .map(|(name, hops)| (*name, hops.as_slice()))
+            .collect();
+        validate_chain_transition_order(&views).expect("sing → xray → sing walk stays valid");
+
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            xray_fixture("2", "XrayOne", 10802),
+            chain_fixture("8", "ChainAX", json!(["1", "2"]), 10808),
+        ];
+        let plan = validate_activation(&rows).expect("xray-last stays the accepted walk");
+        assert_eq!(plan.egresses.len(), 1, "xray hop keeps its row's leg");
+    }
+
+    #[test]
+    fn t63_rejects_consecutive_extra_core_hops() {
+        let extra_first = t63_hop(ChainHopKind::Extra, "node 1");
+        let std_mid = t63_hop(ChainHopKind::Standard, "node 2");
+        let extra_last = t63_hop(ChainHopKind::Extra, "node 3");
+        let shapes: Vec<(&str, Vec<ChainHop>)> = vec![
+            (
+                "AdjacentExtras",
+                vec![extra_first.clone(), extra_last.clone()],
+            ),
+            ("SpreadExtras", vec![extra_first, std_mid, extra_last]),
+        ];
+        for (name, hops) in &shapes {
+            let chains = [(*name, hops.as_slice())];
+            let error = validate_chain_transition_order(&chains)
+                .expect_err("a second extra-core hop fails");
+            assert!(matches!(error, EngineError::ChainViolation { .. }));
+            let text = error.to_string();
+            assert!(text.contains(CHAIN_EGRESS_RULE), "family wrap: {text}");
+            assert!(text.contains(name), "names chain: {text}");
+            assert!(
+                text.contains("at most one extracore hop per chain"),
+                "family rule: {text}"
+            );
+            assert!(text.contains("node 1"), "names first hop: {text}");
+            assert!(text.contains("node 3"), "names last hop: {text}");
+        }
+    }
+
+    #[test]
+    fn t63_rejects_xray_custom_xray_shapes() {
+        let text = t63_ordering_rejected(
+            "ConsecutiveXray",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Xray, "node 2"),
+            ],
+        );
+        assert!(
+            text.contains("two consecutive xray hops"),
+            "pattern: {text}"
+        );
+        let text = t63_ordering_rejected(
+            "XrayThenExtra",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Extra, "node 2"),
+            ],
+        );
+        assert!(
+            text.contains("an xray hop followed by an extra/custom hop"),
+            "pattern: {text}"
+        );
+        t63_ordering_rejected(
+            "XrayThenCustom",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Custom, "node 2"),
+            ],
+        );
+        t63_ordering_rejected(
+            "ExtraThenXray",
+            &[
+                t63_hop(ChainHopKind::Extra, "node 1"),
+                t63_hop(ChainHopKind::Xray, "node 2"),
+            ],
+        );
+        t63_ordering_rejected(
+            "CustomThenXray",
+            &[
+                t63_hop(ChainHopKind::Custom, "node 1"),
+                t63_hop(ChainHopKind::Xray, "node 2"),
+            ],
+        );
+        t63_ordering_rejected(
+            "XrayCustomXray",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Custom, "node 2"),
+                t63_hop(ChainHopKind::Xray, "node 3"),
+            ],
+        );
+    }
+
+    #[test]
+    fn t63_rejects_selector_slot() {
+        let autoselector = ChainHop {
+            kind: ChainHopKind::Standard,
+            ref_id: None,
+            node: Some(
+                json!({"type": "autoselector"})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            ),
+            label: "node 2".to_string(),
+        };
+        let slots = [t63_hop(ChainHopKind::Standard, "node 1"), autoselector];
+        let chains = [("AutoSelect", slots.as_slice())];
+        let error = validate_chain_transition_order(&chains).expect_err("autoselector slot fails");
+        assert!(matches!(error, EngineError::ChainViolation { .. }));
+        let text = error.to_string();
+        assert!(text.contains(CHAIN_EGRESS_RULE), "family wrap: {text}");
+        assert!(text.contains("AutoSelect"), "names chain: {text}");
+        assert!(
+            text.contains(
+                "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)"
+            ),
+            "family text: {text}"
+        );
+        assert!(text.contains("node 2"), "names slot: {text}");
+
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            chain_fixture("8", "AutoChain", json!([{"type": "autoselector"}]), 10808),
+        ];
+        let error = validate_activation(&rows).expect_err("apply path rejects the slot");
+        assert!(matches!(error, EngineError::ChainViolation { .. }));
+        let text = error.to_string();
+        assert!(
+            text.contains("chain hops cannot take an autoselector"),
+            "family error through the apply path: {text}"
+        );
+    }
+
+    #[test]
+    fn t63_valid_chains_byte_identical_after_validation() {
+        let ref_rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802),
+            chain_fixture("8", "ChainAB", json!(["1", "2"]), 10808),
+        ];
+        let xray_rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            xray_fixture("2", "XrayOne", 10802),
+            chain_fixture("8", "ChainAX", json!(["1", "2"]), 10808),
+        ];
+        let inline_rows = vec![chain_fixture(
+            "8",
+            "ChainInline",
+            json!([{"type": "vless", "server": "198.51.100.9", "server_port": 443}]),
+            10808,
+        )];
+        validate_chain_transition_order(&[(
+            "ChainAX",
+            [
+                t63_hop(ChainHopKind::Standard, "node 1"),
+                ChainHop {
+                    kind: ChainHopKind::Xray,
+                    ref_id: Some("2".to_string()),
+                    node: None,
+                    label: "node 2 (\"2\")".to_string(),
+                },
+            ]
+            .as_slice(),
+        )])
+        .expect("today's xray-last chain stays the accepted transition");
+        validate_chain_transition_order(&[(
+            "ChainInline",
+            [ChainHop {
+                kind: ChainHopKind::Standard,
+                ref_id: None,
+                node: Some(
+                    json!({"type": "vless", "server": "198.51.100.9", "server_port": 443})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+                label: "node 1".to_string(),
+            }]
+            .as_slice(),
+        )])
+        .expect("today's inline standard chain stays valid");
+
+        assert_eq!(
+            generate(&ref_rows).expect("ref chain generates").json,
+            r#"{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in-1","listen":"127.0.0.1","listen_port":10801},{"type":"mixed","tag":"in-2","listen":"127.0.0.1","listen_port":10802},{"type":"mixed","tag":"in-8","listen":"127.0.0.1","listen_port":10808}],"outbounds":[{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-1"},{"type":"vless","server":"198.51.100.9","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555","tls":{"enabled":true,"server_name":"198.51.100.9"},"tag":"out-2"},{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-8-hop-0","detour":"out-8-hop-1"},{"type":"vless","server":"198.51.100.9","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555","tls":{"enabled":true,"server_name":"198.51.100.9"},"tag":"out-8-hop-1"},{"type":"direct","tag":"direct"}],"endpoints":[],"route":{"rules":[{"inbound":["in-1"],"action":"route","outbound":"out-1"},{"inbound":["in-2"],"action":"route","outbound":"out-2"},{"inbound":["in-8"],"action":"route","outbound":"out-8-hop-0"}],"final":"direct"}}"#,
+            "today's stock ref chain bytes"
+        );
+        assert_eq!(
+            generate(&xray_rows).expect("xray chain generates").json,
+            r#"{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in-1","listen":"127.0.0.1","listen_port":10801},{"type":"mixed","tag":"in-2","listen":"127.0.0.1","listen_port":10802},{"type":"mixed","tag":"in-8","listen":"127.0.0.1","listen_port":10808}],"outbounds":[{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-1"},{"type":"socks","tag":"out-2","server":"127.0.0.1","server_port":11801,"version":"5"},{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-8-hop-0","detour":"out-8-hop-1"},{"type":"socks","tag":"out-8-hop-1","server":"127.0.0.1","server_port":11801,"version":"5"},{"type":"direct","tag":"direct"}],"endpoints":[],"route":{"rules":[{"inbound":["in-1"],"action":"route","outbound":"out-1"},{"inbound":["in-2"],"action":"route","outbound":"out-2"},{"inbound":["in-8"],"action":"route","outbound":"out-8-hop-0"}],"final":"direct"}}"#,
+            "today's xray-last chain bytes"
+        );
+        assert_eq!(
+            generate(&inline_rows).expect("inline chain generates").json,
+            r#"{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in-8","listen":"127.0.0.1","listen_port":10808}],"outbounds":[{"type":"vless","server":"198.51.100.9","server_port":443,"tag":"out-8-hop-0"},{"type":"direct","tag":"direct"}],"endpoints":[],"route":{"rules":[{"inbound":["in-8"],"action":"route","outbound":"out-8-hop-0"}],"final":"direct"}}"#,
+            "today's inline standard chain bytes"
+        );
+    }
+
     #[test]
     fn t23_missing_binaries_fail_typed_without_side_effects() {
         let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
@@ -11788,6 +12334,154 @@ Active Connections\r
     }
 
     #[test]
+    fn t68_params_declare_mux_matches_engine_logic() {
+        // Divergence-proofing: `params_declare_mux` and the engine's own
+        // params-key mux logic (`apply_mux` via `generate`) must agree on the
+        // same fixtures the t02 multiplex emission tests pin — `mux:"on"` on
+        // the four mux-capable protocol shapes, then the default / off /
+        // junk vless controls. One shared rule; drift is a bug because
+        // health.rs probes exactly what this function claims is muxed.
+        fn engine_multiplex(
+            protocol: &str,
+            params: serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            let row = fixture("9", "Muxed", protocol, params, "127.0.0.1", 10809);
+            let generated = generate(std::slice::from_ref(&row)).expect("params generate");
+            let value = generated.value();
+            let node = value["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(protocol))
+                .unwrap_or_else(|| panic!("{protocol} egress present"));
+            node.get("multiplex").cloned()
+        }
+        let on = |mut params: serde_json::Value| {
+            let obj = params.as_object_mut().expect("object");
+            obj.insert("mux".to_string(), json!("on"));
+            obj.insert("brutal_enable".to_string(), json!(true));
+            obj.insert("brutal_up_mbps".to_string(), json!(100));
+            obj.insert("brutal_down_mbps".to_string(), json!(50));
+            params
+        };
+        for (protocol, base) in [
+            ("vless", vless_params()),
+            (
+                "trojan",
+                json!({"type": "trojan", "server": "198.51.100.9", "server_port": 443,
+                       "password": "secret"}),
+            ),
+            (
+                "vmess",
+                json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                       "uuid": "11111111-2222-4333-8444-555555555555"}),
+            ),
+            ("shadowsocks", ss_params("pass1")),
+        ] {
+            let params = on(base);
+            assert!(
+                params_declare_mux(&params.to_string()),
+                "{protocol} declares the mux:\"on\" shape"
+            );
+            assert_eq!(
+                engine_multiplex(protocol, params),
+                Some(json!({"enabled": true})),
+                "{protocol} engine parity on mux:\"on\""
+            );
+        }
+
+        for spelling in ["on", "  on  ", "ON", "On"] {
+            let mut params = vless_params();
+            params
+                .as_object_mut()
+                .expect("object")
+                .insert("mux".to_string(), json!(spelling));
+            assert!(
+                params_declare_mux(&params.to_string()),
+                "{spelling:?} declares mux like the engine's trimmed compare"
+            );
+            assert_eq!(
+                engine_multiplex("vless", params),
+                Some(json!({"enabled": true})),
+                "engine emits enabled for {spelling:?}"
+            );
+        }
+        for spelling in ["off", "OFF"] {
+            let mut params = vless_params();
+            params
+                .as_object_mut()
+                .expect("object")
+                .insert("mux".to_string(), json!(spelling));
+            assert!(
+                !params_declare_mux(&params.to_string()),
+                "{spelling:?} says nothing to warm: the row multiplexes off"
+            );
+            assert_eq!(
+                engine_multiplex("vless", params),
+                Some(json!({"enabled": false})),
+                "engine emits disabled for {spelling:?}"
+            );
+        }
+        let mut blank = vless_params();
+        blank
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("   "));
+        assert!(
+            !params_declare_mux(&blank.to_string()),
+            "blank declares nothing, like the engine's empty default"
+        );
+        assert_eq!(
+            engine_multiplex("vless", blank),
+            None,
+            "engine emits no multiplex key for blank"
+        );
+        assert!(
+            !params_declare_mux(&vless_params().to_string()),
+            "the default shape declares nothing"
+        );
+
+        // Junk `mux` values fail config generation and declare nothing here.
+        let mut junk = vless_params();
+        junk.as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("sometimes"));
+        assert!(
+            !params_declare_mux(&junk.to_string()),
+            "junk never counts as muxed"
+        );
+        let junk_row = fixture("9", "Junk", "vless", junk, "127.0.0.1", 10809);
+        assert!(
+            generate(std::slice::from_ref(&junk_row)).is_err(),
+            "engine rejects the junk spelling outright"
+        );
+
+        // Non-string `mux` values are dropped exactly like `take_flat` does.
+        let mut not_string = vless_params();
+        not_string
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!(true));
+        assert!(
+            !params_declare_mux(&not_string.to_string()),
+            "a bool mux value declares nothing"
+        );
+        assert_eq!(
+            engine_multiplex("vless", not_string),
+            None,
+            "engine drops the non-string mux key"
+        );
+
+        // Raw params the engine's params_object cannot parse never declare.
+        for raw in ["", "   ", "null", "[]", "{{{"] {
+            assert!(
+                !params_declare_mux(raw),
+                "unparseable params never declare mux: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
     fn review_xray_flat_unknown_keys_reject_loud() {
         let mut ph2 = xray_params();
         ph2.as_object_mut()
@@ -12866,6 +13560,370 @@ Active Connections\r
         );
     }
 
+    fn t58_generate_rules(rules: Vec<serde_json::Value>) -> GeneratedConfig {
+        let mut map = HashMap::new();
+        map.insert("p1".to_string(), rules);
+        let row = t37_row_with_preset();
+        generate_with_presets(std::slice::from_ref(&row), &map).expect("generates")
+    }
+
+    #[test]
+    fn t58_emission_serves_each_action_verbatim() {
+        let in_tag = inbound_tag("1");
+        let out_tag = outbound_tag("1");
+
+        let generated = t58_generate_rules(vec![json!({"action": "sniff"})]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2, "sniff rule + isolation, got {rules:?}");
+        assert_eq!(
+            rules[0]["action"],
+            json!("sniff"),
+            "sniff is served verbatim"
+        );
+        assert_eq!(
+            rules[0]["inbound"],
+            json!([in_tag]),
+            "still scoped to the row"
+        );
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("outbound"),
+            "no outbound synthesized for sniff, got {rules:?}"
+        );
+        assert_eq!(
+            rules[1]["outbound"],
+            json!(out_tag),
+            "isolation follows presets"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "resolve", "server": "dns-local", "strategy": "prefer_ipv4",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules[0]["action"], json!("resolve"));
+        assert_eq!(rules[0]["server"], json!("dns-local"));
+        assert_eq!(rules[0]["strategy"], json!("prefer_ipv4"));
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("outbound"),
+            "resolve never routes, got {rules:?}"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route-options", "override_address": "192.0.2.53", "override_port": 53,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["action"],
+            json!("route-options"),
+            "served verbatim"
+        );
+        assert_eq!(rules[0]["override_address"], json!("192.0.2.53"));
+        assert_eq!(rules[0]["override_port"], json!(53));
+        assert_eq!(
+            rules[0]["outbound"],
+            json!(out_tag),
+            "route-options joins the outbound-carrying set"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route-options", "outbound": "direct",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["outbound"],
+            json!("direct"),
+            "known direct exit is kept"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "reject", "method": "drop", "no_drop": true,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules[0]["action"], json!("reject"));
+        assert_eq!(rules[0]["method"], json!("drop"));
+        assert_eq!(rules[0]["no_drop"], json!(true));
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "block", "method": "reply",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["action"],
+            json!("reject"),
+            "block serves as reject"
+        );
+        assert_eq!(
+            rules[0]["method"],
+            json!("reply"),
+            "reject method flows through the merge"
+        );
+    }
+
+    #[test]
+    fn t59_emission_passes_new_attributes_verbatim() {
+        let in_tag = inbound_tag("1");
+        let out_tag = outbound_tag("1");
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route",
+            "source_ip_cidr": ["10.0.0.0/8", "127.0.0.0/8"],
+            "invert": true,
+            "process_path_regex": "mstsc\\.exe$",
+            "source_port": 10808,
+            "source_port_range": "1000:2000",
+            "ip_version": 6,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2, "route rule + isolation, got {rules:?}");
+        assert_eq!(
+            rules[0]["source_ip_cidr"],
+            json!(["10.0.0.0/8", "127.0.0.0/8"]),
+            "source cidr rides the clone verbatim"
+        );
+        assert_eq!(rules[0]["invert"], json!(true));
+        assert_eq!(rules[0]["process_path_regex"], json!("mstsc\\.exe$"));
+        assert_eq!(rules[0]["source_port"], json!(10808));
+        assert_eq!(rules[0]["source_port_range"], json!("1000:2000"));
+        assert_eq!(rules[0]["ip_version"], json!(6));
+        assert_eq!(
+            rules[0]["inbound"],
+            json!([in_tag]),
+            "still scoped to the row"
+        );
+        assert_eq!(
+            rules[0]["outbound"],
+            json!(out_tag),
+            "route exit is synthesized around the new attributes"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "direct",
+            "source_ip_is_private": true,
+            "source_port": "9090",
+            "source_ip_cidr": "127.0.0.0/8",
+            "custom_attr": 7,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules[0]["source_ip_is_private"], json!(true));
+        assert_eq!(rules[0]["source_port"], json!("9090"));
+        assert_eq!(rules[0]["source_ip_cidr"], json!("127.0.0.0/8"));
+        assert_eq!(
+            rules[0]["custom_attr"],
+            json!(7),
+            "unknown attributes stay tolerated at emission too"
+        );
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("outbound"),
+            "direct never grows an outbound, got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn t58_route_options_unknown_exit_stays_loud() {
+        let bad = |rules: Vec<serde_json::Value>| {
+            let mut map = HashMap::new();
+            map.insert("p1".to_string(), rules);
+            let row = t37_row_with_preset();
+            generate_with_presets(std::slice::from_ref(&row), &map)
+                .expect_err("unknown exit must fail loudly")
+        };
+        for action in ["route", "route-options"] {
+            let error = bad(vec![
+                json!({"action": action, "outbound": "some-other-row"}),
+            ]);
+            let text = error.to_string();
+            assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+            assert!(text.contains("names an unknown exit"), "{text}");
+        }
+    }
+
+    #[test]
+    fn t60_rule_names_scrubbed_from_emission() {
+        let in_tag = inbound_tag("1");
+        let out_tag = outbound_tag("1");
+        let generated = t58_generate_rules(vec![
+            json!({
+                "action": "route", "name": "Office exit",
+                "domain": ["example.com"],
+            }),
+            json!({
+                "action": "direct", "name": "Local LAN",
+                "ip_cidr": ["10.0.0.0/8"],
+            }),
+            json!({"action": "block", "name": "Mail ports", "port": [25]}),
+            json!({"action": "sniff", "name": "Sniff opener"}),
+        ]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules.len(),
+            5,
+            "4 named preset rules + 1 isolation, got {rules:?}"
+        );
+        for (index, rule) in rules.iter().enumerate() {
+            assert!(
+                !rule.as_object().expect("rule object").contains_key("name"),
+                "rule {index} never carries its authoring name into config: {rule}"
+            );
+        }
+        assert_eq!(rules[0]["action"], json!("route"));
+        assert_eq!(
+            rules[0]["domain"],
+            json!(["example.com"]),
+            "matchers survive"
+        );
+        assert_eq!(
+            rules[0]["outbound"],
+            json!(out_tag),
+            "route exit still synthesized"
+        );
+        assert_eq!(rules[1]["action"], json!("direct"));
+        assert_eq!(rules[2]["action"], json!("reject"), "block normalizes");
+        assert_eq!(rules[3]["action"], json!("sniff"));
+        assert!(
+            rules.iter().all(|rule| rule["inbound"] == json!([in_tag])),
+            "every emitted rule stays scoped to the row"
+        );
+        assert_eq!(
+            rules[4]["outbound"],
+            json!(out_tag),
+            "isolation rule unchanged"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route", "name": "Direct exit", "outbound": "direct",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["outbound"],
+            json!("direct"),
+            "an explicit known exit is kept"
+        );
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("name"),
+            "the name still never reaches config"
+        );
+    }
+
+    #[test]
+    fn t60_unknown_exit_emission_stays_loud() {
+        for action in ["route", "proxy", "route-options"] {
+            let mut map = HashMap::new();
+            map.insert(
+                "p1".to_string(),
+                vec![json!({"action": action, "name": "Named hop", "outbound": "some-other-row"})],
+            );
+            let row = t37_row_with_preset();
+            let error = generate_with_presets(std::slice::from_ref(&row), &map)
+                .expect_err("unknown exit must stay loud");
+            let text = error.to_string();
+            assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+            assert!(text.contains("rule 0"), "{text}");
+            assert!(text.contains("names an unknown exit"), "{text}");
+            assert!(
+                !text.contains("Named hop"),
+                "the authoring label stays out of the failure: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn t58_live_throne_country_profile_check() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
+        // Throne-country-style profile in Throne doc shape: sniff opener,
+        // private-range direct rules, country-suffix direct list, catch-all
+        // route. Throne's own profiles open with a leading DNS rule; that
+        // action is a non-concept here, so the proof profile carries none.
+        let profile = r#"{
+            "kind": "throne-route-profile",
+            "v": 1,
+            "name": "throne-country",
+            "rules": [
+                {"action": "sniff"},
+                {"action": "direct", "source_ip_is_private": true},
+                {"action": "direct", "ip_is_private": true},
+                {"action": "direct", "domain_suffix": ["cn"]},
+                {"action": "route"}
+            ]
+        }"#;
+        let parsed = crate::preset::parse_preset_json(profile, "throne-country")
+            .expect("PROBE profile parses at intake");
+        let mut map = HashMap::new();
+        map.insert("p1".to_string(), parsed.rules);
+        let row = t37_row_with_preset();
+        let generated = generate_with_presets(std::slice::from_ref(&row), &map)
+            .expect("PROBE profile: generates");
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules.len(),
+            6,
+            "5 preset rules + 1 isolation, got {rules:?}"
+        );
+        assert_eq!(rules[0]["action"], json!("sniff"), "sniff opener served");
+        assert_eq!(
+            rules[1]["source_ip_is_private"],
+            json!(true),
+            "private source range goes direct"
+        );
+        assert_eq!(
+            rules[2]["ip_is_private"],
+            json!(true),
+            "private IP goes direct"
+        );
+        assert_eq!(
+            rules[3]["domain_suffix"],
+            json!(["cn"]),
+            "country suffix goes direct"
+        );
+        assert_eq!(
+            rules[4]["outbound"],
+            json!(outbound_tag("1")),
+            "catch-all routes to the row's outbound"
+        );
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-t58-live-profile-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, &generated.json).expect("temp config writes");
+        let output = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("check runs");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "PROBE profile: sing-box check EXIT 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn t48_clash_reservation_none_when_exhausted() {
         const START: u16 = 12777;
@@ -12985,6 +14043,371 @@ Active Connections\r
         assert!(
             backend.drain_log_lines().is_empty(),
             "stop drops stale lines with the sidecar"
+        );
+    }
+
+    fn t62_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        dir
+    }
+
+    /// Stages bytes the same way the confirmed download flow does: a file at
+    /// the name-derived staged path (the engine resolves it via the staged
+    /// map — never from disk globs).
+    fn t62_stage(dir: &Path, name: &str, files: &mut HashMap<String, PathBuf>) -> PathBuf {
+        let file = dir.join(crate::store::rule_set_file_name(name));
+        std::fs::write(&file, format!("staged:{name}")).expect("staged bytes write");
+        files.insert(name.to_string(), file.clone());
+        file
+    }
+
+    #[test]
+    fn t62_emission_local_rule_set_entries() {
+        let dir = t62_temp_dir("t62emit");
+        let mut files = HashMap::new();
+        let song = t62_stage(&dir, "Song", &mut files);
+        let other = t62_stage(&dir, "Other", &mut files);
+
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![
+                json!({"action": "route", "rule_set": ["Song"]}),
+                json!({"action": "direct", "rule_set": ["Song", "Other"]}),
+                json!({"action": "block", "rule_set": ["Song"], "port": [25]}),
+            ],
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect("staged map generates");
+        let value = generated.value();
+
+        // One entry per distinct staged set, local + binary + absolute staged
+        // path, deduped across every rule in the build.
+        let entries = value["route"]["rule_set"].as_array().expect("emitted");
+        assert_eq!(
+            entries.len(),
+            2,
+            "Song dedupes, Other joins once: {entries:?}"
+        );
+        assert_eq!(entries[0]["type"], json!("local"), "{entries:?}");
+        assert_eq!(entries[0]["tag"], json!("rs-Song"));
+        assert_eq!(entries[0]["format"], json!("binary"));
+        assert_eq!(
+            entries[0]["path"],
+            json!(song.display().to_string()),
+            "the sidecar points at the staged file, never a remote URL"
+        );
+        assert_eq!(entries[1]["tag"], json!("rs-Other"));
+        assert_eq!(entries[1]["path"], json!(other.display().to_string()));
+
+        // Rules reference the rs-* tags; matchers and scoping stay intact.
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 4, "3 preset rules + 1 isolation");
+        assert_eq!(rules[0]["rule_set"], json!(["rs-Song"]));
+        assert_eq!(rules[1]["rule_set"], json!(["rs-Song", "rs-Other"]));
+        assert_eq!(rules[2]["rule_set"], json!(["rs-Song"]));
+        let in_tag = inbound_tag(&row.id);
+        let out_tag = outbound_tag(&row.id);
+        assert_eq!(rules[0]["outbound"], json!(out_tag));
+        // "block" serves as reject — a reject rule carries no outbound exit;
+        // the port matcher and rule_set reference stay scoped.
+        assert_eq!(rules[2]["action"], json!("reject"));
+        assert!(
+            rules[2].get("outbound").is_none(),
+            "reject has no exit: {}",
+            rules[2]
+        );
+        assert_eq!(rules[2]["port"], json!([25]));
+        assert_eq!(rules[3]["outbound"], json!(out_tag), "the isolation route");
+        for rule in rules.iter() {
+            assert_eq!(rule["inbound"], json!([in_tag]), "{rule}");
+        }
+
+        // A build whose preset rules carry no rule_set keeps `route.rule_set`
+        // absent: the key exists only when staged sets are actually used.
+        let plain = three_standard();
+        let mut empty_file_map = HashMap::new();
+        empty_file_map.insert("Song".to_string(), song);
+        let generated =
+            generate_with_rule_sets(&plain, &HashMap::new(), &empty_file_map).expect("generates");
+        assert!(
+            generated.value()["route"].get("rule_set").is_none(),
+            "the route stays clean without rule_set references"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t62_missing_rule_set_fails_loud() {
+        let dir = t62_temp_dir("t62missing");
+
+        // Staged by name in the map, but the file vanished from disk: loud
+        // BadPreset naming the set and the path, never skip, never substitute.
+        let vanished = dir.join("Ghost.srs");
+        let mut files = HashMap::new();
+        files.insert("Ghost".to_string(), vanished.clone());
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route", "rule_set": ["Ghost"]})],
+        );
+        let row = t37_row_with_preset();
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect_err("vanished staged file must fail");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+        assert!(text.contains("Ghost"), "names the set: {text}");
+        assert!(
+            text.contains(vanished.display().to_string().as_str()),
+            "names the missing staged path: {text}"
+        );
+        assert!(
+            text.contains("re-download"),
+            "points at the staging surface: {text}"
+        );
+
+        // A reference with no staged name at all resolves through the same
+        // staging grammar and fails just as loud.
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &HashMap::new())
+            .expect_err("unlisted name must fail");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+        assert!(text.contains("Ghost"), "{text}");
+        assert!(text.contains("missing"), "{text}");
+
+        // Two distinct staged names that sanitize to one tag collide — the
+        // mapping stays one set per tag, loud.
+        let mut files = HashMap::new();
+        let first = t62_stage(&dir, "a b", &mut files);
+        let second = t62_stage(&dir, "a-b", &mut files);
+        assert_eq!(
+            first, second,
+            "distinct names in one sanitize bucket share a file — that is the collision"
+        );
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "direct", "rule_set": ["a b", "a-b"]})],
+        );
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect_err("tag collision must fail");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+        assert!(text.contains("rs-a-b"), "{text}");
+        assert!(text.contains("rename"), "{text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t62_no_remote_rule_set_emission_ever() {
+        // Q4a: Option B is dead — the sidecar never fetches. Whatever the
+        // staging state, a generated config can never gain a remote entry and
+        // an unresolvable reference fails the build instead of substituting.
+        let dir = t62_temp_dir("t62remote");
+        let mut files = HashMap::new();
+        t62_stage(&dir, "Song", &mut files);
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route", "rule_set": ["Song"]})],
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect("generates");
+        let value = generated.value();
+        for entry in value["route"]["rule_set"].as_array().expect("entries") {
+            assert_eq!(
+                entry["type"],
+                json!("local"),
+                "only local entries exist: {entry}"
+            );
+        }
+        assert!(
+            !value.to_string().contains("\"type\":\"remote\""),
+            "no generated config ever contains a remote rule_set entry: {}",
+            generated.json
+        );
+
+        // Nothing to resolve → the build fails loud; there is no remote-type
+        // fallback path that would emit anything.
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &HashMap::new())
+            .expect_err("unresolvable must fail");
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{error}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t62_live_srs_rule_set_preset_check() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+
+        // Proof-time compile with the pinned binary (outside the app: it
+        // models the maintainer-hosted artifact; the app fetch is the only
+        // in-app path and stays behind the per-download confirm).
+        let dir = t62_temp_dir("t62live");
+        let source = dir.join("source.json");
+        std::fs::write(
+            &source,
+            r#"{"version":1,"rules":[{"ip_cidr":["10.0.0.0/8"],"outbound":"direct"}]}"#,
+        )
+        .expect("source set writes");
+        let staged = dir.join(crate::store::rule_set_file_name("living-set"));
+        let compiled = std::process::Command::new(&binary)
+            .arg("rule-set")
+            .arg("compile")
+            .arg("--output")
+            .arg(&staged)
+            .arg(&source)
+            .output()
+            .expect("the pinned binary compiles rule sets");
+        assert!(
+            compiled.status.success(),
+            "PROBE compile: {} stderr: {}",
+            compiled.status,
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(staged.is_file(), "the compiled .srs stages locally");
+        std::fs::remove_file(&source).ok();
+
+        // The staged file rides the app's own staging grammar (name → staged
+        // file name), synced into the engine exactly like main.rs does.
+        let mut files = HashMap::new();
+        files.insert("living-set".to_string(), staged.clone());
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route", "rule_set": ["living-set"]})],
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect("PROBE srs: generates");
+        let value = generated.value();
+        let entries = value["route"]["rule_set"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["type"], json!("local"));
+        assert_eq!(entries[0]["tag"], json!("rs-living-set"));
+        assert_eq!(
+            entries[0]["path"],
+            json!(staged.display().to_string()),
+            "the sidecar loads the app-staged bytes"
+        );
+        assert_eq!(
+            value["route"]["rules"][0]["rule_set"],
+            json!(["rs-living-set"])
+        );
+
+        let path = dir.join("generated.json");
+        std::fs::write(&path, &generated.json).expect("temp config writes");
+        let output = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("check runs");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            output.status.success(),
+            "PROBE srs: sing-box check EXIT 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn t80_shard_processes_lists_live_pids() {
+        let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
+        controller.set_fork_probe(|| Ok(PathBuf::from("test-fork-bin")));
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        controller.set_extra_probe(|_| Ok(PathBuf::from("test-extra-exe")));
+
+        assert_eq!(
+            controller.shard_processes(),
+            vec![
+                ("stock".to_string(), None),
+                ("fork".to_string(), None),
+                ("xray".to_string(), None),
+                ("extra-0".to_string(), None),
+            ],
+            "idle slots are named but offer no pid to sample"
+        );
+
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            noise_fixture("2", "NoiseOne", 10802),
+            xray_fixture("3", "XrayOne", 10803),
+            extra_fixture("4", "SlotA", 10804),
+        ];
+        controller.start_all(&rows).expect("every shard starts");
+        for (handle, pid) in [
+            (&stock, 4101u32),
+            (&fork, 4102),
+            (&xray, 4103),
+            (&extra, 4104),
+        ] {
+            handle.set_pid(Some(pid));
+        }
+
+        assert_eq!(
+            controller.shard_processes(),
+            vec![
+                ("stock".to_string(), Some(4101)),
+                ("fork".to_string(), Some(4102)),
+                ("xray".to_string(), Some(4103)),
+                ("extra-4".to_string(), Some(4104)),
+            ],
+            "one (label, pid) per live shard; extras named by their row id"
+        );
+
+        // The cohort is exactly what poll_shards tracks: the same crash comes
+        // back under the same label, and that shard stops offering a pid.
+        extra.inject_crash("signal: killed");
+        let crashes = controller.poll_shards();
+        assert_eq!(
+            crashes.first().map(|(shard, _)| shard.as_str()),
+            Some("extra-4"),
+            "poll_shards and shard_processes agree on the shard name: {crashes:?}"
+        );
+        let after = controller.shard_processes();
+        assert!(
+            after.contains(&("extra-4".to_string(), None)),
+            "a dead extra shard drops its pid: {after:?}"
+        );
+
+        controller.stop_all();
+        assert!(
+            controller
+                .shard_processes()
+                .iter()
+                .all(|(_, pid)| pid.is_none()),
+            "stopping every shard clears the whole cohort"
         );
     }
 }

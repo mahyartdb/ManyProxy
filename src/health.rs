@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::{inbound_tag, outbound_tag};
+use crate::engine::{inbound_tag, outbound_tag, params_declare_mux};
 use crate::store::{now_unix, HealthHistoryEntry, HealthSnapshot, ProxyConfig};
 
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
@@ -79,7 +79,16 @@ impl ProbeExclusions {
 }
 
 const MAX_SAMPLES: usize = 10_000;
-const MAX_LOG_RECORDS: usize = 5_000;
+/// T-31: the default kept-log ring, unchanged from the pre-feature shape.
+pub const MAX_LOG_RECORDS: usize = 5_000;
+/// T-31: the configurable window the Settings field may name.
+pub const MIN_LOG_MAX_LINES: usize = 500;
+pub const MAX_LOG_MAX_LINES: usize = 50_000;
+
+/// Clamp a requested kept-line cap into the supported window.
+pub fn clamp_log_max_lines(cap: usize) -> usize {
+    cap.clamp(MIN_LOG_MAX_LINES, MAX_LOG_MAX_LINES)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthKind {
@@ -866,9 +875,55 @@ pub fn test_group(
     stop: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Vec<TestOutcome> {
-    run_group(configs, stop, &mut on_progress, |chunk| {
+    use std::sync::atomic::Ordering;
+
+    let total = configs.len();
+    let first = run_group(configs, stop, &mut on_progress, |chunk| {
         test_all_stoppable(chunk, url, prober, stop)
-    })
+    });
+    // T-18 mux warm-up: rows whose params declare multiplex pay the mux
+    // cold-chain inside their first probe, so that reading sits at the worst
+    // case. The first pass never becomes an outcome below; every mux row that
+    // came back live runs one second URL test through the same staged runner
+    // (same batch size, poll interval and concurrency cap, same stop flag)
+    // and only its sample is returned. Failures and dead results stand
+    // unretried; rows the params do not mark muxed keep exactly one probe.
+    let mut first_by_id: HashMap<String, TestOutcome> = first
+        .into_iter()
+        .map(|outcome| (outcome.sample.config_id.clone(), outcome))
+        .collect();
+    let mut recorded: Vec<TestOutcome> = Vec::with_capacity(total);
+    let mut warm: Vec<ProxyConfig> = Vec::new();
+    for config in configs {
+        let first_outcome = first_by_id.remove(&config.id);
+        let warmed = params_declare_mux(&config.params)
+            && first_outcome.as_ref().is_some_and(|outcome| {
+                outcome.sample.latency_ms.is_some_and(|latency| latency > 0)
+            });
+        if warmed {
+            // First pass retired as the warm-up; the second pass refills the
+            // row's sample from the runner below.
+            warm.push(config.clone());
+        } else if let Some(outcome) = first_outcome {
+            recorded.push(outcome);
+        }
+    }
+    if !warm.is_empty() && !stop.load(Ordering::SeqCst) {
+        let measured = recorded.len();
+        let seconds = run_group(
+            &warm,
+            stop,
+            &mut |done, _| {
+                // Keep the runner's done/total shape: rows measured so far across
+                // the whole group, warm-up passes excluded just like their
+                // samples.
+                on_progress(measured.saturating_add(done).min(total), total);
+            },
+            |chunk| test_all_stoppable(chunk, url, prober, stop),
+        );
+        recorded.extend(seconds);
+    }
+    recorded
 }
 
 #[cfg(test)]
@@ -1115,6 +1170,28 @@ pub fn url_test_sparkline(entries: &[HealthHistoryEntry], limit: usize) -> Vec<u
     sparkline_latencies(&samples, limit)
 }
 
+/// Tone for the sparkline caption, decided by the newest persisted url/ping
+/// entry: an error reads [`LatencyTone::Failed`], a latency picks its Throne
+/// band, and an empty history stays neutral `Unknown`. Speed-test durations
+/// are skipped exactly like [`url_test_sparkline`] skips them, so a download
+/// time can never pick a latency band; ties on `at` keep the later entry.
+pub fn sparkline_caption_tone(entries: &[HealthHistoryEntry]) -> LatencyTone {
+    let mut newest: Option<&HealthHistoryEntry> = None;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind != HealthKind::SpeedTest.as_str())
+    {
+        if newest.is_none_or(|current| entry.at >= current.at) {
+            newest = Some(entry);
+        }
+    }
+    match newest {
+        Some(entry) if entry.error.is_some() => LatencyTone::Failed,
+        Some(entry) => latency_tone(entry.latency_ms),
+        None => LatencyTone::Unknown,
+    }
+}
+
 #[cfg(test)]
 pub fn parse_clash_totals(body: &str) -> Result<(u64, u64), String> {
     let value: serde_json::Value =
@@ -1136,6 +1213,60 @@ pub struct ClashConn {
     pub tx_bytes: u64,
 
     pub dest: String,
+
+    /// `metadata.network` as the core reported it (`"tcp"`/`"udp"`, blank when
+    /// absent). Kept raw so the counter classifier owns the one normalization.
+    pub network: String,
+}
+
+/// T-25: transport bucket for one snapshot row. `Other` still counts as active;
+/// it just cannot claim a TCP or UDP slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnProto {
+    Tcp,
+    Udp,
+    Other,
+}
+
+/// T-25: `N active · M TCP · K UDP` derived from clash snapshot rows. Counts
+/// only — no row content reaches the status bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnCounts {
+    pub active: usize,
+    pub tcp: usize,
+    pub udp: usize,
+}
+
+impl ConnCounts {
+    /// Pure classifier over one row's `metadata.network`.
+    pub fn proto_of(network: &str) -> ConnProto {
+        match network.trim().to_ascii_lowercase().as_str() {
+            "tcp" => ConnProto::Tcp,
+            "udp" => ConnProto::Udp,
+            _ => ConnProto::Other,
+        }
+    }
+
+    /// Aggregate across every row the poll merged, whatever core produced it.
+    pub fn from_conns<'a>(conns: impl IntoIterator<Item = &'a ClashConn>) -> Self {
+        let mut counts = Self::default();
+        for conn in conns {
+            counts.active = counts.active.saturating_add(1);
+            match Self::proto_of(&conn.network) {
+                ConnProto::Tcp => counts.tcp = counts.tcp.saturating_add(1),
+                ConnProto::Udp => counts.udp = counts.udp.saturating_add(1),
+                ConnProto::Other => {}
+            }
+        }
+        counts
+    }
+
+    pub fn status_text(&self) -> String {
+        format!(
+            "{} active · {} TCP · {} UDP",
+            self.active, self.tcp, self.udp
+        )
+    }
 }
 
 pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
@@ -1156,6 +1287,10 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
         let meta = item.get("metadata");
         let inbound = meta
             .and_then(|m| m.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let network = meta
+            .and_then(|m| m.get("network"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let dest = meta
@@ -1184,6 +1319,7 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
             rx_bytes: rx,
             tx_bytes: tx,
             dest: dest.to_string(),
+            network: network.to_string(),
         });
     }
     Ok(out)
@@ -1695,7 +1831,9 @@ impl HealthStore {
     }
 
     pub fn record_outcome(&mut self, outcome: &TestOutcome) {
-        self.push_sample(outcome.sample.clone());
+        if !outcome_is_neutral(outcome) {
+            self.push_sample(outcome.sample.clone());
+        }
         if let Some(success) = &outcome.success {
             let entry = self
                 .traffic
@@ -1909,6 +2047,23 @@ impl HealthStore {
         }
     }
 
+    /// Presentation-tone of the latest samples: a dead verdict (the newest
+    /// url/ping sample carries an error, no live latency) reads
+    /// [`LatencyTone::Failed`]; a live latency picks its Throne band via
+    /// [`latency_tone`]; everything else — untested rows, speed-only
+    /// summaries, live rows without a latency — stays neutral `Unknown`.
+    /// Pure view of stored samples: no probing is scheduled and no
+    /// classification changes.
+    pub fn health_tone(&self, config_id: &str) -> LatencyTone {
+        match self.status(config_id) {
+            RowHealth {
+                state: RowState::Dead,
+                ..
+            } => LatencyTone::Failed,
+            RowHealth { latency_ms, .. } => latency_tone(latency_ms),
+        }
+    }
+
     pub fn counts(&self, ids: &[String]) -> (usize, usize) {
         let mut live = 0;
         let mut dead = 0;
@@ -1949,22 +2104,104 @@ impl HealthStore {
     }
 }
 
-#[cfg(test)]
+/// True when a probe outcome must not rewrite the sample ring: a zero-latency
+/// live report (a cold listener's zero reading) or an error-only report whose
+/// cause classifies as local (the probe's own listen/bind aborted, not the
+/// row). Dns/Egress causes and every other shape stay decisive and overwrite,
+/// and traffic accounting is not subject to this gate.
+pub fn outcome_is_neutral(outcome: &TestOutcome) -> bool {
+    if let Some(cause) = &outcome.sample.error {
+        return classify_health_cause(cause) == HealthCause::Local;
+    }
+    outcome.sample.latency_ms == Some(0)
+}
+
+/// Health readout cap for the tray Select-exit dialog's monitor section.
+pub const BEST_ROWS_MONITOR_TOP_N: usize = 5;
+
+/// Rank rows best-first by their latest health sample: live rows with a known
+/// latency first, fastest first; live rows without a latency next; rows with
+/// no url/ping sample after those; dead rows last. Equal ranks keep the
+/// caller's order, so unknown/dead/no-sample bundles render in a stable,
+/// deterministic order. A pure view of existing samples — nothing is probed,
+/// re-sampled, or restarted, and group-test stop flags stay untouched.
+pub fn best_rows_by_health<'a>(
+    rows: &'a [ProxyConfig],
+    health: &HealthStore,
+) -> Vec<&'a ProxyConfig> {
+    let mut ordered: Vec<&'a ProxyConfig> = rows.iter().collect();
+    ordered.sort_by_key(|row| {
+        let row_health = health.status(&row.id);
+        match row_health.state {
+            RowState::Live => (0u8, row_health.latency_ms.unwrap_or(u64::MAX)),
+            RowState::Unknown => (1u8, 0u64),
+            RowState::Dead => (2u8, 0u64),
+        }
+    });
+    ordered
+}
+
+/// Read-only monitor lines for the tray Select-exit dialog, computed per
+/// open: a `Best by health in {group}:` header plus the top five rows ranked
+/// by [`best_rows_by_health`], rendered as `N) {name} ({row_summary})` with
+/// `(stale)` appended the way row traffic text marks staleness. `None`
+/// without rows — the caller hides the section, leaving no empty block.
+/// Names and health summaries only, the data row text already shows; no
+/// secrets, params, or URLs ever enter the strings.
+pub fn best_rows_monitor_lines(
+    group: &str,
+    rows: &[ProxyConfig],
+    health: &HealthStore,
+) -> Option<(String, Vec<String>)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let lines = best_rows_by_health(rows, health)
+        .into_iter()
+        .take(BEST_ROWS_MONITOR_TOP_N)
+        .enumerate()
+        .map(|(index, row)| {
+            let stale = if health.is_stale(&row.id) {
+                " (stale)"
+            } else {
+                ""
+            };
+            let summary = health.row_summary(&row.id).trim().to_string();
+            let summary = if summary.is_empty() {
+                "no probes this session".to_string()
+            } else {
+                summary
+            };
+            format!("{}) {} ({summary}){stale}", index + 1, row.name)
+        })
+        .collect();
+    Some((format!("Best by health in {group}:"), lines))
+}
+
+/// Presentation-only latency band for probe readouts: Throne-style `<=100 ms`
+/// green, `<=300 ms` yellow, past that red; a failed probe (latest sample
+/// carries an error) reads darker than a plain poor latency; a row without a
+/// probe stays neutral. Pure presentation — bands never gate probing,
+/// pruning, re-sampling, or classification (`classify_health_cause`
+/// untouched), and a slow-but-alive sample keeps its place in the series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyTone {
     Unknown,
+    Failed,
     Fast,
     Slow,
     Poor,
 }
 
-#[cfg(test)]
+/// Map a probed latency onto the Throne §F.1 bands: `None` stays
+/// [`LatencyTone::Unknown`]; the 100 ms and 300 ms boundaries are inclusive
+/// (`<=100` green, `<=300` yellow, `>300` red).
 pub fn latency_tone(latency_ms: Option<u64>) -> LatencyTone {
     match latency_ms {
         None => LatencyTone::Unknown,
-        Some(ms) if ms < 500 => LatencyTone::Fast,
-        Some(ms) if ms < 1500 => LatencyTone::Slow,
-        _ => LatencyTone::Poor,
+        Some(ms) if ms <= 100 => LatencyTone::Fast,
+        Some(ms) if ms <= 300 => LatencyTone::Slow,
+        Some(_) => LatencyTone::Poor,
     }
 }
 
@@ -2094,13 +2331,36 @@ fn tag_matches_bounded(line: &str, tag: &str) -> bool {
     false
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LogStore {
     records: VecDeque<LogRecord>,
     push_seq: u64,
+    cap: usize,
+}
+
+impl Default for LogStore {
+    fn default() -> Self {
+        Self::with_capacity(MAX_LOG_RECORDS)
+    }
 }
 
 impl LogStore {
+    /// T-31: build a ring at a caller-chosen cap. The settings path clamps to
+    /// `500..=50_000` before it gets here; zero would degenerate every push
+    /// into an immediate eviction, so the instance floor is one record.
+    pub fn with_capacity(cap: usize) -> LogStore {
+        LogStore {
+            records: VecDeque::new(),
+            push_seq: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    /// T-31: the instance cap this ring evicts at.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     pub fn push_raw(&mut self, line: &str, tags: &LogTagIndex) {
         let stripped = crate::engine::strip_ansi_codes(line);
         let message = redact_secrets(&stripped);
@@ -2117,7 +2377,7 @@ impl LogStore {
 
     fn push(&mut self, record: LogRecord) {
         self.push_seq = self.push_seq.wrapping_add(1);
-        if self.records.len() >= MAX_LOG_RECORDS {
+        if self.records.len() >= self.cap {
             if let Some(position) = self
                 .records
                 .iter()
@@ -2132,7 +2392,7 @@ impl LogStore {
     }
 
     /// Monotonic count of records pushed, so a tail view can notice new output
-    /// even when the capped ring keeps `all().len()` pinned at `MAX_LOG_RECORDS`.
+    /// even when the capped ring keeps `all().len()` pinned at the instance cap.
     pub fn push_seq(&self) -> u64 {
         self.push_seq
     }
@@ -2765,6 +3025,171 @@ mod tests {
     }
 
     #[test]
+    fn t65_latency_bands_100_300_matrix() {
+        assert_eq!(
+            latency_tone(None),
+            LatencyTone::Unknown,
+            "no latency stays neutral"
+        );
+        assert_eq!(latency_tone(Some(0)), LatencyTone::Fast);
+        assert_eq!(latency_tone(Some(99)), LatencyTone::Fast);
+        assert_eq!(
+            latency_tone(Some(100)),
+            LatencyTone::Fast,
+            "100 boundary inclusive"
+        );
+        assert_eq!(
+            latency_tone(Some(101)),
+            LatencyTone::Slow,
+            "one past 100 turns yellow"
+        );
+        assert_eq!(latency_tone(Some(299)), LatencyTone::Slow);
+        assert_eq!(
+            latency_tone(Some(300)),
+            LatencyTone::Slow,
+            "300 boundary inclusive"
+        );
+        assert_eq!(
+            latency_tone(Some(301)),
+            LatencyTone::Poor,
+            "one past 300 turns red"
+        );
+        assert_eq!(latency_tone(Some(u64::MAX)), LatencyTone::Poor);
+
+        let mut store = HealthStore::default();
+        let url_sample = |at: i64, latency: Option<u64>, error: Option<&str>| HealthSample {
+            config_id: "row".to_string(),
+            at,
+            kind: HealthKind::UrlTest,
+            latency_ms: latency,
+            error: error.map(|cause| cause.to_string()),
+        };
+        let record = |store: &mut HealthStore, sample: HealthSample| {
+            store.record_outcome(&TestOutcome {
+                sample,
+                success: None,
+            });
+        };
+
+        record(&mut store, url_sample(1, Some(250), None));
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Slow,
+            "250 ms sits in yellow"
+        );
+
+        record(&mut store, url_sample(2, Some(100), None));
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Fast,
+            "boundary stays green"
+        );
+
+        record(&mut store, url_sample(3, Some(301), None));
+        assert_eq!(store.health_tone("row"), LatencyTone::Poor, "301 turns red");
+
+        assert_eq!(
+            store.health_tone("never-probed"),
+            LatencyTone::Unknown,
+            "an unprobed row keeps the neutral tone"
+        );
+
+        record(&mut store, url_sample(4, None, Some("upstream refused")));
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Failed,
+            "an error-only sample reads Failed, not a latency band"
+        );
+
+        record(
+            &mut store,
+            url_sample(5, Some(90), Some("upstream refused")),
+        );
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Failed,
+            "the error wins over a latency in the same sample"
+        );
+
+        record(&mut store, url_sample(6, None, None));
+        assert_eq!(store.status("row").state, RowState::Live);
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Unknown,
+            "live without a latency stays neutral"
+        );
+
+        let speedy = TestOutcome {
+            sample: HealthSample {
+                config_id: "speedy".to_string(),
+                at: 1,
+                kind: HealthKind::SpeedTest,
+                latency_ms: Some(2700),
+                error: Some("dial refused".to_string()),
+            },
+            success: None,
+        };
+        store.record_outcome(&speedy);
+        assert_eq!(
+            store.status("speedy").state,
+            RowState::Unknown,
+            "a speed sample never classifies the row"
+        );
+        assert_eq!(
+            store.health_tone("speedy"),
+            LatencyTone::Unknown,
+            "a failed speed summary stays distinct from a failed probe"
+        );
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Unknown,
+            "the url row keeps its verdict beside the speed sample"
+        );
+
+        let caption = |at: i64, latency: Option<u64>, error: Option<&str>| HealthHistoryEntry {
+            config_id: "row".to_string(),
+            at,
+            kind: "url-test".to_string(),
+            latency_ms: latency,
+            error: error.map(|cause| cause.to_string()),
+        };
+        assert_eq!(sparkline_caption_tone(&[]), LatencyTone::Unknown);
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, Some(300), None)]),
+            LatencyTone::Slow,
+            "the caption bands by its newest latency"
+        );
+        assert_eq!(
+            sparkline_caption_tone(&[
+                caption(1, Some(90), None),
+                caption(2, None, Some("port in use")),
+            ]),
+            LatencyTone::Failed,
+            "a failed newest entry darkens the caption"
+        );
+        assert_eq!(
+            sparkline_caption_tone(&[
+                caption(1, None, Some("port in use")),
+                caption(2, Some(90), None),
+            ]),
+            LatencyTone::Fast,
+            "a later success clears the failed tone"
+        );
+        let duration_caption = HealthHistoryEntry {
+            config_id: "row".to_string(),
+            at: 2,
+            kind: "speed-test".to_string(),
+            latency_ms: Some(5000),
+            error: None,
+        };
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, Some(90), None), duration_caption]),
+            LatencyTone::Fast,
+            "speed durations never pick a latency band for the caption"
+        );
+    }
+
+    #[test]
     fn t09_test_group_chunks_with_progress() {
         let configs: Vec<ProxyConfig> = (0..205)
             .map(|i| {
@@ -2802,10 +3227,9 @@ mod tests {
 
         assert_eq!(latency_tone(None), LatencyTone::Unknown);
         assert_eq!(latency_tone(Some(33)), LatencyTone::Fast);
-        assert_eq!(latency_tone(Some(499)), LatencyTone::Fast);
-        assert_eq!(latency_tone(Some(500)), LatencyTone::Slow);
-        assert_eq!(latency_tone(Some(1499)), LatencyTone::Slow);
-        assert_eq!(latency_tone(Some(1500)), LatencyTone::Poor);
+        assert_eq!(latency_tone(Some(299)), LatencyTone::Slow);
+        assert_eq!(latency_tone(Some(500)), LatencyTone::Poor);
+        assert_eq!(latency_tone(Some(1499)), LatencyTone::Poor);
     }
 
     #[test]
@@ -2886,6 +3310,221 @@ mod tests {
         for outcome in &outcomes {
             assert_eq!(test_result_string(outcome), "9ms");
         }
+    }
+
+    fn mux_fixture(id: &str, name: &str, bind: &str, port: u16) -> ProxyConfig {
+        let mut config = fixture(id, name, "vless", bind, port);
+        config.params = r#"{"mux": "on"}"#.to_string();
+        config
+    }
+
+    #[test]
+    fn t68_mux_rows_get_second_probe_only_live_first() {
+        let configs = vec![
+            mux_fixture("m1", "Warmable", "127.0.0.1", 10801),
+            mux_fixture("m2", "DeadStands", "127.0.0.1", 10802),
+            fixture("p1", "Plain", "vless", "127.0.0.1", 10803),
+        ];
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_latency("m1", 33);
+        handle.script_failure("m2", "upstream refused");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |_, _| {});
+
+        assert_eq!(handle.calls_for("m1").len(), 2, "live mux row probes twice");
+        assert_eq!(
+            handle.calls_for("m2").len(),
+            1,
+            "decisive first-pass failure stands unretried"
+        );
+        assert_eq!(handle.calls_for("p1").len(), 1, "non-mux row probes once");
+        for call in handle.calls_for("m1") {
+            assert_eq!(
+                call.kind,
+                HealthKind::UrlTest,
+                "the second pass is a url test"
+            );
+            assert_eq!(call.bind, "127.0.0.1");
+            assert_eq!(call.url, DEFAULT_TEST_URL);
+        }
+
+        let mut store = HealthStore::default();
+        for outcome in &outcomes {
+            store.record_outcome(outcome);
+        }
+        assert_eq!(
+            outcomes.len(),
+            configs.len(),
+            "one recorded outcome per row"
+        );
+        assert_eq!(store.row_summary("m1"), "33ms", "the recorded mux sample");
+        assert_eq!(
+            store.row_summary("m2"),
+            "dead",
+            "the failed first pass is not retried"
+        );
+        assert!(matches!(store.status("m1").state, RowState::Live));
+        assert!(matches!(store.status("m2").state, RowState::Dead));
+    }
+
+    #[test]
+    fn t68_recorded_sample_is_second_pass() {
+        struct WarmSequence {
+            calls: Mutex<HashMap<String, usize>>,
+        }
+        impl HealthProber for WarmSequence {
+            fn url_test(
+                &self,
+                config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+                _url: &str,
+            ) -> Result<ProbeSuccess, String> {
+                let mut calls = self.calls.lock().unwrap();
+                let count = calls.entry(config.id.clone()).or_insert(0);
+                *count += 1;
+                Ok(ProbeSuccess {
+                    latency_ms: if *count == 1 { 111 } else { 222 },
+                    bytes_rx: 10,
+                    bytes_tx: 20,
+                })
+            }
+            fn tcp_ping(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+            ) -> Result<ProbeSuccess, String> {
+                unreachable!("url path only");
+            }
+        }
+
+        let configs = vec![mux_fixture("m", "Warmable", "127.0.0.1", 10801)];
+        let prober = WarmSequence {
+            calls: Mutex::new(HashMap::new()),
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |_, _| {});
+
+        assert_eq!(outcomes.len(), 1, "the first sample never lands");
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.sample.config_id, "m");
+        assert_eq!(
+            outcome.sample.latency_ms,
+            Some(222),
+            "the recorded sample is the second pass"
+        );
+        assert!(outcome.sample.error.is_none());
+
+        let mut store = HealthStore::default();
+        store.record_outcome(outcome);
+        assert_eq!(store.row_summary("m"), "222ms");
+        // The warm-up probe's bucket is dropped whole: only the second
+        // pass's ProbeSuccess reaches the traffic ledger.
+        let stats = store.traffic("m");
+        assert_eq!(stats.probes, 1);
+        assert_eq!(stats.rx_bytes, 10);
+        assert_eq!(stats.tx_bytes, 20);
+        assert_eq!(
+            *prober.calls.lock().unwrap().get("m").expect("probed"),
+            2,
+            "the warm-up pass still runs"
+        );
+    }
+
+    #[test]
+    fn t68_non_mux_single_probe_unchanged() {
+        let mut off = fixture("off", "MuxOff", "vless", "127.0.0.1", 10801);
+        off.params = r#"{"mux": "off"}"#.to_string();
+        let mut blank = fixture("blank", "MuxBlank", "vless", "127.0.0.1", 10802);
+        blank.params = r#"{"mux": "   "}"#.to_string();
+        let mut plain = fixture("plain", "Plain", "vmess", "127.0.0.1", 10803);
+        plain.params = r#"{}"#.to_string();
+
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_latency("plain", 55);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let configs = vec![off, blank, plain];
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |done, total| {
+            progress.push((done, total));
+        });
+
+        for id in ["off", "blank", "plain"] {
+            assert_eq!(handle.calls_for(id).len(), 1, "{id} probes exactly once");
+        }
+        assert_eq!(outcomes.len(), 3, "one recorded outcome per row");
+        let mut store = HealthStore::default();
+        for outcome in &outcomes {
+            store.record_outcome(outcome);
+        }
+        // The single passes' own samples stand, unmodified by warm-up logic.
+        for (id, latency) in [("off", 42), ("blank", 42), ("plain", 55)] {
+            assert_eq!(
+                store.row_summary(id),
+                format!("{latency}ms"),
+                "{id} keeps its single-pass sample"
+            );
+        }
+        assert_eq!(
+            progress,
+            vec![(3, 3)],
+            "progress shape matches the bare runner"
+        );
+    }
+
+    #[test]
+    fn t68_stop_before_second_pass_prevents_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopOnFirst {
+            stop: Arc<AtomicBool>,
+            calls: Mutex<usize>,
+        }
+        impl HealthProber for StopOnFirst {
+            fn url_test(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+                _url: &str,
+            ) -> Result<ProbeSuccess, String> {
+                *self.calls.lock().unwrap() += 1;
+                self.stop.store(true, Ordering::SeqCst);
+                Ok(ProbeSuccess {
+                    latency_ms: 9,
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                })
+            }
+            fn tcp_ping(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+            ) -> Result<ProbeSuccess, String> {
+                unreachable!("url path only");
+            }
+        }
+
+        // The stop flips during the mux row's first pass: the second pass
+        // must never start, and the warm-up sample stays out of the record
+        // set entirely — a stop can leave a mux row unmeasured, never
+        // warm-up-measured.
+        let configs = vec![mux_fixture("m", "Warmable", "127.0.0.1", 10801)];
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prober = StopOnFirst {
+            stop: stop.clone(),
+            calls: Mutex::new(0),
+        };
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |_, _| {});
+
+        assert_eq!(
+            *prober.calls.lock().unwrap(),
+            1,
+            "one warm-up URL test, no second probe after the stop"
+        );
+        assert!(outcomes.is_empty(), "the stopped run records no mux sample");
     }
 
     #[test]
@@ -3582,6 +4221,72 @@ mod tests {
     }
 
     #[test]
+    fn t75_conn_counts_from_snapshot_rows() {
+        let body = r#"{"connections":[
+            {"chains":["direct"],"download":2877275,"id":"a99cac52","metadata":{"destinationIP":"127.0.0.1","destinationPort":"19097","host":"","network":"tcp","sourceIP":"127.0.0.1","sourcePort":"51241","type":"mixed/in-7"},"rule":"final","upload":89},
+            {"chains":["direct"],"download":500,"id":"dns-1","metadata":{"destinationIP":"1.1.1.1","destinationPort":"53","host":"","network":"udp","sourceIP":"127.0.0.1","sourcePort":"51242","type":"mixed/in-7"},"rule":"final","upload":60},
+            {"chains":["direct"],"download":70,"id":"quic-1","metadata":{"destinationIP":"203.0.113.9","destinationPort":"443","host":"cdn.example.com","network":"quic","sourceIP":"127.0.0.1","sourcePort":"51243","type":"mixed/in-8"},"rule":"final","upload":5},
+            {"chains":["direct"],"download":10,"id":"no-net","metadata":{"destinationIP":"203.0.113.10","destinationPort":"443","host":"x.example.com","sourceIP":"127.0.0.1","sourcePort":"51244","type":"mixed/in-8"},"rule":"final","upload":1}
+        ],"downloadTotal":2877855,"uploadTotal":155}"#;
+        let rows = crate::health::parse_clash_entries(body).expect("entries parse");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].network, "tcp");
+        assert_eq!(rows[1].network, "udp");
+        assert_eq!(rows[2].network, "quic");
+        assert_eq!(rows[3].network, "", "missing network stays blank");
+        let counts = crate::health::ConnCounts::from_conns(rows.iter());
+        assert_eq!(
+            counts,
+            crate::health::ConnCounts {
+                active: 4,
+                tcp: 1,
+                udp: 1
+            }
+        );
+        assert_eq!(counts.status_text(), "4 active · 1 TCP · 1 UDP");
+    }
+
+    #[test]
+    fn t75_conn_counts_tcp_udp_split() {
+        use crate::health::{ConnCounts, ConnProto};
+        assert_eq!(ConnCounts::proto_of("tcp"), ConnProto::Tcp);
+        assert_eq!(ConnCounts::proto_of(" TCP "), ConnProto::Tcp);
+        assert_eq!(ConnCounts::proto_of("udp"), ConnProto::Udp);
+        assert_eq!(ConnCounts::proto_of(""), ConnProto::Other);
+        assert_eq!(ConnCounts::proto_of("sctp"), ConnProto::Other);
+
+        let conn = |id: &str, network: &str| ClashConn {
+            id: id.to_string(),
+            row_id: Some("7".to_string()),
+            rx_bytes: 1,
+            tx_bytes: 1,
+            dest: "example.com".to_string(),
+            network: network.to_string(),
+        };
+        let rows = [
+            conn("a", "tcp"),
+            conn("b", "tcp"),
+            conn("c", "udp"),
+            conn("d", ""),
+            conn("e", "quic"),
+        ];
+        let counts = ConnCounts::from_conns(rows.iter());
+        assert_eq!(
+            counts,
+            ConnCounts {
+                active: 5,
+                tcp: 2,
+                udp: 1
+            },
+            "unknown/blank networks stay active-only"
+        );
+        assert_eq!(
+            ConnCounts::from_conns(std::iter::empty()).status_text(),
+            "0 active · 0 TCP · 0 UDP"
+        );
+    }
+
+    #[test]
     fn logs_filter_to_config_and_redact_secrets() {
         let active = vec![
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
@@ -3993,6 +4698,7 @@ mod tests {
                 rx_bytes: rx,
                 tx_bytes: tx,
                 dest: dest.to_string(),
+                network: "tcp".to_string(),
             }
         }
         let probe = "www.gstatic.com";
@@ -4586,6 +5292,61 @@ mod tests {
         );
     }
 
+    /// T-31: the eviction picker keeps crash-cause lines at any configurable
+    /// cap, not just the default ring.
+    #[test]
+    fn t81_crash_cause_lines_protected_at_any_cap() {
+        let tags = LogTagIndex::build(&[]);
+        for cap in [
+            3usize,
+            MIN_LOG_MAX_LINES,
+            MAX_LOG_RECORDS,
+            MAX_LOG_MAX_LINES,
+        ] {
+            let mut logs = LogStore::with_capacity(cap);
+            assert_eq!(logs.cap(), cap, "instance cap keeps {cap}");
+            logs.push_raw("panic: runtime error in sidecar", &tags);
+            logs.push_raw("FATAL: core dumped", &tags);
+            for i in 0..(cap + 40) {
+                logs.push_raw(&format!("info heartbeat {i}"), &tags);
+            }
+            assert_eq!(logs.all().len(), cap, "ring capped at {cap}");
+            let messages: Vec<&str> = logs
+                .all()
+                .iter()
+                .map(|record| record.message.as_str())
+                .collect();
+            assert!(
+                messages.iter().any(|m| m.contains("panic")),
+                "panic pinned at {cap}"
+            );
+            assert!(
+                messages.iter().any(|m| m.contains("FATAL")),
+                "fatal pinned at {cap}"
+            );
+        }
+
+        let mut small = LogStore::with_capacity(MIN_LOG_MAX_LINES);
+        for i in 0..(MIN_LOG_MAX_LINES + 100) {
+            small.push_raw(&format!("info line {i}"), &tags);
+        }
+        assert_eq!(
+            small.all().len(),
+            MIN_LOG_MAX_LINES,
+            "the 500-line choice rings at 500"
+        );
+
+        let mut big = LogStore::with_capacity(MAX_LOG_MAX_LINES);
+        for i in 0..(MAX_LOG_MAX_LINES + 10) {
+            big.push_raw(&format!("info line {i}"), &tags);
+        }
+        assert_eq!(
+            big.all().len(),
+            MAX_LOG_MAX_LINES,
+            "the 50,000-line choice is respected"
+        );
+    }
+
     #[test]
     fn t47_latest_health_index_matches_scan() {
         let mut store = HealthStore::default();
@@ -4896,5 +5657,398 @@ mod tests {
     #[test]
     fn resolve_probe_ips_unresolvable_is_empty() {
         assert!(resolve_probe_ips("no-such-host.invalid").is_empty());
+    }
+
+    #[test]
+    fn t64_best_rows_ordering_live_wins_wrong_dead_last() {
+        let rows = vec![
+            fixture("1", "Fast", "vless", "127.0.0.1", 10801),
+            fixture("2", "Slow", "vless", "127.0.0.1", 10802),
+            fixture("3", "FastTwin", "vless", "127.0.0.1", 10803),
+            fixture("4", "Regressed", "vless", "127.0.0.1", 10804),
+            fixture("5", "PingOnly", "vless", "127.0.0.1", 10805),
+            fixture("6", "NoSample", "vless", "127.0.0.1", 10806),
+            fixture("7", "Dead", "vless", "127.0.0.1", 10807),
+        ];
+        let url = |id: &str, at: i64, latency: Option<u64>, error: Option<&str>| -> TestOutcome {
+            TestOutcome {
+                success: None,
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: latency,
+                    error: error.map(str::to_string),
+                },
+            }
+        };
+        let ping = |id: &str, at: i64, latency: u64| -> TestOutcome {
+            TestOutcome {
+                success: None,
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at,
+                    kind: HealthKind::TcpPing,
+                    latency_ms: Some(latency),
+                    error: None,
+                },
+            }
+        };
+        let mut store = HealthStore::default();
+        for probe in [
+            url("1", 1, Some(45), None),
+            url("2", 1, Some(220), None),
+            url("3", 1, Some(45), None),
+            url("4", 1, Some(45), None),
+            url("4", 3, Some(999), None),
+            ping("5", 1, 30),
+            url(
+                "7",
+                1,
+                None,
+                Some("dial 203.0.113.7:8388: connection refused"),
+            ),
+        ] {
+            store.record_outcome(&probe);
+        }
+
+        let ranked = |rows: &[ProxyConfig]| {
+            best_rows_by_health(rows, &store)
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ranked(&rows),
+            vec!["5", "1", "3", "2", "4", "6", "7"],
+            "latency ascending on the LATEST sample (Regressed keeps its 999 not its old 45), \
+             equal 45ms ties keep input order, no-sample then dead last"
+        );
+        let reversed: Vec<ProxyConfig> = rows.iter().rev().cloned().collect();
+        assert_eq!(
+            ranked(&reversed),
+            vec!["5", "3", "1", "2", "4", "6", "7"],
+            "equal-latency ties follow input order; the live > unknown > dead tiers never flip"
+        );
+        assert!(
+            best_rows_by_health(&[], &store).is_empty(),
+            "empty group ranks to empty"
+        );
+        assert_eq!(ranked(&rows[6..7]), vec!["7"], "a lone row stays itself");
+
+        let (title, lines) = best_rows_monitor_lines("Home", &rows, &store).expect("lines exist");
+        assert_eq!(title, "Best by health in Home:");
+        assert_eq!(
+            lines,
+            vec![
+                "1) PingOnly (30ms)".to_string(),
+                "2) Fast (45ms)".to_string(),
+                "3) FastTwin (45ms)".to_string(),
+                "4) Slow (220ms)".to_string(),
+                "5) Regressed (999ms)".to_string(),
+            ],
+            "top five capped: NoSample (no probes) and Dead fall out of the cap"
+        );
+
+        let edge_rows = vec![
+            fixture("s1", "Ghost", "vless", "127.0.0.1", 10811),
+            fixture("s2", "Down", "vless", "127.0.0.1", 10812),
+        ];
+        let mut edge = HealthStore::default();
+        edge.mark_stale("s1");
+        edge.record_outcome(&url(
+            "s2",
+            1,
+            None,
+            Some("dial 203.0.113.7:8388: connection refused"),
+        ));
+        let (edge_title, edge_lines) =
+            best_rows_monitor_lines("Home", &edge_rows, &edge).expect("edge lines exist");
+        assert_eq!(edge_title, "Best by health in Home:");
+        assert_eq!(
+            edge_lines,
+            vec![
+                "1) Ghost (no probes this session) (stale)".to_string(),
+                "2) Down (dead)".to_string(),
+            ],
+            "unknown sorts before dead in input order, stale suffix matches row text"
+        );
+        assert!(
+            best_rows_monitor_lines("Home", &[], &edge).is_none(),
+            "empty group hides the section"
+        );
+    }
+
+    fn t66_url(config_id: &str, at: i64, latency: Option<u64>, error: Option<&str>) -> TestOutcome {
+        TestOutcome {
+            success: None,
+            sample: HealthSample {
+                config_id: config_id.to_string(),
+                at,
+                kind: HealthKind::UrlTest,
+                latency_ms: latency,
+                error: error.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn t66_outcome_is_neutral_matrix() {
+        let probe =
+            |latency: Option<u64>, error: Option<&str>| t66_url("row", now_unix(), latency, error);
+
+        // Zero-latency live reports are neutral (Throne: 0 → keep previous).
+        assert!(outcome_is_neutral(&probe(Some(0), None)));
+        assert!(
+            outcome_is_neutral(&probe(
+                None,
+                Some("url test failed for \"B\": bad local port (port 0 serves nothing)")
+            )),
+            "zero latency reads beside its cause"
+        );
+
+        // Local instrument failures are neutral — the local-abort family maps
+        // through classify_health_cause with no new string matching.
+        for cause in [
+            "url test failed for \"A\": bind permission denied",
+            "preflight says: LAN confirm required",
+            "port 18501 is inside the reserved clash-controller range",
+            "url test failed for \"B\": bad local port (port 0 serves nothing)",
+        ] {
+            assert!(
+                outcome_is_neutral(&probe(None, Some(cause))),
+                "local abort stays neutral: {cause}"
+            );
+        }
+
+        // Decisive errors overwrite.
+        for cause in [
+            "cannot resolve endpoint bad.invalid:443",
+            "no such host",
+            "dial 203.0.113.7:8388: connection refused",
+            "upstream reset by peer",
+            "url test timed out",
+            "url test failed for \"C\": probe panicked",
+            "unsupported protocol \"dial-up\" for \"C\" (no health probe for this protocol yet)",
+        ] {
+            assert!(
+                !outcome_is_neutral(&probe(None, Some(cause))),
+                "decisive error overwrites: {cause}"
+            );
+            assert!(
+                !outcome_is_neutral(&probe(Some(0), Some(cause))),
+                "an error colors the whole sample: {cause}"
+            );
+        }
+
+        // Every live reading overwrites, and so do shapes the ring already
+        // accepts today (latency>0, and the bare None/None live shape).
+        assert!(!outcome_is_neutral(&probe(Some(1), None)));
+        assert!(!outcome_is_neutral(&probe(None, None)));
+    }
+
+    #[test]
+    fn t66_zero_latency_keeps_previous_sample() {
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("row", 1, Some(90), None));
+
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "row".to_string(),
+                at: 2,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(0),
+                error: None,
+            },
+            success: Some(ProbeSuccess {
+                latency_ms: 0,
+                bytes_rx: 2048,
+                bytes_tx: 512,
+            }),
+        });
+
+        // The ring's previous honest sample stays latest; status() unchanged.
+        let status = store.status("row");
+        assert!(matches!(status.state, RowState::Live));
+        assert_eq!(status.latency_ms, Some(90));
+        assert_eq!(status.cause_kind, None);
+        assert_eq!(store.row_summary("row"), "90ms");
+        let previous = store.latest("row").expect("ring keeps a sample");
+        assert_eq!(previous.at, 1, "the zero reading never became latest");
+        assert_eq!(store.samples.len(), 1, "no sample pushed");
+
+        // Traffic accounting keeps accruing regardless of the gate.
+        let stats = store.traffic("row");
+        assert_eq!(stats.rx_bytes, 2048);
+        assert_eq!(stats.tx_bytes, 512);
+        assert_eq!(stats.probes, 1);
+    }
+
+    #[test]
+    fn t66_aborted_group_probe_does_not_overwrite() {
+        use std::sync::atomic::Ordering;
+
+        let configs: Vec<ProxyConfig> = (0..102)
+            .map(|i| {
+                fixture(
+                    &i.to_string(),
+                    &format!("Row{i}"),
+                    "vless",
+                    "127.0.0.1",
+                    10801,
+                )
+            })
+            .collect();
+        let total = configs.len();
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_failure("0", "dial refused");
+
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("0", 1, Some(55), None));
+        store.record_outcome(&t66_url("100", 1, Some(88), None));
+        store.record_outcome(&t66_url("101", 1, Some(88), None));
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress: Vec<(usize, usize)> = Vec::new();
+        let outcomes = test_group(
+            &configs,
+            DEFAULT_TEST_URL,
+            &prober,
+            &stop,
+            |done, done_total| {
+                progress.push((done, done_total));
+                if done == GROUP_TEST_BATCH_SIZE && done_total == total {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        // The stop lands between chunks: queued rows are never probed, so an
+        // aborted run pushes no samples for them.
+        assert_eq!(outcomes.len(), GROUP_TEST_BATCH_SIZE, "one chunk completed");
+        assert_eq!(
+            progress,
+            vec![(GROUP_TEST_BATCH_SIZE, total)],
+            "abort lands between chunks"
+        );
+        assert!(handle.calls_for("100").is_empty(), "queued row unprobed");
+        assert!(handle.calls_for("101").is_empty(), "queued row unprobed");
+
+        for outcome in &outcomes {
+            store.record_outcome(outcome);
+        }
+
+        // The already-completed probes' outcomes stand.
+        let dead = store.status("0");
+        assert!(matches!(dead.state, RowState::Dead));
+        assert!(
+            dead.cause.as_deref().unwrap_or("").contains("dial refused"),
+            "decisive record stands: {:?}",
+            dead.cause
+        );
+        assert_eq!(
+            store.row_summary("3"),
+            "42ms",
+            "completed probe still overwrote its row"
+        );
+
+        // Rows still queued at stop time keep their previous outcomes.
+        for id in ["100", "101"] {
+            assert!(matches!(store.status(id).state, RowState::Live), "{id}");
+            assert_eq!(store.row_summary(id), "88ms", "keep-previous stands: {id}");
+            assert_eq!(
+                store.latest(id).expect("ring entry kept").at,
+                1,
+                "no overwrite after stop: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn t66_decisive_dead_still_overwrites() {
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("dns", 1, Some(70), None));
+        store.record_outcome(&t66_url("egress", 1, Some(70), None));
+
+        store.record_outcome(&t66_url(
+            "dns",
+            3,
+            None,
+            Some("url test failed for \"A\": cannot resolve endpoint bad.invalid:443"),
+        ));
+        let dns = store.status("dns");
+        assert!(
+            matches!(dns.state, RowState::Dead),
+            "dns failure overwrites"
+        );
+        assert_eq!(dns.cause_kind, Some(HealthCause::Dns));
+        assert_eq!(store.latest("dns").expect("ring advanced").at, 3);
+
+        store.record_outcome(&t66_url(
+            "egress",
+            3,
+            None,
+            Some("dial 203.0.113.7:8388: connection refused"),
+        ));
+        let egress = store.status("egress");
+        assert!(matches!(egress.state, RowState::Dead));
+        assert_eq!(egress.cause_kind, Some(HealthCause::Egress));
+        assert_eq!(store.latest("egress").expect("ring advanced").at, 3);
+
+        // A decisive dead also lands on a row the ring knows nothing about.
+        store.record_outcome(&t66_url("fresh", 3, None, Some("url test timed out")));
+        assert!(matches!(store.status("fresh").state, RowState::Dead));
+        assert_eq!(store.row_summary("fresh"), "dead");
+
+        // Contrast — a local abort is neutral: the previous outcome keeps.
+        store.record_outcome(&t66_url("kept", 1, Some(64), None));
+        store.record_outcome(&t66_url(
+            "kept",
+            2,
+            None,
+            Some("url test failed for \"K\": bind permission denied"),
+        ));
+        let kept = store.status("kept");
+        assert!(
+            matches!(kept.state, RowState::Live),
+            "a local abort is neutral"
+        );
+        assert_eq!(kept.latency_ms, Some(64));
+        assert_eq!(store.latest("kept").expect("ring kept").at, 1);
+    }
+
+    #[test]
+    fn t66_live_result_still_overwrites() {
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("row", 1, None, Some("url test timed out")));
+        assert!(matches!(store.status("row").state, RowState::Dead));
+
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "row".to_string(),
+                at: 2,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(123),
+                error: None,
+            },
+            success: Some(ProbeSuccess {
+                latency_ms: 123,
+                bytes_rx: 96,
+                bytes_tx: 16,
+            }),
+        });
+        let live = store.status("row");
+        assert!(matches!(live.state, RowState::Live), "live overwrites dead");
+        assert_eq!(live.latency_ms, Some(123));
+        assert_eq!(live.cause, None);
+        assert_eq!(store.row_summary("row"), "123ms");
+        assert_eq!(store.latest("row").expect("ring advanced").at, 2);
+
+        // A later live reading also refreshes a previous live sample.
+        store.record_outcome(&t66_url("row", 3, Some(97), None));
+        let refreshed = store.status("row");
+        assert!(matches!(refreshed.state, RowState::Live));
+        assert_eq!(refreshed.latency_ms, Some(97));
+        assert_eq!(store.row_summary("row"), "97ms");
     }
 }

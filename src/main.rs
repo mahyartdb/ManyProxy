@@ -9,11 +9,13 @@ mod store;
 mod tray;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::badge::Badge;
@@ -58,17 +60,19 @@ use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
+use qrcodegen::{QrCode, QrCodeEcc};
 
 use engine::{
-    engine_binary_file_name, fork_binary_file_name, lan_confirm_description, lan_confirm_text,
-    lan_exposure_warning, requires_lan_confirm, resolve_engine_binary, resolve_fork_binary,
-    resolve_xray_binary, strip_ansi_codes, xray_binary_file_name, AutoRestartConfig,
-    EngineController, EngineError, LAN_CONFIRM_TITLE,
+    engine_binary_file_name, fork_binary_file_name, is_custom_config_protocol,
+    lan_confirm_description, lan_confirm_text, lan_exposure_warning, requires_lan_confirm,
+    resolve_engine_binary, resolve_fork_binary, resolve_xray_binary, strip_ansi_codes,
+    xray_binary_file_name, AutoRestartConfig, EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
-    format_speed_result, ping_all, redact_secrets, resolve_hostname, speed_group, test_all,
-    test_group, truncate, url_test_sparkline, HealthKind, HealthProber, HealthStore, LogLevel,
-    LogStore, LogTagIndex, ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode,
+    clamp_log_max_lines, format_speed_result, outcome_is_neutral, ping_all, redact_secrets,
+    resolve_hostname, sparkline_caption_tone, speed_group, test_all, test_group, truncate,
+    url_test_sparkline, HealthKind, HealthProber, HealthStore, LatencyTone, LogLevel, LogStore,
+    LogTagIndex, ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode,
     SpeedtestOutcome, TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL,
     RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
 };
@@ -94,12 +98,13 @@ use store::{
     is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
     prune_duplicates_confirm_text, prune_invalid_confirm_text, prune_unavailable_confirm_text,
     rewrite_server_to_ip, row_security_label, row_server_hostname, validate_extra_params,
-    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ChainHopSlot, ConfigPatch,
-    DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold, HysteriaFold, MuxFold,
-    NaiveFold, NewConfig, ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold,
-    SshFold, Store, StoreError, Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold,
-    TransportFold, TuicFold, WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP,
-    DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, AutoClearGroupConfig,
+    ChainHopSlot, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold,
+    HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig, ProxyConfig,
+    RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SortDirection, SshFold, Store, StoreError,
+    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
+    WindowGeometry, WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    VALID_PROTOCOLS,
 };
 
 actions!(
@@ -111,6 +116,7 @@ actions!(
         StartSelected,
         StopSelected,
         TestSelected,
+        StopTesting,
         ClearChecked,
         EditSelected,
         DeleteSelected,
@@ -150,6 +156,7 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("ctrl-k", OpenPalette, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-u", CopyUrls, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-r", UpdateCurrentGroup, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-.", StopTesting, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
@@ -167,18 +174,56 @@ pub const STARTUP_REFRESH_DEFER_SECS: u64 = 3;
 
 pub const APP_TITLE: &str = "ManyProxy";
 
-fn app_window_options() -> WindowOptions {
+/// T-26: the one `· N running` suffix shared by the window title and the tray
+/// tooltip, so the two surfaces can never drift. Empty while nothing runs.
+pub fn running_title_suffix(running: usize) -> String {
+    if running == 0 {
+        String::new()
+    } else {
+        format!(" · {running} running")
+    }
+}
+
+/// T-26: composed window title for a running count — `ManyProxy` at zero,
+/// `ManyProxy · N running` above it. Consumed by the OS window title, the
+/// custom titlebar label, and (through `tray::tray_tooltip`) the tray tooltip.
+pub fn window_title_text(running: usize) -> String {
+    format!("{APP_TITLE}{}", running_title_suffix(running))
+}
+
+fn app_window_options(geometry: Option<WindowGeometry>) -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(APP_TITLE.into());
     }
 
-    options.window_bounds = Some(WindowBounds::Windowed(Bounds::new(
-        point(px(0.), px(0.)),
-        size(px(1000.), px(700.)),
-    )));
-    options.window_min_size = Some(size(px(880.), px(620.)));
+    // T-32: a sane stored rectangle seeds the window; absent, corrupt, or
+    // non-finite meta keeps today's fixed 1000×700 at (0, 0) — first run.
+    let bounds = geometry.and_then(WindowGeometry::clamped).map_or_else(
+        || Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(700.))),
+        |geometry| {
+            Bounds::new(
+                point(px(geometry.x), px(geometry.y)),
+                size(px(geometry.width), px(geometry.height)),
+            )
+        },
+    );
+    options.window_bounds = Some(WindowBounds::Windowed(bounds));
+    options.window_min_size = Some(size(
+        px(WindowGeometry::MIN_WIDTH),
+        px(WindowGeometry::MIN_HEIGHT),
+    ));
     options
+}
+
+/// T-32: the persisted rectangle, read before the window exists — the only
+/// point `app_window_options` can seed `WindowBounds` from. A missing file, an
+/// unreadable store, or an absent/corrupt key all read as `None`, which is
+/// exactly today's startup rectangle.
+fn stored_window_geometry() -> Option<WindowGeometry> {
+    Store::peek_meta_readonly(&Store::default_path(), Store::META_GEOMETRY)
+        .as_deref()
+        .and_then(WindowGeometry::from_json)
 }
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -195,6 +240,7 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Start selected", "F5"),
     ("Stop selected", "Shift-F5"),
     ("Test selected", "Ctrl-T"),
+    ("Stop Testing", "Ctrl-."),
     ("Edit selected", "Ctrl-E"),
     ("Delete selected", "Delete"),
     ("Focus search", "Ctrl-F"),
@@ -319,6 +365,18 @@ fn group_delete_confirm_description(name: &str, count: usize, subscriptions: usi
     )
 }
 
+/// T-34: one session-sourced notice — the previous run left a running
+/// snapshot behind without reaching any clean-exit path.
+const UNCLEAN_EXIT_NOTICE: &str =
+    "Previous run carried running endpoints and did not exit cleanly.";
+
+fn unclean_exit_notice(previous_clean: bool, last_snapshot: &[String]) -> Option<Notification> {
+    if previous_clean || last_snapshot.is_empty() {
+        return None;
+    }
+    Some(Notification::warning(UNCLEAN_EXIT_NOTICE))
+}
+
 fn close_confirm_description(running_names: &[String]) -> Option<String> {
     if running_names.is_empty() {
         return None;
@@ -364,6 +422,83 @@ fn about_body(
     out
 }
 
+/// T-33: one row of the per-row bind picker. The id carries the row so two
+/// rows never register the same option path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindHostChoice {
+    id: String,
+    value: String,
+}
+
+impl SearchableListItem for BindHostChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.value.clone().into()
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BindHostChoiceList(Vec<BindHostChoice>);
+
+impl BindHostChoiceList {
+    fn for_row(row_id: &str, hosts: &[String]) -> Self {
+        Self(
+            hosts
+                .iter()
+                .map(|host| BindHostChoice {
+                    id: format!("row-bind-option-{row_id}-{host}"),
+                    value: host.clone(),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl SearchableListDelegate for BindHostChoiceList {
+    type Item = BindHostChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&BindHostChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        BindHostChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &BindHostChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.value.clone())
+                .into_any_element(),
+        )
+    }
+}
+
 struct LibraryDelegate {
     rows: Vec<ProxyConfig>,
     search_index: Vec<RowSearchIndex>,
@@ -373,6 +508,8 @@ struct LibraryDelegate {
     selected: Option<IndexPath>,
 
     health: HashMap<String, String>,
+
+    health_tone: HashMap<String, LatencyTone>,
 
     running: HashSet<String>,
 
@@ -391,7 +528,18 @@ struct LibraryDelegate {
 
     show_security: bool,
 
-    type_security_sort: bool,
+    /// T-27: the one sort concept — a key plus a direction, persisted in the
+    /// `library_sort` meta key. Replaces the retired `type_security_sort` bool.
+    sort: LibrarySort,
+
+    /// T-27 mirrors the sort keys read on render. All three are pushed from
+    /// state the app already holds (health store samples, session traffic
+    /// mirror, out-IP resolutions) — the sort never polls.
+    latency: HashMap<String, u64>,
+
+    data_traffic: HashMap<String, (u64, u64)>,
+
+    out_ips: HashMap<String, String>,
 
     row_columns: RowColumns,
 
@@ -400,11 +548,28 @@ struct LibraryDelegate {
     endpoint_inputs: HashMap<String, RowEndpointInputs>,
 
     pending_endpoint_commits: Vec<String>,
+
+    /// T-33: the bind-address menu every per-row picker draws from — constants
+    /// first, then the persisted extras. Pushed from the store on reload, so a
+    /// Settings edit reaches every picker on the next paint.
+    bind_hosts: Vec<String>,
 }
 
 struct RowEndpointInputs {
+    /// The draft holder for both control shapes: the free-text field on
+    /// custom-config rows, and the value a pick writes on every other row.
     bind: Entity<InputState>,
     port: Entity<InputState>,
+    /// T-33: the picker for rows whose listen comes from the generated config.
+    /// Custom-config rows never draw it.
+    picker: Entity<SelectState<BindHostChoiceList>>,
+    /// The host list the picker was last built from.
+    picker_hosts: Vec<String>,
+    /// The value the picker was last told to show, so a stable row does not
+    /// re-select on every paint.
+    picker_selected: Option<String>,
+    /// A confirmed pick waiting for the window-aware paint step to apply it.
+    pick_pending: Option<String>,
     _subs: Vec<Subscription>,
     clean_bind: String,
     clean_port: String,
@@ -591,6 +756,261 @@ fn search_hosts(params: &str) -> (String, String) {
     (server, address)
 }
 
+/// T-23: the port facet of the search grammar — one `port=` token per query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortPredicate {
+    lo: u16,
+    hi: u16,
+}
+
+impl PortPredicate {
+    fn matches(self, port: u16) -> bool {
+        port >= self.lo && port <= self.hi
+    }
+
+    /// Canonical form shown in the status-bar filter text.
+    fn label(self) -> String {
+        format!("port: {}..{}", self.lo, self.hi)
+    }
+}
+
+/// Parse a single `port=` token: `port=N`, `port=N:M`, `port=N:` or `port=:M`.
+/// Returns `None` for anything else — including the malformed forms (`port=`,
+/// `port=x`, `port=5:1`, `port=:`, out-of-`u16` values) which stay literal
+/// substring text instead of raising an error state.
+fn parse_port_predicate(token: &str) -> Option<PortPredicate> {
+    let (key, value) = token.split_once('=')?;
+    if !key.eq_ignore_ascii_case("port") {
+        return None;
+    }
+    let (lo, hi) = match value.split_once(':') {
+        // port=N — exact port.
+        None => {
+            let exact = value.parse::<u16>().ok()?;
+            (exact, exact)
+        }
+        // port=N: — open-ended range up to the last u16.
+        Some((lo_raw, "")) => (lo_raw.parse::<u16>().ok()?, u16::MAX),
+        // port=:M — open-ended range from zero.
+        Some(("", hi_raw)) => (0, hi_raw.parse::<u16>().ok()?),
+        // port=N:M — inclusive range, reversed bounds are malformed.
+        Some((lo_raw, hi_raw)) => {
+            let lo = lo_raw.parse::<u16>().ok()?;
+            let hi = hi_raw.parse::<u16>().ok()?;
+            if lo > hi {
+                return None;
+            }
+            (lo, hi)
+        }
+    };
+    Some(PortPredicate { lo, hi })
+}
+
+/// Split a query into its single `port=` predicate (if any) and the remaining
+/// substring text. The text part is token-rejoined, so `port=10801 group: api`
+/// keeps matching the blob for `group: api`. A second `port=` token is left in
+/// the text part — it then degrades to a literal substring (documented above).
+fn split_port_query(query: &str) -> (Option<PortPredicate>, String) {
+    let mut predicate = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for token in query.split_whitespace() {
+        if predicate.is_none() {
+            if let Some(parsed) = parse_port_predicate(token) {
+                predicate = Some(parsed);
+                continue;
+            }
+        }
+        kept.push(token);
+    }
+    if predicate.is_none() {
+        // No port token: keep today's query bytes untouched.
+        return (None, query.to_string());
+    }
+    (predicate, kept.join(" "))
+}
+
+/// T-27: the per-row maps the sort keys read, borrowed for one `apply_filter`
+/// pass. Everything here is a mirror the app already keeps fresh on its normal
+/// ticks, so sorting is a pure render-time computation.
+struct SortContext<'a> {
+    /// Latest successful URL-test sample per row, in milliseconds.
+    latency: &'a HashMap<String, u64>,
+    /// Per-row current (session) data-plane counters, rx then tx.
+    data_traffic: &'a HashMap<String, (u64, u64)>,
+    /// Per-row accumulated counters in the store's counting window, rx then tx.
+    totals: &'a HashMap<String, (u64, u64)>,
+    /// Resolved egress IP per row, as text.
+    out_ips: &'a HashMap<String, String>,
+}
+
+/// T-27: what a header-menu row does — pick a key, or reverse the direction.
+#[derive(Debug, Clone, Copy)]
+enum SortMenuAction {
+    Key(LibrarySortKey),
+    Direction,
+}
+
+impl SortContext<'_> {
+    fn numeric(&self, key: LibrarySortKey, row_id: &str) -> Option<u64> {
+        match key {
+            LibrarySortKey::Latency => self.latency.get(row_id).copied(),
+            LibrarySortKey::Download => self.data_traffic.get(row_id).map(|(rx, _)| *rx),
+            LibrarySortKey::Upload => self.data_traffic.get(row_id).map(|(_, tx)| *tx),
+            LibrarySortKey::TrafficTotal => self
+                .totals
+                .get(row_id)
+                .map(|(rx, tx)| rx.saturating_add(*tx)),
+            LibrarySortKey::TrafficDown => self.totals.get(row_id).map(|(rx, _)| *rx),
+            LibrarySortKey::TrafficUp => self.totals.get(row_id).map(|(_, tx)| *tx),
+            _ => None,
+        }
+    }
+
+    fn out_ip(&self, row_id: &str) -> Option<&str> {
+        self.out_ips
+            .get(row_id)
+            .map(String::as_str)
+            .filter(|text| !text.trim().is_empty())
+    }
+}
+
+/// T-27: the secondary order that keeps unknown/missing values stable across
+/// ticks. Row ids are numeric strings; compare them as numbers so "2" precedes
+/// "10", and fall back to bytes for anything else.
+fn row_id_order(a: &str, b: &str) -> Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => a.cmp(b),
+    }
+}
+
+/// T-27: one key, one direction. Known values rank by the key (direction
+/// applied); unknown or missing values are pinned last regardless of direction
+/// and ordered by row id among themselves, so a list never jumps between ticks.
+/// `TypeSecurity` carries its own fixed order (the retired toggle) and ignores
+/// the direction; `None` never reaches here.
+fn compare_library_rows(
+    context: &SortContext,
+    sort: LibrarySort,
+    a: &ProxyConfig,
+    b: &ProxyConfig,
+) -> Ordering {
+    if sort.key == LibrarySortKey::TypeSecurity {
+        return compare_type_security(a, b);
+    }
+    let descending = sort.direction == SortDirection::Descending;
+    if sort.key == LibrarySortKey::OutIp {
+        return match (context.out_ip(&a.id), context.out_ip(&b.id)) {
+            (Some(left), Some(right)) => {
+                let order = left.cmp(right);
+                (if descending { order.reverse() } else { order })
+                    .then_with(|| row_id_order(&a.id, &b.id))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => row_id_order(&a.id, &b.id),
+        };
+    }
+    match (
+        context.numeric(sort.key, &a.id),
+        context.numeric(sort.key, &b.id),
+    ) {
+        (Some(left), Some(right)) => {
+            let order = left.cmp(&right);
+            (if descending { order.reverse() } else { order })
+                .then_with(|| row_id_order(&a.id, &b.id))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => row_id_order(&a.id, &b.id),
+    }
+}
+
+/// T-27: which keys each sortable header offers. The health/status column owns
+/// the probe and identification keys, including the retired toggle's
+/// Type|Security; the traffic column owns the accumulated counters.
+fn sort_header_keys(column: &str) -> &'static [LibrarySortKey] {
+    static HEALTH: [LibrarySortKey; 6] = [
+        LibrarySortKey::None,
+        LibrarySortKey::Latency,
+        LibrarySortKey::Download,
+        LibrarySortKey::Upload,
+        LibrarySortKey::OutIp,
+        LibrarySortKey::TypeSecurity,
+    ];
+    static TRAFFIC: [LibrarySortKey; 4] = [
+        LibrarySortKey::None,
+        LibrarySortKey::TrafficTotal,
+        LibrarySortKey::TrafficDown,
+        LibrarySortKey::TrafficUp,
+    ];
+    match column {
+        "traffic" => &TRAFFIC,
+        _ => &HEALTH,
+    }
+}
+
+fn column_header_label(label: &'static str, width: f32, cx: &App) -> AnyElement {
+    div()
+        .w(px(width))
+        .flex_shrink_0()
+        .truncate()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
+
+/// T-27: a sortable column header — a labeled cell in the header strip that
+/// carries the sort menu on right-click (the same context-menu affordance the
+/// row cards use). The active column shows its direction in the label.
+fn sort_header_cell(
+    column: &'static str,
+    label: &'static str,
+    width: f32,
+    sort: LibrarySort,
+    view: Entity<AppView>,
+    cx: &App,
+) -> AnyElement {
+    let active = sort_header_keys(column).contains(&sort.key);
+    let marker = if active {
+        match sort.key {
+            LibrarySortKey::TypeSecurity => " ·",
+            _ if sort.direction == SortDirection::Descending => " ↓",
+            _ => " ↑",
+        }
+    } else {
+        ""
+    };
+    let tip = if active {
+        format!(
+            "{label} — sorted by {} ({}) — right-click to change",
+            sort.key.label(),
+            sort.direction.label()
+        )
+    } else {
+        format!("{label} — right-click to pick a sort key")
+    };
+    let tooltip_text = tip.clone();
+    div()
+        .id(format!("sort-header-{column}"))
+        .test_support()
+        .w(px(width))
+        .flex_shrink_0()
+        .truncate()
+        .text_sm()
+        .text_color(if active {
+            cx.theme().accent
+        } else {
+            cx.theme().muted_foreground
+        })
+        .aria_label(tip)
+        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tooltip_text.clone())).into())
+        .child(format!("{label}{marker}"))
+        .context_menu(move |menu, _, _| AppView::sort_header_menu(menu, column, sort, &view))
+        .into_any_element()
+}
+
 impl LibraryDelegate {
     fn new() -> Self {
         Self {
@@ -601,6 +1021,7 @@ impl LibraryDelegate {
             query: String::new(),
             selected: None,
             health: HashMap::new(),
+            health_tone: HashMap::new(),
             running: HashSet::new(),
             crashed: HashSet::new(),
             traffic: HashMap::new(),
@@ -611,12 +1032,23 @@ impl LibraryDelegate {
             facet_protocol: None,
             facet_status: None,
             show_security: false,
-            type_security_sort: false,
+            sort: LibrarySort::default(),
+            latency: HashMap::new(),
+            data_traffic: HashMap::new(),
+            out_ips: HashMap::new(),
             row_columns: RowColumns::default(),
             app_view: None,
             endpoint_inputs: HashMap::new(),
             pending_endpoint_commits: Vec::new(),
+            bind_hosts: Store::BIND_HOST_CONSTANTS
+                .iter()
+                .map(|host| host.to_string())
+                .collect(),
         }
+    }
+
+    fn set_bind_hosts(&mut self, hosts: Vec<String>) {
+        self.bind_hosts = hosts;
     }
 
     fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
@@ -675,8 +1107,18 @@ impl LibraryDelegate {
                 .placeholder("auto")
                 .default_value(port_default.to_string())
         });
+        let hosts = self.bind_hosts.clone();
+        let picker = cx.new(|cx| {
+            let choices = BindHostChoiceList::for_row(row_id, &hosts);
+            let selected = choices
+                .0
+                .iter()
+                .position(|choice| choice.value == bind_default)
+                .map(IndexPath::new);
+            SelectState::new(choices, selected, window, cx)
+        });
 
-        let mut subs = Vec::with_capacity(2);
+        let mut subs = Vec::with_capacity(3);
         for state in [&bind, &port] {
             let id = row_id.to_string();
             subs.push(cx.subscribe(
@@ -695,16 +1137,46 @@ impl LibraryDelegate {
                 },
             ));
         }
+        let pick_id = row_id.to_string();
+        subs.push(cx.subscribe(
+            &picker,
+            move |list: &mut ListState<Self>,
+                  _emitter: Entity<SelectState<BindHostChoiceList>>,
+                  event: &SelectEvent<BindHostChoiceList>,
+                  cx: &mut Context<ListState<Self>>| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                list.delegate_mut().queue_bind_pick(&pick_id, value);
+                cx.notify();
+            },
+        ));
         self.endpoint_inputs.insert(
             row_id.to_string(),
             RowEndpointInputs {
                 bind,
                 port,
+                picker,
+                picker_hosts: hosts,
+                picker_selected: Some(bind_default.to_string()),
+                pick_pending: None,
                 _subs: subs,
                 clean_bind: bind_default.to_string(),
                 clean_port: port_default.to_string(),
             },
         );
+    }
+
+    /// T-33: one confirmed pick — from the picker's Confirm event, or a test
+    /// driving the same seam. The host lands in the bind draft, and the row is
+    /// queued for the ordinary endpoint commit so `save_listen_gate` runs on it.
+    fn queue_bind_pick(&mut self, row_id: &str, host: &str) {
+        if let Some(inputs) = self.endpoint_inputs.get_mut(row_id) {
+            inputs.pick_pending = Some(host.to_string());
+        }
+        if !self.pending_endpoint_commits.iter().any(|id| id == row_id) {
+            self.pending_endpoint_commits.push(row_id.to_string());
+        }
     }
 
     fn sync_row_inputs(
@@ -715,9 +1187,17 @@ impl LibraryDelegate {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let hosts = self.bind_hosts.clone();
         let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
             return;
         };
+        if let Some(pick) = inputs.pick_pending.take() {
+            if inputs.bind.read(cx).value().as_str() != pick {
+                inputs
+                    .bind
+                    .update(cx, |state, cx| state.set_value(pick.clone(), window, cx));
+            }
+        }
         let bind_current = inputs.bind.read(cx).value().to_string();
         let port_current = inputs.port.read(cx).value().to_string();
         if !inputs.bind.focus_handle(cx).is_focused(window)
@@ -737,6 +1217,32 @@ impl LibraryDelegate {
                 state.set_value(port_stored.to_string(), window, cx)
             });
             inputs.clean_port = port_stored.to_string();
+        }
+        if inputs.picker_hosts != hosts {
+            inputs.picker_hosts = hosts.clone();
+            inputs.picker_selected = None;
+            let choices = BindHostChoiceList::for_row(row_id, &hosts);
+            inputs
+                .picker
+                .update(cx, |state, cx| state.set_items(choices, window, cx));
+        }
+        // A bind the list no longer holds (a hand-edited row) leaves the picker
+        // empty rather than inventing an entry — the list stays the authority.
+        let current = inputs.bind.read(cx).value().to_string();
+        if inputs.picker_selected.as_deref() != Some(current.as_str())
+            && hosts.iter().any(|host| host == &current)
+        {
+            inputs.picker.update(cx, |state, cx| {
+                state.set_selected_value(&current, window, cx)
+            });
+            inputs.picker_selected = Some(current);
+        } else if !hosts.iter().any(|host| host == &current) && inputs.picker_selected.is_some() {
+            // The selected value left the list: drop the selection so the
+            // picker shows its placeholder instead of a vanished host.
+            inputs
+                .picker
+                .update(cx, |state, cx| state.set_selected_index(None, window, cx));
+            inputs.picker_selected = None;
         }
     }
 
@@ -790,6 +1296,7 @@ impl LibraryDelegate {
             });
             inputs.clean_bind = row.bind_ip;
             inputs.clean_port = port_stored;
+            inputs.pick_pending = None;
             self.pending_endpoint_commits.retain(|id| id != row_id);
         }
         dirty
@@ -797,11 +1304,21 @@ impl LibraryDelegate {
 
     fn apply_filter(&mut self) {
         let selected_id = self.selected_row().map(|row| row.id.clone());
-        let lowered = self.query.trim().to_lowercase();
+        let (port, text) = split_port_query(self.query.trim());
+        let lowered = text.to_lowercase();
         let mut visible = Vec::new();
         for (index, blob) in self.search_index.iter().enumerate() {
             if !blob.matches_lowered(&lowered) {
                 continue;
+            }
+            if let Some(predicate) = port {
+                let in_range = self
+                    .rows
+                    .get(index)
+                    .is_some_and(|row| predicate.matches(row.port));
+                if !in_range {
+                    continue;
+                }
             }
             if !self.row_matches_facets(index) {
                 continue;
@@ -809,8 +1326,22 @@ impl LibraryDelegate {
             visible.push(index);
         }
 
-        if self.type_security_sort {
-            visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
+        if !self.sort.is_none() {
+            if self.sort.key == LibrarySortKey::TypeSecurity {
+                // T-27: the retired toggle's ordering, unchanged — protocol
+                // ascending, then transport security descending, then name.
+                visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
+            } else {
+                let context = SortContext {
+                    latency: &self.latency,
+                    data_traffic: &self.data_traffic,
+                    totals: &self.traffic,
+                    out_ips: &self.out_ips,
+                };
+                visible.sort_by(|&a, &b| {
+                    compare_library_rows(&context, self.sort, &self.rows[a], &self.rows[b])
+                });
+            }
         }
         self.visible = visible;
         self.selected = selected_id.and_then(|id| {
@@ -860,7 +1391,14 @@ impl LibraryDelegate {
         }
         let query = self.query.trim();
         if !query.is_empty() {
-            parts.push(format!("search: \"{query}\""));
+            let (port, text) = split_port_query(query);
+            if let Some(predicate) = port {
+                parts.push(predicate.label());
+            }
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(format!("search: \"{text}\""));
+            }
         }
         parts.join(" · ")
     }
@@ -940,8 +1478,26 @@ impl LibraryDelegate {
         self.show_security = show;
     }
 
-    fn set_type_security_sort(&mut self, sort: bool) {
-        self.type_security_sort = sort;
+    /// T-27: swap the whole sort model (key + direction) and re-rank what the
+    /// filters kept. The setter never persists — the owner (AppView) writes the
+    /// meta row, matching how the column toggles work.
+    fn set_sort(&mut self, sort: LibrarySort) {
+        self.sort = sort;
+        self.apply_filter();
+    }
+
+    fn set_latency(&mut self, latency: HashMap<String, u64>) {
+        self.latency = latency;
+        self.apply_filter();
+    }
+
+    fn set_data_traffic(&mut self, data_traffic: HashMap<String, (u64, u64)>) {
+        self.data_traffic = data_traffic;
+        self.apply_filter();
+    }
+
+    fn set_out_ips(&mut self, out_ips: HashMap<String, String>) {
+        self.out_ips = out_ips;
         self.apply_filter();
     }
 
@@ -1010,6 +1566,10 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
+    fn set_health_tone(&mut self, health_tone: HashMap<String, LatencyTone>) {
+        self.health_tone = health_tone;
+    }
+
     fn set_running(&mut self, ids: Vec<String>) {
         self.running = ids.into_iter().collect();
         self.refresh_search_words();
@@ -1022,6 +1582,7 @@ impl LibraryDelegate {
 
     fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
         self.traffic = traffic;
+        self.apply_filter();
     }
 
     fn set_search_context(
@@ -1064,6 +1625,36 @@ impl LibraryDelegate {
     }
 }
 
+/// T-31: the tone each level paints in, from the active theme. `Info` keeps the
+/// default text color, `Debug` recedes to muted, `Warn` is the theme amber, and
+/// `Error` the theme danger red; both theme modes resolve these tokens.
+fn log_level_text_color(level: LogLevel, theme: &Theme) -> Hsla {
+    match level {
+        LogLevel::Error => theme.danger,
+        LogLevel::Warn => theme.warning,
+        LogLevel::Info => theme.foreground,
+        LogLevel::Debug => theme.muted_foreground,
+    }
+}
+
+/// T-31: a visible line already carries its parsed level as `[level]`.
+fn log_line_level(line: &str) -> LogLevel {
+    line.strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(label, _)| LogLevel::from_label(label))
+        .unwrap_or(LogLevel::Info)
+}
+
+/// T-31: the Settings "Maximum kept log lines" text to a clamped cap. `None`
+/// means the text is not a whole number.
+fn parse_log_cap(raw: &str) -> Option<usize> {
+    let digits = raw.trim().replace(',', "");
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<usize>().ok().map(clamp_log_max_lines)
+}
+
 struct LogLinesDelegate {
     lines: Vec<String>,
 }
@@ -1087,15 +1678,17 @@ impl ListDelegate for LogLinesDelegate {
         &mut self,
         index: IndexPath,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
         let line = self.lines.get(index.row)?.clone();
         let tip = line.clone();
+        let tone = log_level_text_color(log_line_level(&line), cx.theme());
         Some(
             ListItem::new(format!("log-line-{}", index.row)).child(
                 div()
                     .id(format!("log-line-text-{}", index.row))
                     .text_sm()
+                    .text_color(tone)
                     .truncate()
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(line),
@@ -1192,11 +1785,20 @@ impl ListDelegate for LibraryDelegate {
                 });
             }
         }
-        let (bind_state, port_state) = self
+        let (bind_state, port_state, bind_picker) = self
             .endpoint_inputs
             .get(&row_id)
-            .map(|inputs| (inputs.bind.clone(), inputs.port.clone()))
+            .map(|inputs| {
+                (
+                    inputs.bind.clone(),
+                    inputs.port.clone(),
+                    inputs.picker.clone(),
+                )
+            })
             .expect("R3: row editors ensured above");
+        // T-33: custom-config rows stay JSON-governed — their listen comes from
+        // the document, so they keep the free-text bind field (no picker).
+        let custom_config_row = is_custom_config_protocol(&row.protocol);
 
         let item = ListItem::new(format!("library-row-{}", row.id))
             .selected(selected)
@@ -1231,11 +1833,12 @@ impl ListDelegate for LibraryDelegate {
             health.as_deref(),
             self.crashed.contains(&row.id),
         );
-        let badge_color = match tone {
-            ServingTone::Failed => cx.theme().danger,
-            ServingTone::Serving => cx.theme().success,
-            ServingTone::Stopped => cx.theme().muted_foreground,
-        };
+        let probe_tone = self
+            .health_tone
+            .get(&row.id)
+            .copied()
+            .unwrap_or(LatencyTone::Unknown);
+        let health_text_color = health_tone_color(probe_tone, cx);
         let lamp_color = match tone {
             ServingTone::Failed => cx.theme().danger,
             ServingTone::Serving => cx.theme().success,
@@ -1329,7 +1932,7 @@ impl ListDelegate for LibraryDelegate {
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
-                        .text_color(badge_color)
+                        .text_color(health_text_color)
                         .tooltip({
                             let tip = tip.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
@@ -1437,23 +2040,71 @@ impl ListDelegate for LibraryDelegate {
                                 }
                             }
                         }))
-                        .child(
+                        .child(if custom_config_row {
                             div()
                                 .id(format!("row-bind-{row_id}"))
                                 .test_support()
                                 .w(px(118.))
                                 .tooltip({
                                     let tip = format!(
-                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts",
+                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts \
+                                         (custom config: listens come from the JSON)",
                                         row.name
                                     );
                                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                                 })
-                                .child(Input::new(&bind_state).id(format!("row-bind-input-{row_id}")).small().aria_label(format!(
-                                    "Serve bind address for {}",
-                                    row.name
-                                ))),
-                        )
+                                .child(
+                                    Input::new(&bind_state)
+                                        .id(format!("row-bind-input-{row_id}"))
+                                        .small()
+                                        .aria_label(format!("Serve bind address for {}", row.name)),
+                                )
+                                .into_any_element()
+                        } else {
+                            div()
+                                .id(format!("row-bind-{row_id}"))
+                                .test_support()
+                                .w(px(118.))
+                                .tooltip({
+                                    let tip = format!(
+                                        "Serve bind address for \"{}\" — pick one from the address \
+                                         list (Settings → Addresses); port stays free-text",
+                                        row.name
+                                    );
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .child(
+                                    Select::new(&bind_picker)
+                                        .id(format!("row-bind-picker-{row_id}"))
+                                        .small()
+                                        .placeholder("pick address")
+                                        .accessibility_label(format!(
+                                            "Serve bind address for {}",
+                                            row.name
+                                        )),
+                                )
+                                .into_any_element()
+                        })
+                        .children((!custom_config_row).then(|| {
+                            let add_app = self.app_view.clone();
+                            let add_tip = format!(
+                                "Add address… — opens Settings → Addresses; the list is the only \
+                                 source for row binds, \"{}\"",
+                                row.name
+                            );
+                            Button::new(format!("row-bind-add-{row_id}"))
+                                .small()
+                                .label("Add…")
+                                .accessibility_label("Add address…")
+                                .tooltip(add_tip)
+                                .on_click(move |_, window, cx| {
+                                    if let Some(app) = add_app.clone() {
+                                        app.update(cx, |view, cx| {
+                                            view.open_settings_dialog(window, cx);
+                                        });
+                                    }
+                                })
+                        }))
                         .child(
                             div()
                                 .id(format!("row-port-{row_id}"))
@@ -1804,12 +2455,208 @@ fn footer_commit_label(dialog: &str) -> &'static str {
         "export" => "Export",
         "bulk-move" => "Move",
         "group-rename" => "Rename",
+        "rule-set-add-dialog" => "Add",
         "share" => "Copy link",
         _ => "Close",
     }
 }
 
 const SHARE_WARNING: &str = "This link carries the endpoint's credentials — anyone holding it can use it. Prefer Copy URLs for credential-free sharing.";
+
+// ---- T-28: share-dialog QR of the two listener URLs ---------------------
+
+/// Modules of quiet zone baked into every grid — the QR spec's minimum.
+const SHARE_QR_QUIET_ZONE: usize = 4;
+/// Side of one QR plate in the Share dialog. The plate never shrinks; the module
+/// grid scales inside it, so the quiet zone cannot be clipped by a resize.
+const SHARE_QR_PLATE_PX: f32 = 132.;
+
+/// A monochrome QR module grid with its quiet zone baked in, row-major and square.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QrGrid {
+    side: usize,
+    dark: Vec<bool>,
+}
+
+impl QrGrid {
+    fn is_dark(&self, col: usize, row: usize) -> bool {
+        col < self.side && row < self.side && self.dark[row * self.side + col]
+    }
+
+    /// FNV-1a over the row-major module bits: the regression fingerprint for a fixed
+    /// payload, since decoding a rendered QR is out of scope by decision.
+    #[cfg(test)]
+    fn fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for &dark in &self.dark {
+            hash ^= u64::from(dark);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+}
+
+/// Encode one listener URL as a byte-mode QR at least error-correction level M (the ticket
+/// allows L or M; M already fits these URLs in a 33-module grid, quiet zone included,
+/// and tolerates a smudge on a phone screen). The encoder picks the smallest version
+/// that fits, well past the ticket's 255-byte ceiling, and we add the quiet zone.
+fn qr_grid(payload: &str) -> Result<QrGrid, String> {
+    let code = QrCode::encode_binary(payload.as_bytes(), QrCodeEcc::Medium)
+        .map_err(|_| format!("QR payload too long ({} bytes)", payload.len()))?;
+    let inner = code.size() as usize;
+    let side = inner + SHARE_QR_QUIET_ZONE * 2;
+    let mut dark = vec![false; side * side];
+    for row in 0..inner {
+        for col in 0..inner {
+            if code.get_module(col as i32, row as i32) {
+                dark[(row + SHARE_QR_QUIET_ZONE) * side + col + SHARE_QR_QUIET_ZONE] = true;
+            }
+        }
+    }
+    Ok(QrGrid { side, dark })
+}
+
+/// The row's two listener URLs, byte-identical to `proxy_urls`, with their labels.
+fn share_qr_payloads(config: &ProxyConfig) -> [(&'static str, String); 2] {
+    let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+    [("socks", socks), ("http", http)]
+}
+
+/// Where the module grid lands inside a plate box: cell edge plus the grid origin. The
+/// whole grid — quiet zone included — is centered and never exceeds the box, so a
+/// resize cannot clip the quiet zone; whole-pixel cells keep modules square and crisp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QrPlate {
+    cell: f32,
+    x: f32,
+    y: f32,
+    side: usize,
+}
+
+impl QrPlate {
+    fn fit(width: f32, height: f32, side: usize) -> Self {
+        let box_side = width.min(height).max(0.);
+        let raw = box_side / side as f32;
+        let cell = if raw >= 1. { raw.floor() } else { raw };
+        let plate = cell * side as f32;
+        Self {
+            cell,
+            x: ((width - plate) / 2.).max(0.),
+            y: ((height - plate) / 2.).max(0.),
+            side,
+        }
+    }
+
+    fn plate_side(&self) -> f32 {
+        self.cell * self.side as f32
+    }
+
+    fn module_origin(&self, col: usize, row: usize) -> (f32, f32) {
+        (
+            self.x + col as f32 * self.cell,
+            self.y + row as f32 * self.cell,
+        )
+    }
+}
+
+/// Paint the white plate (quiet zone included) and the dark modules on top of it.
+/// Scanners read black-on-white, so the plate keeps that pair in both themes while the
+/// surrounding dialog and the labels stay theme-colored.
+fn paint_share_qr(grid: &QrGrid, plate: QrPlate, window: &mut Window) {
+    let plate_side = px(plate.plate_side());
+    window.paint_quad(fill(
+        Bounds::new(
+            point(px(plate.x), px(plate.y)),
+            size(plate_side, plate_side),
+        ),
+        rgb(0xFFFFFF),
+    ));
+    for row in 0..grid.side {
+        for col in 0..grid.side {
+            if !grid.is_dark(col, row) {
+                continue;
+            }
+            let (x, y) = plate.module_origin(col, row);
+            window.paint_quad(fill(
+                Bounds::new(point(px(x), px(y)), size(px(plate.cell), px(plate.cell))),
+                rgb(0x000000),
+            ));
+        }
+    }
+}
+
+/// One labeled QR plate. The payload that cannot encode (far beyond any listener URL)
+/// degrades to a caption rather than an empty square.
+fn share_qr_block(label: &'static str, url: &str, id: &'static str, cx: &App) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    let content: AnyElement = match qr_grid(url) {
+        Ok(grid) => {
+            let grid = Rc::new(grid);
+            let side = grid.side;
+            canvas(
+                move |bounds, _, _| {
+                    QrPlate::fit(
+                        bounds.size.width.as_f32(),
+                        bounds.size.height.as_f32(),
+                        side,
+                    )
+                },
+                move |_, plate, window, _| paint_share_qr(&grid, plate, window),
+            )
+            .size_full()
+            .into_any_element()
+        }
+        Err(reason) => div()
+            .text_xs()
+            .text_color(muted)
+            .child(reason)
+            .into_any_element(),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .id(id)
+                .test_support()
+                .w(px(SHARE_QR_PLATE_PX))
+                .h(px(SHARE_QR_PLATE_PX))
+                .flex_shrink_0()
+                .child(content),
+        )
+        .child(
+            div()
+                .id(format!("{id}-label"))
+                .test_support()
+                .text_xs()
+                .text_color(muted)
+                .child(label),
+        )
+}
+
+/// The dialog's QR region: both schemes side by side, one scannable code each.
+fn share_qr_region(payloads: &[(&'static str, String); 2], cx: &App) -> impl IntoElement {
+    div()
+        .id("share-qr-region")
+        .test_support()
+        .flex()
+        .flex_wrap()
+        .gap_3()
+        .child(share_qr_block(
+            payloads[0].0,
+            &payloads[0].1,
+            "share-qr-socks",
+            cx,
+        ))
+        .child(share_qr_block(
+            payloads[1].0,
+            &payloads[1].1,
+            "share-qr-http",
+            cx,
+        ))
+}
 
 fn advanced_settings_button(view: &Entity<AppView>, form: &ConfigForm) -> impl IntoElement {
     let adv_view = view.clone();
@@ -8246,6 +9093,29 @@ fn group_test_summary_toast(
     }
 }
 
+/// T-19: the toggle-on confirm's own acknowledgment text, exactly the ticket
+/// wording; skip-delete-confirm can never substitute for it.
+fn auto_clear_opt_in_note(group: &str) -> String {
+    format!(
+        "Unavailable rows in \"{group}\" will be removed automatically after group tests pass \
+         with dead rows. Running rows and the row being edited are never removed."
+    )
+}
+
+/// T-19: one summary per sweep; always plural "rows", the kept-reason list is
+/// named only when not empty, in canonical running → editing → in-flight
+/// batch order.
+fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[String]) -> String {
+    if kept.is_empty() {
+        format!("Auto-cleared {removed} unavailable rows in \"{group}\"")
+    } else {
+        format!(
+            "Auto-cleared {removed} unavailable rows in \"{group}\" (kept: {})",
+            kept.join(", ")
+        )
+    }
+}
+
 fn speed_test_summary_toast(
     scope: &str,
     mode: SpeedtestMode,
@@ -8407,6 +9277,21 @@ fn lamp_access_label(tone: ServingTone, name: &str) -> String {
     }
 }
 
+/// Theme color for a probe's LatencyTone: Throne §F.1 bands map green /
+/// yellow / red with the 100/300 boundaries, a failed probe reads a darker
+/// red than a plain poor latency, and an untested/no-sample row keeps the
+/// neutral muted tone. Colors only — no probe, classification, or cutoff
+/// change rides along.
+fn health_tone_color(tone: LatencyTone, cx: &App) -> Hsla {
+    match tone {
+        LatencyTone::Fast => cx.theme().success,
+        LatencyTone::Slow => cx.theme().warning,
+        LatencyTone::Poor => cx.theme().danger,
+        LatencyTone::Failed => cx.theme().danger.blend(hsla(0., 0., 0., 0.35)),
+        LatencyTone::Unknown => cx.theme().muted_foreground,
+    }
+}
+
 fn check_chip_tip(position: usize, total: usize) -> String {
     format!("Checked {position} of {total} — bulk action target")
 }
@@ -8549,6 +9434,11 @@ fn start_all_partial_message(started: usize, failed_names: &[String]) -> String 
 }
 
 const SEARCH_PLACEHOLDER: &str = "Search configurations";
+
+/// T-23: the one hint that the `port=` grammar exists — a tooltip on the search
+/// box, because the pinned placeholder is too narrow to carry it.
+const SEARCH_HINT: &str =
+    "port=N or port=N:M filters by listen port (port=10801, port=10800:10900, port=10801:, port=:10900)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowColumns {
@@ -8694,6 +9584,10 @@ fn refresh_summary_text(
     failures: usize,
     conflicts: usize,
     in_use: usize,
+    added_names: &[String],
+    updated_names: &[String],
+    removed_names: &[String],
+    kept_in_use_names: &[String],
 ) -> (bool, String) {
     let mut summary =
         format!("{label}: [+]Added {added} / [~]Updated {updated} / [-]Deleted {removed}");
@@ -8712,7 +9606,71 @@ fn refresh_summary_text(
     if conflicts > 0 {
         summary.push_str(&format!(" · {conflicts} conflict(s) — your edits kept"));
     }
+    if let Some(report) =
+        refresh_named_report_block(added_names, updated_names, removed_names, kept_in_use_names)
+    {
+        summary.push('\n');
+        summary.push_str(&report);
+    }
     (failures > 0 || conflicts > 0, summary)
+}
+
+/// Cap on names rendered per report section; overflow folds into a
+/// "+ N more…" line. Data beyond the cap still exists in the payload.
+const REFRESH_REPORT_NAME_CAP: usize = 12;
+
+/// Named identity block under the count line: `Added N profiles: [+] name /
+/// Updated N profiles: [~] name / Deleted N profile: [-] name / Still in use,
+/// so kept: [=] name`. Sections with zero rows are omitted; `None` when every
+/// list is empty (count-only summary).
+fn refresh_named_report_block(
+    added_names: &[String],
+    updated_names: &[String],
+    removed_names: &[String],
+    kept_in_use_names: &[String],
+) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+    for (verb, marker, names) in [
+        ("Added", "[+]", added_names),
+        ("Updated", "[~]", updated_names),
+        ("Deleted", "[-]", removed_names),
+    ] {
+        if names.is_empty() {
+            continue;
+        }
+        let noun = if names.len() == 1 {
+            "profile"
+        } else {
+            "profiles"
+        };
+        let mut section = format!("{verb} {} {noun}:", names.len());
+        for name in names.iter().take(REFRESH_REPORT_NAME_CAP) {
+            section.push_str(&format!("\n{marker} {name}"));
+        }
+        let overflow = names.len().saturating_sub(REFRESH_REPORT_NAME_CAP);
+        if overflow > 0 {
+            section.push_str(&format!("\n+ {overflow} more…"));
+        }
+        sections.push(section);
+    }
+    if !kept_in_use_names.is_empty() {
+        let mut section = "Still in use, so kept:".to_string();
+        for name in kept_in_use_names.iter().take(REFRESH_REPORT_NAME_CAP) {
+            section.push_str(&format!("\n[=] {name}"));
+        }
+        let overflow = kept_in_use_names
+            .len()
+            .saturating_sub(REFRESH_REPORT_NAME_CAP);
+        if overflow > 0 {
+            section.push_str(&format!("\n+ {overflow} more…"));
+        }
+        sections.push(section);
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
 }
 
 fn restore_done_message(outcome: &RestoreOutcome) -> String {
@@ -8955,6 +9913,22 @@ fn normalize_test_url(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Same fetch policy as subscriptions — validated at save time, before any
+/// update check ever runs: https-only allow, plaintext http warns, internal
+/// hosts are refused outright.
+fn normalize_update_feed_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("feed URL must not be empty".to_string());
+    }
+    match store::subscription_fetch_policy(trimmed) {
+        store::SubscriptionFetchPolicy::Allow | store::SubscriptionFetchPolicy::Warn { .. } => {
+            Ok(trimmed.to_string())
+        }
+        store::SubscriptionFetchPolicy::Block { reason } => Err(reason.to_string()),
+    }
+}
+
 fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> String {
     row_override
         .filter(|url| !url.trim().is_empty())
@@ -9192,6 +10166,14 @@ fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
     }
 }
 
+/// T-33: the message a Settings field shows inline — the field's own sentence
+/// when the store named one, otherwise the error's display text.
+fn store_error_text(error: &StoreError) -> String {
+    field_error_target(error)
+        .map(|(_, message)| message)
+        .unwrap_or_else(|| error.to_string())
+}
+
 fn bind_port_collision_warning(
     rows: &[ProxyConfig],
     exclude_id: Option<&str>,
@@ -9236,32 +10218,32 @@ pub struct FetchedSubscription {
     pub userinfo: Option<store::SubscriptionQuota>,
 }
 
-type SubscriptionHostResolver = fn(&str) -> Result<Vec<std::net::IpAddr>, String>;
-
-fn resolve_subscription_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
-    use std::net::ToSocketAddrs as _;
-    (host, 0u16)
-        .to_socket_addrs()
-        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-        .map_err(|_| "subscription host does not resolve".to_string())
+/// T-12: everything one confirmed `.srs` download needs, resolved when the
+/// user clicks **Download** on the per-file confirm dialog. The type is
+/// constructed only in the confirm handler — staging a download without the
+/// on-screen explicit confirm is not expressible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSetDownloadGrant {
+    pub name: String,
+    pub file_name: String,
+    pub url: String,
+    pub dir: PathBuf,
 }
 
-async fn resolve_subscription_addresses(
-    host: String,
-    resolver: SubscriptionHostResolver,
-) -> Vec<std::net::IpAddr> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(resolver(&host).unwrap_or_default());
-    });
-    rx.await.unwrap_or_default()
+/// Shared T-08 subscription fetch pipeline: policy gates before any network at
+/// every hop, `ManyProxy/<version>` UA, no-follow redirect loop, 20 s timeout,
+/// 8 MiB cap. T-12's `.srs` staging fetch routes through this exact pipeline so
+/// rule-set downloads get byte-identical transport policy (parity is literal).
+struct FetchedHttp {
+    body: Vec<u8>,
+    userinfo: Option<store::SubscriptionQuota>,
 }
 
-async fn fetch_subscription_body(
+async fn fetch_http_body(
     client: Arc<dyn HttpClient>,
     url: &str,
     resolver: SubscriptionHostResolver,
-) -> Result<FetchedSubscription, String> {
+) -> Result<FetchedHttp, String> {
     use futures::AsyncReadExt as _;
     const MAX_BYTES: usize = store::SUBSCRIPTION_MAX_BYTES;
     const TIMEOUT_SECS: u64 = store::SUBSCRIPTION_TIMEOUT_SECS;
@@ -9283,6 +10265,7 @@ async fn fetch_subscription_body(
         }
         let request = http_client::http::Request::builder()
             .uri(current.as_str())
+            .header("user-agent", user_agent_header())
             .follow_redirects(http_client::RedirectPolicy::NoFollow)
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .body(AsyncBody::empty())
@@ -9328,11 +10311,65 @@ async fn fetch_subscription_body(
                 return Err("subscription body too large".to_string());
             }
         }
-        return String::from_utf8(buf)
-            .map(|body| FetchedSubscription { body, userinfo })
-            .map_err(|_| "subscription body is not UTF-8".to_string());
+        return Ok(FetchedHttp {
+            body: buf,
+            userinfo,
+        });
     }
     Err("subscription fetch failed (too many redirects)".to_string())
+}
+
+async fn fetch_subscription_body(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    resolver: SubscriptionHostResolver,
+) -> Result<FetchedSubscription, String> {
+    let fetched = fetch_http_body(client, url, resolver).await?;
+    String::from_utf8(fetched.body)
+        .map(|body| FetchedSubscription {
+            body,
+            userinfo: fetched.userinfo,
+        })
+        .map_err(|_| "subscription body is not UTF-8".to_string())
+}
+
+/// T-12: the confirmed rule-set download rides the same pipeline; `.srs` is
+/// binary, so the body stays bytes (never UTF-8-validated like subscriptions).
+async fn fetch_rule_set_body(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    resolver: SubscriptionHostResolver,
+) -> Result<Vec<u8>, String> {
+    Ok(fetch_http_body(client, url, resolver).await?.body)
+}
+
+type SubscriptionHostResolver = fn(&str) -> Result<Vec<std::net::IpAddr>, String>;
+
+fn resolve_subscription_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::ToSocketAddrs as _;
+    (host, 0u16)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .map_err(|_| "subscription host does not resolve".to_string())
+}
+
+async fn resolve_subscription_addresses(
+    host: String,
+    resolver: SubscriptionHostResolver,
+) -> Vec<std::net::IpAddr> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resolver(&host).unwrap_or_default());
+    });
+    rx.await.unwrap_or_default()
+}
+
+/// Every outbound fetch-layer request carries `User-Agent: ManyProxy/<APP_VERSION>`.
+/// A static, per-release identifier with zero device identity: Throne's
+/// `x-hwid`/`x-device-*` header family is device fingerprinting, and this
+/// function must never gain any hostname/MAC/ID component.
+pub(crate) fn user_agent_header() -> String {
+    format!("ManyProxy/{}", APP_VERSION)
 }
 
 fn is_fetch_redirect(status: http_client::http::StatusCode) -> bool {
@@ -9375,6 +10412,464 @@ fn fetch_redirect_location(
         .to_str()
         .ok()?;
     resolve_fetch_redirect(current_url, location)
+}
+
+pub const UPDATE_FEED_URL_DEFAULT: &str =
+    "https://api.github.com/repos/QMahyar/ManyProxy/releases/latest";
+
+/// T-06: the update check is a passive JSON GET — 10 s timeout, one MiB cap,
+/// at most five hand-followed hops. It reads the feed and nothing else;
+/// release assets are never fetched, hashed, or executed by the app.
+const UPDATE_FEED_TIMEOUT_SECS: u64 = 10;
+
+const UPDATE_FEED_MAX_REDIRECTS: usize = store::SUBSCRIPTION_MAX_REDIRECTS;
+
+const UPDATE_FEED_MAX_BYTES: usize = 1024 * 1024;
+
+pub const UPDATE_FEED_EMPTY_MESSAGE: &str = "No releases published yet.";
+
+/// One release entry read out of the JSON feed. The app keeps parsed
+/// metadata only — assets are never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedRelease {
+    pub tag_name: String,
+    pub prerelease: bool,
+    pub html_url: Option<String>,
+    pub release_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseCompare {
+    UpToDate,
+    Newer,
+    Older,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemverIdent {
+    Numeric(u64),
+    Alnum(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTag {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub idents: Vec<SemverIdent>,
+}
+
+/// Strips the leading `v`, splits `major.minor.patch` from the optional
+/// `-prerelease` suffix, and ignores `+build` metadata per semver rule 10.
+pub fn parse_release_tag(tag: &str) -> Option<ParsedTag> {
+    let trimmed = tag.trim();
+    let no_v = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let no_build = no_v.split('+').next().unwrap_or(no_v);
+    let (core, suffix) = match no_build.split_once('-') {
+        Some((core, suffix)) => (core, suffix),
+        None => (no_build, ""),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if suffix.is_empty() {
+        if no_build.contains('-') {
+            return None;
+        }
+        return Some(ParsedTag {
+            major,
+            minor,
+            patch,
+            idents: Vec::new(),
+        });
+    }
+    let mut idents = Vec::new();
+    for ident in suffix.split('.') {
+        if ident.is_empty() {
+            return None;
+        }
+        if ident.bytes().all(|b| b.is_ascii_digit()) {
+            idents.push(SemverIdent::Numeric(ident.parse::<u64>().ok()?));
+        } else {
+            idents.push(SemverIdent::Alnum(ident.to_string()));
+        }
+    }
+    Some(ParsedTag {
+        major,
+        minor,
+        patch,
+        idents,
+    })
+}
+
+/// Compares two parsed tags. Equal triples rank the plain release above its
+/// own prereleases (rule 10); two prerelease tag sets compare per rule 11
+/// (numeric < alphanumeric, larger set outranks the smaller).
+pub fn compare_parsed_tags(a: &ParsedTag, b: &ParsedTag) -> std::cmp::Ordering {
+    let triple = (a.major, a.minor, a.patch).cmp(&(b.major, b.minor, b.patch));
+    if triple != std::cmp::Ordering::Equal {
+        return triple;
+    }
+    match (a.idents.is_empty(), b.idents.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => compare_pre_identifiers(&a.idents, &b.idents),
+    }
+}
+
+fn compare_pre_identifiers(a: &[SemverIdent], b: &[SemverIdent]) -> std::cmp::Ordering {
+    for (left, right) in a.iter().zip(b.iter()) {
+        let ordering = match (left, right) {
+            (SemverIdent::Numeric(left), SemverIdent::Numeric(right)) => left.cmp(right),
+            (SemverIdent::Numeric(_), SemverIdent::Alnum(_)) => std::cmp::Ordering::Less,
+            (SemverIdent::Alnum(_), SemverIdent::Numeric(_)) => std::cmp::Ordering::Greater,
+            (SemverIdent::Alnum(left), SemverIdent::Alnum(right)) => left.cmp(right),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+pub fn compare_release_to_running(tag_name: &str, running: &str) -> ReleaseCompare {
+    let Some(candidate) = parse_release_tag(tag_name) else {
+        return ReleaseCompare::UpToDate;
+    };
+    let Some(current) = parse_release_tag(running) else {
+        return ReleaseCompare::UpToDate;
+    };
+    match compare_parsed_tags(&candidate, &current) {
+        std::cmp::Ordering::Greater => ReleaseCompare::Newer,
+        std::cmp::Ordering::Less => ReleaseCompare::Older,
+        std::cmp::Ordering::Equal => ReleaseCompare::UpToDate,
+    }
+}
+
+/// The running binary only sees prerelease tags when it itself carries a
+/// prerelease suffix (the brief: `APP_VERSION` rides the channel).
+fn running_is_prerelease(running: &str) -> bool {
+    running.contains('-')
+}
+
+fn newest_tag_among(entries: &[FetchedRelease], allow_prerelease: bool) -> Option<FetchedRelease> {
+    let mut best: Option<(ParsedTag, &FetchedRelease)> = None;
+    for entry in entries {
+        if entry.prerelease && !allow_prerelease {
+            continue;
+        }
+        let Some(parsed) = parse_release_tag(&entry.tag_name) else {
+            continue;
+        };
+        let replace = match &best {
+            Some((top, _)) => compare_parsed_tags(&parsed, top) == std::cmp::Ordering::Greater,
+            None => true,
+        };
+        if replace {
+            best = Some((parsed, entry));
+        }
+    }
+    best.map(|(_, entry)| entry.clone())
+}
+
+fn json_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .map(str::to_string)
+}
+
+fn release_entry(value: &serde_json::Value) -> Option<FetchedRelease> {
+    if !value.is_object() {
+        return None;
+    }
+    Some(FetchedRelease {
+        tag_name: json_str_field(value, "tag_name")?,
+        prerelease: value
+            .get("prerelease")
+            .and_then(|field| field.as_bool())
+            .unwrap_or(false),
+        html_url: json_str_field(value, "html_url"),
+        release_name: json_str_field(value, "name"),
+    })
+}
+
+/// Parses the feed body. `Ok(None)` means nothing a compare can act on —
+/// everything published is prerelease-only while the running build is stable,
+/// or no release carries a comparable tag. HTTP 404 stays with the fetch fn.
+pub fn parse_release_feed(
+    body: &str,
+    list_endpoint: bool,
+    running: &str,
+) -> Result<Option<FetchedRelease>, String> {
+    const MALFORMED: &str = "update feed is not valid JSON";
+    let value: serde_json::Value =
+        serde_json::from_str(body.trim()).map_err(|_| MALFORMED.to_string())?;
+    let allow_prerelease = running_is_prerelease(running);
+    if list_endpoint {
+        let entries = value.as_array().ok_or_else(|| MALFORMED.to_string())?;
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if let Some(release) = release_entry(entry) {
+                candidates.push(release);
+            }
+        }
+        Ok(newest_tag_among(&candidates, allow_prerelease))
+    } else {
+        let feed = release_entry(&value).ok_or_else(|| MALFORMED.to_string())?;
+        if feed.prerelease && !allow_prerelease {
+            return Ok(None);
+        }
+        if parse_release_tag(&feed.tag_name).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(feed))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCheckOutcome {
+    UpToDate,
+    NoReleases,
+    Newer(FetchedRelease),
+}
+
+/// Darkens the feed result into a dialog outcome: 404 is the exact
+/// "No releases published yet." state (not an error class), a filtered
+/// release set is up-to-date, and every other failure is a plain error.
+pub fn update_check_outcome(
+    fetched: Result<Option<FetchedRelease>, String>,
+) -> Result<UpdateCheckOutcome, String> {
+    match fetched {
+        Ok(Some(release)) => {
+            let candidate = compare_release_to_running(&release.tag_name, APP_VERSION);
+            Ok(match candidate {
+                ReleaseCompare::Newer => UpdateCheckOutcome::Newer(release),
+                ReleaseCompare::UpToDate | ReleaseCompare::Older => UpdateCheckOutcome::UpToDate,
+            })
+        }
+        Ok(None) => Ok(UpdateCheckOutcome::UpToDate),
+        Err(why) if why == UPDATE_FEED_EMPTY_MESSAGE => Ok(UpdateCheckOutcome::NoReleases),
+        Err(why) => Err(why),
+    }
+}
+
+/// (message element id, message text, optional release title, optional https
+/// releases page) — the single source the dialog renders from, so tests pin
+/// the exact strings without pulling them out of a painted frame.
+fn update_check_presentation(
+    outcome: &UpdateCheckOutcome,
+    running: &str,
+) -> (&'static str, String, Option<String>, Option<String>) {
+    match outcome {
+        UpdateCheckOutcome::UpToDate => (
+            "update-up-to-date",
+            format!("ManyProxy {running} is up to date."),
+            None,
+            None,
+        ),
+        UpdateCheckOutcome::NoReleases => (
+            "update-no-releases",
+            UPDATE_FEED_EMPTY_MESSAGE.to_string(),
+            None,
+            None,
+        ),
+        UpdateCheckOutcome::Newer(release) => {
+            let tag = release.tag_name.trim().to_string();
+            let name = release
+                .release_name
+                .clone()
+                .filter(|name| !name.trim().is_empty() && name.trim() != tag);
+            let url = release
+                .html_url
+                .clone()
+                .filter(|value| value.trim().starts_with("https://"));
+            (
+                "update-new-version",
+                format!("New version available: {tag} (running {running})"),
+                name,
+                url,
+            )
+        }
+    }
+}
+
+/// Stable binaries stay on `releases/latest`; a prerelease build rides the
+/// releases list so prerelease tags become visible (the channel rule).
+pub fn effective_update_feed_url(override_url: Option<&str>, running: &str) -> String {
+    if let Some(url) = override_url.filter(|value| !value.trim().is_empty()) {
+        return url.trim().to_string();
+    }
+    let default = UPDATE_FEED_URL_DEFAULT.trim();
+    if running_is_prerelease(running) {
+        if let Some(prefix) = default.strip_suffix("/releases/latest") {
+            return format!("{prefix}/releases");
+        }
+    }
+    default.to_string()
+}
+
+/// A feed URL targets the releases *list* when the path (sans query or
+/// fragment) ends in a `releases` segment — GitHub exposes
+/// `/repos/<owner>/<repo>/releases` (list) vs `/releases/latest` (single).
+fn is_releases_list_url(url: &str) -> bool {
+    let path = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or("") == "releases"
+}
+
+/// Fetches the JSON-only release feed through the subscription fetch policy —
+/// the same SSRF guards (https-only allow, plaintext http warns, internal
+/// hosts never fetched), redirects followed by hand.
+pub async fn fetch_release_feed(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    resolver: SubscriptionHostResolver,
+) -> Result<Option<FetchedRelease>, String> {
+    use futures::AsyncReadExt as _;
+    const MAX_BYTES: usize = UPDATE_FEED_MAX_BYTES;
+    let list_endpoint = is_releases_list_url(url);
+    let mut current = url.trim().to_string();
+    for _ in 0..=UPDATE_FEED_MAX_REDIRECTS {
+        if let store::SubscriptionFetchPolicy::Block { reason } =
+            store::subscription_fetch_policy(&current)
+        {
+            return Err(reason.to_string());
+        }
+        if let Some(host) = store::subscription_url_host(&current) {
+            let resolved = resolve_subscription_addresses(host, resolver).await;
+            if let store::SubscriptionFetchPolicy::Block { reason } =
+                store::subscription_fetch_policy_resolved(&current, &resolved)
+            {
+                return Err(reason.to_string());
+            }
+        }
+        let request = http_client::http::Request::builder()
+            .uri(current.as_str())
+            .header("user-agent", user_agent_header())
+            .follow_redirects(http_client::RedirectPolicy::NoFollow)
+            .timeout(std::time::Duration::from_secs(UPDATE_FEED_TIMEOUT_SECS))
+            .body(AsyncBody::empty())
+            .map_err(|_| "update feed request failed".to_string())?;
+        let mut response = client
+            .send(request)
+            .await
+            .map_err(|_| "update feed fetch failed".to_string())?;
+        if is_fetch_redirect(response.status()) {
+            match fetch_redirect_location(response.headers(), &current) {
+                Some(next) => {
+                    current = next;
+                    continue;
+                }
+                None => return Err("update feed fetch failed (bad redirect)".to_string()),
+            }
+        }
+        if response.status().as_u16() == 404 {
+            // No releases published and still-private repos both land here.
+            return Err(UPDATE_FEED_EMPTY_MESSAGE.to_string());
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "update feed fetch failed (status {})",
+                response.status().as_u16()
+            ));
+        }
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65_536];
+        loop {
+            let n = response
+                .body_mut()
+                .read(&mut chunk)
+                .await
+                .map_err(|_| "update feed fetch failed".to_string())?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > MAX_BYTES {
+                return Err("update feed body too large".to_string());
+            }
+        }
+        let body =
+            String::from_utf8(buf).map_err(|_| "update feed body is not UTF-8".to_string())?;
+        return parse_release_feed(&body, list_endpoint, APP_VERSION);
+    }
+    Err("update feed fetch failed (too many redirects)".to_string())
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        lp_operation: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show_cmd: i32,
+    ) -> isize;
+}
+
+/// Opens the releases page in the user's own browser on their explicit
+/// click — https-only, no prefetch, no app-initiated navigation.
+fn open_release_in_browser(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Err("only https release pages can open in a browser".to_string());
+    }
+    open_url_shell_execute(trimmed)
+}
+
+#[cfg(windows)]
+fn open_url_shell_execute(url: &str) -> Result<(), String> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt as _;
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(once(0))
+            .collect()
+    }
+    let operation = wide("open");
+    let file = wide(url);
+    let instance = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    if instance > 32 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot open the browser to {url} (shell returned {instance})"
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn open_url_shell_execute(_url: &str) -> Result<(), String> {
+    Err("opening the release page needs the Windows shell (ManyProxy is Windows-only)".to_string())
 }
 
 pub const INTERVAL_PRESETS: &[i64] = &[0, 3_600, 21_600, 43_200, 86_400, 604_800];
@@ -9768,6 +11263,7 @@ struct GroupRowView {
     kind: String,
     quota: Option<String>,
     skip: bool,
+    auto_clear: bool,
     sub_ids: Vec<String>,
 }
 
@@ -9775,6 +11271,7 @@ fn group_row_views(
     counts: &[(String, usize)],
     subs: &[ProxySubscription],
     skip: &dyn Fn(&str) -> bool,
+    auto_clear: &dyn Fn(&str) -> bool,
     now: i64,
 ) -> Vec<GroupRowView> {
     use std::collections::BTreeMap;
@@ -9818,6 +11315,7 @@ fn group_row_views(
                 kind,
                 quota,
                 skip: skipped,
+                auto_clear: auto_clear(name),
                 sub_ids: feeding.iter().map(|sub| sub.id.clone()).collect(),
             }
         })
@@ -9932,13 +11430,29 @@ fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String 
 }
 
 #[derive(Clone)]
+/// T-11 simple-rules boxes (write-once authoring sugar over the same stored
+/// rules): the rules JSON view stays the single source of truth — box text
+/// expands into the structured rules on save and round-trips nowhere.
 struct PresetForm {
     name: Entity<InputState>,
     rules: Entity<TextareaState>,
+    simple_direct: Entity<TextareaState>,
+    simple_block: Entity<TextareaState>,
+    simple_proxy: Entity<TextareaState>,
 }
 
 impl PresetForm {
     fn restored(window: &mut Window, cx: &mut Context<AppView>, name: &str, rules: &str) -> Self {
+        Self::restored_with_boxes(window, cx, name, rules, &SimpleRuleBoxes::default())
+    }
+
+    fn restored_with_boxes(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        name: &str,
+        rules: &str,
+        boxes: &SimpleRuleBoxes,
+    ) -> Self {
         Self {
             name: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -9950,10 +11464,95 @@ impl PresetForm {
                     .placeholder("Optional rules JSON (preset object or rules array)")
                     .default_value(rules.to_string())
             }),
+            simple_direct: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("domain:example.com, suffix:cn — one rule per line")
+                    .default_value(boxes.direct.clone())
+            }),
+            simple_block: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("keyword:ads, processName:updater.exe")
+                    .default_value(boxes.block.clone())
+            }),
+            simple_proxy: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("ruleset:streaming, domain:netflix.com")
+                    .default_value(boxes.proxy.clone())
+            }),
         }
     }
 
-    fn element(self, _cx: &App) -> impl IntoElement {
+    fn element(self, cx: &App) -> impl IntoElement {
+        use crate::preset::SimpleRulesBox;
+        let mut simple = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id("preset-simple-rules")
+                    .test_support()
+                    .text_sm()
+                    .child("Simple rules"),
+            )
+            .child(
+                div()
+                    .id("preset-simple-help")
+                    .test_support()
+                    .text_sm()
+                    .child(
+                        "One rule per line: tokens domain:/suffix:/keyword:/regex:/ruleset:/ip:/processName:/processPath: separated by commas or spaces; blank and # lines are skipped. ruleset: names require a staged rule set (Rule sets section) — unstaged sets fail loud when the preset attaches and at config generation.",
+                    ),
+            );
+        for (r#box, state) in [
+            (SimpleRulesBox::Direct, &self.simple_direct),
+            (SimpleRulesBox::Block, &self.simple_block),
+            (SimpleRulesBox::Proxy, &self.simple_proxy),
+        ] {
+            simple = simple
+                .child(
+                    div()
+                        .id(format!("preset-simple-label-{}", r#box.action()))
+                        .test_support()
+                        .text_sm()
+                        .child(r#box.label()),
+                )
+                .child(
+                    div()
+                        .id(format!("field-preset-simple-{}", r#box.action()))
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Textarea::new(state).h(px(56.))),
+                );
+        }
+        let invalid_lines = simple_rules_invalid_rows(&self, cx);
+        if !invalid_lines.is_empty() {
+            let mut fold = div()
+                .id("preset-simple-invalid-lines")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .id("preset-simple-invalid-header")
+                        .test_support()
+                        .text_sm()
+                        .child("Invalid lines"),
+                );
+            for (index, (r#box, line)) in invalid_lines.into_iter().enumerate() {
+                fold = fold.child(
+                    div()
+                        .id(format!("preset-simple-invalid-{index}"))
+                        .test_support()
+                        .text_sm()
+                        .child(format!("{} box: {}", r#box.label(), line)),
+                );
+            }
+            simple = simple.child(fold);
+        }
         div()
             .flex()
             .flex_col()
@@ -9969,7 +11568,63 @@ impl PresetForm {
                     .child(Label::new("Rules JSON (optional)"))
                     .child(Textarea::new(&self.rules).h(px(120.))),
             )
+            .child(simple)
     }
+}
+
+/// T-11: a snapshot of the three simple-rules boxes read from a form at
+/// commit time. Empty boxes contribute nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SimpleRuleBoxes {
+    direct: String,
+    block: String,
+    proxy: String,
+}
+
+impl SimpleRuleBoxes {
+    fn from_form(form: &PresetForm, cx: &App) -> Self {
+        Self {
+            direct: form.simple_direct.read(cx).value().to_string(),
+            block: form.simple_block.read(cx).value().to_string(),
+            proxy: form.simple_proxy.read(cx).value().to_string(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.direct.trim().is_empty()
+            && self.block.trim().is_empty()
+            && self.proxy.trim().is_empty()
+    }
+}
+
+/// The invalid lines the current parse of the three boxes produces; the
+/// fold always mirrors the text as typed and exists for this session only —
+/// nothing is persisted. Cheap: the parser is pure and small inputs are the
+/// norm.
+fn simple_rules_invalid_rows(
+    form: &PresetForm,
+    cx: &App,
+) -> Vec<(crate::preset::SimpleRulesBox, String)> {
+    use crate::preset::SimpleRulesBox;
+    let mut rows = Vec::new();
+    for (r#box, state) in [
+        (SimpleRulesBox::Direct, &form.simple_direct),
+        (SimpleRulesBox::Block, &form.simple_block),
+        (SimpleRulesBox::Proxy, &form.simple_proxy),
+    ] {
+        let text = state.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let parsed = crate::preset::parse_simple_rules(r#box, r#box.action(), &text);
+        rows.extend(
+            parsed
+                .invalid
+                .into_iter()
+                .map(|line| (r#box, line.to_string())),
+        );
+    }
+    rows
 }
 
 fn preset_row(
@@ -9984,6 +11639,9 @@ fn preset_row(
         .gap_2()
         .child(Label::new(preset.name.clone()))
         .child(preset_row_summary(&preset, &attached));
+    if preset.locked {
+        row = row.child(Label::new("Locked"));
+    }
     if preset.source == "url" && preset.source_url.is_some() {
         let refresh_view = view.clone();
         let refresh_id = preset.id.clone();
@@ -10002,8 +11660,27 @@ fn preset_row(
     let remove_id = preset.id.clone();
     let edit_view = view.clone();
     let edit_preset = preset.clone();
+    let lock_view = view.clone();
+    let lock_id = preset.id.clone();
+    let lock_next = !preset.locked;
     let export_view = view.clone();
     let export_preset = preset.clone();
+    row = row.child(
+        Button::new(format!("preset-lock-{}", preset.id))
+            .label(if preset.locked { "Unlock" } else { "Lock" })
+            .tooltip(if preset.locked {
+                "Allow modifications again (the rules gain an editor)"
+            } else {
+                "Prevent modifications: the rules stay byte-stable; attach/detach unaffected"
+            })
+            .on_click(move |_, window, cx| {
+                let id = lock_id.clone();
+                let locked = lock_next;
+                lock_view.update(cx, |view, cx| {
+                    view.commit_preset_lock(&id, locked, window, cx);
+                });
+            }),
+    );
     row = row.child(
         Button::new(format!("preset-export-{}", preset.id))
             .label("Export link")
@@ -10056,10 +11733,110 @@ enum PresetRulesOp {
     Add,
 }
 
+/// T-12: one staged rule set, listed under the presets manager's "Rule sets"
+/// sub-list: `{name, url, bytes, downloaded_at, used_by presets}`.
+fn rule_set_summary(row: &store::RuleSetRow, used_by: &[String]) -> String {
+    let mut parts = vec![
+        crate::import::redact_link(&row.url),
+        format_bytes(row.bytes),
+        format_last_refresh(Some(row.downloaded_at), now_unix()),
+    ];
+    if !used_by.is_empty() {
+        parts.push(format!("used by {}", used_by.join(", ")));
+    }
+    parts.join(" · ")
+}
+
+fn rule_set_row(
+    view: Entity<AppView>,
+    row: store::RuleSetRow,
+    used_by: Vec<String>,
+) -> impl IntoElement {
+    let redownload_view = view.clone();
+    let redownload_row = row.clone();
+    let remove_view = view.clone();
+    let remove_id = row.id.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(Label::new(format!("{} · {}", row.name, row.file_name)))
+        .child(Label::new(rule_set_summary(&row, &used_by)))
+        .child(
+            Button::new(format!("rule-set-redownload-{}", row.id))
+                .label("Re-Download")
+                .tooltip("Confirm the download again; bytes are overwritten")
+                .on_click(move |_, window, cx| {
+                    let row = redownload_row.clone();
+                    redownload_view.update(cx, |view, cx| {
+                        view.open_rule_set_download_confirm(
+                            RuleSetDownloadGrant {
+                                name: row.name.clone(),
+                                file_name: row.file_name.clone(),
+                                url: row.url.clone(),
+                                dir: crate::store::rule_sets_dir(),
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+        )
+        .child(
+            Button::new(format!("rule-set-remove-{}", row.id))
+                .label("Remove")
+                .tooltip("Removes the staged file; blocked while presets use the set")
+                .on_click(move |_, window, cx| {
+                    let id = remove_id.clone();
+                    remove_view.update(cx, |view, cx| {
+                        view.commit_rule_set_remove(&id, window, cx);
+                    });
+                }),
+        )
+}
+
+/// T-09 attribute fold keys, rendered per rule as JSON-shape fields. The
+/// rules JSON box stays the single editing surface; no per-key input state.
+const PRESET_FOLD_KEYS: &[(&str, &str)] = &[
+    ("source_ip_cidr", "Source CIDR"),
+    ("source_ip_is_private", "Source is private"),
+    ("source_port", "Source port"),
+    ("source_port_range", "Source port range"),
+    ("ip_version", "IP version"),
+    ("invert", "Invert"),
+    ("process_path_regex", "Process path regex"),
+];
+
+fn preset_rule_attribute_folds(
+    preset_id: &str,
+    index: usize,
+    rule: &serde_json::Value,
+) -> Vec<AnyElement> {
+    PRESET_FOLD_KEYS
+        .iter()
+        .filter_map(|(key, label)| {
+            let value = rule.get(*key)?;
+            Some(
+                div()
+                    .id(format!("preset-rule-fold-{preset_id}-{index}-{key}"))
+                    .test_support()
+                    .text_sm()
+                    .child(format!(
+                        "{label}: {}",
+                        serde_json::to_string(value).unwrap_or_default()
+                    ))
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}
+
 fn preset_advanced_section(
     view: Entity<AppView>,
     preset: &store::RoutePreset,
-    form: PresetForm,
+    form: Option<PresetForm>,
+    exits: &[String],
 ) -> impl IntoElement {
     let mut section = div().flex().flex_col().gap_1().child(
         div()
@@ -10080,27 +11857,59 @@ fn preset_advanced_section(
             );
         }
     };
+    let locked = preset.locked;
     for (index, rule) in rules.iter().enumerate() {
         let action = rule
             .get("action")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("?");
         let tabs = crate::preset::rule_attribute_tabs(rule).join(" · ");
-        let cycle_view = view.clone();
-        let cycle_form = form.clone();
-        let remove_view = view.clone();
-        let remove_form = form.clone();
-        section = section.child(
+        let name = rule
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty());
+        let label = match name {
+            Some(name) => format!("Rule {index} — \"{name}\" — {action} · {tabs}"),
+            None => format!("Rule {index} — {action} · {tabs}"),
+        };
+        let mut row = div().flex().flex_row().items_center().gap_2().child(
             div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
+                .id(format!("preset-rule-name-{}-{index}", preset.id))
+                .test_support()
+                .text_sm()
+                .child(label),
+        );
+        if crate::preset::action_carries_outbound(action) {
+            let outbound_text = match rule.get("outbound").and_then(serde_json::Value::as_str) {
+                Some(tag) => format!("Outbound: {tag}"),
+                None => "Outbound: serving row".to_string(),
+            };
+            row = row.child(
+                div()
+                    .id(format!("preset-rule-outbound-{}-{index}", preset.id))
+                    .test_support()
+                    .text_sm()
+                    .child(outbound_text),
+            );
+            if !locked {
+                row = row.child(
                     div()
+                        .id(format!("preset-rule-exits-{}-{index}", preset.id))
+                        .test_support()
                         .text_sm()
-                        .child(format!("Rule {index} — {action} · {tabs}")),
-                )
+                        .child(format!(
+                            "Exits: {}",
+                            crate::preset::preset_exit_suggestions(exits).join(" · ")
+                        )),
+                );
+            }
+        }
+        if let Some(form) = &form {
+            let cycle_view = view.clone();
+            let cycle_form = form.clone();
+            let remove_view = view.clone();
+            let remove_form = form.clone();
+            row = row
                 .child(
                     Button::new(format!("preset-rule-action-{}-{index}", preset.id))
                         .small()
@@ -10132,21 +11941,35 @@ fn preset_advanced_section(
                                 );
                             });
                         }),
-                ),
-        );
+                );
+        }
+        section = section.child(row);
+        for fold in preset_rule_attribute_folds(&preset.id, index, rule) {
+            section = section.child(fold);
+        }
     }
-    let add_view = view.clone();
-    section.child(
-        Button::new(format!("preset-rule-add-{}", preset.id))
-            .small()
-            .label("Add rule")
-            .tooltip("Append a fresh direct rule to the rules box")
-            .on_click(move |_, window, cx| {
-                add_view.update(cx, |_, cx| {
-                    AppView::rewrite_preset_rules_box(&form, &PresetRulesOp::Add, window, cx);
-                });
-            }),
-    )
+    match form {
+        Some(form) => {
+            let add_view = view.clone();
+            section.child(
+                Button::new(format!("preset-rule-add-{}", preset.id))
+                    .small()
+                    .label("Add rule")
+                    .tooltip("Append a fresh direct rule to the rules box")
+                    .on_click(move |_, window, cx| {
+                        add_view.update(cx, |_, cx| {
+                            AppView::rewrite_preset_rules_box(
+                                &form,
+                                &PresetRulesOp::Add,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            )
+        }
+        None => section,
+    }
 }
 
 fn spawn_tick(
@@ -10987,6 +12810,14 @@ impl ConnRow {
     }
 }
 
+/// The only two Connections-tab cells that click-to-copy: the destination cell
+/// and the per-row exit endpoint (`bind:port`). Indexed by painted row order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnCopyTarget {
+    Dest(usize),
+    Endpoint(usize),
+}
+
 fn build_conn_rows(
     snapshot: &[(String, crate::health::ClashConn)],
     deltas: &HashMap<String, (u64, u64)>,
@@ -11043,6 +12874,76 @@ impl ExitTraffic {
     }
 }
 
+/// How many per-exit rows the traffic dialog lists before rolling the tail up.
+const TRAFFIC_TOP_EXITS: usize = 9;
+
+/// One ranking for every place exits are shown: heaviest first, with totals
+/// ties broken by stable identity so the same data always paints identically.
+fn exit_traffic_order(a: &ExitTraffic, b: &ExitTraffic) -> std::cmp::Ordering {
+    b.total()
+        .cmp(&a.total())
+        .then_with(|| a.row_id.cmp(&b.row_id))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.bind.cmp(&b.bind))
+}
+
+/// What the dialog lists: the top [`TRAFFIC_TOP_EXITS`] exits plus the count
+/// and exact byte totals of every exit ranked below them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrafficExitSplit {
+    top: Vec<ExitTraffic>,
+    other_exits: usize,
+    other_rx: u64,
+    other_tx: u64,
+}
+
+impl TrafficExitSplit {
+    fn other_line(&self) -> Option<String> {
+        (self.other_exits > 0)
+            .then(|| traffic_other_line_text(self.other_exits, self.other_rx, self.other_tx))
+    }
+}
+
+fn traffic_other_line_text(count: usize, rx: u64, tx: u64) -> String {
+    format!(
+        "Other ({count} more · ↓{} ↑{})",
+        format_bytes(rx),
+        format_bytes(tx)
+    )
+}
+
+/// Ranks the exits, keeps the top nine and sums the rest. Recomputed from the
+/// rows handed in, so every period paints its own split and nothing is stored.
+fn traffic_top9_split(exits: &[ExitTraffic]) -> TrafficExitSplit {
+    let mut ranked: Vec<ExitTraffic> = exits.to_vec();
+    ranked.sort_by(exit_traffic_order);
+    let split_at = ranked.len().min(TRAFFIC_TOP_EXITS);
+    let rest = ranked.split_off(split_at);
+    let mut other_rx = 0u64;
+    let mut other_tx = 0u64;
+    for exit in &rest {
+        other_rx = other_rx.saturating_add(exit.rx_bytes);
+        other_tx = other_tx.saturating_add(exit.tx_bytes);
+    }
+    TrafficExitSplit {
+        top: ranked,
+        other_exits: rest.len(),
+        other_rx,
+        other_tx,
+    }
+}
+
+/// Bar denominator taken over every row (never the "Other" aggregate), so the
+/// stacked bars keep truthful proportions once the tail is rolled up.
+fn traffic_bar_max(exits: &[ExitTraffic]) -> u64 {
+    exits
+        .iter()
+        .map(ExitTraffic::total)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn conn_exit_of(rows: &[ProxyConfig], row_id: Option<&str>) -> (String, String, String) {
     match row_id.and_then(|id| rows.iter().find(|row| row.id == id)) {
         Some(row) => (
@@ -11074,7 +12975,7 @@ fn aggregate_exit_traffic(
             })
         })
         .collect();
-    exits.sort_by_key(|exit| std::cmp::Reverse(exit.total()));
+    exits.sort_by(exit_traffic_order);
     exits
 }
 
@@ -11176,6 +13077,397 @@ impl InspectorTab {
     }
 }
 
+// --- T-30: per-shard CPU/RAM sampling (read-only, own children only) ---------
+//
+// The sidecars are this app's own child processes, so reading their kernel
+// counters is the user's own information: no enumeration, no network, no
+// telemetry. Everything below is bounded by the pid list the controller hands
+// over; nothing here can name a process the app did not spawn.
+
+/// Samples kept per shard, one per engine tick (`ENGINE_POLL_TICK_SECS`), so
+/// the ring spans five minutes of history and never grows.
+const SHARD_SAMPLE_RING: usize = 60;
+
+/// `PROCESS_QUERY_LIMITED_INFORMATION` — the least right that still answers
+/// `GetProcessTimes` / `GetProcessMemoryInfo`.
+#[cfg(all(windows, not(test)))]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// `OpenProcess` says this when the pid exists but our token may not query it.
+#[cfg(all(windows, not(test)))]
+const ERROR_ACCESS_DENIED: u32 = 5;
+
+/// One tick's raw counters for one shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProcessSample {
+    /// Kernel + user CPU time in 100 ns units (`GetProcessTimes`).
+    cpu_100ns: u64,
+    /// `PROCESS_MEMORY_COUNTERS.WorkingSetSize` in bytes.
+    ram_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleRead {
+    Sampled(ProcessSample),
+    /// Pid is gone (exited, or exited between ticks): drop it silently.
+    Gone,
+    /// The OS refused the handle (permission): say so instead of guessing.
+    Denied,
+}
+
+/// The single seam between the sampler and Win32. Production points it at
+/// [`win32_process_sample`]; tests inject canned readings, so `cargo test`
+/// never opens a process handle.
+type ProcessSampler = Box<dyn Fn(u32) -> SampleRead>;
+
+/// CPU as a percentage of **one core** over `window`: `cpu delta / wall
+/// time`. Both sides are in 100 ns units, so a sidecar that saturates one core
+/// reads 100.0 and a multi-threaded one legitimately reads above it (each
+/// extra core adds 100). `None` when there is no honest number to plot: an
+/// empty window, or a counter that went backwards (a different process
+/// generation took the pid).
+fn cpu_percent_of_one_core(
+    prev_cpu_100ns: u64,
+    now_cpu_100ns: u64,
+    window: Duration,
+) -> Option<f32> {
+    let window_100ns = window.as_nanos() / 100;
+    if window_100ns == 0 {
+        return None;
+    }
+    let delta = now_cpu_100ns.checked_sub(prev_cpu_100ns)?;
+    Some((delta as f64 / window_100ns as f64 * 100.0) as f32)
+}
+
+/// CPU (% of one core) and RAM (MB) series for one shard, oldest first.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ShardRing {
+    cpu: Vec<f32>,
+    ram: Vec<f32>,
+}
+
+fn push_shard_sample(series: &mut Vec<f32>, value: f32) {
+    if series.len() >= SHARD_SAMPLE_RING {
+        series.remove(0);
+    }
+    series.push(value);
+}
+
+/// Fold one tick of readings into the rings.
+///
+/// - labels that are no longer live are evicted (shard died or was renamed);
+/// - a changed pid is a respawn: its ring starts empty, and the old baseline
+///   is gone, so no sample ever mixes two process generations;
+/// - the first sample of a generation only primes the baseline (there is no
+///   delta yet), so charts start on the second tick;
+/// - a gone pid drops the shard's ring without a trace.
+///
+/// Returns the labels whose handle the OS refused on this tick.
+fn fold_shard_samples(
+    rings: &mut BTreeMap<String, ShardRing>,
+    baselines: &mut BTreeMap<String, (u32, ProcessSample, Instant)>,
+    live: &[(String, u32)],
+    sampler: &dyn Fn(u32) -> SampleRead,
+    at: Instant,
+) -> HashSet<String> {
+    rings.retain(|label, _| live.iter().any(|(name, _)| name == label));
+    baselines.retain(|label, _| live.iter().any(|(name, _)| name == label));
+
+    let mut denied = HashSet::new();
+    for (label, pid) in live {
+        let previous = baselines
+            .get(label)
+            .and_then(|(prev_pid, sample, prev_at)| {
+                (*prev_pid == *pid).then_some((*sample, *prev_at))
+            });
+        if baselines.contains_key(label) && previous.is_none() {
+            rings.insert(label.clone(), ShardRing::default());
+            baselines.remove(label);
+        }
+        match sampler(*pid) {
+            SampleRead::Sampled(sample) => {
+                let ring = rings.entry(label.clone()).or_default();
+                if let Some((prev_sample, prev_at)) = previous {
+                    let window = at.saturating_duration_since(prev_at);
+                    if let Some(cpu) =
+                        cpu_percent_of_one_core(prev_sample.cpu_100ns, sample.cpu_100ns, window)
+                    {
+                        push_shard_sample(&mut ring.cpu, cpu);
+                        push_shard_sample(&mut ring.ram, sample.ram_bytes as f32 / 1_048_576.0);
+                    }
+                }
+                baselines.insert(label.clone(), (*pid, sample, at));
+            }
+            SampleRead::Gone => {
+                rings.remove(label);
+                baselines.remove(label);
+            }
+            SampleRead::Denied => {
+                denied.insert(label.clone());
+            }
+        }
+    }
+    denied
+}
+
+const SHARD_NOT_RUNNING: &str = "not running";
+const SHARD_SAMPLING_UNAVAILABLE: &str = "(sampling unavailable)";
+const SHARD_COLLECTING: &str = "collecting first sample";
+
+/// One row of the Runtime-stats per-shard section: either two plottable series
+/// or a caption saying why there is nothing to plot.
+#[derive(Debug, Clone, PartialEq)]
+struct ShardStatRow {
+    label: String,
+    cpu: Vec<f32>,
+    ram: Vec<f32>,
+    caption: Option<&'static str>,
+}
+
+fn shard_stat_rows(
+    shards: &[(String, Option<u32>)],
+    rings: &BTreeMap<String, ShardRing>,
+    denied: &HashSet<String>,
+) -> Vec<ShardStatRow> {
+    shards
+        .iter()
+        .map(|(label, pid)| {
+            let ring = rings.get(label);
+            let caption = if pid.is_none() {
+                Some(SHARD_NOT_RUNNING)
+            } else if denied.contains(label) {
+                Some(SHARD_SAMPLING_UNAVAILABLE)
+            } else if ring.is_none_or(|ring| ring.cpu.len() < 2) {
+                Some(SHARD_COLLECTING)
+            } else {
+                None
+            };
+            ShardStatRow {
+                label: label.clone(),
+                cpu: ring.map(|ring| ring.cpu.clone()).unwrap_or_default(),
+                ram: ring.map(|ring| ring.ram.clone()).unwrap_or_default(),
+                caption,
+            }
+        })
+        .collect()
+}
+
+fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
+    let live = rows
+        .iter()
+        .filter(|row| row.caption != Some(SHARD_NOT_RUNNING))
+        .count();
+    if live == 0 {
+        return "no sidecar running".to_string();
+    }
+    let sampled = rows.iter().filter(|row| row.caption.is_none()).count();
+    let mut summary = format!("{live} live shard(s), {sampled} charted");
+    if rows
+        .iter()
+        .any(|row| row.caption == Some(SHARD_SAMPLING_UNAVAILABLE))
+    {
+        summary.push_str(", sampling unavailable");
+    }
+    summary
+}
+
+/// Sparkline-shaped line for one series: same `LineChart` family and sizing as
+/// the health sparkline, one per series so CPU and RAM never share a scale.
+fn shard_sparkline(series: &[f32]) -> impl IntoElement {
+    struct SeriesPoint {
+        x: String,
+        y: f64,
+    }
+    let points: Vec<SeriesPoint> = series
+        .iter()
+        .enumerate()
+        .map(|(index, value)| SeriesPoint {
+            x: index.to_string(),
+            y: f64::from(*value),
+        })
+        .collect();
+    div().w(px(120.)).h(px(24.)).child(
+        LineChart::new(points)
+            .x(|point: &SeriesPoint| point.x.clone())
+            .y(|point: &SeriesPoint| point.y)
+            .x_axis(false)
+            .grid(false),
+    )
+}
+
+fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
+    let mut entry = div()
+        .id(format!("shard-stat-{}", row.label))
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap_1();
+    match row.caption {
+        Some(caption) => {
+            entry = entry.child(
+                div()
+                    .id(format!("shard-caption-{}", row.label))
+                    .test_support()
+                    .text_xs()
+                    .child(format!("{}: {caption}", row.label)),
+            );
+        }
+        None => {
+            let latest_cpu = row.cpu.last().copied().unwrap_or(0.0);
+            let latest_ram = row.ram.last().copied().unwrap_or(0.0);
+            entry = entry
+                .child(
+                    div()
+                        .id(format!("shard-label-{}", row.label))
+                        .test_support()
+                        .text_xs()
+                        .child(format!(
+                            "{} · CPU {latest_cpu:.1}% of one core · RAM {latest_ram:.1} MB",
+                            row.label
+                        )),
+                )
+                .child(
+                    div()
+                        .id(format!("shard-chart-{}", row.label))
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(shard_sparkline(&row.cpu))
+                        .child(shard_sparkline(&row.ram)),
+                );
+        }
+    }
+    entry.into_any_element()
+}
+
+/// Read one child's counters. Windows-only, same posture as `dpapi`: raw
+/// `extern "system"` declarations, no crate, and the handle is closed on every
+/// path.
+#[cfg(all(windows, not(test)))]
+mod win32_process {
+    use std::ffi::c_void;
+
+    use super::{
+        ProcessSample, SampleRead, ERROR_ACCESS_DENIED, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    impl FileTime {
+        /// `FILETIME` counts 100 ns ticks in two halves.
+        fn ticks(&self) -> u64 {
+            (u64::from(self.high) << 32) | u64::from(self.low)
+        }
+    }
+
+    /// `PROCESS_MEMORY_COUNTERS` — only `WorkingSetSize` is read; the rest
+    /// keeps the layout the callee fills.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        _page_fault_count: u32,
+        _peak_working_set_size: usize,
+        working_set_size: usize,
+        _quota_peak_paged_pool_usage: usize,
+        _quota_paged_pool_usage: usize,
+        _quota_peak_non_paged_pool_usage: usize,
+        _quota_non_paged_pool_usage: usize,
+        _pagefile_usage: usize,
+        _peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    /// Owns the query handle; dropping it is the only side effect in here.
+    struct OwnedHandle(*mut c_void);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub(super) fn sample(pid: u32) -> SampleRead {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return if GetLastError() == ERROR_ACCESS_DENIED {
+                    SampleRead::Denied
+                } else {
+                    SampleRead::Gone
+                };
+            }
+            let handle = OwnedHandle(handle);
+
+            let mut creation = FileTime::default();
+            let mut exit = FileTime::default();
+            let mut kernel = FileTime::default();
+            let mut user = FileTime::default();
+            if GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                return SampleRead::Gone;
+            }
+
+            let cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            let mut counters = ProcessMemoryCounters {
+                cb,
+                ..Default::default()
+            };
+            if GetProcessMemoryInfo(handle.0, &mut counters, cb) == 0 {
+                return SampleRead::Gone;
+            }
+
+            SampleRead::Sampled(ProcessSample {
+                cpu_100ns: kernel.ticks().saturating_add(user.ticks()),
+                ram_bytes: counters.working_set_size as u64,
+            })
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn win32_process_sample(pid: u32) -> SampleRead {
+    win32_process::sample(pid)
+}
+
+/// Tests inject their own readings (no handle ever opens under `cargo test`),
+/// and non-Windows builds have no Win32 to ask — both degrade to the caption
+/// instead of pretending a number exists.
+#[cfg(any(test, not(windows)))]
+fn win32_process_sample(_pid: u32) -> SampleRead {
+    SampleRead::Denied
+}
+
 struct AppView {
     focus: FocusHandle,
     libraries: Entity<ListState<LibraryDelegate>>,
@@ -11196,6 +13488,7 @@ struct AppView {
     logs_seen: u64,
 
     log_inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
+    log_cap_input: Option<Entity<InputState>>,
 
     /// Captured just before a control-driven sheet swap. The live input text
     /// wins over the committed filter fields so typed-but-unapplied text
@@ -11205,6 +13498,10 @@ struct AppView {
     log_list: Option<Entity<ListState<LogLinesDelegate>>>,
 
     expanded_subs: HashSet<String>,
+
+    /// T-27: resolved out-IP text per row id, session-only. The resolution
+    /// action already computes it; keeping it per row is what `out_ip` sorts by.
+    out_ip_by_row: HashMap<String, String>,
 
     traffic_last_seen: TrafficSeenMap,
 
@@ -11223,11 +13520,21 @@ struct AppView {
     refresh_batch_failed: usize,
     refresh_batch_conflicts: usize,
     refresh_batch_in_use: usize,
+    refresh_batch_added_names: Vec<String>,
+    refresh_batch_updated_names: Vec<String>,
+    refresh_batch_removed_names: Vec<String>,
+    refresh_batch_in_use_names: Vec<String>,
     refresh_generation: u64,
     inflight_refreshes: HashSet<String>,
+    /// T-20: refreshes whose completion carries the named `[+]/[~]/[-]/[=]`
+    /// report — set for manual origins only, so due-tick refreshes finish
+    /// count-only.
+    inflight_named_refreshes: HashSet<String>,
 
     probe_url_in_flight: bool,
     probe_ping_in_flight: bool,
+
+    update_check_in_flight: bool,
 
     probe_stop: Arc<AtomicBool>,
 
@@ -11238,6 +13545,14 @@ struct AppView {
     subs_form: Option<SubForm>,
 
     preset_form: Option<PresetForm>,
+
+    /// T-19: the row whose ConfigForm edit dialog is open, while it is open —
+    /// auto-clear never removes the row under edit.
+    edit_form_open: Option<String>,
+
+    /// T-12: one confirmed rule-set download at a time; the explicit per-file
+    /// confirm never batches.
+    rule_set_download_in_flight: bool,
 
     import_parse_in_flight: bool,
 
@@ -11272,11 +13587,19 @@ struct AppView {
 
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
 
+    /// T-25: counts derived from `conn_snapshot` on the traffic tick, so the
+    /// status bar never walks the snapshot per frame.
+    conn_counts: crate::health::ConnCounts,
+
     conn_delta: HashMap<String, (u64, u64)>,
 
     conn_selected_only: bool,
 
     conn_sort_desc: bool,
+
+    conn_copied: Option<ConnCopyTarget>,
+
+    conn_copied_generation: u64,
 
     last_traffic_poll_at: i64,
 
@@ -11287,6 +13610,20 @@ struct AppView {
     palette: Option<Entity<CommandState>>,
 
     traffic_period: store::TrafficPeriod,
+
+    /// T-30: per-shard CPU (% of one core) / RAM (MB) rings, keyed by the
+    /// shard label `poll_shards` uses. One entry per live shard, 60 samples.
+    shard_rings: BTreeMap<String, ShardRing>,
+
+    /// T-30: previous raw counters per label — the delta baseline for the next
+    /// engine tick. Dropped with the shard, re-primed on respawn.
+    shard_baselines: BTreeMap<String, (u32, ProcessSample, Instant)>,
+
+    /// T-30: shards whose handle the OS refused on the last tick.
+    shard_denied: HashSet<String>,
+
+    /// T-30: the read-only sampler seam; production reads Win32, tests inject.
+    process_sampler: ProcessSampler,
 
     started_at: std::time::Instant,
 }
@@ -11311,15 +13648,44 @@ impl AppView {
     }
 
     fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
+        let mut store = store;
+        // T-34: read the previous session's verdict first, then assume this
+        // session is dirty. The write lands before any restore logic, so a
+        // kill/crash leaves "0" (unclean) for the next boot.
+        let previous_clean_exit = store.last_clean_exit();
+        let last_snapshot = store.load_running_snapshot();
+        if let Err(error) = store.set_last_clean_exit(false) {
+            eprintln!("clean-exit marker reset failed: {error}");
+        }
+        if let Some(notice) = unclean_exit_notice(previous_clean_exit, &last_snapshot) {
+            // The notification layer needs the Root view, which the window only
+            // adopts after this constructor returns: the decision is taken here
+            // at boot, the toast lands on the first frame — once.
+            cx.on_next_frame(window, move |_view, window, cx| {
+                window.push_notification(notice, cx);
+            });
+        }
+        // T-33: the first read seeds the address list once (constants + every
+        // row's current bind); every later read is the stored extras alone.
+        let bind_hosts = store.bind_hosts();
         let libraries = cx.new(|cx| {
             ListState::new(LibraryDelegate::new(), window, cx)
                 .searchable(false)
                 .selectable(true)
         });
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH_PLACEHOLDER));
+        let last_query = store.library_last_query().unwrap_or_default();
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(SEARCH_PLACEHOLDER)
+                .default_value(last_query.clone())
+        });
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
+        let sort = store.library_sort();
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
+            state.delegate_mut().set_sort(sort);
+            state.delegate_mut().query = last_query;
+            state.delegate_mut().set_bind_hosts(bind_hosts);
             list_cx.notify();
         });
 
@@ -11346,8 +13712,6 @@ impl AppView {
 
         apply_appearance(&store.appearance(), Some(window), cx);
 
-        let last_snapshot = store.load_running_snapshot();
-
         {
             let our_ports: Vec<u16> = store
                 .list()
@@ -11364,6 +13728,7 @@ impl AppView {
         .into_iter()
         .map(|(file, found)| sidecar_presence_line(&file, found))
         .collect::<Vec<_>>();
+        let log_cap = store.log_max_lines();
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
@@ -11371,7 +13736,7 @@ impl AppView {
             store,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
-            logs: LogStore::default(),
+            logs: LogStore::with_capacity(log_cap),
             log_filter: String::new(),
             log_exclude: String::new(),
             log_regex: String::new(),
@@ -11381,10 +13746,12 @@ impl AppView {
             logs_seen: 0,
 
             log_inputs: None,
+            log_cap_input: None,
             log_reopen_draft: None,
 
             log_list: None,
             expanded_subs: HashSet::new(),
+            out_ip_by_row: HashMap::new(),
             traffic_last_seen: TrafficSeenMap::default(),
             traffic_tick_in_flight: false,
             traffic_mirror_hydrated: false,
@@ -11398,15 +13765,24 @@ impl AppView {
             refresh_batch_failed: 0,
             refresh_batch_conflicts: 0,
             refresh_batch_in_use: 0,
+            refresh_batch_added_names: Vec::new(),
+            refresh_batch_updated_names: Vec::new(),
+            refresh_batch_removed_names: Vec::new(),
+            refresh_batch_in_use_names: Vec::new(),
             refresh_generation: 0,
             inflight_refreshes: HashSet::new(),
+            inflight_named_refreshes: HashSet::new(),
             probe_url_in_flight: false,
             probe_ping_in_flight: false,
+
+            update_check_in_flight: false,
             probe_stop: Arc::new(AtomicBool::new(false)),
             group_test_in_flight: false,
             speedtest_mode: SpeedtestMode::Download,
             subs_form: None,
             preset_form: None,
+            edit_form_open: None,
+            rule_set_download_in_flight: false,
             import_parse_in_flight: false,
             import_parse_epoch: 0,
             import_cancel_epoch: None,
@@ -11430,6 +13806,7 @@ impl AppView {
                         return;
                     }
                     let query = emitter.read(cx).value().to_string();
+                    view.remember_library_query(&query);
                     view.libraries.update(cx, |state, list_cx| {
                         let delegate = state.delegate_mut();
                         delegate.query = query;
@@ -11445,12 +13822,19 @@ impl AppView {
             row_columns,
             inspector_tab: InspectorTab::Details,
             conn_snapshot: Vec::new(),
+            conn_counts: crate::health::ConnCounts::default(),
             conn_delta: HashMap::new(),
             conn_selected_only: true,
             conn_sort_desc: true,
+            conn_copied: None,
+            conn_copied_generation: 0,
             last_traffic_poll_at: 0,
             palette: None,
             traffic_period: store::TrafficPeriod::Day,
+            shard_rings: BTreeMap::new(),
+            shard_baselines: BTreeMap::new(),
+            shard_denied: HashSet::new(),
+            process_sampler: Box::new(win32_process_sample),
             started_at: std::time::Instant::now(),
         };
         let mut view = view;
@@ -11504,6 +13888,11 @@ impl AppView {
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.notify_engine_crash(window, cx);
+        // T-19: an edit dialog that left no dialog active anywhere is gone —
+        // stop protecting its row from auto-clear.
+        if self.edit_form_open.is_some() && !window.has_active_dialog(cx) {
+            self.edit_form_open = None;
+        }
         if let Err(error) = self.reload_inner_no_poll(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
@@ -11542,15 +13931,22 @@ impl AppView {
 
     fn reload_inner_impl(&mut self, cx: &mut Context<Self>, poll: bool) -> Result<(), StoreError> {
         let rows = self.store.list()?;
+        let bind_hosts = self.store.bind_hosts();
         self.drain_engine_logs(&rows);
 
         if poll {
             self.poll_engine();
         }
         let health = self.health_map();
+        let health_tones = self.health_tones();
+        // T-27: sort mirrors — pulled from state the ticks already maintain.
+        let latency = self.latency_map(&rows);
+        let data_traffic = self.data_traffic_map(&rows);
+        let out_ips = self.out_ip_by_row.clone();
         let running = self.engine.running_ids();
 
         self.snapshot_running_set(&running);
+        self.sync_running_title(running.len(), cx);
         if let Some(tray) = &self.tray {
             tray.set_running(running.len());
         }
@@ -11570,7 +13966,10 @@ impl AppView {
         }
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
+            state.delegate_mut().set_bind_hosts(bind_hosts);
             state.delegate_mut().set_health(health);
+
+            state.delegate_mut().set_health_tone(health_tones);
 
             state.delegate_mut().set_running(running);
 
@@ -11578,6 +13977,9 @@ impl AppView {
                 .delegate_mut()
                 .set_crashed(self.engine.ids_on_crashed_shards());
             state.delegate_mut().set_traffic(traffic);
+            state.delegate_mut().set_latency(latency);
+            state.delegate_mut().set_data_traffic(data_traffic);
+            state.delegate_mut().set_out_ips(out_ips);
             state
                 .delegate_mut()
                 .set_search_context(sub_labels, preset_names);
@@ -12198,6 +14600,72 @@ impl AppView {
         }
     }
 
+    fn commit_update_feed_url(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            match self.store.clear_update_feed_url() {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(format!(
+                            "Feed URL cleared — updates check {UPDATE_FEED_URL_DEFAULT}"
+                        )),
+                        cx,
+                    );
+                    true
+                }
+                Err(error) => {
+                    self.report_save_error(error, window, cx);
+                    false
+                }
+            }
+        } else {
+            match normalize_update_feed_url(trimmed) {
+                Ok(url) => {
+                    let shown = redact_subscription_url(&url);
+                    match self.store.set_update_feed_url(&url) {
+                        Ok(()) => {
+                            if matches!(
+                                store::subscription_fetch_policy(trimmed),
+                                store::SubscriptionFetchPolicy::Warn { .. }
+                            ) {
+                                window.push_notification(
+                                    Notification::warning(format!(
+                                        "Feed URL set over plaintext http — prefer https: {shown}"
+                                    )),
+                                    cx,
+                                );
+                            } else {
+                                window.push_notification(
+                                    Notification::success(format!(
+                                        "Feed URL set — updates check {shown}"
+                                    )),
+                                    cx,
+                                );
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            self.report_save_error(error, window, cx);
+                            false
+                        }
+                    }
+                }
+                Err(reason) => {
+                    window.push_notification(
+                        Notification::error(format!("Invalid feed URL: {reason}")),
+                        cx,
+                    );
+                    false
+                }
+            }
+        }
+    }
+
     fn commit_row_test_url(
         &mut self,
         id: &str,
@@ -12276,6 +14744,8 @@ impl AppView {
             return false;
         }
         if self.commit_row_test_url(id, raw_url, window, cx) {
+            // T-19: the edit committed — release the row-under-edit protection.
+            self.edit_form_open = None;
             return true;
         }
         *form_error.borrow_mut() = Some((
@@ -12519,7 +14989,8 @@ impl AppView {
         let commit_key = commit.clone();
         let dialog_link =
             crate::import::share_link_for_config(&config.protocol, &config.name, &config.params);
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        let payloads = share_qr_payloads(&config);
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -12541,7 +15012,10 @@ impl AppView {
                                 .test_support()
                                 .text_sm()
                                 .child(dialog_link.clone()),
-                        ),
+                        )
+                        // T-28: the credential-free contact strings, one QR per scheme,
+                        // as a transcription of the same text (never of the share link).
+                        .child(share_qr_region(&payloads, cx)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -13098,7 +15572,7 @@ impl AppView {
         close_confirm_description(&self.running_names_for_close())
     }
 
-    fn confirm_close_stop(&mut self) {
+    fn confirm_close_stop(&mut self, window: &Window) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
@@ -13108,7 +15582,30 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
+        self.mark_clean_exit();
+        self.save_window_geometry(window);
         self.close_confirmed = true;
+    }
+
+    /// T-32: mirrors the window rectangle into meta on the same orderly-exit
+    /// paths `snapshot_running_set` already uses. A killed process keeps the
+    /// last clean-exit save — the snapshot's own tolerance. Maximized
+    /// rectangles are not persisted (out of scope): the pre-maximize windowed
+    /// rect from the previous clean exit stays current.
+    fn save_window_geometry(&mut self, window: &Window) {
+        if !matches!(window.window_bounds(), WindowBounds::Windowed(_)) {
+            return;
+        }
+        let bounds = window.bounds();
+        let geometry = WindowGeometry {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+        };
+        if let Err(error) = self.store.set_window_geometry(geometry) {
+            eprintln!("window geometry save failed: {error}");
+        }
     }
 
     fn snapshot_running_set(&mut self, running: &[String]) {
@@ -13118,6 +15615,24 @@ impl AppView {
         self.last_snapshot = running.to_vec();
         if let Err(error) = self.store.save_running_snapshot(running) {
             eprintln!("running snapshot failed: {error}");
+        }
+    }
+
+    /// T-34: every orderly exit writes the marker right after its snapshot
+    /// clear. A kill/crash never reaches here, so boot's "0" stands.
+    fn mark_clean_exit(&mut self) {
+        if let Err(error) = self.store.set_last_clean_exit(true) {
+            eprintln!("clean-exit marker failed: {error}");
+        }
+    }
+
+    /// T-26: mirrors the running count into the OS window title on the exact
+    /// cadence the tray tooltip is fed from — no extra poll or timer. The
+    /// custom titlebar label composes the same `window_title_text` at render.
+    fn sync_running_title(&self, running: usize, cx: &mut Context<Self>) {
+        let title = window_title_text(running);
+        if let Some(handle) = cx.active_window() {
+            let _ = handle.update(cx, move |_, window, _| window.set_window_title(&title));
         }
     }
 
@@ -13177,7 +15692,7 @@ impl AppView {
             }
         }
         if actions.contains(&crate::tray::TrayAction::Quit) {
-            self.quit_from_tray();
+            self.quit_from_tray(window);
             return true;
         }
         for action in actions {
@@ -13225,7 +15740,7 @@ impl AppView {
                 self.show_window_from_tray(window, cx);
                 self.copy_config_folder(window, cx);
             }
-            crate::tray::TrayAction::Quit => self.quit_from_tray(),
+            crate::tray::TrayAction::Quit => self.quit_from_tray(window),
         }
     }
 
@@ -13249,7 +15764,7 @@ impl AppView {
         );
     }
 
-    fn quit_from_tray(&mut self) {
+    fn quit_from_tray(&mut self, window: &Window) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
@@ -13259,6 +15774,8 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
+        self.mark_clean_exit();
+        self.save_window_geometry(window);
 
         self.tray = None;
     }
@@ -13421,6 +15938,63 @@ impl AppView {
         }
     }
 
+    /// T-33: adds one address to the list the row pickers draw from. The store
+    /// owns validation (IP literals only, no duplicates); the message it returns
+    /// is exactly what the Settings field shows inline.
+    fn commit_add_bind_host(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<String>, String> {
+        match self.store.add_bind_host(raw) {
+            Ok(hosts) => {
+                self.refresh_bind_hosts(cx);
+                window
+                    .push_notification(Notification::success(format!("Added {}", raw.trim())), cx);
+                Ok(hosts)
+            }
+            Err(error) => {
+                let message = store_error_text(&error);
+                window.push_notification(Notification::error(message.clone()), cx);
+                Err(message)
+            }
+        }
+    }
+
+    /// T-33: removes one extra. The store refuses constants and any bind a row
+    /// still uses; that refusal names the blocking row(s) and lands inline.
+    fn commit_remove_bind_host(
+        &mut self,
+        host: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<String>, String> {
+        match self.store.remove_bind_host(host) {
+            Ok(hosts) => {
+                self.refresh_bind_hosts(cx);
+                window.push_notification(Notification::success(format!("Removed {host}")), cx);
+                Ok(hosts)
+            }
+            Err(error) => {
+                let message = store_error_text(&error);
+                window.push_notification(Notification::error(message.clone()), cx);
+                Err(message)
+            }
+        }
+    }
+
+    /// T-33: pushes the current list into every picker at once — a Settings edit
+    /// is visible in all rows on the next paint.
+    fn refresh_bind_hosts(&mut self, cx: &mut Context<Self>) {
+        let hosts = self.store.bind_hosts();
+        self.libraries.update(cx, |list, cx| {
+            list.delegate_mut().set_bind_hosts(hosts);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
@@ -13451,8 +16025,31 @@ impl AppView {
         });
         let test_url_reader = test_url_state.clone();
         let test_url_view = view.clone();
+        let current_feed_url = self.store.update_feed_url().unwrap_or_default();
+        let feed_url_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!("Default: {UPDATE_FEED_URL_DEFAULT}"))
+                .default_value(current_feed_url)
+        });
+        let feed_url_reader = feed_url_state.clone();
+        let feed_url_view = view.clone();
+        let cap_text = self.logs.cap().to_string();
+        let cap_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("500–50,000")
+                .default_value(cap_text)
+        });
+        let cap_reader = cap_state.clone();
+        self.log_cap_input = Some(cap_state.clone());
         let db_path = Store::default_path().display().to_string();
         let export_path = Store::default_export_path().display().to_string();
+        // T-33: the Settings address list is the single authority the row
+        // pickers draw from. The dialog edits these cells; every commit goes
+        // through the store, then the delegate's copied list is refreshed.
+        let bind_hosts_cell = Rc::new(RefCell::new(self.store.bind_hosts()));
+        let bind_host_error_cell: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let bind_host_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 192.168.1.20 or fd00::7"));
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
 
 
@@ -13482,6 +16079,10 @@ impl AppView {
             let skip_delete_on = *skip_delete_state.borrow();
             let save_reader = test_url_reader.clone();
             let save_view = test_url_view.clone();
+            let feed_reader = feed_url_reader.clone();
+            let feed_view = feed_url_view.clone();
+            let cap_save_view = view.clone();
+            let cap_save_reader = cap_reader.clone();
             let copy_db_view = test_url_view.clone();
             let db_path_for_copy = db_path.clone();
             let copy_export_view = test_url_view.clone();
@@ -13489,6 +16090,8 @@ impl AppView {
             let clear_traffic_view = test_url_view.clone();
             let clear_health_view = test_url_view.clone();
             let clear_snapshot_view = test_url_view.clone();
+            let bind_hosts_render_cell = bind_hosts_cell.clone();
+            let bind_host_error_render_cell = bind_host_error_cell.clone();
             dialog
                 .title("Settings")
                 .child(
@@ -13617,6 +16220,41 @@ impl AppView {
                         .child(Separator::horizontal())
                         .child(
                             div()
+                                .id("settings-section-update")
+                                .test_support()
+                                .text_sm()
+                                .child("Update check"),
+                        )
+                        .child(dialog_field(
+                            "field-settings-update-feed",
+                            "Update feed URL (blank = default)",
+                            feed_url_reader.clone(),
+                        ))
+                        .child(
+                            div()
+                                .id("settings-update-feed-note")
+                                .test_support()
+                                .child(format!(
+                                    "Checking GETs this JSON feed (10s timeout, ≤5 redirects, \
+                                     1 MiB cap) and compares tags; nothing downloads or runs. \
+                                     Default: {UPDATE_FEED_URL_DEFAULT}"
+                                )),
+                        )
+                        .child(
+                            Button::new("settings-save-update-feed")
+                                .label("Save feed URL")
+                                .on_click(move |_, window, cx| {
+                                    let url = feed_reader.read(cx).value().to_string();
+                                    feed_view.update(cx, |view, cx| {
+                                        view.commit_update_feed_url(&url, window, cx);
+                                    });
+                                }),
+                        )
+
+
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
                                 .id("settings-section-engine")
                                 .test_support()
                                 .text_sm()
@@ -13650,6 +16288,30 @@ impl AppView {
                                     "On restarts a crashed core with backoff (up to 3 tries) and \
                                      tells you when it recovers. Default on.",
                                 ),
+                        )
+                        .child(dialog_field(
+                            "field-log-cap",
+                            "Maximum kept log lines",
+                            cap_reader.clone(),
+                        ))
+                        .child(
+                            div()
+                                .id("settings-log-cap-note")
+                                .test_support()
+                                .child(
+                                    "Range 500–50,000 (default 5,000). Saving rebuilds the \
+                                     log ring: lines already recorded are dropped.",
+                                ),
+                        )
+                        .child(
+                            Button::new("settings-save-log-cap")
+                                .label("Save log cap")
+                                .on_click(move |_, window, cx| {
+                                    let raw = cap_save_reader.read(cx).value().to_string();
+                                    cap_save_view.update(cx, |view, cx| {
+                                        view.commit_log_cap(window, &raw, cx);
+                                    });
+                                }),
                         )
 
 
@@ -13930,6 +16592,133 @@ impl AppView {
                             ),
                         )
                         .child(
+                            div()
+                                .id("settings-section-addresses")
+                                .test_support()
+                                .text_sm()
+                                .child("Addresses"),
+                        )
+                        .child(
+                            div()
+                                .id("settings-addresses-note")
+                                .test_support()
+                                .child(
+                                    "Rows pick their serve address from this list; ports stay \
+                                     free-text. 127.0.0.1 and 0.0.0.0 are built in and cannot be \
+                                     removed. Add IPv4/IPv6 literals only — no hostnames. A host a \
+                                     row still uses cannot be removed.",
+                                ),
+                        )
+                        .child({
+                            let mut list = div().flex().flex_col().gap_1();
+                            for host in bind_hosts_render_cell.borrow().clone() {
+                                let constant =
+                                    Store::BIND_HOST_CONSTANTS.contains(&host.as_str());
+                                let mut host_row = div()
+                                    .id(format!("settings-bind-host-{host}"))
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id(format!("settings-bind-host-value-{host}"))
+                                            .test_support()
+                                            .child(host.clone()),
+                                    );
+                                if constant {
+                                    host_row = host_row.child(
+                                        div()
+                                            .id(format!("settings-bind-host-builtin-{host}"))
+                                            .test_support()
+                                            .child("built in"),
+                                    );
+                                } else {
+                                    let remove_view = view.clone();
+                                    let remove_host = host.clone();
+                                    let remove_cell = bind_hosts_cell.clone();
+                                    let remove_error = bind_host_error_cell.clone();
+                                    host_row = host_row.child(
+                                        Button::new(format!(
+                                            "settings-bind-host-remove-{host}"
+                                        ))
+                                        .small()
+                                        .label("Remove")
+                                        .accessibility_label(format!("Remove {host}"))
+                                        .on_click(move |_, window, cx| {
+                                            let remove_host = remove_host.clone();
+                                            let remove_cell = remove_cell.clone();
+                                            let remove_error = remove_error.clone();
+                                            remove_view.update(cx, |view, cx| {
+                                                match view.commit_remove_bind_host(
+                                                    &remove_host,
+                                                    window,
+                                                    cx,
+                                                ) {
+                                                    Ok(hosts) => {
+                                                        *remove_error.borrow_mut() = None;
+                                                        *remove_cell.borrow_mut() = hosts;
+                                                    }
+                                                    Err(message) => {
+                                                        *remove_error.borrow_mut() =
+                                                            Some(message);
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }),
+                                    );
+                                }
+                                list = list.child(host_row);
+                            }
+                            list
+                        })
+                        .child(dialog_field(
+                            "field-settings-bind-host",
+                            "Add address (IPv4 or IPv6 literal)",
+                            bind_host_input.clone(),
+                        ))
+                        .child({
+                            let add_view = view.clone();
+                            let add_input = bind_host_input.clone();
+                            let add_cell = bind_hosts_cell.clone();
+                            let add_error = bind_host_error_cell.clone();
+                            Button::new("settings-bind-host-add")
+                                .label("Add address")
+                                .on_click(move |_, window, cx| {
+                                    let raw = add_input.read(cx).value().to_string();
+                                    let add_input = add_input.clone();
+                                    let add_cell = add_cell.clone();
+                                    let add_error = add_error.clone();
+                                    add_view.update(cx, |view, cx| {
+                                        match view.commit_add_bind_host(&raw, window, cx) {
+                                            Ok(hosts) => {
+                                                add_input.update(cx, |state, cx| {
+                                                    state.set_value(String::new(), window, cx)
+                                                });
+                                                *add_error.borrow_mut() = None;
+                                                *add_cell.borrow_mut() = hosts;
+                                            }
+                                            Err(message) => {
+                                                *add_error.borrow_mut() = Some(message);
+                                            }
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                        })
+                        .child({
+                            let error_text = bind_host_error_render_cell
+                                .borrow()
+                                .clone()
+                                .unwrap_or_default();
+                            div()
+                                .id("settings-bind-host-error")
+                                .test_support()
+                                .child(error_text)
+                        })
+                        .child(
                             div().id("settings-tray-note").test_support().child(
                                 "Closing the window hides to the tray while endpoints run; \
                                  Quit in the tray menu stops everything and exits.",
@@ -14098,7 +16887,12 @@ impl AppView {
             }
             None => "none selected".to_string(),
         };
-        let lines = vec![
+        let shard_rows = shard_stat_rows(
+            &self.engine.shard_processes(),
+            &self.shard_rings,
+            &self.shard_denied,
+        );
+        let mut lines = vec![
             format!("Uptime: {uptime}"),
             format!("Endpoints: {running} running / {total} stored"),
             format!(
@@ -14119,8 +16913,8 @@ impl AppView {
             format!("Subscriptions: {subs_line}"),
             format!("Database: {db_line}"),
             format!("Selected: {selected_line}"),
-            "Process CPU/RAM: not sampled in this build (phase 2)".to_string(),
         ];
+        lines.push(format!("Processes: {}", shard_stats_summary(&shard_rows)));
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let mut body = div().flex().flex_col().gap_1();
             for (ix, line) in lines.iter().enumerate() {
@@ -14131,6 +16925,22 @@ impl AppView {
                         .text_sm()
                         .child(line.clone()),
                 );
+            }
+            body =
+                body.child(
+                    div()
+                        .id("runtime-shard-stats")
+                        .test_support()
+                        .mt_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_xs().child(
+                            "Sidecar processes — CPU % of one core, RAM in MB, last 60 ticks",
+                        )),
+                );
+            for row in shard_rows.iter() {
+                body = body.child(shard_stat_row_view(row));
             }
             dialog
                 .title("Runtime stats")
@@ -14153,12 +16963,8 @@ impl AppView {
         let exits = aggregate_exit_traffic(&rows, &totals);
         let (exit_count, rx, tx) = store::Store::traffic_period_summary(&totals, period);
         let summary = traffic_stats_summary_text(period, exit_count, rx, tx);
-        let max = exits
-            .iter()
-            .map(ExitTraffic::total)
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        let split = traffic_top9_split(&exits);
+        let max = traffic_bar_max(&exits);
         let cycle_view = view.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let cycle_view = cycle_view.clone();
@@ -14198,7 +17004,7 @@ impl AppView {
                         .child("No traffic recorded yet — start an exit and pass data."),
                 );
             }
-            for exit in &exits {
+            for exit in &split.top {
                 body = body.child(
                     div()
                         .id(format!("traffic-stat-{}", exit.row_id))
@@ -14212,6 +17018,15 @@ impl AppView {
                             format_bytes(exit.rx_bytes),
                             format_bytes(exit.tx_bytes),
                         )),
+                );
+            }
+            if let Some(other) = split.other_line() {
+                body = body.child(
+                    div()
+                        .id("traffic-stats-other")
+                        .test_support()
+                        .text_sm()
+                        .child(other),
                 );
             }
             dialog
@@ -14229,6 +17044,7 @@ impl AppView {
 
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sidecars = self.sidecar_presence.clone();
+        let about_view = cx.entity();
         let body = about_body(
             APP_VERSION,
             GIT_HASH,
@@ -14236,12 +17052,162 @@ impl AppView {
             &Store::default_path().display().to_string(),
             &Store::default_export_path().display().to_string(),
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            alert
-                .button_props(DialogButtonProps::default().ok_text("Close"))
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let check_view = about_view.clone();
+            dialog
                 .title(format!("About {APP_TITLE}"))
-                .description(body.clone())
-                .on_ok(|_, _, _| true)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("about-body")
+                                .test_support()
+                                .text_sm()
+                                .child(body.clone()),
+                        )
+                        .child(
+                            Button::new("about-check-for-updates")
+                                .small()
+                                .label("Check for updates")
+                                .tooltip("Fetch the release feed once (JSON only — nothing downloads or runs)")
+                                .on_click(move |_, window, cx| {
+                                    window.close_all_dialogs(cx);
+                                    check_view.update(cx, |view, cx| {
+                                        view.check_for_updates(window, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "about-dialog-ok",
+                    "about-dialog-cancel",
+                    "Close",
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
+    /// One update check per click: GET the JSON feed once, then surface the
+    /// compare result. Nothing auto-checks at startup or in the background —
+    /// the ticket forbids it (checking ≠ updating; nothing is ever fetched
+    /// besides this one JSON read).
+    fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_check_in_flight {
+            window.push_notification(Notification::info("An update check is already running"), cx);
+            return;
+        }
+        let configured = self
+            .store
+            .update_feed_url()
+            .filter(|value| !value.trim().is_empty());
+        let feed_url = effective_update_feed_url(configured.as_deref(), APP_VERSION);
+        self.update_check_in_flight = true;
+        let client = cx.http_client();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let fetched = fetch_release_feed(client, &feed_url, resolve_subscription_host).await;
+            cx.update(|cx| {
+                if let Some(handle) = cx.active_window() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.finish_update_check(fetched, window, cx);
+                        });
+                    });
+                } else {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.finish_update_check_no_window(fetched, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_update_check(
+        &mut self,
+        fetched: Result<Option<FetchedRelease>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_check_in_flight = false;
+        cx.notify();
+        match update_check_outcome(fetched) {
+            Ok(outcome) => self.open_update_check_dialog(outcome, window, cx),
+            Err(why) => {
+                // every remaining failure is a plain error notification; the
+                // strings carry no URL or body echoes, only the fixed cause
+                window.push_notification(
+                    Notification::error(format!("Update check failed: {why}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn finish_update_check_no_window(
+        &mut self,
+        _fetched: Result<Option<FetchedRelease>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_check_in_flight = false;
+        cx.notify();
+    }
+
+    fn open_update_check_dialog(
+        &mut self,
+        outcome: UpdateCheckOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (id, message, release_name, release_url) =
+            update_check_presentation(&outcome, APP_VERSION);
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let mut body = div().flex().flex_col().gap_1();
+            body = body.child(
+                div()
+                    .id(id.to_string())
+                    .test_support()
+                    .text_sm()
+                    .child(message.clone()),
+            );
+            if let Some(name) = release_name.clone() {
+                body = body.child(
+                    div()
+                        .id("update-release-name")
+                        .test_support()
+                        .text_sm()
+                        .child(name),
+                );
+            }
+            if let Some(url) = release_url.clone() {
+                body = body.child(
+                    Button::new("update-open-releases")
+                        .small()
+                        .label("Open releases in browser")
+                        .tooltip(format!(
+                            "Opens {url} in your own browser — the app downloads nothing"
+                        ))
+                        .on_click(move |_, window, cx| {
+                            if let Err(why) = open_release_in_browser(&url) {
+                                window.push_notification(Notification::error(why), cx);
+                            }
+                        }),
+                );
+            }
+            dialog
+                .title("Check for updates")
+                .child(body)
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "update-dialog-ok",
+                    "update-dialog-cancel",
+                    "Close",
+                    Rc::new(|_, _| true),
+                ))
         });
     }
 
@@ -14442,6 +17408,46 @@ impl AppView {
         map
     }
 
+    /// T-27: the latest URL-test sample per row, in ms. Dead samples (an error
+    /// with no latency), ping-only evidence and never-tested rows are absent —
+    /// which is what pins them last when `latency` sorts.
+    fn latency_map(&self, rows: &[ProxyConfig]) -> HashMap<String, u64> {
+        let mut map = HashMap::new();
+        for row in rows {
+            let Some(sample) = self.health_store.latest_of(&row.id, HealthKind::UrlTest) else {
+                continue;
+            };
+            if sample.error.is_some() {
+                continue;
+            }
+            if let Some(latency_ms) = sample.latency_ms {
+                map.insert(row.id.clone(), latency_ms);
+            }
+        }
+        map
+    }
+
+    /// T-27: the per-row session traffic mirror the traffic tick already keeps
+    /// (`download`/`upload` sort keys).
+    fn data_traffic_map(&self, rows: &[ProxyConfig]) -> HashMap<String, (u64, u64)> {
+        rows.iter()
+            .filter_map(|row| {
+                self.health_store
+                    .data_traffic(&row.id)
+                    .map(|totals| (row.id.clone(), totals))
+            })
+            .collect()
+    }
+
+    fn health_tones(&self) -> HashMap<String, LatencyTone> {
+        self.engine
+            .running_ids()
+            .iter()
+            .filter(|id| !self.health_store.row_summary(id).trim().is_empty())
+            .map(|id| (id.clone(), self.health_store.health_tone(id)))
+            .collect()
+    }
+
     fn health_counts(&self) -> (usize, usize) {
         self.health_store.counts(&self.engine.running_ids())
     }
@@ -14455,10 +17461,25 @@ impl AppView {
         }
     }
 
+    /// T-25: `N active · M TCP · K UDP` from the last merged clash snapshot.
+    /// Hidden while no core runs — there is no collection to report, and zeros
+    /// would read as a measured idle instead of "nothing is being polled".
+    fn conn_counter_text(&self) -> Option<String> {
+        if self.engine.running_count() == 0 {
+            return None;
+        }
+        Some(self.conn_counts.status_text())
+    }
+
     fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
         let mut snapshots = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
             self.health_store.record_outcome(outcome);
+            if outcome_is_neutral(outcome) {
+                // A neutral probe never became a health sample; keeping it out
+                // of the snapshots stops hydrate from reviving it as latest.
+                continue;
+            }
             snapshots.push(HealthSnapshot {
                 config_id: outcome.sample.config_id.clone(),
                 at: outcome.sample.at,
@@ -14592,22 +17613,44 @@ impl AppView {
                     view.prober = prober;
                     view.group_test_in_flight = false;
                     view.record_and_persist(&outcomes);
+                    // T-19: the sweep's outcomes are already persisted by
+                    // record_and_persist, so auto-clear consumes them through
+                    // the same snapshots the manual prune reads — no second
+                    // probe pass lives anywhere.
+                    let cleared = view.auto_clear_after_sweep(&group);
                     let (live, dead) = view.health_counts();
-                    (live, dead)
+                    (live, dead, cleared)
                 });
-                let Ok((live, dead)) = recorded else {
+                let Ok((live, dead, auto_cleared)) = recorded else {
                     return;
                 };
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
                 let message = group_test_summary_toast(&group, count, live, dead, stopped);
+                let auto_text = auto_cleared
+                    .as_ref()
+                    .map(|(removed, kept)| auto_clear_summary_toast(&group, *removed, kept));
+                let auto_success = auto_cleared
+                    .as_ref()
+                    .is_some_and(|(removed, _)| *removed > 0);
                 if let Some(handle) = window {
                     if handle
                         .update(cx, |_, window, cx| {
                             view.update(cx, |view, cx| {
                                 view.reload(window, cx);
                                 window.push_notification(Notification::success(message), cx);
+                                // T-19: exactly ONE auto-clear summary per
+                                // sweep — success when rows went, info when
+                                // every candidate was protected.
+                                if let Some(auto_text) = auto_text {
+                                    let auto = if auto_success {
+                                        Notification::success(auto_text)
+                                    } else {
+                                        Notification::info(auto_text)
+                                    };
+                                    window.push_notification(auto, cx);
+                                }
                             });
                         })
                         .is_ok()
@@ -14886,7 +17929,9 @@ impl AppView {
                         }
                         if prober.supports(row) {
                             match prober.out_ip(row, &row.bind_ip, row.port, RESOLVE_IP_URL) {
-                                Ok(ip) => ips.push(ip),
+                                // T-27: keep the row association so the `out_ip`
+                                // sort key has per-row text to compare.
+                                Ok(ip) => ips.push((row.id.clone(), ip)),
                                 Err(cause) => failed.push(format!("\"{}\": {cause}", row.name)),
                             }
                         } else {
@@ -14911,7 +17956,16 @@ impl AppView {
                     return;
                 };
                 let (ips, failed) = resolved;
-                let message = out_ip_summary_toast(&scope, &ips, &failed);
+                let message = out_ip_summary_toast(
+                    &scope,
+                    &ips.iter().map(|(_, ip)| ip.clone()).collect::<Vec<_>>(),
+                    &failed,
+                );
+                view.update(cx, |view, _| {
+                    for (id, ip) in &ips {
+                        view.out_ip_by_row.insert(id.clone(), ip.clone());
+                    }
+                });
                 if let Some(handle) = window {
                     if handle
                         .update(cx, |_, window, cx| {
@@ -15399,6 +18453,199 @@ impl AppView {
         }
     }
 
+    /// T-19: end-of-group-test-sweep application. Runs after the sweep has
+    /// persisted its outcomes, so candidates come from the same health
+    /// snapshots the manual "Unavailable" prune reads — no second probe. The
+    /// ticket's protected classes (running, row under edit, in-flight refresh
+    /// batch) are excluded at the candidate-filter level; removal goes through
+    /// the shared removal pipeline. Returns one (removed, kept-reasons) pair
+    /// when a summary is warranted.
+    fn auto_clear_after_sweep(&mut self, group: &str) -> Option<(usize, Vec<String>)> {
+        if !self.store.auto_clear_enabled(group) {
+            return None;
+        }
+        let dead = match self.store.unavailable_rows_in_group(group) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("auto-clear read failed: {error}");
+                return None;
+            }
+        };
+        if dead.is_empty() {
+            return None;
+        }
+        let editing = self.edit_form_open.clone();
+        let batch_members = self.refresh_batch_members.clone();
+        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
+        let mut skip = HashSet::new();
+        let mut reasons_seen: HashSet<&'static str> = HashSet::new();
+        for row in dead {
+            let reason = if running.contains(&row.id) {
+                Some("running")
+            } else if editing.as_deref() == Some(row.id.as_str()) {
+                Some("editing")
+            } else if row
+                .subscription_id
+                .as_deref()
+                .is_some_and(|subscription| batch_members.contains(subscription))
+            {
+                Some("in-flight batch")
+            } else {
+                None
+            };
+            if let Some(name) = reason {
+                skip.insert(row.id.clone());
+                reasons_seen.insert(name);
+            }
+        }
+        let removed = match self.store.remove_unavailable_in_group(group, &skip) {
+            Ok(rows) => rows.len(),
+            Err(error) => {
+                eprintln!("auto-clear removal failed: {error}");
+                return None;
+            }
+        };
+        let kept: Vec<String> = ["running", "editing", "in-flight batch"]
+            .iter()
+            .filter(|reason| reasons_seen.contains(**reason))
+            .map(|reason| (*reason).to_string())
+            .collect();
+        if removed == 0 && kept.is_empty() {
+            return None;
+        }
+        Some((removed, kept))
+    }
+
+    /// T-19: only this confirm's ACK enables the flag — the note is
+    /// auto-clear's own, and the store rejects any enable without note_seen.
+    fn commit_auto_clear_opt_in(
+        &mut self,
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let config = AutoClearGroupConfig {
+            enabled: true,
+            on_date: now_unix(),
+            note_seen: true,
+        };
+        match self.store.set_auto_clear_group(group, config) {
+            Ok(()) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Auto-clear unavailable enabled for \"{group}\""
+                    )),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot enable auto-clear: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn commit_auto_clear_off(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (on_date, note_seen) = match self.store.auto_clear_group(group) {
+            Some(config) => (config.on_date, config.note_seen),
+            None => (0, false),
+        };
+        let config = AutoClearGroupConfig {
+            enabled: false,
+            on_date,
+            note_seen,
+        };
+        match self.store.set_auto_clear_group(group, config) {
+            Ok(()) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Auto-clear unavailable disabled for \"{group}\""
+                    )),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot disable auto-clear: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// T-19: toggling auto-clear on opens this note once per group; the sheet
+    /// origin re-opens the sheet on every exit so the switch re-reads the
+    /// store, the facet origin just lets the window redraw revert visuals.
+    fn open_auto_clear_opt_in_confirm(
+        &mut self,
+        group: &str,
+        from_groups_sheet: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let group = group.to_string();
+        let title = format!("Enable auto-clear in group \"{group}\"?");
+        let description = auto_clear_opt_in_note(&group);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let group = group.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Enable"),
+                )
+                .title(title.clone())
+                .description(description.clone())
+                .on_ok({
+                    let view = view.clone();
+                    let group = group.clone();
+                    move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.commit_auto_clear_opt_in(&group, window, cx);
+                            if from_groups_sheet {
+                                window.close_all_dialogs(cx);
+                                view.open_groups_dialog(window, cx);
+                            }
+                        });
+                        !from_groups_sheet
+                    }
+                })
+                .on_cancel({
+                    let view = view.clone();
+                    move |_, window, cx| {
+                        if !from_groups_sheet {
+                            return true;
+                        }
+                        view.update(cx, |exposed, cx| {
+                            window.close_all_dialogs(cx);
+                            exposed.open_groups_dialog(window, cx);
+                        });
+                        false
+                    }
+                })
+                .on_close({
+                    let view = view.clone();
+                    move |_, window, cx| {
+                        if !from_groups_sheet {
+                            return;
+                        }
+                        view.update(cx, |exposed, cx| {
+                            window.close_all_dialogs(cx);
+                            exposed.open_groups_dialog(window, cx);
+                        });
+                    }
+                })
+        });
+    }
+
     fn health_store_prune_group(&mut self, group: &str) {
         let ids: HashSet<String> = self
             .store
@@ -15427,20 +18674,53 @@ impl AppView {
         );
     }
 
-    fn toggle_type_security_sort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sort = !self.libraries.read(cx).delegate().type_security_sort;
+    /// T-27: one writer for the sort model — persists the meta row beside
+    /// `library_columns`, mirrors the choice to the list, and says which order
+    /// is live (the retired toggle's notification, now covering every key).
+    fn set_library_sort(
+        &mut self,
+        key: LibrarySortKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let direction = self.libraries.read(cx).delegate().sort.direction;
+        self.commit_library_sort(LibrarySort::new(key, direction), window, cx);
+    }
+
+    fn toggle_library_sort_direction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.libraries.read(cx).delegate().sort;
+        self.commit_library_sort(
+            LibrarySort::new(current.key, current.direction.toggled()),
+            window,
+            cx,
+        );
+    }
+
+    fn commit_library_sort(
+        &mut self,
+        sort: LibrarySort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_type_security_sort(sort);
+            state.delegate_mut().set_sort(sort);
             list_cx.notify();
         });
+        if let Err(error) = self.store.set_library_sort(sort) {
+            window.push_notification(
+                Notification::error(format!("Could not save sort: {error}")),
+                cx,
+            );
+        }
         window.push_notification(
-            Notification::info(if sort {
-                "Sort: Type|Security".to_string()
-            } else {
+            Notification::info(if sort.is_none() {
                 "Sort: library order".to_string()
+            } else {
+                format!("Sort: {} · {}", sort.key.label(), sort.direction.label())
             }),
             cx,
         );
+        cx.notify();
     }
 
     fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -15772,6 +19052,46 @@ impl AppView {
         self.log_filter = include;
         self.log_exclude = exclude;
         self.log_regex = pattern;
+        cx.notify();
+    }
+
+    /// T-31: persist `log_max_lines` and rebuild the ring at the clamped cap.
+    /// The rebuild preserves nothing: changing the cap mid-session truncates
+    /// every present record for the fresh ring (no partial-growth state), which
+    /// the Settings note beside the field states.
+    fn commit_log_cap(&mut self, window: &mut Window, raw: &str, cx: &mut Context<Self>) {
+        let Some(cap) = parse_log_cap(raw) else {
+            window.push_notification(
+                Notification::warning(format!(
+                    "Maximum kept log lines must be a whole number (500–50,000) — keeping {}",
+                    self.logs.cap()
+                )),
+                cx,
+            );
+            return;
+        };
+        if let Err(error) = self.store.set_log_max_lines(cap) {
+            window.push_notification(
+                Notification::error(format!("Cannot save the log cap: {error}")),
+                cx,
+            );
+            return;
+        }
+        if let Some(input) = self.log_cap_input.clone() {
+            input.update(cx, |state, cx| state.set_value(cap.to_string(), window, cx));
+        }
+        if cap == self.logs.cap() {
+            return;
+        }
+        self.logs = LogStore::with_capacity(cap);
+        self.logs_seen = 0;
+        if let Some(list) = self.log_list.clone() {
+            let lines = self.log_lines(cx);
+            list.update(cx, |state, cx| {
+                state.delegate_mut().lines = lines;
+                cx.notify();
+            });
+        }
         cx.notify();
     }
 
@@ -16246,11 +19566,12 @@ impl AppView {
                         .ok_variant(ButtonVariant::Danger),
                 )
                 .title("Restore library")
-                .description(
+                .description(format!(
                     "This replaces the current library with the exported backup \
                      (row ids, groups, enabled flags, subscriptions, and deletions \
-                     are restored exactly).",
-                )
+                     are restored exactly). {}",
+                    crate::store::RESTORE_REQUIRES_CLAUSE
+                ))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.commit_library_restore(&payload, window, cx)
@@ -16597,6 +19918,10 @@ impl AppView {
         );
         let view = cx.entity();
         let id = config.id.clone();
+        // T-19: protecting the row under edit from auto-clear starts here and
+        // ends with one of the dialog's exits (commit success, footer Cancel,
+        // Esc close) plus the reload guard for anything that slips past.
+        self.edit_form_open = Some(id.clone());
         let title = format!("Edit {}", config.name);
 
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
@@ -16621,6 +19946,7 @@ impl AppView {
 
         let snapshot = config.clone();
         let element_view = view.clone();
+        let track_source = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let patch = reader.as_patch_vs(cx, &snapshot);
             let url = reader.test_url.read(cx).value().to_string();
@@ -16649,6 +19975,12 @@ impl AppView {
             dialog
                 .title(title.clone())
                 .overlay_closable(false)
+                .on_close({
+                    let track_view = track_source.clone();
+                    move |_, _, cx| {
+                        track_view.update(cx, |view, _| view.edit_form_open = None);
+                    }
+                })
                 .child(form.clone().element(
                     element_view.clone(),
                     cx,
@@ -16662,12 +19994,36 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
-                .footer(dialog_footer(
-                    "edit-dialog-ok",
-                    "edit-dialog-cancel",
-                    footer_commit_label("edit"),
-                    commit_click,
-                ))
+                .footer(
+                    // T-19: the shared footer closes with close_all_dialogs and
+                    // would leave edit_form_open set; the Cancel click must
+                    // release the row-under-edit protection itself.
+                    DialogFooter::new()
+                        .child(
+                            Button::new("edit-dialog-cancel")
+                                .small()
+                                .label("Cancel")
+                                .on_click({
+                                    let track_view = track_source.clone();
+                                    move |_, window, cx| {
+                                        track_view.update(cx, |view, _| {
+                                            view.edit_form_open = None;
+                                        });
+                                        window.close_all_dialogs(cx);
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("edit-dialog-ok")
+                                .small()
+                                .label(footer_commit_label("edit"))
+                                .on_click(move |_, window, cx| {
+                                    if commit_click(window, cx) {
+                                        window.close_all_dialogs(cx);
+                                    }
+                                }),
+                        ),
+                )
         });
     }
 
@@ -17648,7 +21004,7 @@ impl AppView {
                         cx,
                     ),
                 }
-                self.start_subscription_refresh(sub, cx);
+                self.start_subscription_refresh(sub, true, cx);
                 true
             }
             Err(error) => {
@@ -17729,6 +21085,10 @@ impl AppView {
         failed: usize,
         conflicts: usize,
         in_use: usize,
+        added_names: &[String],
+        updated_names: &[String],
+        removed_names: &[String],
+        kept_in_use_names: &[String],
     ) -> bool {
         if !self.refresh_batch_members.remove(sub_id) {
             return false;
@@ -17739,6 +21099,14 @@ impl AppView {
         self.refresh_batch_failed += failed;
         self.refresh_batch_conflicts += conflicts;
         self.refresh_batch_in_use += in_use;
+        self.refresh_batch_added_names
+            .extend(added_names.iter().cloned());
+        self.refresh_batch_updated_names
+            .extend(updated_names.iter().cloned());
+        self.refresh_batch_removed_names
+            .extend(removed_names.iter().cloned());
+        self.refresh_batch_in_use_names
+            .extend(kept_in_use_names.iter().cloned());
         self.refresh_batch_members.is_empty()
     }
 
@@ -17760,7 +21128,9 @@ impl AppView {
     }
 
     fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
-        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0) {
+        if self.is_batch_member(sub_id)
+            && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[])
+        {
             self.flush_refresh_batch(window, cx);
         }
     }
@@ -17780,18 +21150,41 @@ impl AppView {
         failed: usize,
         conflicts: usize,
         in_use: usize,
+        added_names: &[String],
+        updated_names: &[String],
+        removed_names: &[String],
+        kept_in_use_names: &[String],
         window: &mut Window,
         cx: &mut App,
     ) {
         if self.is_batch_member(sub_id) {
-            if self
-                .accumulate_batch_member(sub_id, added, updated, removed, failed, conflicts, in_use)
-            {
+            if self.accumulate_batch_member(
+                sub_id,
+                added,
+                updated,
+                removed,
+                failed,
+                conflicts,
+                in_use,
+                added_names,
+                updated_names,
+                removed_names,
+                kept_in_use_names,
+            ) {
                 self.flush_refresh_batch(window, cx);
             }
         } else {
             window.push_notification(notice, cx);
         }
+    }
+
+    fn take_batch_name_lists(&mut self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        (
+            std::mem::take(&mut self.refresh_batch_added_names),
+            std::mem::take(&mut self.refresh_batch_updated_names),
+            std::mem::take(&mut self.refresh_batch_removed_names),
+            std::mem::take(&mut self.refresh_batch_in_use_names),
+        )
     }
 
     fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize, usize) {
@@ -17803,16 +21196,31 @@ impl AppView {
         let failed = std::mem::take(&mut self.refresh_batch_failed);
         let conflicts = std::mem::take(&mut self.refresh_batch_conflicts);
         let in_use = std::mem::take(&mut self.refresh_batch_in_use);
+        self.refresh_batch_added_names.clear();
+        self.refresh_batch_updated_names.clear();
+        self.refresh_batch_removed_names.clear();
+        self.refresh_batch_in_use_names.clear();
         (total, added, updated, removed, failed, conflicts, in_use)
     }
 
     fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
+        let (added_names, updated_names, removed_names, kept_in_use_names) =
+            self.take_batch_name_lists();
         let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
-        let (warn, text) =
+        let (warn, mut text) =
             coalesced_refresh_message(total, added, updated, removed, failed, conflicts, in_use)
                 .unwrap_or((false, String::new()));
         if text.is_empty() {
             return;
+        }
+        if let Some(report) = refresh_named_report_block(
+            &added_names,
+            &updated_names,
+            &removed_names,
+            &kept_in_use_names,
+        ) {
+            text.push('\n');
+            text.push_str(&report);
         }
         window.push_notification(
             if warn {
@@ -17834,7 +21242,7 @@ impl AppView {
             self.refresh_batch_total = self.refresh_batch_total.saturating_sub(1);
         }
         let started = match self.store.get_subscription(sub_id) {
-            Ok(Some(sub)) => self.start_subscription_refresh(sub, cx),
+            Ok(Some(sub)) => self.start_subscription_refresh(sub, true, cx),
             Ok(None) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
                 false
@@ -17895,10 +21303,14 @@ impl AppView {
     fn start_subscription_refresh(
         &mut self,
         sub: ProxySubscription,
+        named: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.note_refresh_started(&sub.id) {
             return false;
+        }
+        if named {
+            self.inflight_named_refreshes.insert(sub.id.clone());
         }
         let client = cx.http_client();
         let weak = cx.entity().downgrade();
@@ -17938,6 +21350,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.inflight_refreshes.remove(sub_id);
+        let named = self.inflight_named_refreshes.remove(sub_id);
 
         match self.store.get_subscription(sub_id) {
             Ok(None) => {
@@ -17960,6 +21373,10 @@ impl AppView {
                     1,
                     0,
                     0,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
                     window,
                     cx,
                 );
@@ -17990,12 +21407,28 @@ impl AppView {
                                 1,
                                 0,
                                 0,
+                                &[],
+                                &[],
+                                &[],
+                                &[],
                                 window,
                                 cx,
                             );
                         } else {
                             let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
                             let failed = outcome.failures.len();
+                            let (added_names, updated_names, removed_names, kept_in_use_names) =
+                                if named {
+                                    (
+                                        outcome.added_names.as_slice(),
+                                        outcome.updated_names.as_slice(),
+                                        outcome.removed_names.as_slice(),
+                                        outcome.kept_in_use_names.as_slice(),
+                                    )
+                                } else {
+                                    let empty: &[String] = &[];
+                                    (empty, empty, empty, empty)
+                                };
                             let (warn, summary) = refresh_summary_text(
                                 label,
                                 outcome.added,
@@ -18006,6 +21439,10 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                             );
 
                             if warn {
@@ -18029,6 +21466,10 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                                 window,
                                 cx,
                             );
@@ -18051,6 +21492,10 @@ impl AppView {
                                 1,
                                 0,
                                 0,
+                                &[],
+                                &[],
+                                &[],
+                                &[],
                                 window,
                                 cx,
                             );
@@ -18073,6 +21518,10 @@ impl AppView {
                         1,
                         0,
                         0,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
                         window,
                         cx,
                     );
@@ -18094,6 +21543,10 @@ impl AppView {
                         1,
                         0,
                         0,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
                         window,
                         cx,
                     );
@@ -18111,6 +21564,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.inflight_refreshes.remove(sub_id);
+        let named = self.inflight_named_refreshes.remove(sub_id);
 
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
@@ -18135,8 +21589,32 @@ impl AppView {
                             self.push_refresh_log(&format!(
                                 "error subscription refresh \"{label}\": refresh failed ({error})"
                             ));
-                            self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                            self.accumulate_batch_member(
+                                sub_id,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                &[],
+                                &[],
+                                &[],
+                                &[],
+                            );
                         } else {
+                            let (added_names, updated_names, removed_names, kept_in_use_names) =
+                                if named {
+                                    (
+                                        outcome.added_names.as_slice(),
+                                        outcome.updated_names.as_slice(),
+                                        outcome.removed_names.as_slice(),
+                                        outcome.kept_in_use_names.as_slice(),
+                                    )
+                                } else {
+                                    let empty: &[String] = &[];
+                                    (empty, empty, empty, empty)
+                                };
                             let (warn, summary) = refresh_summary_text(
                                 &label,
                                 outcome.added,
@@ -18147,6 +21625,10 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                             );
                             if warn {
                                 self.push_refresh_log(&format!(
@@ -18163,17 +21645,21 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                             );
                         }
                     }
                     Err(_) => {
-                        self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                        self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
                     }
                 }
             }
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
-                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
             }
         }
         if self.refresh_batch_members.is_empty() {
@@ -18211,10 +21697,10 @@ impl AppView {
         match self.store.preset_rules_map() {
             Ok(map) => {
                 self.engine.set_preset_rules(map);
-                Ok(())
             }
-            Err(error) => Err(format!("cannot load routing presets: {error}")),
+            Err(error) => return Err(format!("cannot load routing presets: {error}")),
         }
+        self.sync_rule_sets_to_engine()
     }
 
     fn try_preset_commit(
@@ -18311,17 +21797,18 @@ impl AppView {
         None
     }
 
-    fn commit_preset_create(
+    fn commit_preset_create_with_boxes(
         &mut self,
         name: String,
         rules_text: String,
+        boxes: SimpleRuleBoxes,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if name.trim().is_empty() && rules_text.trim().is_empty() {
+        if name.trim().is_empty() && rules_text.trim().is_empty() && boxes.is_empty() {
             return true;
         }
-        let rules = if rules_text.trim().is_empty() {
+        let mut rules = if rules_text.trim().is_empty() {
             Vec::new()
         } else {
             match crate::preset::parse_preset_json(&rules_text, &name) {
@@ -18332,6 +21819,10 @@ impl AppView {
                 }
             }
         };
+        match AppView::expand_simple_rule_boxes(&boxes, window, cx) {
+            Ok(mut expanded) => rules.append(&mut expanded),
+            Err(()) => return false,
+        }
         let create_name = if name.trim().is_empty() {
             window.push_notification(
                 Notification::error("Invalid routing preset: preset needs a name"),
@@ -18358,6 +21849,49 @@ impl AppView {
                 false
             }
         }
+    }
+
+    /// T-11: expand the simple-rules boxes into structured rules, appending
+    /// them to the hand-built rules. Any invalid line blocks the save loud:
+    /// nothing is dropped, corrected, or stored, and the boxes keep their
+    /// text for the editor's "Invalid lines" fold. The expanded rules flow
+    /// through the store's own `validate_preset_rules` gate unchanged — no
+    /// new intake errors here.
+    fn expand_simple_rule_boxes(
+        boxes: &SimpleRuleBoxes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<serde_json::Value>, ()> {
+        let mut rules: Vec<serde_json::Value> = Vec::new();
+        let mut invalid: Vec<String> = Vec::new();
+        for (r#box, text) in [
+            (crate::preset::SimpleRulesBox::Direct, boxes.direct.as_str()),
+            (crate::preset::SimpleRulesBox::Block, boxes.block.as_str()),
+            (crate::preset::SimpleRulesBox::Proxy, boxes.proxy.as_str()),
+        ] {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let parsed = crate::preset::parse_simple_rules(r#box, r#box.action(), text);
+            invalid.extend(
+                parsed
+                    .invalid
+                    .into_iter()
+                    .map(|line| format!("{} box: {}", r#box.label(), line)),
+            );
+            rules.extend(parsed.rules);
+        }
+        if invalid.is_empty() {
+            return Ok(rules);
+        }
+        window.push_notification(
+            Notification::error(format!(
+                "Invalid simple-rules lines block saving — fix or remove them (shown under \"Invalid lines\"): {}",
+                invalid.join(" | ")
+            )),
+            cx,
+        );
+        Err(())
     }
 
     fn commit_preset_create_structured(
@@ -18580,6 +22114,9 @@ impl AppView {
         });
     }
 
+    /// Compat entry for contract tests that only exercise the rules JSON
+    /// layer (empty boxes expand to nothing).
+    #[cfg(test)]
     fn commit_preset_edit(
         &mut self,
         id: &str,
@@ -18588,7 +22125,26 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let rules = if rules_text.trim().is_empty() {
+        self.commit_preset_edit_with_boxes(
+            id,
+            name,
+            rules_text,
+            SimpleRuleBoxes::default(),
+            window,
+            cx,
+        )
+    }
+
+    fn commit_preset_edit_with_boxes(
+        &mut self,
+        id: &str,
+        name: String,
+        rules_text: String,
+        boxes: SimpleRuleBoxes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut rules = if rules_text.trim().is_empty() {
             Vec::new()
         } else {
             match crate::preset::parse_preset_json(&rules_text, &name) {
@@ -18599,6 +22155,10 @@ impl AppView {
                 }
             }
         };
+        match AppView::expand_simple_rule_boxes(&boxes, window, cx) {
+            Ok(mut expanded) => rules.append(&mut expanded),
+            Err(()) => return false,
+        }
         let renamed = match self.store.rename_preset(id, &name) {
             Ok(preset) => preset,
             Err(StoreError::NotFound(_)) => {
@@ -18706,6 +22266,38 @@ impl AppView {
         }
     }
 
+    /// T-10 prevent-modifications lock. The toggle is the owner's positive
+    /// action (no confirm dialog); it protects the rules, never the attach
+    /// relationship.
+    fn commit_preset_lock(
+        &mut self,
+        id: &str,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.set_preset_locked(id, locked) {
+            Ok(_) => {
+                self.reload(window, cx);
+                if locked {
+                    window.push_notification(
+                        Notification::success("Routing preset locked — import a copy to modify"),
+                        cx,
+                    );
+                } else {
+                    window.push_notification(Notification::success("Routing preset unlocked"), cx);
+                }
+            }
+            Err(StoreError::NotFound(_)) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+        }
+        self.reopen_presets_if_open(window, cx);
+    }
+
     fn open_preset_edit_dialog(
         &mut self,
         preset: store::RoutePreset,
@@ -18716,19 +22308,81 @@ impl AppView {
             .rules()
             .map(|rules| serde_json::Value::Array(rules).to_string())
             .unwrap_or_default();
+        let title = format!("Edit preset {}", preset.name);
+        if preset.locked {
+            // T-10: a locked preset renders a readonly editor — view-only
+            // rows, no inputs, no save/copy-edit path.
+            let id = preset.id.clone();
+            let name = preset.name.clone();
+            let json_text = rules_text;
+            let advanced_view = cx.entity();
+            window.open_dialog(cx, move |dialog: Dialog, _, _| {
+                dialog
+                    .title(title.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(format!("preset-locked-hint-{id}"))
+                                    .test_support()
+                                    .text_sm()
+                                    .child("Locked — import a copy to modify"),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("preset-locked-name-{id}"))
+                                    .test_support()
+                                    .text_sm()
+                                    .child(format!("Name: {name}")),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("preset-locked-json-{id}"))
+                                    .test_support()
+                                    .text_sm()
+                                    .child(json_text.clone()),
+                            )
+                            .child(preset_advanced_section(
+                                advanced_view.clone(),
+                                &preset,
+                                None,
+                                &[],
+                            )),
+                    )
+                    .button_props(DialogButtonProps::default())
+                    .footer(dialog_footer(
+                        "preset-locked-close",
+                        "preset-locked-close",
+                        "Close",
+                        Rc::new(|_, _| true),
+                    ))
+            });
+            return;
+        }
+        let exits: Vec<String> = self
+            .store
+            .preset_attachments(&preset.id)
+            .unwrap_or_default()
+            .iter()
+            .map(|row| crate::engine::outbound_tag(&row.id))
+            .collect();
         let form = PresetForm::restored(window, cx, &preset.name, &rules_text);
         let view = cx.entity();
         let reader = form.clone();
         let id = preset.id.clone();
-        let title = format!("Edit preset {}", preset.name);
         let builder_view = view.clone();
         let builder_preset = preset.clone();
         let builder_form = form.clone();
+        let builder_exits = exits.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
+            let boxes = SimpleRuleBoxes::from_form(&reader, cx);
             view.update(cx, |view, cx| {
-                view.commit_preset_edit(&id, name, rules, window, cx)
+                view.commit_preset_edit_with_boxes(&id, name, rules, boxes, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -18741,7 +22395,8 @@ impl AppView {
                 .child(preset_advanced_section(
                     builder_view.clone(),
                     &builder_preset,
-                    builder_form.clone(),
+                    Some(builder_form.clone()),
+                    builder_exits.as_slice(),
                 ))
                 .button_props(
                     DialogButtonProps::default()
@@ -19100,18 +22755,401 @@ impl AppView {
         }
     }
 
+    // ——— T-12: .srs rule-set staging (explicit confirm-per-download only) ——
+
+    fn sync_rule_sets_to_engine(&mut self) -> Result<(), String> {
+        let dir = crate::store::rule_sets_dir();
+        let files: HashMap<String, PathBuf> = self
+            .store
+            .list_rule_sets()
+            .map_err(|error| format!("cannot load rule sets: {error}"))?
+            .into_iter()
+            .map(|row| (row.name, dir.join(row.file_name)))
+            .collect();
+        self.engine.set_rule_set_files(files);
+        Ok(())
+    }
+
+    fn open_rule_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Rule set name"));
+        let url_state =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://host.example/set.srs"));
+        let view = cx.entity();
+        let name_reader = name_state.clone();
+        let url_reader = url_state.clone();
+        let commit_view = view.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let name = name_reader.read(cx).value().to_string();
+            let url = url_reader.read(cx).value().to_string();
+            if name.trim().is_empty() && url.trim().is_empty() {
+                return true;
+            }
+            commit_view.update(cx, |view, cx| {
+                view.begin_rule_set_download(name, url, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        let commit_click = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit_click.clone();
+            dialog
+                .title("Add rule set by URL")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(dialog_field(
+                            "field-rule-set-name",
+                            "Name",
+                            name_state.clone(),
+                        ))
+                        .child(dialog_field(
+                            "field-rule-set-url",
+                            "Rule set URL",
+                            url_state.clone(),
+                        ))
+                        .child(Label::new(
+                            "The download runs only after you confirm it below — each download is one explicit confirmation",
+                        )),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "rule-set-add-dialog-ok",
+                    "rule-set-add-dialog-cancel",
+                    footer_commit_label("rule-set-add-dialog"),
+                    commit_click,
+                ))
+        });
+    }
+
+    /// The Add-by-URL commit: validate the name, run the same policy gate as
+    /// subscriptions (internal hosts block, plaintext http warn at the
+    /// confirm), allocate a collision-free staged name, then request the
+    /// explicit confirm. Nothing is fetched here.
+    fn begin_rule_set_download(
+        &mut self,
+        name: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let name = match crate::store::Store::validated_rule_set_name(&name) {
+            Ok(name) => name,
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                return false;
+            }
+        };
+        match store::subscription_fetch_policy(url.trim()) {
+            store::SubscriptionFetchPolicy::Block { reason } => {
+                window.push_notification(
+                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    cx,
+                );
+                return false;
+            }
+            store::SubscriptionFetchPolicy::Warn { .. } | store::SubscriptionFetchPolicy::Allow => {
+            }
+        }
+        let dir = crate::store::rule_sets_dir();
+        let taken: HashSet<String> = match self.store.list_rule_sets() {
+            Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    cx,
+                );
+                return false;
+            }
+        };
+        let mut candidate = name.clone();
+        let mut suffix = 1;
+        loop {
+            let file_name = crate::store::rule_set_file_name(&candidate);
+            if !taken.contains(&candidate) && !dir.join(&file_name).exists() {
+                let grant = RuleSetDownloadGrant {
+                    name: candidate,
+                    file_name,
+                    url: url.trim().to_string(),
+                    dir,
+                };
+                self.open_rule_set_download_confirm(grant, window, cx);
+                return true;
+            }
+            suffix += 1;
+            if suffix > 100 {
+                break;
+            }
+            candidate = format!("{name}-{suffix}");
+        }
+        window.push_notification(
+            Notification::error(format!(
+                "no free staging name for \"{name}\" — remove stale rule sets first"
+            )),
+            cx,
+        );
+        false
+    }
+
+    /// The exact one-confirmation-per-download callout. Blocked URLs never get
+    /// here; http warns through the same policy verdicts subscriptions use.
+    fn open_rule_set_download_confirm(
+        &mut self,
+        grant: RuleSetDownloadGrant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match store::subscription_fetch_policy(grant.url.trim()) {
+            store::SubscriptionFetchPolicy::Block { reason } => {
+                window.push_notification(
+                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    cx,
+                );
+                return;
+            }
+            store::SubscriptionFetchPolicy::Warn { reason } => {
+                window.push_notification(Notification::warning(reason.to_string()), cx);
+            }
+            store::SubscriptionFetchPolicy::Allow => {}
+        }
+        let view = cx.entity();
+        let warn = match store::subscription_fetch_policy(grant.url.trim()) {
+            store::SubscriptionFetchPolicy::Warn { reason } => format!("\n{reason}"),
+            _ => String::new(),
+        };
+        let overwrites = grant.dir.join(&grant.file_name).exists();
+        let description = format!(
+            "Download this rule set? {}\n{}\
+             Staged file: {}\\{}",
+            grant.url,
+            warn,
+            grant.dir.display(),
+            grant.file_name,
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let grant = grant.clone();
+            let view = view.clone();
+            let description = description.clone();
+            let mut props = DialogButtonProps::default()
+                .show_cancel(true)
+                .ok_text("Download");
+            if overwrites {
+                props = props.ok_variant(ButtonVariant::Danger);
+            }
+            alert
+                .confirm()
+                .button_props(props)
+                .title("Download rule set?")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.start_rule_set_download(grant.clone(), window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Reached only from the confirm dialog's Download click. Fetches through
+    /// the shared subscription pipeline, then stages bytes + row.
+    fn start_rule_set_download(
+        &mut self,
+        grant: RuleSetDownloadGrant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rule_set_download_in_flight {
+            window.push_notification(
+                Notification::warning("A rule set download is already in flight — wait for it"),
+                cx,
+            );
+            return;
+        }
+        self.rule_set_download_in_flight = true;
+        let client = cx.http_client();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let fetched = fetch_rule_set_body(client, &grant.url, resolve_subscription_host).await;
+            cx.update(|cx| {
+                if let Some(handle) = cx.active_window() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.finish_rule_set_download(&grant, fetched, window, cx);
+                        });
+                    });
+                } else {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.finish_rule_set_download_no_window(&grant, fetched, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Post-download staging shared by both finish variants: write the staged
+    /// bytes, then record the row (or refresh the identical row on re-download).
+    fn stage_rule_set_bytes(
+        &mut self,
+        grant: &RuleSetDownloadGrant,
+        bytes: Vec<u8>,
+    ) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&grant.dir)
+            .map_err(|error| format!("cannot create {}: {error}", grant.dir.display()))?;
+        let path = grant.dir.join(&grant.file_name);
+        std::fs::write(&path, &bytes)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        let existing = self
+            .store
+            .list_rule_sets()
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|row| row.name == grant.name));
+        let recorded = match existing {
+            Some(row) => self
+                .store
+                .touch_rule_set(&row.id, &grant.url, bytes.len() as u64),
+            None => self
+                .store
+                .create_rule_set(&grant.name, &grant.url, bytes.len() as u64),
+        };
+        if let Err(error) = recorded {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.to_string());
+        }
+        self.sync_presets_to_engine()?;
+        Ok(path)
+    }
+
+    fn finish_rule_set_download(
+        &mut self,
+        grant: &RuleSetDownloadGrant,
+        fetched: Result<Vec<u8>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.rule_set_download_in_flight = false;
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                window.push_notification(
+                    Notification::error(format!(
+                        "Cannot download rule set \"{}\" ({}): {reason}",
+                        grant.name,
+                        crate::import::redact_link(&grant.url),
+                    )),
+                    cx,
+                );
+                return false;
+            }
+        };
+        let bytes_len = bytes.len();
+        match self.stage_rule_set_bytes(grant, bytes) {
+            Ok(path) => {
+                window.push_notification(
+                    Notification::success(format!(
+                        "Rule set \"{}\" staged ({} bytes) — {}",
+                        grant.name,
+                        bytes_len,
+                        crate::health::truncate(&path.display().to_string(), 160),
+                    )),
+                    cx,
+                );
+                self.reload(window, cx);
+                self.reopen_presets_if_open(window, cx);
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!(
+                        "Cannot stage rule set \"{}\" ({}): {error}",
+                        grant.name,
+                        crate::import::redact_link(&grant.url),
+                    )),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    fn finish_rule_set_download_no_window(
+        &mut self,
+        grant: &RuleSetDownloadGrant,
+        fetched: Result<Vec<u8>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.rule_set_download_in_flight = false;
+        if let Ok(bytes) = fetched {
+            if self.stage_rule_set_bytes(grant, bytes).is_ok() {
+                self.reload_quiet(cx);
+            }
+        }
+    }
+
+    /// Remove: blocked while any preset references the set (loud inline), the
+    /// file delete lands right after the row so no orphan cache bytes survive.
+    fn commit_rule_set_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.store.get_rule_set(id).ok().flatten();
+        let Some(row) = existing else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        match self.store.delete_rule_set(id) {
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Ok(Some(file_name)) => {
+                let path = crate::store::staged_rule_set_path(&file_name);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success(format!(
+                                "Rule set \"{}\" removed (staged file deleted)",
+                                row.name
+                            )),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        window.push_notification(
+                            Notification::error(format!(
+                                "Rule set \"{}\" removed, but the staged file could not be deleted: {} ({error}) — delete it manually",
+                                row.name,
+                                path.display()
+                            )),
+                            cx,
+                        );
+                    }
+                }
+                let _ = self.sync_presets_to_engine();
+                self.reload(window, cx);
+                self.reopen_presets_if_open(window, cx);
+            }
+        }
+    }
+
     fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_presets_dialog_restored("", "", window, cx);
+        self.open_presets_dialog_restored("", "", &SimpleRuleBoxes::default(), window, cx);
     }
 
     fn open_presets_dialog_restored(
         &mut self,
         name: &str,
         rules: &str,
+        boxes: &SimpleRuleBoxes,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = PresetForm::restored(window, cx, name, rules);
+        let form = PresetForm::restored_with_boxes(window, cx, name, rules, boxes);
         self.preset_form = Some(form.clone());
         let view = cx.entity();
         let reader = form.clone();
@@ -19144,15 +23182,39 @@ impl AppView {
                     .push(format!("\"{}\"", row.name));
             }
         }
+        let rule_sets = match self.store.list_rule_sets() {
+            Ok(rule_sets) => rule_sets,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
+        let mut rule_set_used: HashMap<String, Vec<String>> = HashMap::new();
+        for preset in &presets {
+            if let Ok(names) = self.store.rule_sets_in_use(&preset.id) {
+                for name in names {
+                    rule_set_used
+                        .entry(name)
+                        .or_default()
+                        .push(preset.name.clone());
+                }
+            }
+        }
+        let rule_set_view = view.clone();
+        let rule_set_add_view = view.clone();
         let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
-            if name.trim().is_empty() && rules.trim().is_empty() {
+            let boxes = SimpleRuleBoxes::from_form(&reader, cx);
+            if name.trim().is_empty() && rules.trim().is_empty() && boxes.is_empty() {
                 return true;
             }
             commit_view.update(cx, |view, cx| {
-                view.commit_preset_create(name, rules, window, cx)
+                view.commit_preset_create_with_boxes(name, rules, boxes, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -19174,6 +23236,46 @@ impl AppView {
                     preset.clone(),
                     attached.get(&preset.id).cloned().unwrap_or_default(),
                 ));
+            }
+
+            // T-12: the Rule sets sub-list — explicit confirm-per-download
+            // staging lives here, never anywhere else.
+            body = body.child(
+                div()
+                    .id("rule-sets-section-title")
+                    .test_support()
+                    .text_sm()
+                    .child("Rule sets"),
+            );
+            if rule_sets.is_empty() {
+                body = body.child(Label::new(
+                    "No rule sets staged — Add by URL downloads an .srs file into data\\rule-sets after you confirm each download",
+                ));
+            }
+            for rule_set in &rule_sets {
+                body = body.child(rule_set_row(
+                    rule_set_view.clone(),
+                    rule_set.clone(),
+                    rule_set_used
+                        .get(&rule_set.name)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+            }
+            {
+                let value = rule_set_add_view.clone();
+                body = body.child(
+                    div().flex().flex_row().items_center().gap_2().child(
+                        Button::new("rule-set-add")
+                            .label("Add by URL")
+                            .tooltip("Download an .srs rule set from an https URL (you confirm each download)")
+                            .on_click(move |_, window, cx| {
+                                value.update(cx, |view, cx| {
+                                    view.open_rule_set_add_dialog(window, cx);
+                                });
+                            }),
+                    ),
+                );
             }
 
 
@@ -19245,8 +23347,9 @@ impl AppView {
         };
         let name = form.name.read(cx).value().to_string();
         let rules = form.rules.read(cx).value().to_string();
+        let boxes = SimpleRuleBoxes::from_form(form, cx);
         window.close_all_dialogs(cx);
-        self.open_presets_dialog_restored(&name, &rules, window, cx);
+        self.open_presets_dialog_restored(&name, &rules, &boxes, window, cx);
     }
 
     fn open_preset_attach_dialog(
@@ -19269,12 +23372,66 @@ impl AppView {
                 Vec::new()
             }
         };
+        // Read-only monitor, computed once per open: rows of the selected
+        // row's group, ranked by their latest health samples. No probing, no
+        // sampling, no persistence — purely the ordering view of what the
+        // session already knows.
+        let monitor = {
+            let group_rows: Vec<ProxyConfig> = self
+                .store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.group == config.group)
+                .collect();
+            crate::health::best_rows_monitor_lines(&config.group, &group_rows, &self.health_store)
+        };
         let commit: DialogCommit = Rc::new(|_, _| true);
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let mut body = div().flex().flex_col().gap_2();
+            if let Some((monitor_title, monitor_lines)) = &monitor {
+                let mut section = div()
+                    .id("preset-attach-monitor")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("preset-attach-monitor-title")
+                            .test_support()
+                            .text_sm()
+                            .child(monitor_title.clone()),
+                    );
+                for (index, line) in monitor_lines.iter().enumerate() {
+                    section = section.child(
+                        div()
+                            .id(format!("preset-attach-monitor-{index}"))
+                            .test_support()
+                            .text_sm()
+                            .child(line.clone()),
+                    );
+                }
+                body = body.child(section);
+            }
+            if !presets.is_empty() {
+                body = body.child(
+                    div()
+                        .id("preset-attach-exits")
+                        .test_support()
+                        .text_sm()
+                        .child(format!(
+                            "Route exits for \"{config_name}\": {}",
+                            crate::preset::preset_exit_suggestions(&[crate::engine::outbound_tag(
+                                &config_id
+                            )])
+                            .join(" · ")
+                        )),
+                );
+            }
             if presets.is_empty() {
                 body = body.child(
                     "No routing presets yet — import one first (throne://route link or preset JSON)",
@@ -19734,7 +23891,7 @@ impl AppView {
 
     fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
         for sub in self.due_subscriptions() {
-            self.start_subscription_refresh(sub, cx);
+            self.start_subscription_refresh(sub, false, cx);
         }
     }
 
@@ -19791,7 +23948,7 @@ impl AppView {
         self.begin_refresh_batch(&ids);
         let mut started = 0;
         for sub in due {
-            if self.start_subscription_refresh(sub, cx) {
+            if self.start_subscription_refresh(sub, true, cx) {
                 started += 1;
             }
         }
@@ -19823,7 +23980,7 @@ impl AppView {
         self.begin_refresh_batch(&ids);
         let mut started = 0;
         for sub in subs {
-            if self.start_subscription_refresh(sub, cx) {
+            if self.start_subscription_refresh(sub, true, cx) {
                 started += 1;
             }
         }
@@ -19918,7 +24075,7 @@ impl AppView {
 
                         for id in &ids {
                             if let Ok(Some(sub)) = view.store.get_subscription(id) {
-                                view.start_subscription_refresh(sub, cx);
+                                view.start_subscription_refresh(sub, true, cx);
                             }
                         }
                         view.reopen_subscriptions_if_open(window, cx);
@@ -19949,6 +24106,7 @@ impl AppView {
         }
 
         let cause = self.poll_engine();
+        self.tick_shard_samples();
         self.reload_quiet_no_poll(cx);
         if let Some(notification) = self.service_engine_crash() {
             self.push_engine_notification(notification, cx);
@@ -19966,11 +24124,31 @@ impl AppView {
             return None;
         }
         let detail = self.poll_engine();
+        self.tick_shard_samples();
         self.reload_quiet_no_poll(cx);
         if let Some(notification) = self.service_engine_crash() {
             window.push_notification(notification, cx);
         }
         detail
+    }
+
+    /// T-30: one sampling pass, riding the existing engine tick (no new timer).
+    /// The pid cohort comes from the controller, so only this app's own
+    /// sidecars can ever be opened.
+    fn tick_shard_samples(&mut self) {
+        let live: Vec<(String, u32)> = self
+            .engine
+            .shard_processes()
+            .into_iter()
+            .filter_map(|(label, pid)| pid.map(|pid| (label, pid)))
+            .collect();
+        self.shard_denied = fold_shard_samples(
+            &mut self.shard_rings,
+            &mut self.shard_baselines,
+            &live,
+            self.process_sampler.as_ref(),
+            Instant::now(),
+        );
     }
 
     fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
@@ -19982,7 +24160,7 @@ impl AppView {
         self.begin_refresh_batch(&ids);
         let mut started = 0;
         for sub in due {
-            if self.start_subscription_refresh(sub, cx) {
+            if self.start_subscription_refresh(sub, false, cx) {
                 started += 1;
             }
         }
@@ -20176,6 +24354,8 @@ impl AppView {
             .sweep(now, &ok_cores, &seen, &live_cores);
 
         self.conn_snapshot = snapshot;
+        self.conn_counts =
+            crate::health::ConnCounts::from_conns(self.conn_snapshot.iter().map(|(_, conn)| conn));
         self.conn_delta = conn_deltas;
         self.last_traffic_poll_at = now;
         let mut updated = 0;
@@ -20256,17 +24436,19 @@ impl AppView {
         }
     }
 
-    fn history_line(&self, config_id: &str) -> AnyElement {
+    fn history_line(&self, config_id: &str, cx: &App) -> AnyElement {
         let since = now_unix().saturating_sub(90 * 86_400);
         let entries = match self.store.load_health_history(config_id, Some(since)) {
             Ok(entries) => entries,
             Err(_) => return div().child("history unavailable").into_any_element(),
         };
         let latencies = url_test_sparkline(&entries, 120);
+        let caption_tone = sparkline_caption_tone(&entries);
         if latencies.len() < 2 {
             return div()
                 .id("config-history-empty")
                 .test_support()
+                .text_color(health_tone_color(caption_tone, cx))
                 .child(match latencies.len() {
                     1 => format!("1 probe recorded — no trend yet ({})", latencies[0]),
                     _ => "no health history yet — press Test to record a probe".to_string(),
@@ -20280,12 +24462,19 @@ impl AppView {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(format!("{} samples · latest {}ms", latencies.len(), latest))
+            .child(
+                div()
+                    .text_color(health_tone_color(caption_tone, cx))
+                    .child(format!("{} samples · latest {}ms", latencies.len(), latest)),
+            )
             .child(Self::latency_sparkline(&latencies))
             .into_any_element()
     }
 
     const MOTION_FAST_MS: u64 = 150;
+
+    /// How long a `Copied!` transient marker stays painted after a cell click.
+    const CONN_COPIED_TOOLTIP_MS: u64 = 1500;
 
     fn motion_fast_duration(cx: &App) -> Duration {
         if cx.reduce_motion() {
@@ -20544,15 +24733,15 @@ impl AppView {
 
     fn render_inspector_health(
         &self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.render_detail_health(config))
-            .child(self.render_detail_history(config))
+            .child(self.render_detail_health(cx, config))
+            .child(self.render_detail_history(cx, config))
     }
 
     fn render_inspector_presets(
@@ -20630,13 +24819,55 @@ impl AppView {
         })
     }
 
-    fn copy_connection_dest(&mut self, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Writes the cell value to the clipboard (bind:port-safe display strings
+    /// only). Returns `false` without touching the clipboard for an empty value.
+    fn copy_connection_dest(
+        &mut self,
+        dest: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if dest.is_empty() {
             window.push_notification(Notification::warning("No destination to copy"), cx);
-            return;
+            return false;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(dest.to_string()));
-        window.push_notification(Notification::success(format!("Copied {dest}")), cx);
+        true
+    }
+
+    /// Click-to-copy for a Connections cell: clipboard write plus a transient
+    /// inline `Copied!` marker anchored at the clicked cell. Repeat clicks reuse
+    /// the generation guard so the newest marker survives its full window.
+    fn copy_conn_cell(
+        &mut self,
+        target: ConnCopyTarget,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.copy_connection_dest(value, window, cx) {
+            return;
+        }
+        self.conn_copied = Some(target);
+        self.conn_copied_generation = self.conn_copied_generation.wrapping_add(1);
+        let generation = self.conn_copied_generation;
+        cx.notify();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(Self::CONN_COPIED_TOOLTIP_MS))
+                .await;
+            cx.update(|cx| {
+                weak.update(cx, |view, cx| {
+                    if view.conn_copied_generation == generation {
+                        view.conn_copied = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+        })
+        .detach();
     }
 
     fn render_inspector_logs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -20872,41 +25103,95 @@ impl AppView {
             for (ix, row) in rows.iter().enumerate() {
                 let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
                 let dest = row.dest.clone();
-                let dest_label = if dest.is_empty() {
+                let dest_display = if dest.is_empty() {
                     "(no destination)".to_string()
                 } else {
                     redact_secrets(&dest)
                 };
-                pane = pane.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .id(format!("conn-col-dest-{ix}"))
-                                .test_support()
-                                .w(px(dest_width_px))
-                                .overflow_hidden()
-                                .child(
-                                    Button::new(format!("conn-copy-{ix}"))
-                                        .small()
-                                        .label(dest_label)
-                                        .tooltip("Copy destination")
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.copy_connection_dest(&dest, window, cx);
-                                        })),
-                                ),
-                        )
-                        .child(div().text_sm().child(format!(
-                            "{} · {} · {} · ↓{} ↑{} · Δ{}",
-                            name,
-                            bind,
-                            protocol,
-                            format_bytes(row.rx_bytes),
-                            format_bytes(row.tx_bytes),
-                            format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
-                        ))),
-                );
+                // Copy the displayed string; an empty dest has no hostname to copy.
+                let dest_value = if dest.is_empty() {
+                    String::new()
+                } else {
+                    dest_display.clone()
+                };
+                let mut dest_cell = div()
+                    .id(format!("conn-col-dest-{ix}"))
+                    .test_support()
+                    .w(px(dest_width_px))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        Button::new(format!("conn-copy-{ix}"))
+                            .small()
+                            .label(dest_display)
+                            .tooltip("Copy destination")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.copy_conn_cell(
+                                    ConnCopyTarget::Dest(ix),
+                                    &dest_value,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    );
+                if self.conn_copied == Some(ConnCopyTarget::Dest(ix)) {
+                    dest_cell = dest_cell.child(
+                        div()
+                            .id(format!("conn-copied-dest-{ix}"))
+                            .test_support()
+                            .text_sm()
+                            .child("Copied!"),
+                    );
+                }
+
+                // The endpoint cell copies the row's active `bind:port` contact
+                // verbatim; unclaimed rows (no exit) stay non-copyable.
+                let endpoint_value = bind.clone();
+                let endpoint_claimed = row.row_id.is_some();
+                let mut endpoint_button = Button::new(format!("conn-endpoint-{ix}"))
+                    .small()
+                    .label(bind);
+                if endpoint_claimed {
+                    endpoint_button =
+                        endpoint_button
+                            .tooltip("Copy endpoint")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.copy_conn_cell(
+                                    ConnCopyTarget::Endpoint(ix),
+                                    &endpoint_value,
+                                    window,
+                                    cx,
+                                );
+                            }));
+                }
+                let mut meta = div()
+                    .id(format!("conn-meta-{ix}"))
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .child(name)
+                    .child("·")
+                    .child(endpoint_button);
+                if self.conn_copied == Some(ConnCopyTarget::Endpoint(ix)) {
+                    meta = meta.child(
+                        div()
+                            .id(format!("conn-copied-endpoint-{ix}"))
+                            .test_support()
+                            .child("Copied!"),
+                    );
+                }
+                meta = meta.child(format!(
+                    "· {protocol} · ↓{} ↑{} · Δ{}",
+                    format_bytes(row.rx_bytes),
+                    format_bytes(row.tx_bytes),
+                    format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
+                ));
+
+                pane = pane.child(div().flex().flex_col().child(dest_cell).child(meta));
             }
         }
         pane
@@ -21187,12 +25472,14 @@ impl AppView {
             .child(value_row)
     }
 
-    fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
+    fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+        let tone = self.health_store.health_tone(&config.id);
         div().id("config-health").test_support().child(
-            GroupBox::new()
-                .title("Health")
-                .gap_1()
-                .child(self.health_store.detail_line(&config.id).into_any_element()),
+            GroupBox::new().title("Health").gap_1().child(
+                div()
+                    .text_color(health_tone_color(tone, cx))
+                    .child(self.health_store.detail_line(&config.id).into_any_element()),
+            ),
         )
     }
 
@@ -21223,12 +25510,12 @@ impl AppView {
         )
     }
 
-    fn render_detail_history(&self, config: &ProxyConfig) -> impl IntoElement {
+    fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         div().id("config-history").test_support().child(
             GroupBox::new()
                 .title("History")
                 .gap_1()
-                .child(self.history_line(&config.id)),
+                .child(self.history_line(&config.id, cx)),
         )
     }
 
@@ -21806,6 +26093,20 @@ impl AppView {
                     .child(ports)
             });
         }
+
+        if let Some(counters) = self.conn_counter_text() {
+            center = center.child(Separator::vertical()).child({
+                let tip = counters.clone();
+                div()
+                    .id("conn-counters")
+                    .test_support()
+                    .min_w_0()
+                    .max_w(px(180.))
+                    .truncate()
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(counters)
+            });
+        }
         let mut right = div()
             .id("status-right")
             .test_support()
@@ -21875,13 +26176,27 @@ impl AppView {
 
     fn sync_search_box(view: &Entity<Self>, text: &str, window: &mut Window, cx: &mut App) {
         view.update(cx, |view, cx| {
+            view.remember_library_query(text);
             view.search_input.update(cx, |input, cx| {
                 input.set_value(text.to_string(), window, cx);
             });
         });
     }
 
+    /// T-23: keep the last-filter memory in step with the query. `set_value`
+    /// never emits `InputEvent::Change`, so the clear paths call this directly.
+    /// A blank query clears the key rather than storing one, and a write hiccup
+    /// only costs the memory — the live filter is unaffected.
+    fn remember_library_query(&mut self, query: &str) {
+        let _ = if query.trim().is_empty() {
+            self.store.clear_library_last_query()
+        } else {
+            self.store.set_library_last_query(query)
+        };
+    }
+
     fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_library_query("");
         self.search_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
@@ -21937,6 +26252,14 @@ impl AppView {
     ) -> impl IntoElement {
         self.sync_facet_pickers(window, cx);
         let has_facets = self.libraries.read(cx).delegate().facets_active();
+        // T-19: the facet area carries the same per-group opt-in switch for
+        // the focused group; has no group to protect by design.
+        let facet_group_now = self.libraries.read(cx).delegate().facet_group.clone();
+        let facet_auto_clear = facet_group_now
+            .as_deref()
+            .map(|group| self.store.auto_clear_enabled(group))
+            .unwrap_or(false);
+        let facet_auto_view = cx.entity();
 
         let (group_tip, protocol_tip, status_tip) = {
             let libraries = self.libraries.read(cx);
@@ -21981,6 +26304,7 @@ impl AppView {
                     .test_support()
                     .flex_1()
                     .min_w(px(140.))
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(SEARCH_HINT)).into())
                     .child(
                         Input::new(&self.search_input)
                             .small()
@@ -22033,6 +26357,50 @@ impl AppView {
                         view.open_groups_dialog(window, cx);
                     })),
             )
+            .child(match facet_group_now {
+                Some(group) => {
+                    let slug = slugify_group_id(&group);
+                    div()
+                        .id(format!("facet-auto-clear-{slug}"))
+                        .test_support()
+                        .child(
+                            Switch::new(format!("facet-auto-clear-switch-{slug}"))
+                                .checked(facet_auto_clear)
+                                .label("Auto-clear unavailable")
+                                .tooltip(
+                                    "Opt-in per group: after this group's URL test ends, its \
+                                     unavailable rows are removed automatically. Running rows \
+                                     and the row being edited are never removed; enabling asks \
+                                     its own confirmation.",
+                                )
+                                .accessibility_label(format!(
+                                    "Auto-clear unavailable rows in group \"{group}\" after group tests"
+                                ))
+                                .on_change({
+                                    let facet_auto_view = facet_auto_view.clone();
+                                    move |next: &bool, window, cx| {
+                                        let view = facet_auto_view.clone();
+                                        if *next {
+                                            view.update(cx, |view, cx| {
+                                                view.open_auto_clear_opt_in_confirm(
+                                                    &group, false, window, cx,
+                                                )
+                                            });
+                                        } else {
+                                            view.update(cx, |view, cx| {
+                                                view.commit_auto_clear_off(&group, window, cx)
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
+                        .into_any_element()
+                }
+                None => div()
+                    .id("facet-auto-clear-idle")
+                    .test_support()
+                    .into_any_element(),
+            })
             .child(if has_facets {
                 Button::new("clear-facets")
                     .small()
@@ -22046,6 +26414,141 @@ impl AppView {
                 div().id("facets-idle").test_support().into_any_element()
             })
             .into_any_element()
+    }
+
+    /// T-27: the library list's column header strip. The visible columns come
+    /// from `library_columns`; the health and traffic cells are sortable and
+    /// carry the picker menu, the rest are labels that keep the strip lined up.
+    fn render_library_column_headers(&self, cx: &mut Context<Self>) -> AnyElement {
+        let columns = self.row_columns;
+        let sort = self.libraries.read(cx).delegate().sort;
+        let has_rows = !self.libraries.read(cx).delegate().rows.is_empty();
+        let view = cx.entity();
+        if !has_rows {
+            // An empty library keeps today's empty-state clean: a header strip
+            // over nothing is noise.
+            return div()
+                .id("library-column-headers")
+                .test_support()
+                .into_any_element();
+        }
+        let mut strip = div()
+            .id("library-column-headers")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            // The gutter the row cards spend on the serving lamp and checkbox.
+            .child(div().w(px(28.)).flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Name"),
+            );
+        if columns.upstream {
+            strip = strip.child(column_header_label("Upstream", 180., cx));
+        }
+        if columns.health {
+            strip = strip.child(sort_header_cell(
+                "health",
+                "Health",
+                150.,
+                sort,
+                view.clone(),
+                cx,
+            ));
+        }
+        if columns.group {
+            strip = strip.child(column_header_label("Group", 100., cx));
+        }
+        if columns.traffic {
+            strip = strip.child(sort_header_cell("traffic", "Traffic", 120., sort, view, cx));
+        }
+        strip.into_any_element()
+    }
+
+    /// T-27: the header picker — the key list for this column plus the direction
+    /// toggle, with the live choice marked. Item ids are pinned
+    /// (`sort-header-{column}-{key|direction}`) for the UI test.
+    fn sort_header_menu(
+        menu: PopupMenu,
+        column: &'static str,
+        sort: LibrarySort,
+        view: &Entity<AppView>,
+    ) -> PopupMenu {
+        let mut menu = menu;
+        for key in sort_header_keys(column) {
+            let current = *key == sort.key;
+            let label = if current {
+                format!("{} ✓", key.label())
+            } else {
+                key.label().to_string()
+            };
+            let tip = if current {
+                format!("{} — current sort", key.label())
+            } else {
+                format!("Sort by {}", key.label())
+            };
+            menu = menu.item(Self::sort_menu_item(
+                column,
+                key.token(),
+                label,
+                tip,
+                SortMenuAction::Key(*key),
+                view,
+            ));
+        }
+        let next = sort.direction.toggled();
+        menu.item(Self::sort_menu_item(
+            column,
+            "direction",
+            format!("Direction: {} → {}", sort.direction.label(), next.label()),
+            "Reverse the active key (Type | Security keeps its fixed order)".to_string(),
+            SortMenuAction::Direction,
+            view,
+        ))
+    }
+
+    fn sort_menu_item(
+        column: &'static str,
+        id_suffix: &'static str,
+        label: String,
+        tip: String,
+        action: SortMenuAction,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let id = format!("sort-header-{column}-{id_suffix}");
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            let text = label.clone();
+            let tip = tip.clone();
+            div()
+                .id(id.clone())
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(text.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .child(text)
+        })
+        .on_click(move |_, window, cx| {
+            view.update(cx, |view, cx| match action {
+                SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
+                SortMenuAction::Direction => view.toggle_library_sort_direction(window, cx),
+            });
+        })
     }
 
     fn render_bulk_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -22729,8 +27232,18 @@ impl AppView {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // T-19: auto-clear opt-ins snapshot at sheet open; every toggle
+        // re-opens this sheet so the switch always reads the store.
+        let auto_flagged: HashSet<String> =
+            self.store.auto_clear_enabled_groups().into_iter().collect();
 
-        let rows = group_row_views(&counts, &subs, &|group| flagged.contains(group), now_unix());
+        let rows = group_row_views(
+            &counts,
+            &subs,
+            &|group| flagged.contains(group),
+            &|group| auto_flagged.contains(group),
+            now_unix(),
+        );
         let commit: DialogCommit = Rc::new(|_, _| true);
 
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
@@ -22839,8 +27352,6 @@ impl AppView {
                     );
                 }
                 buttons = buttons.child(
-
-
                     Button::new(format!("group-delete-{slug}"))
                         .label("Delete")
                         .on_click(move |_, window, cx| {
@@ -22851,12 +27362,48 @@ impl AppView {
                         }),
                 );
 
+                // T-19: the sheet render is a snapshot; the toggle never writes
+                // silently — enable opens this switch's own confirm note, and
+                // both handlers re-open the sheet to re-read the store.
+                let auto_view = view.clone();
+                let auto_group = row.name.clone();
+                let auto_switch = Switch::new(format!("group-auto-clear-{slug}"))
+                    .checked(row.auto_clear)
+                    .label("Auto-clear unavailable")
+                    .tooltip(
+                        "Opt-in per group: after this group's URL test ends, its unavailable \
+                         rows are removed automatically. Running rows and the row being edited \
+                         are never removed; enabling asks its own confirmation.",
+                    )
+                    .accessibility_label(format!(
+                        "Auto-clear unavailable rows in group \"{}\" after group tests",
+                        row.name
+                    ))
+                    .on_change(move |next: &bool, window, cx| {
+                        let group = auto_group.clone();
+                        let view = auto_view.clone();
+                        if *next {
+                            view.update(cx, |view, cx| {
+                                view.open_auto_clear_opt_in_confirm(&group, true, window, cx)
+                            });
+                        } else {
+                            view.update(cx, |view, cx| {
+                                view.commit_auto_clear_off(&group, window, cx)
+                            });
+                        }
+                    });
 
                 let mut column = div()
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(buttons)
+                    .child(
+                        div()
+                            .id(format!("group-auto-clear-{slug}"))
+                            .test_support()
+                            .child(auto_switch),
+                    )
                     .child(
                         div()
                             .id(format!("group-kind-{slug}"))
@@ -23229,6 +27776,12 @@ impl AppView {
                     return;
                 }
                 view.test_selected_health(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &StopTesting, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.stop_group_tests(window, cx);
             }))
             .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
                 view.clear_checked_unless_dialog(window, cx);
@@ -24083,9 +28636,9 @@ impl AppView {
                                 topbar_menu_row(
                                     "stop-testing",
                                     "Stop Testing",
-                                    "Stop Testing",
+                                    "Stop Testing (Ctrl-.)",
                                     "Stop the running group test",
-                                    None,
+                                    Some(("ctrl-.", "(Ctrl-.)", "Ctrl-.")),
                                 )
                             })
                             .on_click({
@@ -24093,6 +28646,25 @@ impl AppView {
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.stop_group_tests(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "check-for-updates",
+                                    "Check for updates",
+                                    "Check for updates",
+                                    "Fetch the release feed once (JSON only — nothing downloads or runs)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.check_for_updates(window, cx);
                                     });
                                 }
                             }),
@@ -24131,25 +28703,6 @@ impl AppView {
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_row_columns_dialog(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "sort-type-security",
-                                    "Sort Type|Security",
-                                    "Sort Type|Security",
-                                    "Toggle Type-then-Security display order",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.toggle_type_security_sort(window, cx);
                                     });
                                 }
                             }),
@@ -24212,8 +28765,12 @@ impl Render for AppView {
         });
 
         let show_detail = self.config_count(cx) != 0;
+        // T-26: the titlebar label carries the same `· N running` text the OS
+        // title gets, both composed from the one shared helper.
+        let current_title = window_title_text(self.engine.running_count());
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
+        let column_headers = self.render_library_column_headers(cx);
         let empty_ctas = self.render_empty_ctas(cx);
         let mut list_pane = div()
             .id("config-list")
@@ -24224,11 +28781,12 @@ impl Render for AppView {
             .min_h_0()
             .child(facet_bar)
             .child(bulk_bar)
+            .child(column_headers)
             .child(List::new(&self.libraries).flex_1());
         list_pane = list_pane.child(empty_ctas);
 
         self.render_shell(cx)
-            .child(TitleBar::new().child(Label::new(APP_TITLE)))
+            .child(TitleBar::new().child(Label::new(current_title)))
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -24267,12 +28825,13 @@ fn main() {
     let launch_intake = std::env::args()
         .skip(1)
         .find_map(|arg| classify_open_with(&arg));
+    let startup_geometry = stored_window_geometry();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
 
         bind_app_keys(cx);
         cx.spawn(async move |cx| {
-            cx.open_window(app_window_options(), |window, cx| {
+            cx.open_window(app_window_options(startup_geometry), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 view.update(cx, |view, cx| {
                     view.refresh_due_on_startup_deferred(cx);
@@ -24328,7 +28887,12 @@ fn main() {
                         return false;
                     };
                     match view.read_with(cx, |view, _| view.close_veto_text()) {
-                        None => true,
+                        None => {
+                            // T-34: a plain close with nothing running is an
+                            // orderly exit too — mark it before the window goes.
+                            view.update(cx, |view, _| view.mark_clean_exit());
+                            true
+                        }
                         Some(description) => {
                             let confirm_view = view.clone();
                             window.open_alert_dialog(cx, move |alert, _, _| {
@@ -24346,7 +28910,7 @@ fn main() {
                                     .description(description)
                                     .on_ok(move |_, window, cx| {
                                         confirm_view.update(cx, |view, _| {
-                                            view.confirm_close_stop();
+                                            view.confirm_close_stop(window);
                                         });
                                         window.remove_window();
                                         true
@@ -24370,12 +28934,15 @@ mod tests {
     use std::rc::Rc;
 
     use crate::engine::AutoRestartConfig;
-    use crate::store::{NewConfig, Store};
+    use crate::store::{
+        AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError, WindowGeometry,
+    };
     use crate::AppView;
+    use crate::ExitTraffic;
     use gpui_kit::component::dialog::Dialog;
     use gpui_kit::component::{Root, WindowExt};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{px, size, AppContext, Entity, TestAppContext};
+    use gpui_kit::{point, px, size, AppContext, Entity, TestAppContext};
 
     fn seed_input(name: &str) -> NewConfig {
         NewConfig {
@@ -24390,7 +28957,7 @@ mod tests {
 
     #[test]
     fn window_options_carry_app_title() {
-        let options = crate::app_window_options();
+        let options = crate::app_window_options(None);
         let title = options
             .titlebar
             .expect("titlebar options")
@@ -24401,7 +28968,7 @@ mod tests {
 
     #[test]
     fn window_options_carry_startup_size() {
-        let options = crate::app_window_options();
+        let options = crate::app_window_options(None);
         let bounds = options
             .window_bounds
             .expect("startup window bounds")
@@ -24413,6 +28980,90 @@ mod tests {
         assert_eq!(min.height, gpui_kit::px(620.));
     }
 
+    /// T-32: a sane stored rectangle seeds the startup window; a stored
+    /// rectangle under the minimums can never seed a smaller window.
+    #[test]
+    fn t82_app_options_seeds_stored_geometry() {
+        let stored = WindowGeometry {
+            x: 240.,
+            y: 120.,
+            width: 1280.,
+            height: 900.,
+        };
+        let options = crate::app_window_options(Some(stored));
+        let bounds = options
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(240.), px(120.)));
+        assert_eq!(bounds.size, size(px(1280.), px(900.)));
+        let min = options.window_min_size.expect("startup window minimum");
+        assert_eq!(min, size(px(880.), px(620.)), "minimums are unchanged");
+
+        let undersized = crate::app_window_options(Some(WindowGeometry {
+            x: 0.,
+            y: 0.,
+            width: 100.,
+            height: 100.,
+        }));
+        let bounds = undersized
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(
+            bounds.size,
+            size(px(880.), px(620.)),
+            "a stored rectangle below the minimums seeds the minimums"
+        );
+    }
+
+    /// T-32: no stored meta — or a corrupt payload — leaves the startup
+    /// rectangle indistinguishable from today's fixed 1000×700 at (0, 0).
+    #[test]
+    fn t82_default_bounds_when_meta_absent_or_corrupt() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+
+        let absent = crate::app_window_options(store.window_geometry());
+        let bounds = absent
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(0.), px(0.)));
+        assert_eq!(bounds.size, size(px(1000.), px(700.)));
+
+        store
+            .set_meta(Store::META_GEOMETRY, "not json at all")
+            .expect("junk writes");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "corrupt JSON reads as absent"
+        );
+        let corrupt = crate::app_window_options(store.window_geometry());
+        let bounds = corrupt
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(0.), px(0.)));
+        assert_eq!(bounds.size, size(px(1000.), px(700.)));
+
+        store
+            .set_meta(Store::META_GEOMETRY, r#"{"x":40,"y":40}"#)
+            .expect("partial payload writes");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "a partial rectangle reads as absent"
+        );
+        let partial = crate::app_window_options(store.window_geometry());
+        let bounds = partial
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(0.), px(0.)));
+        assert_eq!(bounds.size, size(px(1000.), px(700.)));
+    }
+
     #[test]
     fn exe_icon_asset_is_valid_ico() {
         let bytes = std::fs::read("assets/icon.ico").expect("assets/icon.ico is committed");
@@ -24420,6 +29071,45 @@ mod tests {
         assert_eq!(&bytes[0..4], &[0, 0, 1, 0], "ICO magic");
         let count = u16::from_le_bytes([bytes[4], bytes[5]]);
         assert!(count >= 1, "at least one icon image");
+    }
+
+    #[test]
+    fn t55_app_version_is_plain_semver() {
+        // T-05: the Cargo version must stay a plain `major.minor.patch`
+        // semver — the `-beta.1` prerelease suffix lives on the release
+        // tag, and main.rs:184 must keep deriving this from the manifest.
+        let src = std::fs::read_to_string(file!()).expect("src/main.rs readable");
+        let definition = src
+            .lines()
+            .find(|line| line.contains("const APP_VERSION"))
+            .expect("main.rs defines APP_VERSION");
+        assert!(
+            definition.contains("env!(\"CARGO_PKG_VERSION\")"),
+            "APP_VERSION must derive from CARGO_PKG_VERSION, got {definition:?}"
+        );
+        assert_eq!(
+            crate::APP_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            "APP_VERSION rides the manifest version"
+        );
+        let version = crate::APP_VERSION;
+        assert!(!version.starts_with('v'), "no tag-style prefix: {version}");
+        assert!(
+            !version.contains('-') && !version.contains('+'),
+            "plain semver only — prerelease/build suffixes belong to the release tag: {version}"
+        );
+        let components: Vec<&str> = version.split('.').collect();
+        assert_eq!(
+            components.len(),
+            3,
+            "APP_VERSION must be major.minor.patch, got {version}"
+        );
+        for (position, component) in components.iter().enumerate() {
+            assert!(
+                !component.is_empty() && component.bytes().all(|b| b.is_ascii_digit()),
+                "APP_VERSION component {position} must be a non-empty number, got {component:?} in {version}"
+            );
+        }
     }
 
     #[test]
@@ -24515,6 +29205,201 @@ mod tests {
         );
     }
 
+    /// T-31: every level resolves to its own theme tone, in both theme modes,
+    /// and the visible `[level]` prefix maps back to the ingested level.
+    #[gpui_kit::test]
+    fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
+        use gpui_kit::component::ThemeMode;
+
+        cx.update(gpui_kit::init);
+        let levels = [
+            crate::LogLevel::Error,
+            crate::LogLevel::Warn,
+            crate::LogLevel::Info,
+            crate::LogLevel::Debug,
+        ];
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            cx.update(|cx| {
+                crate::Theme::change(mode, None, cx);
+                let theme = crate::Theme::global(cx);
+                assert_eq!(theme.mode, mode, "the tone check runs in {mode:?}");
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Error, theme),
+                    theme.danger,
+                    "error paints the theme danger red"
+                );
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Warn, theme),
+                    theme.warning,
+                    "warn paints the theme amber"
+                );
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Info, theme),
+                    theme.foreground,
+                    "info keeps the default text color"
+                );
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Debug, theme),
+                    theme.muted_foreground,
+                    "debug recedes to muted"
+                );
+                for (index, left) in levels.iter().enumerate() {
+                    for right in levels.iter().skip(index + 1) {
+                        assert_ne!(
+                            crate::log_level_text_color(*left, theme),
+                            crate::log_level_text_color(*right, theme),
+                            "{left:?} and {right:?} stay distinct in {mode:?}"
+                        );
+                    }
+                }
+            });
+        }
+
+        assert_eq!(
+            crate::log_line_level("[error] dial refused"),
+            crate::LogLevel::Error
+        );
+        assert_eq!(
+            crate::log_line_level("[warn] retry slow"),
+            crate::LogLevel::Warn
+        );
+        assert_eq!(
+            crate::log_line_level("[info] engine started"),
+            crate::LogLevel::Info
+        );
+        assert_eq!(
+            crate::log_line_level("[debug] tick"),
+            crate::LogLevel::Debug
+        );
+        assert_eq!(
+            crate::log_line_level("unprefixed line"),
+            crate::LogLevel::Info,
+            "an unprefixed line keeps the default tone"
+        );
+    }
+
+    /// T-31: filter/exclude/regex/level/tail output is byte-identical at any
+    /// ring cap, `with_store` hydrates the meta cap, and saving a new cap
+    /// rebuilds the ring empty (the documented truncation).
+    #[gpui_kit::test]
+    fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.set_log_max_lines(500).expect("cap writes");
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            500,
+            "with_store hydrates the meta cap"
+        );
+
+        let tags = crate::health::LogTagIndex::default();
+        let source: Vec<String> = (0..400)
+            .map(|i| match i % 4 {
+                0 => format!("error dial {i} refused password=hunter2"),
+                1 => format!("warn retry {i} slow"),
+                2 => format!("debug tick {i}"),
+                _ => format!("info heartbeat {i}"),
+            })
+            .collect();
+
+        let cases = [
+            ("", "", "", None, true),
+            ("dial", "", "", None, true),
+            ("", "slow", "", None, true),
+            ("", "", "refused$", None, false),
+            ("", "", "", Some(crate::LogLevel::Warn), true),
+            ("heartbeat", "", "", Some(crate::LogLevel::Info), false),
+        ];
+        for (filter, exclude, pattern, level, tail) in cases {
+            let mut by_cap = Vec::new();
+            for cap in [500usize, 50_000] {
+                let lines = cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        let mut logs = crate::LogStore::with_capacity(cap);
+                        for line in &source {
+                            logs.push_raw(line, &tags);
+                        }
+                        view.logs = logs;
+                        view.log_filter = filter.to_string();
+                        view.log_exclude = exclude.to_string();
+                        view.log_regex = pattern.to_string();
+                        view.log_level = level;
+                        view.log_tail = tail;
+                        view.visible_log_lines(cx)
+                    })
+                });
+                by_cap.push(lines);
+            }
+            assert_eq!(
+                by_cap[0], by_cap[1],
+                "cap must not change {filter:?}/{exclude:?}/{pattern:?}/{level:?}/{tail}"
+            );
+            assert!(
+                !by_cap[0].iter().any(|line| line.contains("hunter2")),
+                "redaction still decorates only redacted text"
+            );
+        }
+
+        let tail = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut logs = crate::LogStore::with_capacity(500);
+                for line in &source {
+                    logs.push_raw(line, &tags);
+                }
+                view.logs = logs;
+                view.log_filter.clear();
+                view.log_exclude.clear();
+                view.log_regex.clear();
+                view.log_level = None;
+                view.log_tail = true;
+                view.visible_log_lines(cx)
+            })
+        });
+        assert_eq!(tail.len(), 200, "tail keeps the newest 200 lines");
+        assert!(tail
+            .last()
+            .is_some_and(|line| line.contains("heartbeat 399")));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.logs.push_raw("info before cap change", &tags);
+                view.commit_log_cap(window, "50,000", cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            50_000,
+            "a typed save rebuilds the ring at the clamped cap"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.log_max_lines()),
+            50_000,
+            "the new cap persists"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.logs.all().is_empty()),
+            "the fresh ring truncates instead of carrying lines over"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_log_cap(window, "1", cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            500,
+            "saving below the window clamps to 500"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_log_cap(window, "junk", cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            500,
+            "junk keeps the previous cap"
+        );
+    }
+
     #[gpui_kit::test]
     fn close_veto_passes_when_nothing_running(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -24530,10 +29415,15 @@ mod tests {
         let view = stash.borrow().clone().expect("AppView stashed");
 
         assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
-        cx.update(|_, cx| {
-            view.update(cx, |view, _| view.confirm_close_stop());
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.confirm_close_stop(window));
         });
         assert!(view.read_with(cx, |view, _| view.close_confirmed));
+        assert!(
+            view.read_with(cx, |view, _| view.store.window_geometry())
+                .is_some(),
+            "confirm-close also persists the window rectangle (T-32)"
+        );
         assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
     }
 
@@ -28722,6 +33612,25 @@ mod tests {
 
         assert_eq!(export_confirm_description(), export_warning_text());
 
+        let clause = crate::store::RESTORE_REQUIRES_CLAUSE;
+        assert_eq!(
+            clause,
+            "Restore requires a matching ManyProxy export (schema manyproxy-library, version 1)."
+        );
+        assert!(
+            export_warning_text().contains(clause),
+            "export warning carries the restore-requirement clause: {}",
+            export_warning_text()
+        );
+        assert!(
+            export_warning_text().starts_with(
+                "Export carries private keys, tokens, and passwords in plaintext. \
+                 Anyone with this file can use your proxies — store it somewhere safe."
+            ),
+            "the original warning text stays byte-identical: {}",
+            export_warning_text()
+        );
+
         cx.simulate_resize(size(px(1000.), px(700.)));
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
@@ -29728,6 +34637,529 @@ mod tests {
             );
         }
         server.join().expect("stub drains");
+    }
+
+    /// Tall enough that the seeded Connections row lands inside the detail
+    /// viewport (the default 1000x700 frame clips it below the fold).
+    fn t74_paint(cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(1400.), px(1200.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    /// T-24 hermetic Connections pane: one claimed exit row, seeded snapshot,
+    /// no engines and no network, ready for click simulation.
+    fn t74_conn_setup<'a>(
+        cx: &'a mut TestAppContext,
+        dest: &str,
+    ) -> (Entity<AppView>, &'a mut VisualTestContext, String) {
+        use crate::health::ClashConn;
+        use gpui_kit::component::IndexPath;
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10856"))
+            .expect("seed works");
+        let row_id = alpha.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.conn_snapshot = vec![(
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-0".to_string(),
+                        row_id: Some(row_id.clone()),
+                        rx_bytes: 1000,
+                        tx_bytes: 50,
+                        dest: dest.to_string(),
+                        network: "tcp".to_string(),
+                    },
+                )];
+                view.conn_delta = std::collections::HashMap::new();
+                view.inspector_tab = crate::InspectorTab::Connections;
+                view.conn_selected_only = false;
+                view.conn_sort_desc = true;
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                cx.notify();
+            });
+        });
+        t74_paint(cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-140.))),
+                cx,
+            );
+        });
+        t74_paint(cx);
+        cx.run_until_parked();
+        let endpoint = view.read_with(cx, |view, cx| {
+            let rows = view.libraries.read(cx).delegate().rows.clone();
+            let selected = view.selected_config(cx).map(|config| config.id);
+            let built = crate::build_conn_rows(
+                &view.conn_snapshot,
+                &view.conn_delta,
+                selected.as_deref(),
+                view.conn_selected_only,
+                view.conn_sort_desc,
+            );
+            crate::conn_exit_of(&rows, built[0].row_id.as_deref()).1
+        });
+        (view, cx, endpoint)
+    }
+
+    #[gpui_kit::test]
+    fn t74_click_dest_copies_exact_string(cx: &mut TestAppContext) {
+        let dest = "flow-0.example.com";
+        let (_view, cx, _endpoint) = t74_conn_setup(cx, dest);
+        assert_painted(cx, "config-connections");
+        assert_painted(cx, "conn-copy-0");
+
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            clip, dest,
+            "dest cell copies the displayed dest string exactly: {clip}"
+        );
+        for canary in [
+            "11111111",
+            "198.51.100.9",
+            "uuid",
+            "password",
+            "server_port",
+        ] {
+            assert!(
+                !clip.contains(canary),
+                "dest copy carries the display value only, found {canary}: {clip}"
+            );
+        }
+
+        // Repeat click copies again (idempotent; no state jam).
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        let clip_again = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            clip_again, dest,
+            "repeat click re-copies the dest: {clip_again}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t74_click_endpoint_copies_endpoint_only(cx: &mut TestAppContext) {
+        let dest = "flow-0.example.com";
+        let (_view, cx, endpoint) = t74_conn_setup(cx, dest);
+        assert_painted(cx, "conn-endpoint-0");
+
+        cx.update(|window, cx| {
+            window.click("conn-endpoint-0", cx);
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            clip, endpoint,
+            "endpoint cell copies the row's bind:port contact only: {clip}"
+        );
+        assert!(
+            clip.contains(':'),
+            "endpoint stays bind:port shaped: {clip}"
+        );
+        assert_ne!(clip, dest, "endpoint copy never carries the destination");
+        for canary in [dest, "11111111", "198.51.100.9", "uuid", "password"] {
+            assert!(
+                !clip.contains(canary),
+                "endpoint copy excludes every other value, found {canary}: {clip}"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t74_copied_tooltip_transient_clears(cx: &mut TestAppContext) {
+        let (_view, cx, _endpoint) = t74_conn_setup(cx, "flow-0.example.com");
+        assert_eq!(
+            AppView::CONN_COPIED_TOOLTIP_MS,
+            1500,
+            "the Copied! marker window is ~1.5s"
+        );
+        assert_absent(cx, "conn-copied-dest-0".to_string());
+
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        t74_paint(cx);
+        assert_painted(cx, "conn-copied-dest-0");
+
+        // Still painted just before the window elapses; a tick runs no timer yet.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(
+                AppView::CONN_COPIED_TOOLTIP_MS - 200,
+            ));
+        let _ = cx.executor().tick();
+        t74_paint(cx);
+        assert_painted(cx, "conn-copied-dest-0");
+
+        // Past the window it auto-dismisses with no further interaction.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        t74_paint(cx);
+        assert_absent(cx, "conn-copied-dest-0".to_string());
+    }
+
+    #[gpui_kit::test]
+    fn t74_other_cells_not_click_copyable(cx: &mut TestAppContext) {
+        let (_view, cx, _endpoint) = t74_conn_setup(cx, "flow-0.example.com");
+        assert_painted(cx, "conn-copy-0");
+        assert_painted(cx, "conn-endpoint-0");
+        assert_painted(cx, "conn-meta-0");
+
+        // The name · protocol · traffic cell has no copy handler: clicking it
+        // leaves the clipboard untouched and lights no marker.
+        let meta = cx
+            .update(|window, _| window.try_find("conn-meta-0".to_string()))
+            .expect("meta cell renders");
+        let bounds = meta.bounds();
+        cx.update(|window, cx| {
+            window.click_at(
+                "conn-meta-0",
+                gpui_kit::point(px(2.), bounds.size.height * 0.5),
+                cx,
+            );
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(
+            clip.is_empty(),
+            "clicking a non-target cell copies nothing: {clip}"
+        );
+        assert_absent(cx, "conn-copied-dest-0".to_string());
+        assert_absent(cx, "conn-copied-endpoint-0".to_string());
+
+        // A dest click lights only the dest marker, never the endpoint's.
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        t74_paint(cx);
+        assert_painted(cx, "conn-copied-dest-0");
+        assert_absent(cx, "conn-copied-endpoint-0".to_string());
+    }
+
+    /// T-25 hermetic status-bar proof: a fake engine serves one row (no
+    /// binaries, no network) while the poll-result merge seeds a two-core
+    /// snapshot, so the counter line renders exactly what the snapshot holds.
+    #[gpui_kit::test]
+    fn t75_status_bar_renders_counter_line(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+        use crate::health::{ClashConn, ProbeExclusions};
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10971"))
+            .expect("seed works");
+        let row_id = alpha.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _handle) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.engine.running_count() > 0),
+            "fake core runs without a sidecar"
+        );
+
+        let conn = |id: &str, network: &str| ClashConn {
+            id: id.to_string(),
+            row_id: Some(row_id.clone()),
+            rx_bytes: 100,
+            tx_bytes: 10,
+            dest: "flow.example.com".to_string(),
+            network: network.to_string(),
+        };
+        let results = vec![
+            (
+                ClashTarget {
+                    core: "stock".to_string(),
+                    port: 19090,
+                    secret: "s3cret".to_string(),
+                },
+                Ok(vec![conn("a", "tcp"), conn("b", "udp")]),
+            ),
+            (
+                ClashTarget {
+                    core: "fork".to_string(),
+                    port: 19091,
+                    secret: "s3cret".to_string(),
+                },
+                Ok(vec![conn("c", "tcp"), conn("d", "")]),
+            ),
+        ];
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_traffic_results(results, &ProbeExclusions::new(), cx);
+            });
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.conn_counter_text()),
+            Some("4 active · 2 TCP · 1 UDP".to_string()),
+            "counts merge both core snapshots; blank network stays active-only"
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert_painted(cx, "conn-counters");
+        assert_painted(cx, "status-center");
+
+        // The region's min-width/truncate/tooltip pattern keeps the segment in
+        // the bar at the minimum frame instead of dropping it.
+        cx.simulate_resize(size(px(880.), px(620.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        let bounds = cx
+            .update(|window, _| window.try_find("conn-counters".to_string()))
+            .expect("counter segment survives the minimum width")
+            .bounds();
+        assert!(
+            bounds.size.width > px(0.),
+            "narrow window truncates, never zero-width: {bounds:?}"
+        );
+        assert!(
+            bounds.origin.x + bounds.size.width <= px(880.) + px(1.),
+            "counter segment stays inside the minimum frame: {bounds:?}"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_traffic_results(Vec::new(), &ProbeExclusions::new(), cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.conn_counter_text()),
+            Some("0 active · 0 TCP · 0 UDP".to_string()),
+            "running but idle still reports zeros"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t75_counter_hidden_when_no_running_cores(cx: &mut TestAppContext) {
+        use crate::health::{ClashConn, ConnCounts};
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10972"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                // A stale snapshot must not leak numbers once every core stops.
+                view.conn_snapshot = vec![(
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-0".to_string(),
+                        row_id: None,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        dest: "flow.example.com".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                )];
+                view.conn_counts = ConnCounts {
+                    active: 1,
+                    tcp: 1,
+                    udp: 0,
+                };
+                cx.notify();
+            });
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.conn_counter_text()),
+            None,
+            "no running cores = no counter line"
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert_absent(cx, "conn-counters".to_string());
+        assert_painted(cx, "status-center");
+    }
+
+    #[test]
+    fn t76_running_title_suffix_shapes() {
+        use crate::{running_title_suffix, window_title_text, APP_TITLE};
+
+        assert_eq!(running_title_suffix(0), "", "idle contributes no suffix");
+        assert_eq!(running_title_suffix(1), " · 1 running");
+        assert_eq!(running_title_suffix(12), " · 12 running");
+
+        assert_eq!(window_title_text(0), APP_TITLE);
+        assert_eq!(window_title_text(0), "ManyProxy");
+        assert_eq!(window_title_text(3), "ManyProxy · 3 running");
+
+        // Count only: no preset marker, no `[Admin]`-family token, no extra text.
+        for text in [window_title_text(0), window_title_text(7)] {
+            assert!(
+                !text.contains('[') && !text.contains(']'),
+                "no token: {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("preset"),
+                "no preset marker: {text}"
+            );
+            assert!(
+                text.starts_with(APP_TITLE),
+                "always starts with the base title: {text}"
+            );
+            assert_eq!(
+                text.matches('·').count(),
+                usize::from(text != APP_TITLE),
+                "exactly one separator when running, none at zero: {text}"
+            );
+        }
+    }
+
+    /// T-26: the label the custom titlebar renders and the OS title both come
+    /// from `window_title_text`, fed by the same `ENGINE_POLL_TICK_SECS`
+    /// (`poll_shards`-driven) count the tray tooltip is fed from.
+    #[gpui_kit::test]
+    fn t76_titlebar_label_follows_running_count(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10981"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _handle) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        let label_text = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                crate::window_title_text(view.engine.running_count())
+            })
+        };
+        assert_eq!(label_text(cx), "ManyProxy", "zero running renders plain");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        let running = view.read_with(cx, |view, _| view.engine.running_count());
+        assert!(running > 0, "fake core runs without a sidecar");
+        assert_eq!(
+            label_text(cx),
+            format!("ManyProxy · {running} running"),
+            "the count reaches the label text"
+        );
+
+        // The frame that draws the composed label renders at that title.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert_painted(cx, "main-content");
+        assert_eq!(label_text(cx), format!("ManyProxy · {running} running"));
+
+        cx.update(|_, cx| view.update(cx, |view, _| view.engine.stop_all()));
+        assert_eq!(
+            label_text(cx),
+            "ManyProxy",
+            "stopping all clears the marker"
+        );
+    }
+
+    /// T-26: one helper feeds both surfaces, so the tray tooltip and the
+    /// titlebar label carry the same text at zero and while running.
+    #[gpui_kit::test]
+    fn t76_tray_tooltip_stays_in_sync(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::tray::tray_tooltip;
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10982"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _handle) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        let surfaces = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                let running = view.engine.running_count();
+                (running, crate::window_title_text(running))
+            })
+        };
+        let (running, title) = surfaces(cx);
+        assert_eq!(running, 0);
+        assert_eq!(title, crate::APP_TITLE);
+        assert_eq!(tray_tooltip(running), title, "idle surfaces agree");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        let (running, title) = surfaces(cx);
+        assert!(running > 0, "fake core runs without a sidecar");
+        assert_eq!(
+            tray_tooltip(running),
+            title,
+            "running surfaces carry the same text"
+        );
+        assert_eq!(title, format!("ManyProxy · {running} running"));
     }
 
     #[gpui_kit::test]
@@ -31583,7 +37015,8 @@ mod tests {
             "explicit refresh still sees One"
         );
 
-        let (_, summary) = refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0, 0);
+        let (_, summary) =
+            refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
         assert!(
             summary.starts_with("One:"),
             "outcome names its sub: {summary}"
@@ -33128,7 +38561,6 @@ mod tests {
                     "resolve-domain-group",
                     "stop-testing",
                     "show-security",
-                    "sort-type-security",
                     "open-palette",
                 ][..],
             ),
@@ -33234,9 +38666,8 @@ mod tests {
                     ("out-ip-selected", "Resolve Out-IP selected"),
                     ("out-ip-group", "Resolve Out-IP group"),
                     ("resolve-domain-group", "Resolve domain group"),
-                    ("stop-testing", "Stop Testing"),
+                    ("stop-testing", "Stop Testing (Ctrl-.)"),
                     ("show-security", "Show security"),
-                    ("sort-type-security", "Sort Type|Security"),
                     ("open-palette", "Command palette (Ctrl-K)"),
                 ][..],
             ),
@@ -33942,7 +39373,6 @@ mod tests {
                     "resolve-domain-group",
                     "stop-testing",
                     "show-security",
-                    "sort-type-security",
                     "open-palette",
                 ][..],
             ),
@@ -34509,6 +39939,417 @@ mod tests {
         }
     }
 
+    fn t73_port_row(
+        id: &str,
+        name: &str,
+        protocol: &str,
+        group: &str,
+        port: u16,
+    ) -> crate::store::ProxyConfig {
+        crate::store::ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            params: r#"{"server":"t73.example.com","server_port":443}"#.to_string(),
+            group: group.to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn t73_visible_ports(delegate: &crate::LibraryDelegate) -> Vec<u16> {
+        delegate
+            .visible
+            .iter()
+            .map(|&index| delegate.rows[index].port)
+            .collect()
+    }
+
+    fn t73_filtered(rows: Vec<crate::store::ProxyConfig>, query: &str) -> (Vec<u16>, String) {
+        let mut delegate = crate::LibraryDelegate::new();
+        delegate.set_rows(rows);
+        delegate.query = query.to_string();
+        delegate.apply_filter();
+        (t73_visible_ports(&delegate), delegate.active_filter_text())
+    }
+
+    fn t73_rows() -> Vec<crate::store::ProxyConfig> {
+        vec![
+            t73_port_row("a", "Alpha", "vless", "g1", 10801),
+            t73_port_row("b", "Beta", "vless", "g1", 10802),
+            t73_port_row("c", "Gamma", "vmess", "g2", 10910),
+            t73_port_row("d", "Delta", "trojan", "g2", 20000),
+        ]
+    }
+
+    #[test]
+    fn t73_port_filter_exact_and_ranges() {
+        use crate::PortPredicate;
+
+        assert_eq!(
+            crate::parse_port_predicate("port=10801:10910"),
+            Some(PortPredicate {
+                lo: 10801,
+                hi: 10910
+            }),
+            "range token parses"
+        );
+        assert_eq!(
+            crate::parse_port_predicate("port=10801"),
+            Some(PortPredicate {
+                lo: 10801,
+                hi: 10801
+            }),
+            "exact token is a one-wide range"
+        );
+
+        let (exact, text) = t73_filtered(t73_rows(), "port=10801");
+        assert_eq!(exact, vec![10801], "exact port matches only that port");
+        assert_eq!(text, "port: 10801..10801", "canonical filter text");
+
+        let (range, text) = t73_filtered(t73_rows(), "port=10801:10910");
+        assert_eq!(range, vec![10801, 10802, 10910], "range is inclusive");
+        assert_eq!(text, "port: 10801..10910", "canonical range text");
+
+        let (case_insensitive, _) = t73_filtered(t73_rows(), "PORT=10802");
+        assert_eq!(
+            case_insensitive,
+            vec![10802],
+            "port key is case-insensitive"
+        );
+
+        let (reversed, text) = t73_filtered(t73_rows(), "port=10910:10801");
+        assert!(
+            reversed.is_empty(),
+            "reversed bounds never behave as a range"
+        );
+        assert_eq!(
+            text, "search: \"port=10910:10801\"",
+            "reversed bounds stay literal text"
+        );
+
+        let (as_text, _) = t73_filtered(t73_rows(), "1080");
+        assert_eq!(
+            as_text,
+            vec![10801, 10802],
+            "bare digits keep today's substring behavior"
+        );
+    }
+
+    #[test]
+    fn t73_port_filter_open_ended_forms() {
+        let (open_top, text) = t73_filtered(t73_rows(), "port=10801:");
+        assert_eq!(open_top, vec![10801, 10802, 10910, 20000], "N..=65535");
+        assert_eq!(text, "port: 10801..65535", "open top renders the ceiling");
+
+        let (open_bottom, text) = t73_filtered(t73_rows(), "port=:10802");
+        assert_eq!(open_bottom, vec![10801, 10802], "0..=M");
+        assert_eq!(text, "port: 0..10802", "open bottom renders the floor");
+
+        let (everything, _) = t73_filtered(t73_rows(), "port=0:");
+        assert_eq!(
+            everything,
+            vec![10801, 10802, 10910, 20000],
+            "0: spans every u16 port"
+        );
+
+        let (ceiling, _) = t73_filtered(t73_rows(), "port=65535:");
+        assert!(ceiling.is_empty(), "65535: is a valid empty range");
+    }
+
+    #[test]
+    fn t73_malformed_port_token_renders_literal() {
+        use crate::LibraryDelegate;
+
+        for token in [
+            "port=",
+            "port=x",
+            "port=:",
+            "port=5:1",
+            "port=65536",
+            "port=10801-10802",
+            "port",
+        ] {
+            assert_eq!(
+                crate::parse_port_predicate(token),
+                None,
+                "{token:?} is not a port predicate"
+            );
+        }
+
+        let rows = vec![
+            t73_port_row("a", "Alpha", "vless", "g1", 10801),
+            t73_port_row("b", "port=x", "vless", "g1", 10803),
+            t73_port_row("c", "port=5:1", "vless", "g1", 10804),
+        ];
+
+        let (hits, text) = t73_filtered(rows.clone(), "port=x");
+        assert_eq!(
+            hits,
+            vec![10803],
+            "port=x matches the row literally named port=x, not by port"
+        );
+        assert_eq!(
+            text, "search: \"port=x\"",
+            "a malformed token keeps today's filter phrasing"
+        );
+
+        let (reversed, _) = t73_filtered(rows.clone(), "port=5:1");
+        assert_eq!(
+            reversed,
+            vec![10804],
+            "a reversed range is literal text, not an error"
+        );
+
+        let (prefix, _) = t73_filtered(rows.clone(), "port=");
+        assert_eq!(
+            prefix,
+            vec![10803, 10804],
+            "port= is a literal substring of both names"
+        );
+
+        let (nonsense, _) = t73_filtered(rows.clone(), "port=:");
+        assert!(nonsense.is_empty(), "port=: neither parses nor matches");
+
+        let (overflow, _) = t73_filtered(rows.clone(), "port=65536");
+        assert!(
+            overflow.is_empty(),
+            "out-of-u16 value is literal, not a panic"
+        );
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(rows);
+        delegate.query = "port=".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            delegate.query, "port=",
+            "the query string itself is never rewritten"
+        );
+    }
+
+    #[test]
+    fn t73_port_composes_with_facets() {
+        use crate::{FacetStatus, LibraryDelegate};
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t73_port_row("1", "Alpha", "vless", "g1", 10801),
+            t73_port_row("2", "Alpha Two", "vless", "g2", 10802),
+            t73_port_row("3", "Beta", "vmess", "g1", 10803),
+        ]);
+        delegate.query = "port=10801:10803 alpha".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            t73_visible_ports(&delegate),
+            vec![10801, 10802],
+            "the text part keeps today's substring behavior inside the range"
+        );
+
+        delegate.set_facet_group(Some("g1".to_string()));
+        assert_eq!(
+            t73_visible_ports(&delegate),
+            vec![10801],
+            "group facet ANDs with the port predicate"
+        );
+        delegate.set_facet_group(Some("g2".to_string()));
+        assert_eq!(t73_visible_ports(&delegate), vec![10802]);
+        delegate.set_facet_group(None);
+
+        delegate.set_facet_protocol(Some("vmess".to_string()));
+        assert!(
+            t73_visible_ports(&delegate).is_empty(),
+            "protocol facet ANDs too — no vmess row matches the text part"
+        );
+        delegate.set_facet_protocol(None);
+
+        delegate.query = "port=10801:10803".to_string();
+        delegate.apply_filter();
+        delegate.set_running(vec!["1".to_string()]);
+        delegate.set_facet_status(Some(FacetStatus::Running));
+        assert_eq!(t73_visible_ports(&delegate), vec![10801]);
+        delegate.set_facet_status(Some(FacetStatus::Stopped));
+        assert_eq!(t73_visible_ports(&delegate), vec![10802, 10803]);
+        delegate.set_facet_status(None);
+
+        delegate.query = "port=10801:10803 port=99999".to_string();
+        delegate.apply_filter();
+        assert!(
+            t73_visible_ports(&delegate).is_empty(),
+            "a second port= token degrades to literal text (pinned)"
+        );
+
+        delegate.query = "port=10801:10803".to_string();
+        delegate.apply_filter();
+        let mut unsorted = t73_visible_ports(&delegate);
+        delegate.set_sort(crate::store::LibrarySort::new(
+            crate::store::LibrarySortKey::TypeSecurity,
+            crate::store::SortDirection::Ascending,
+        ));
+        let mut sorted = t73_visible_ports(&delegate);
+        unsorted.sort_unstable();
+        sorted.sort_unstable();
+        assert_eq!(
+            unsorted, sorted,
+            "the type/security sort only reorders what the filter kept"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t73_last_query_meta_restores_on_launch(cx: &mut TestAppContext) {
+        use gpui_kit::Focusable as _;
+
+        cx.update(gpui_kit::init);
+        // Fixed name (no PID suffix): the delete below runs before any
+        // connection exists, so it self-heals the previous run's leftovers;
+        // a PID suffix made the final delete fail while the view still held
+        // the connection and accumulated one run's files per suite pass.
+        let path = std::env::temp_dir().join("manyproxy-t73-last-query.db");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(
+                store.library_last_query(),
+                None,
+                "a fresh store remembers nothing"
+            );
+            store
+                .set_library_last_query("port=10801")
+                .expect("memory writes");
+            assert_eq!(
+                store.library_last_query().as_deref(),
+                Some("port=10801"),
+                "memory round-trips"
+            );
+            store.clear_library_last_query().expect("clear writes");
+            assert_eq!(store.library_last_query(), None, "cleared reads as absent");
+            store
+                .set_library_last_query("   ")
+                .expect("blank write is accepted");
+            assert_eq!(
+                store
+                    .get_meta(Store::META_LIBRARY_LAST_QUERY)
+                    .expect("meta read"),
+                None,
+                "a blank query never leaves a meta row behind"
+            );
+            store
+                .add(facet_seed("Alpha", "vless", "travel", "10801"))
+                .expect("seed works");
+            store
+                .add(facet_seed("Beta", "vless", "travel", "10802"))
+                .expect("seed works");
+        }
+
+        let store = Store::open_file(&path).expect("reopen works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .search_input
+                .read(cx)
+                .value()
+                .to_string()),
+            "",
+            "empty default opens with an empty search field"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .store
+                .get_meta(Store::META_LIBRARY_LAST_QUERY)
+                .expect("meta read")),
+            None,
+            "the empty default writes no meta row"
+        );
+
+        // Type through the real input: `set_value` emits no Change event, so
+        // keystrokes are the honest way to exercise the persistence path.
+        let handle = view.read_with(cx, |view, cx| view.search_input.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.focus(&handle, cx);
+        });
+        cx.simulate_input("port=10801");
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (typed_query, typed_ports) = view.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            (delegate.query.clone(), t73_visible_ports(delegate))
+        });
+        assert_eq!(
+            typed_query, "port=10801",
+            "typed query reaches the delegate"
+        );
+        assert_eq!(typed_ports, vec![10801], "typed port filter applies");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.library_last_query())
+                .as_deref(),
+            Some("port=10801"),
+            "typing remembers the query"
+        );
+
+        drop(view);
+        let store = Store::open_file(&path).expect("restart reopen works");
+        assert_eq!(
+            store.library_last_query().as_deref(),
+            Some("port=10801"),
+            "the memory survives a clean restart"
+        );
+        let (restarted, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (input_value, restored_query, restored_ports) = restarted.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            (
+                view.search_input.read(cx).value().to_string(),
+                delegate.query.clone(),
+                t73_visible_ports(delegate),
+            )
+        });
+        assert_eq!(
+            input_value, "port=10801",
+            "the search field opens holding the last filter"
+        );
+        assert_eq!(restored_query, "port=10801", "the delegate adopts it");
+        assert_eq!(
+            restored_ports,
+            vec![10801],
+            "the last filter is applied on launch"
+        );
+
+        cx.update(|window, cx| {
+            window.click("clear-search", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (cleared_query, cleared_memory) = restarted.read_with(cx, |view, cx| {
+            (
+                view.libraries.read(cx).delegate().query.clone(),
+                view.store
+                    .get_meta(Store::META_LIBRARY_LAST_QUERY)
+                    .expect("meta read"),
+            )
+        });
+        assert_eq!(
+            cleared_query,
+            String::new(),
+            "clear search empties the query"
+        );
+        assert_eq!(
+            cleared_memory, None,
+            "clear search clears the visible memory too"
+        );
+        // Drop the view (and its store connection) before deleting so the
+        // final cleanup actually succeeds on Windows.
+        drop(restarted);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn t44_facets_and_with_text_query() {
         use crate::store::ProxyConfig;
@@ -34720,7 +40561,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(order(&delegate), vec!["T", "Vtls", "Vreal"]);
-        delegate.set_type_security_sort(true);
+        // T-27: the toggle retired into the sort picker; the equivalent key
+        // (direction is fixed for it) must order exactly as the toggle did.
+        delegate.set_sort(crate::store::LibrarySort::new(
+            crate::store::LibrarySortKey::TypeSecurity,
+            crate::store::SortDirection::Ascending,
+        ));
         assert_eq!(order(&delegate), vec!["T", "Vreal", "Vtls"]);
         assert_eq!(
             delegate
@@ -38465,7 +44311,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
-                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0, 0),
+                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0, 0, &[], &[], &[], &[]),
                     "first of two keeps the batch open"
                 );
             });
@@ -38492,7 +44338,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
-                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0, 0),
+                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]),
                     "last member closes the batch"
                 );
                 view.inflight_refreshes.remove(&b);
@@ -40838,13 +46684,14 @@ mod tests {
     #[test]
     fn t08_still_in_use_counts_in_single_and_coalesced_copy() {
         use crate::{coalesced_refresh_message, refresh_summary_text};
-        let (warn, text) = refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1);
+        let (warn, text) =
+            refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1, &[], &[], &[], &[]);
         assert!(!warn);
         assert!(text.contains("[=] Still in use 1"), "{text}");
         let (warn, text) = coalesced_refresh_message(2, 0, 0, 1, 0, 0, 1).expect("batch reports");
         assert!(!warn);
         assert!(text.contains("[=] Still in use 1"), "{text}");
-        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0);
+        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
         assert!(!text.contains("[=]"), "quiet when nothing serves: {text}");
     }
 
@@ -41007,6 +46854,7 @@ mod tests {
             &counts,
             &subs,
             &|group| store.group_skip_refresh(group),
+            &|_| false,
             now,
         );
         assert_eq!(rows.len(), 3, "union of row groups + fed groups");
@@ -41714,13 +47562,15 @@ mod tests {
     #[test]
     fn refresh_summary_text_names_conflicts() {
         use crate::refresh_summary_text;
-        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0);
+        let (warn, text) =
+            refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
         assert!(!warn);
         assert!(
             text.contains("Nightly") && text.contains("[+]Added 1"),
             "{text}"
         );
-        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2, 0);
+        let (warn, text) =
+            refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2, 0, &[], &[], &[], &[]);
         assert!(warn, "conflicts warn: {text}");
         assert!(
             text.contains('2') && text.contains("conflict"),
@@ -41729,6 +47579,214 @@ mod tests {
         assert!(
             text.contains("your edits kept"),
             "kept, not reverted: {text}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t70_named_report_renders_markers_and_kept_line(cx: &mut TestAppContext) {
+        use crate::refresh_summary_text;
+        let (warn, text) = refresh_summary_text(
+            "Nightly",
+            3,
+            2,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            &["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            &["node-x".to_string(), "node-y".to_string()],
+            &["old-node".to_string()],
+            &["ws-relay".to_string()],
+        );
+        assert!(!warn);
+        assert_eq!(
+            text,
+            "Nightly: [+]Added 3 / [~]Updated 2 / [-]Deleted 1 / [=] Still in use 1\n\
+             Added 3 profiles:\n\
+             [+] alpha\n\
+             [+] beta\n\
+             [+] gamma\n\
+             Updated 2 profiles:\n\
+             [~] node-x\n\
+             [~] node-y\n\
+             Deleted 1 profile:\n\
+             [-] old-node\n\
+             Still in use, so kept:\n\
+             [=] ws-relay"
+        );
+
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.inflight_named_refreshes.insert(sub_id.clone());
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    "Nightly",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                        userinfo: None,
+                    }),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "manual refresh pops once");
+        let lines = view.read_with(cx, |view, _| {
+            view.logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            lines.iter().any(|line| line
+                == "subscription refresh Nightly: [+]Added 1 / [~]Updated 0 / [-]Deleted 0\n\
+                    Added 1 profile:\n\
+                    [+] one"),
+            "manual summary carries the named report: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn t70_report_caps_at_twelve_names_with_more_line() {
+        use crate::refresh_summary_text;
+        let names: Vec<String> = (0..15).map(|index| format!("node-{index:02}")).collect();
+        let (_, text) = refresh_summary_text(
+            "Nightly",
+            15,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            names.as_slice(),
+            &[],
+            &[],
+            &[],
+        );
+        let report = text
+            .split_once('\n')
+            .map(|(_, rest)| rest.to_string())
+            .expect("named report block present");
+        assert_eq!(
+            report.matches("[+] node").count(),
+            12,
+            "cap renders twelve: {report}"
+        );
+        assert!(report.contains("[+] node-11"), "last rendered: {report}");
+        assert!(
+            !report.contains("[+] node-12"),
+            "cap hides the rest: {report}"
+        );
+        assert!(report.ends_with("+ 3 more…"), "overflow marker: {report}");
+    }
+
+    #[gpui_kit::test]
+    fn t70_auto_refresh_keeps_count_only_text(cx: &mut TestAppContext) {
+        use crate::refresh_summary_text;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add_subscription("Alpha", "https://example.com/alpha.txt", "g1", true)
+            .expect("seed works");
+        let beta = store
+            .add_subscription("Beta", "https://example.com/beta.txt", "g2", true)
+            .expect("seed works");
+        let alpha_id = alpha.id.clone();
+        let beta_id = beta.id.clone();
+        let (view, cx) = mount_view(store, cx);
+
+        let (warn, text) =
+            refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1, &[], &[], &[], &[]);
+        assert!(!warn);
+        assert_eq!(
+            text,
+            "Nightly: [+]Added 0 / [~]Updated 0 / [-]Deleted 1 / [=] Still in use 1"
+        );
+        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
+        assert_eq!(text, "Nightly: [+]Added 1 / [~]Updated 0 / [-]Deleted 0");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.begin_refresh_batch(std::slice::from_ref(&alpha_id));
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &alpha_id,
+                    "Alpha",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                        userinfo: None,
+                    }),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "one batch, one count-only toast");
+        assert!(
+            view.read_with(cx, |view, _| view.refresh_batch_added_names.is_empty()),
+            "auto refresh never aggregates names"
+        );
+        let lines = view.read_with(cx, |view, _| {
+            view.logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            lines.iter().all(|line| !line.contains("profiles:")),
+            "auto refresh stays count-only: {lines:?}"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.inflight_named_refreshes.insert(beta_id.clone());
+                view.finish_subscription_refresh(
+                    &beta_id,
+                    "Beta",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@b.example.org:443#one"
+                            .to_string(),
+                        userinfo: None,
+                    }),
+                    1000,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 2, "manual twin pops once");
+        let lines = view.read_with(cx, |view, _| {
+            view.logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("\nAdded 1 profile:\n[+] one")),
+            "manual refresh carries the named report: {lines:?}"
         );
     }
 
@@ -42055,9 +48113,11 @@ mod tests {
         }
 
         let (bind_w, port_w) = cx.update(|window, _| {
+            // T-33: generated-config rows bind through the picker; the port
+            // keeps the free-text input.
             let bind = window
-                .try_find(format!("row-bind-input-{}", alpha.id))
-                .expect("bind input renders")
+                .try_find(format!("row-bind-picker-{}", alpha.id))
+                .expect("bind picker renders")
                 .bounds()
                 .size
                 .width;
@@ -42071,7 +48131,7 @@ mod tests {
         });
         assert!(
             bind_w > px(100.) && bind_w < px(136.),
-            "bind field holds its 118px cell, got {bind_w:?}"
+            "bind picker holds its 118px cell, got {bind_w:?}"
         );
         assert!(
             port_w > px(60.) && port_w < px(92.),
@@ -44174,6 +50234,7 @@ mod tests {
             description: None,
             is_builtin: false,
             last_used_at: None,
+            locked: false,
         };
         let summary = preset_row_summary(&preset, &["\"Row\"".to_string()]);
         assert!(summary.contains("ads"), "{summary}");
@@ -44931,6 +50992,885 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn t59_editor_folds_render_new_keys(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset(
+                "t59-folds",
+                "paste",
+                None,
+                &[
+                    serde_json::json!({
+                        "action": "route",
+                        "source_ip_cidr": ["10.0.0.0/8"],
+                        "source_port": 8080,
+                    }),
+                    serde_json::json!({
+                        "action": "direct",
+                        "source_ip_is_private": true,
+                        "source_port_range": "1000:2000",
+                        "ip_version": 6,
+                        "invert": true,
+                        "process_path_regex": "thm\\.exe$",
+                    }),
+                    serde_json::json!({"action": "direct"}),
+                ],
+            )
+            .expect("preset seeds");
+        let fold_id =
+            |index: usize, key: &str| format!("preset-rule-fold-{}-{index}-{key}", preset.id);
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx);
+            });
+        });
+        paint_dialog_open(cx);
+        for (index, key) in [
+            (0, "source_ip_cidr"),
+            (0, "source_port"),
+            (1, "source_ip_is_private"),
+            (1, "source_port_range"),
+            (1, "ip_version"),
+            (1, "invert"),
+            (1, "process_path_regex"),
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(fold_id(index, key)).is_some()),
+                "fold row {index}/{key} renders in the preset edit dialog"
+            );
+        }
+        for key in ["source_ip_cidr", "invert"] {
+            assert!(
+                cx.update(|window, _| window.try_find(fold_id(2, key)).is_none()),
+                "bare rule renders no {key} fold"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t60_locked_preset_renders_readonly(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let rules = vec![
+            serde_json::json!({
+                "action": "route", "name": "Office exit",
+                "domain": ["example.com"],
+                "source_ip_cidr": ["10.0.0.0/8"],
+            }),
+            serde_json::json!({"action": "direct", "name": "Local"}),
+        ];
+        let preset = store
+            .create_preset("locked-one", "manual", None, &rules)
+            .expect("preset seeds");
+        let pid = preset.id.clone();
+        store.set_preset_locked(&pid, true).expect("lock seeds");
+        // Re-read so the snapshot carries the locked flag, the way the
+        // store-fed flow always opens the dialog.
+        let preset = store
+            .get_preset(&pid)
+            .expect("read works")
+            .expect("preset kept");
+        let (view, cx) = mount_view(store, cx);
+
+        // The manager row offers the explicit toggle...
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find(format!("preset-lock-{pid}")).is_some()),
+            "manager row offers the lock toggle"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // ...and the editor renders readonly for a locked preset.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-locked-hint-{pid}"))
+                .is_some()),
+            "the lock hint renders"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-name-{pid}-0"))
+                .is_some()),
+            "named rules still render their label column"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-outbound-{pid}-0"))
+                .is_some()),
+            "route rules still show their outbound line"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-fold-{pid}-0-source_ip_cidr"))
+                .is_some()),
+            "attribute folds render view-only"
+        );
+        for absent in [
+            format!("preset-rule-action-{pid}-0"),
+            format!("preset-rule-delete-{pid}-0"),
+            format!("preset-rule-add-{pid}"),
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(absent.clone()).is_none()),
+                "locked editor renders no {absent}"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("preset-edit-ok").is_none()),
+            "locked editor renders no save path"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // The same explicit toggle unlocks; the editor gains its editing
+        // surface back.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_lock(&pid, false, window, cx)
+            });
+        });
+        let fresh = view.read_with(cx, |view, _| {
+            view.store
+                .get_preset(&pid)
+                .expect("read works")
+                .expect("preset kept")
+        });
+        assert!(!fresh.locked, "unlock persists");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(fresh, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-edit-ok").is_some()),
+            "unlocked editor restores the save path"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-action-{pid}-0"))
+                .is_some()),
+            "unlocked editor cycles actions again"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t60_completion_lists_valid_exits_only(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // Pure surface: `direct` first, serving tags after, deduped — exactly
+        // the values the engine accepts, nothing invented.
+        assert_eq!(
+            crate::preset::preset_exit_suggestions(&[]),
+            vec!["direct".to_string()]
+        );
+        let tags = [
+            "out-2".to_string(),
+            "out-1".to_string(),
+            "out-2".to_string(),
+            String::new(),
+            "direct".to_string(),
+        ];
+        assert_eq!(
+            crate::preset::preset_exit_suggestions(&tags),
+            vec![
+                "direct".to_string(),
+                "out-2".to_string(),
+                "out-1".to_string(),
+            ],
+            "dedup keeps direct first; empty and repeated tags drop"
+        );
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(tick12_seed("Alpha", "10871"))
+            .expect("seed works");
+        let preset = store
+            .create_preset(
+                "exits",
+                "manual",
+                None,
+                &[
+                    serde_json::json!({"action": "route", "name": "Office exit"}),
+                    serde_json::json!({"action": "direct"}),
+                ],
+            )
+            .expect("preset seeds");
+        let pid = preset.id.clone();
+        store
+            .set_config_preset(&row.id, Some(&pid))
+            .expect("attach works");
+        let (view, cx) = mount_view(store, cx);
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-exits-{pid}-0"))
+                .is_some()),
+            "route rules offer the exits suggestions"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-exits-{pid}-1"))
+                .is_none()),
+            "non-route rules offer none"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let config = view.row_config(&row.id).expect("row reads");
+                view.open_preset_attach_dialog(config, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-exits").is_some()),
+            "the attach dialog compiles the serving exits list"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    fn t64_seed_in_group(name: &str, group: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: group.to_string(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t64_dialog_monitor_section_renders_top_five(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let names = [
+            "Fast",
+            "Slow",
+            "FastTwin",
+            "Regressed",
+            "Idle",
+            "NoSample",
+            "Dead",
+        ];
+        for (index, name) in names.iter().enumerate() {
+            store
+                .add(t64_seed_in_group(
+                    name,
+                    "Work",
+                    &format!("1081{}", index + 1),
+                ))
+                .expect("seed works");
+        }
+        let id_of = {
+            let rows = store.list().expect("rows read");
+            move |name: &str| {
+                rows.iter()
+                    .find(|row| row.name == name)
+                    .map(|row| row.id.clone())
+                    .expect("seeded row id")
+            }
+        };
+        let (view, cx) = mount_view(store, cx);
+        let url = |id: String, at: i64, latency: Option<u64>, error: Option<&str>| -> TestOutcome {
+            TestOutcome {
+                success: None,
+                sample: HealthSample {
+                    config_id: id,
+                    at,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: latency,
+                    error: error.map(str::to_string),
+                },
+            }
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                for outcome in [
+                    url(id_of("Fast"), 1, Some(45), None),
+                    url(id_of("Slow"), 1, Some(220), None),
+                    url(id_of("FastTwin"), 1, Some(45), None),
+                    url(id_of("Regressed"), 1, Some(45), None),
+                    url(id_of("Regressed"), 3, Some(999), None),
+                    url(id_of("Dead"), 1, None, Some("dial refused")),
+                ] {
+                    view.health_store.record_outcome(&outcome);
+                }
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(gpui_kit::component::IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(crate::tray::TrayAction::SelectExit, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "tray Select-exit opens the attach dialog"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_some()),
+            "the monitor section renders"
+        );
+        for index in 0..5 {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-attach-monitor-{index}"))
+                    .is_some()),
+                "entry {index} renders"
+            );
+        }
+        for index in [5, 6] {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-attach-monitor-{index}"))
+                    .is_none()),
+                "cap holds: entry {index} absent"
+            );
+        }
+        let (title, lines) = view.read_with(cx, |view, _| {
+            let rows = view
+                .store
+                .list()
+                .expect("rows read")
+                .into_iter()
+                .filter(|row| row.group == "Work")
+                .collect::<Vec<_>>();
+            crate::health::best_rows_monitor_lines("Work", &rows, &view.health_store)
+                .expect("monitor lines for the group")
+        });
+        assert_eq!(title, "Best by health in Work:");
+        assert_eq!(
+            lines,
+            vec![
+                "1) Fast (45ms)".to_string(),
+                "2) FastTwin (45ms)".to_string(),
+                "3) Slow (220ms)".to_string(),
+                "4) Regressed (999ms)".to_string(),
+                "5) Idle (no probes this session)".to_string(),
+            ],
+            "top five by latest health: 45-tie stable, 220 next, Regressed keeps its LATEST 999, \
+             then the first no-sample row; the second no-sample row and the dead row fall past the cap"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t64_dialog_monitor_hidden_for_empty_group(cx: &mut TestAppContext) {
+        use crate::ProxyConfig;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let only = store
+            .add(t64_seed_in_group("Only", "Work", "10811"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let phantom = ProxyConfig {
+            id: "nobody".to_string(),
+            name: "Ghost".to_string(),
+            protocol: "vless".to_string(),
+            params: "{}".to_string(),
+            group: "Nobody".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10998,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_attach_dialog(phantom.clone(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog still opens for a group with no rows"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_none()),
+            "empty group hides the monitor entirely — no empty-space glitch"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let config = view.row_config(&only.id).expect("row reads");
+                view.open_preset_attach_dialog(config, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_some()),
+            "a single-row group still shows the monitor"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor-0").is_some()),
+            "the one entry renders"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor-1").is_none()),
+            "nothing follows the single row"
+        );
+        let (title, lines) = view.read_with(cx, |view, _| {
+            let rows = view.store.list().expect("rows read");
+            let group = rows
+                .first()
+                .map(|row| row.group.clone())
+                .unwrap_or_default();
+            crate::health::best_rows_monitor_lines(&group, &rows, &view.health_store)
+                .expect("monitor lines")
+        });
+        assert_eq!(title, "Best by health in Work:");
+        assert_eq!(
+            lines,
+            vec!["1) Only (no probes this session)".to_string()],
+            "all-unknown shape renders sanely"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t64_no_switching_behavior_added(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let live = store
+            .add(t64_seed_in_group("Live45", "Work", "10811"))
+            .expect("seed works");
+        store
+            .add(t64_seed_in_group("NoSample", "Work", "10812"))
+            .expect("seed works");
+        let down = store
+            .add(t64_seed_in_group("Down", "Work", "10813"))
+            .expect("seed works");
+        let preset = store
+            .create_preset(
+                "Base",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "direct"})],
+            )
+            .expect("preset seeds");
+        let other = store
+            .create_preset(
+                "Other",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "proxy", "name": "Live45"})],
+            )
+            .expect("preset seeds");
+        store
+            .set_config_preset(&live.id, Some(&preset.id))
+            .expect("attach works");
+        let before_rows = store.list().expect("rows read");
+        let before_presets = store.list_presets().expect("presets read");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.health_store.record_outcome(&TestOutcome {
+                    success: None,
+                    sample: HealthSample {
+                        config_id: live.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: Some(45),
+                        error: None,
+                    },
+                });
+                view.health_store.record_outcome(&TestOutcome {
+                    success: None,
+                    sample: HealthSample {
+                        config_id: down.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("dial refused".to_string()),
+                    },
+                });
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(gpui_kit::component::IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(crate::tray::TrayAction::SelectExit, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_some()),
+            "the monitor renders for the selected row's group"
+        );
+        for index in 0..3 {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-attach-monitor-{index}"))
+                    .is_some()),
+                "entry {index} of three renders"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor-3").is_none()),
+            "exactly three entries — capped, nothing extra"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-attach-{}", other.id))
+                .is_some()),
+            "the Attach button for the unattached preset is untouched"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-detach").is_some()),
+            "the Detach button is untouched"
+        );
+        let (
+            (monitor_title, monitor_lines),
+            after_rows,
+            after_presets,
+            engine_idle,
+            still_attached,
+        ) = view.read_with(cx, |view, _| {
+            let rows = view.store.list().expect("rows read");
+            let group = rows
+                .first()
+                .map(|row| row.group.clone())
+                .unwrap_or_default();
+            let filtered = rows
+                .iter()
+                .filter(|row| row.group == group)
+                .cloned()
+                .collect::<Vec<_>>();
+            let monitor =
+                crate::health::best_rows_monitor_lines(&group, &filtered, &view.health_store)
+                    .expect("monitor lines");
+            let attached = view
+                .row_config(&live.id)
+                .and_then(|row| row.preset_id.clone())
+                .is_some();
+            (
+                monitor,
+                rows,
+                view.store.list_presets().expect("presets read"),
+                view.engine.running_ids().is_empty(),
+                attached,
+            )
+        });
+        assert_eq!(monitor_title, "Best by health in Work:");
+        assert_eq!(
+            monitor_lines,
+            vec![
+                "1) Live45 (45ms)".to_string(),
+                "2) NoSample (no probes this session)".to_string(),
+                "3) Down (dead)".to_string(),
+            ],
+            "monitor text is exactly names + row summaries — display-only, nothing added"
+        );
+        for line in &monitor_lines {
+            assert!(!line.contains("vless"), "protocol stays out: {line}");
+            assert!(
+                !line.contains("198.51.100.9"),
+                "params/server addresses stay out: {line}"
+            );
+            assert!(!line.contains("uuid"), "params stay out: {line}");
+            assert!(!line.contains("out-"), "outbound tags stay out: {line}");
+        }
+        assert_eq!(
+            after_rows, before_rows,
+            "library state untouched by the dialog"
+        );
+        assert_eq!(
+            after_presets, before_presets,
+            "presets untouched by the dialog"
+        );
+        assert!(
+            engine_idle,
+            "engine stands still — no outbound was switched"
+        );
+        assert!(still_attached, "the attachment survives dialog open");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        let (after_close_rows, after_close_presets) = view.read_with(cx, |view, _| {
+            (
+                view.store.list().expect("rows read"),
+                view.store.list_presets().expect("presets read"),
+            )
+        });
+        assert_eq!(
+            after_close_rows, before_rows,
+            "library still untouched after closing"
+        );
+        assert_eq!(
+            after_close_presets, before_presets,
+            "presets still untouched after closing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t61_panel_renders_three_boxes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset("t61-panel", "manual", None, &[])
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-rules").is_some()),
+            "the Simple rules fold renders in the edit dialog"
+        );
+        for action in ["direct", "block", "proxy"] {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-simple-label-{action}"))
+                    .is_some()),
+                "the {action} guideline row renders"
+            );
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("field-preset-simple-{action}"))
+                    .is_some()),
+                "the {action} box renders"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-help").is_some()),
+            "the box help text renders (ruleset: needs staged T-12 sets)"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-invalid-lines").is_none()),
+            "boxes start clean: no invalid fold"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // The manager dialog carries the same fold: every PresetForm surface
+        // offers the boxes.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "preset-simple-rules",
+            "preset-simple-label-direct",
+            "field-preset-simple-direct",
+            "preset-simple-label-block",
+            "field-preset-simple-block",
+            "preset-simple-label-proxy",
+            "field-preset-simple-proxy",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "manager dialog renders {id}"
+            );
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t61_save_appends_box_rules(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = view.preset_form.clone().expect("manager stashes its form");
+                form.name.update(cx, |state, cx| {
+                    state.set_value("t61-mix", window, cx);
+                });
+                form.rules.update(cx, |state, cx| {
+                    state.set_value(
+                        r#"[{"action":"direct","domain":["a.example"]}]"#.to_string(),
+                        window,
+                        cx,
+                    );
+                });
+                form.simple_direct.update(cx, |state, cx| {
+                    state.set_value("domain:b.example, suffix:c.example".to_string(), window, cx);
+                });
+                form.simple_block.update(cx, |state, cx| {
+                    state.set_value("# ports aside\nkeyword:ads".to_string(), window, cx);
+                });
+                form.simple_proxy.update(cx, |state, cx| {
+                    state.set_value("ruleset:streaming\nip:1.1.1.1/32".to_string(), window, cx);
+                });
+            });
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("presets-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert_eq!(presets.len(), 1, "one preset created from both layers");
+        let rules = view.read_with(cx, |view, _| {
+            view.store
+                .get_preset(&presets[0].id)
+                .expect("get works")
+                .expect("preset there")
+                .rules()
+                .expect("rules decode")
+        });
+        assert_eq!(
+            rules.len(),
+            5,
+            "JSON rule + direct line + block line + two proxy lines"
+        );
+        assert_eq!(
+            rules[0],
+            serde_json::json!({"action": "direct", "domain": ["a.example"]}),
+            "the structured JSON layer stays verbatim"
+        );
+        assert_eq!(
+            rules[1],
+            serde_json::json!({
+                "action": "direct",
+                "domain": ["b.example"],
+                "domain_suffix": ["c.example"],
+            }),
+            "the direct line merges into one rule"
+        );
+        assert_eq!(
+            rules[2],
+            serde_json::json!({"action": "block", "domain_keyword": ["ads"]}),
+            "comments skip; the block line stamps its Throne spelling"
+        );
+        assert_eq!(
+            rules[3],
+            serde_json::json!({"action": "proxy", "rule_set": ["streaming"]}),
+            "ruleset: becomes a rule_set ref"
+        );
+        assert_eq!(
+            rules[4],
+            serde_json::json!({"action": "proxy", "ip_cidr": ["1.1.1.1/32"]}),
+            "one rule per proxy line"
+        );
+        assert_eq!(notification_count(cx), before + 1, "one honest toast");
+    }
+
+    #[gpui_kit::test]
+    fn t61_invalid_lines_block_save(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = view.preset_form.clone().expect("manager stashes its form");
+                form.name.update(cx, |state, cx| {
+                    state.set_value("t61-broken", window, cx);
+                });
+                form.simple_direct.update(cx, |state, cx| {
+                    state.set_value("domain:ok.example\nwarp:maybe".to_string(), window, cx);
+                });
+            });
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("presets-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "invalid box lines keep the dialog open"
+        );
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-invalid-lines").is_some()),
+            "the invalid fold mirrors the parse that blocked the save"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-invalid-0").is_some()),
+            "the raw line renders under the fold"
+        );
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert!(presets.is_empty(), "nothing saved while lines are invalid");
+        assert!(
+            notification_count(cx) > before,
+            "the failure is loud, not silent"
+        );
+        let kept = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.preset_form
+                    .clone()
+                    .expect("form kept while the dialog stays open")
+                    .simple_direct
+                    .read(cx)
+                    .value()
+                    .to_string()
+            })
+        });
+        assert_eq!(
+            kept, "domain:ok.example\nwarp:maybe",
+            "invalid lines survive verbatim in the box for this session"
+        );
+    }
+
+    #[gpui_kit::test]
     fn t10_stats_dialogs_open_with_matching_bars(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -45140,6 +52080,14 @@ mod tests {
         });
         assert_eq!(clip, crate::tray::config_folder(), "config folder copies");
         assert!(!clip.is_empty(), "folder never empty");
+        assert_eq!(
+            std::path::Path::new(&clip)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .as_deref(),
+            Some(crate::store::DATA_DIR_NAME),
+            "copied config folder is the app-relative data dir"
+        );
     }
 
     fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
@@ -45442,10 +52390,32 @@ mod tests {
             vec![row.id.clone()]
         );
 
-        cx.update(|_, cx| {
-            view.update(cx, |view, _| view.quit_from_tray());
+        cx.simulate_resize(size(px(1120.), px(760.)));
+        let live_bounds = cx.update(|window, _| window.bounds());
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
         });
         assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.window_geometry()),
+            Some(
+                WindowGeometry {
+                    x: f32::from(live_bounds.origin.x),
+                    y: f32::from(live_bounds.origin.y),
+                    width: f32::from(live_bounds.size.width),
+                    height: f32::from(live_bounds.size.height),
+                }
+                .clamped()
+                .expect("the harness window has finite bounds")
+            ),
+            "tray quit saves the live rectangle (T-32)"
+        );
+        assert_eq!(
+            f32::from(live_bounds.size.width),
+            1120.,
+            "the simulated resize is what gets saved"
+        );
         assert!(
             view.read_with(cx, |view, _| view.store.load_running_snapshot())
                 .is_empty(),
@@ -45456,6 +52426,291 @@ mod tests {
         let quit =
             cx.update(|window, cx| view.update(cx, |view, cx| view.poll_tray_once(window, cx)));
         assert!(!quit, "no tray, no quit, no event drain");
+    }
+
+    /// T-34: every orderly exit path writes `last_clean_exit = "1"`; the boot
+    /// write (`"0"`) is what a kill/crash leaves behind.
+    #[gpui_kit::test]
+    fn t84_clean_quit_flags_last_clean_exit(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Clean quit", "", "10881"))
+            .expect("seed works");
+        assert!(!store.last_clean_exit(), "absent meta reads unclean");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot()),
+            vec![row.id.clone()],
+            "a running set is snapshotted before the exit"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "tray Quit writes the clean marker"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store
+                    .get_meta(Store::META_LAST_CLEAN_EXIT)
+                    .expect("meta reads")
+            }),
+            Some("1".to_string()),
+            "the marker's on-disk shape is \"1\""
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "tray Quit still clears the snapshot"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.set_last_clean_exit(false).expect("reset writes")
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.confirm_close_stop(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "confirm-close-stop writes the clean marker on its own"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.set_last_clean_exit(false).expect("reset writes")
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.mark_clean_exit());
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "the zero-rows plain close flips through the same helper its branch calls"
+        );
+    }
+
+    /// T-34: boot reads the previous verdict, then always writes the dirty
+    /// assumption for the session it is starting.
+    #[gpui_kit::test]
+    fn t84_boot_assumes_dirty_until_quits_cleanly(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store
+                    .get_meta(Store::META_LAST_CLEAN_EXIT)
+                    .expect("meta reads")
+            }),
+            Some("0".to_string()),
+            "boot overwrites a clean marker with the dirty assumption"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "only the clean quit turns the session marker back to clean"
+        );
+    }
+
+    /// T-34: an unclean boot that left a running snapshot behind toasts once;
+    /// the toast text is the ticket's exact string.
+    #[gpui_kit::test]
+    fn t84_unclean_boot_with_running_snapshot_toasts_once(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Crashed run", "", "10882"))
+            .expect("seed works");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot writes");
+        assert!(
+            !store.last_clean_exit(),
+            "a snapshot without a clean marker is the crash shape"
+        );
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the unclean boot toasts exactly once"
+        );
+        assert_eq!(
+            crate::UNCLEAN_EXIT_NOTICE,
+            "Previous run carried running endpoints and did not exit cleanly.",
+            "the toast carries the ticket's exact string"
+        );
+
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the toast is one-shot, not one per frame"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.restore_on_launch(window, cx));
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "restore-on-launch never repeats the toast"
+        );
+    }
+
+    /// T-34: the clean marker suppresses the toast whatever the snapshot
+    /// holds — and that suppression proves the read precedes the boot write.
+    #[gpui_kit::test]
+    fn t84_clean_boot_never_toasts_even_with_snapshot(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Clean run", "", "10883"))
+            .expect("seed works");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot writes");
+        store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "a clean previous exit never toasts, even with a snapshot"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store
+                    .get_meta(Store::META_LAST_CLEAN_EXIT)
+                    .expect("meta reads")
+            }),
+            Some("0".to_string()),
+            "the boot read the clean value before writing the dirty one"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.last_snapshot.clone()),
+            vec![row.id.clone()],
+            "snapshot hydration is unchanged by the marker"
+        );
+
+        let mut empty = Store::open_in_memory().expect("in-memory store opens");
+        empty
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+        let (_empty_view, cx2) = mount_view(empty, cx);
+        cx2.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx2),
+            0,
+            "clean boot with an empty snapshot toasts nothing either"
+        );
+    }
+
+    /// T-34: the marker is a meta value; orderly exits create no files.
+    #[gpui_kit::test]
+    fn t84_no_marker_file_ever_written(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        // Fixed name (no PID suffix): the cleanup below runs before any
+        // connection exists, so it self-heals the previous run's leftovers.
+        // A PID suffix made each suite pass leave a fresh directory behind.
+        let dir = std::env::temp_dir().join("manyproxy-t84-marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let names = |dir: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("dir reads")
+                .map(|entry| {
+                    entry
+                        .expect("entry reads")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let store = Store::open_file(&dir.join("library.db")).expect("file store opens");
+        let before = names(&dir);
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(notification_count(cx), 0, "nothing to report on this boot");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "the clean quit markers the session"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "a clean quit pushes no notification"
+        );
+
+        let after = names(&dir);
+        assert_eq!(
+            after, before,
+            "the clean quit writes no files beyond the database family"
+        );
+        assert!(
+            after.iter().all(|name| name.starts_with("library.db")),
+            "only the database family exists: {after:?}"
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|name| name.to_ascii_lowercase().contains("marker")),
+            "the rejected running.marker sibling never appears: {after:?}"
+        );
+
+        drop(view);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]
@@ -45889,6 +53144,635 @@ mod tests {
         ))
         .expect_err("location-less redirect fails");
         assert!(error.contains("bad redirect"), "loud cause, got {error}");
+    }
+
+    type T56HeaderLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+    fn t56_recording_feed_client(
+        handler: impl Fn(String) -> gpui_kit::http_client::http::Response<gpui_kit::http_client::AsyncBody>
+            + Send
+            + Sync
+            + 'static,
+    ) -> (
+        std::sync::Arc<dyn gpui_kit::http_client::HttpClient>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        T56HeaderLog,
+    ) {
+        use gpui_kit::http_client::FakeHttpClient;
+        let handler = std::sync::Arc::new(handler);
+        let uris = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let header_log: T56HeaderLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = uris.clone();
+        let seen_headers = header_log.clone();
+        let client = FakeHttpClient::create(move |req| {
+            let seen = seen.clone();
+            let seen_headers = seen_headers.clone();
+            let handler = handler.clone();
+            let uri = req.uri().to_string();
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            async move {
+                seen.lock().expect("record works").push(uri.clone());
+                seen_headers.lock().expect("record works").push(headers);
+                Ok(handler(uri))
+            }
+        });
+        (client, uris, header_log)
+    }
+
+    fn t56_release_json(tag: &str, prerelease: bool, html_url: &str, name: &str) -> String {
+        format!(
+            r#"{{"tag_name":"{tag}","prerelease":{prerelease},"html_url":"{html_url}","name":"{name}"}}"#
+        )
+    }
+
+    fn t56_public_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        Ok(vec!["93.184.216.34".parse().expect("ip parses")])
+    }
+
+    fn t56_no_hwid_header(log: &[Vec<(String, String)>]) -> bool {
+        log.iter()
+            .flatten()
+            .all(|(name, _)| !name.to_ascii_lowercase().contains("hwid"))
+    }
+
+    #[test]
+    fn t56_feed_fetch_policy_blocks_internal_hosts() {
+        // a literal loopback feed is refused before any byte moves
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(200, None, "must never fetch"));
+        let error = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            "https://127.0.0.1/updates/releases/latest",
+            t56_public_resolver,
+        ))
+        .expect_err("loopback feed blocked");
+        assert!(error.contains("internal"), "SSRF cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any network"
+        );
+        assert!(t56_no_hwid_header(&header_log.lock().expect("read works")));
+
+        // a redirect back into a private address dies without fetching the hop
+        let (client, fetched, _) = t56_recording_feed_client(|uri| {
+            if uri.ends_with("/releases/latest") {
+                t48_response(302, Some("http://192.168.0.5/evil"), "")
+            } else {
+                t48_response(200, None, "must never fetch")
+            }
+        });
+        let error = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            "https://example.com/updates/releases/latest",
+            t56_public_resolver,
+        ))
+        .expect_err("private redirect blocked");
+        assert!(error.contains("internal"), "rebind cause, got {error}");
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            1,
+            "only the announced feed hop ever happened"
+        );
+
+        // the same policy refuses non-http(s) feeds outright
+        let (client, fetched, _) =
+            t56_recording_feed_client(|_| t48_response(200, None, "must never fetch"));
+        let error = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            "ftp://example.com/feed.json",
+            t56_public_resolver,
+        ))
+        .expect_err("non-http(s) feed blocked");
+        assert!(error.contains("http(s)"), "scheme cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any network"
+        );
+    }
+
+    #[test]
+    fn t56_semver_compare_matrix() {
+        use crate::{compare_release_to_running, ReleaseCompare};
+        // equal tags and their v-aliases stay put
+        assert_eq!(
+            compare_release_to_running("0.0.1", "0.0.1"),
+            ReleaseCompare::UpToDate
+        );
+        assert_eq!(
+            compare_release_to_running("v0.0.1", "0.0.1"),
+            ReleaseCompare::UpToDate
+        );
+        // newer stable, with or without the v prefix
+        assert_eq!(
+            compare_release_to_running("0.0.2", "0.0.1"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("v0.0.2", "0.0.1"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("1.0.0", "0.9.9"),
+            ReleaseCompare::Newer
+        );
+        // older releases are ignored
+        assert_eq!(
+            compare_release_to_running("0.0.0", "0.0.1"),
+            ReleaseCompare::Older
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.1", "0.0.2"),
+            ReleaseCompare::Older
+        );
+        // rule 10: a plain release outranks its own prerelease
+        assert_eq!(
+            compare_release_to_running("0.0.2-beta.1", "0.0.2"),
+            ReleaseCompare::Older
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.2", "0.0.2-beta.1"),
+            ReleaseCompare::Newer
+        );
+        // rule 11: prerelease identifiers order numerically and lexically
+        assert_eq!(
+            compare_release_to_running("0.0.2-beta.2", "0.0.2-beta.1"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.2-alpha", "0.0.2-beta"),
+            ReleaseCompare::Older
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.2-beta", "0.0.2-beta.1"),
+            ReleaseCompare::Older
+        );
+        // unparseable tags never alarm
+        assert_eq!(
+            compare_release_to_running("nickname-of-my-cat", "0.0.1"),
+            ReleaseCompare::UpToDate
+        );
+    }
+
+    #[test]
+    fn t56_404_renders_no_releases_message() {
+        // fetch half: 404 maps to the exact no-releases text and nothing else
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(404, None, "{\"message\":\"Not Found\"}"));
+        let feed_url = crate::effective_update_feed_url(None, crate::APP_VERSION);
+        assert_eq!(feed_url, crate::UPDATE_FEED_URL_DEFAULT);
+        let why = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            &feed_url,
+            t56_public_resolver,
+        ))
+        .expect_err("404 maps to the no-releases text");
+        assert_eq!(why, crate::UPDATE_FEED_EMPTY_MESSAGE);
+        assert_eq!(why, "No releases published yet.");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![feed_url.clone()],
+            "the request targets the feed URL only"
+        );
+        assert!(
+            t56_no_hwid_header(&header_log.lock().expect("read works")),
+            "no hardware id headers ride the update check"
+        );
+
+        // outcome half: the empty feed is a dialog state, not an error class
+        let outcome = crate::update_check_outcome(Err(why.clone()))
+            .expect("empty feed never surfaces as an error");
+        assert_eq!(
+            outcome,
+            crate::UpdateCheckOutcome::NoReleases,
+            "404 renders exactly the no-releases state"
+        );
+
+        // malformed body: loud plain-error detail, never a body or URL echo
+        let (client, fetched, _) =
+            t56_recording_feed_client(|_| t48_response(200, None, "<html>nope</html>"));
+        let malformed = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            &feed_url,
+            t56_public_resolver,
+        ))
+        .expect_err("malformed feed rejected");
+        assert_eq!(malformed, "update feed is not valid JSON");
+        assert_eq!(fetched.lock().expect("read works").len(), 1);
+        let failed = crate::update_check_outcome(Err(malformed))
+            .expect_err("malformed feeds keep failing loudly");
+        assert_eq!(failed, "update feed is not valid JSON");
+    }
+
+    #[gpui_kit::test]
+    fn t56_no_releases_dialog_and_malformed_error_toast(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_update_check(
+                    Err(crate::UPDATE_FEED_EMPTY_MESSAGE.to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "an empty feed renders the dialog"
+        );
+        assert_painted(cx, "update-no-releases");
+        assert_absent(cx, "update-open-releases".to_string());
+        assert_eq!(notification_count(cx), 0, "404 is not an error toast class");
+
+        // a malformed feed is the sibling edge: plain error toast, no dialog
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_update_check(
+                    Err("update feed is not valid JSON".to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "malformed feed never opens the dialog"
+        );
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "malformed feed is a plain error toast"
+        );
+    }
+
+    #[test]
+    fn t56_prerelease_visibility_follows_app_channel() {
+        // stable builds stay on the single `releases/latest` endpoint
+        assert_eq!(
+            crate::effective_update_feed_url(None, "0.0.1"),
+            crate::UPDATE_FEED_URL_DEFAULT
+        );
+        // a prerelease build switches to the releases list endpoint
+        assert_eq!(
+            crate::effective_update_feed_url(None, "0.1.0-beta.1"),
+            "https://api.github.com/repos/QMahyar/ManyProxy/releases"
+        );
+        // an explicit Settings override wins verbatim on either channel
+        assert_eq!(
+            crate::effective_update_feed_url(Some(" https://mirror.example/feed "), "0.0.1"),
+            "https://mirror.example/feed"
+        );
+
+        let list = format!(
+            "[{},{}]",
+            t56_release_json(
+                "v0.0.3-beta.1",
+                true,
+                "https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.3-beta.1",
+                "Beta one",
+            ),
+            t56_release_json(
+                "v0.0.2",
+                false,
+                "https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.2",
+                "Stable build",
+            ),
+        );
+
+        // a prerelease binary sees the newest prerelease tag
+        let picked = crate::parse_release_feed(&list, true, "0.1.0-beta.1")
+            .expect("list feed parses")
+            .expect("prerelease channel surfaces prereleases");
+        assert_eq!(picked.tag_name, "v0.0.3-beta.1");
+        assert!(picked.prerelease);
+
+        // a stable binary ignores prereleases and picks the newest stable
+        let picked = crate::parse_release_feed(&list, true, "0.0.1")
+            .expect("list feed parses")
+            .expect("stable channel still finds the stable release");
+        assert_eq!(picked.tag_name, "v0.0.2");
+
+        // prerelease-only feed with a stable running version is up-to-date
+        let only_prerelease = r#"[{"tag_name":"v0.0.3-beta.1","prerelease":true,"html_url":"https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.3-beta.1"}]"#;
+        assert_eq!(
+            crate::parse_release_feed(only_prerelease, true, crate::APP_VERSION).expect("parses"),
+            None,
+            "nothing eligible means up-to-date, never an alarm"
+        );
+        assert_eq!(
+            crate::parse_release_feed("[]", true, crate::APP_VERSION).expect("parses"),
+            None
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t56_dialog_reports_new_version_with_browser_link(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let release = crate::FetchedRelease {
+            tag_name: "v999.0.1".to_string(),
+            prerelease: false,
+            html_url: Some(
+                "https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1".to_string(),
+            ),
+            release_name: Some("ManyProxy v999.0.1".to_string()),
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_update_check_dialog(
+                    crate::UpdateCheckOutcome::Newer(release),
+                    window,
+                    cx,
+                );
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "update dialog opens"
+        );
+        assert_painted(cx, "update-new-version");
+        assert_painted(cx, "update-release-name");
+        assert_painted(cx, "update-open-releases");
+
+        // the same compare drives the exact message strings
+        let outcome = crate::update_check_outcome(Ok(Some(crate::FetchedRelease {
+            tag_name: "v999.0.1".to_string(),
+            prerelease: false,
+            html_url: None,
+            release_name: None,
+        })))
+        .expect("newer tag compares");
+        let (id, message, name, url) =
+            crate::update_check_presentation(&outcome, crate::APP_VERSION);
+        assert_eq!(id, "update-new-version");
+        assert_eq!(
+            message,
+            format!(
+                "New version available: v999.0.1 (running {})",
+                crate::APP_VERSION
+            )
+        );
+        assert_eq!(
+            name, None,
+            "a release title equal to the tag is not repeated"
+        );
+        assert_eq!(url, None, "a missing page never buys the browser button");
+
+        // up-to-date renders its own fixed copy, without any link button
+        let (id, message, name, url) = crate::update_check_presentation(
+            &crate::UpdateCheckOutcome::UpToDate,
+            crate::APP_VERSION,
+        );
+        assert_eq!(id, "update-up-to-date");
+        assert_eq!(
+            message,
+            format!("ManyProxy {} is up to date.", crate::APP_VERSION)
+        );
+        assert_eq!(name, None);
+        assert_eq!(url, None);
+    }
+
+    #[gpui_kit::test]
+    fn t56_settings_feed_url_round_trip_and_validation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        // store-level round trip: blank = default, override = verbatim trimmed
+        assert_eq!(store.update_feed_url(), None, "no feed override by default");
+        store
+            .set_update_feed_url(" https://mirror.example/feed ")
+            .expect("override saves");
+        assert_eq!(
+            store.update_feed_url(),
+            Some("https://mirror.example/feed".to_string())
+        );
+        store
+            .clear_update_feed_url()
+            .expect("clear restores default");
+        assert_eq!(store.update_feed_url(), None);
+
+        // view-level commit path mirrors the test-URL field's save pattern
+        let (view, cx) = mount_view(store, cx);
+        let ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("https://mirror.example/feed.json", window, cx)
+            })
+        });
+        assert!(ok, "valid override saves");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            Some("https://mirror.example/feed.json".to_string())
+        );
+
+        // an internal host is refused at save time, before any check runs
+        let toasts = notification_count(cx);
+        let blocked = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("https://127.0.0.1/feed.json", window, cx)
+            })
+        });
+        assert!(!blocked, "internal host refused");
+        assert_eq!(
+            notification_count(cx),
+            toasts + 1,
+            "the refusal surfaces the field error"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            Some("https://mirror.example/feed.json".to_string()),
+            "a refused URL never overwrites the working override"
+        );
+
+        // a blank field clears the override back to the default feed
+        let cleared = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("   ", window, cx)
+            })
+        });
+        assert!(cleared, "blank clears");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            None
+        );
+
+        // plaintext http applies per the same fetch policy (warn, not refuse)
+        let http_ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("http://mirror.example/feed.json", window, cx)
+            })
+        });
+        assert!(http_ok, "plaintext http only warns");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            Some("http://mirror.example/feed.json".to_string())
+        );
+    }
+
+    // T-07: the outbound fetch layer identifies itself as exactly
+    // `ManyProxy/<version>` on every request of every hop, and never sends
+    // any device-identification header (Throne's x-hwid / x-device-*
+    // family is banned capability — pinned here, not merely documented).
+
+    fn t57_expected_user_agent() -> String {
+        format!("ManyProxy/{}", crate::APP_VERSION)
+    }
+
+    fn t57_assert_user_agent_on_every_capture(log: &[Vec<(String, String)>]) {
+        assert!(
+            !log.is_empty(),
+            "at least one outgoing request must have been captured"
+        );
+        for (hop, headers) in log.iter().enumerate() {
+            let user_agents: Vec<String> = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value.clone())
+                .collect();
+            assert!(
+                user_agents.len() == 1,
+                "every request carries exactly one user-agent, hop {hop} sent {user_agents:?}"
+            );
+            assert_eq!(
+                user_agents[0],
+                t57_expected_user_agent(),
+                "hop {hop} announces exactly ManyProxy/<version>"
+            );
+        }
+    }
+
+    fn t57_assert_no_device_identifier_headers(log: &[Vec<(String, String)>]) {
+        for (hop, headers) in log.iter().enumerate() {
+            for (name, _) in headers {
+                let lowered = name.to_ascii_lowercase();
+                assert!(
+                    !lowered.contains("hwid"),
+                    "no hwid-named header may ride outbound fetches, hop {hop} sent {name:?}"
+                );
+                assert!(
+                    !lowered.starts_with("x-device"),
+                    "no x-device header may ride outbound fetches, hop {hop} sent {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t57_user_agent_header_on_subscription_fetch() {
+        assert_eq!(
+            crate::user_agent_header(),
+            t57_expected_user_agent(),
+            "the production helper builds the same static identity"
+        );
+        // subscription-style URL with a redirect: the header rides the
+        // builder on every hop of the manual No-Follow loop
+        let (client, fetched, header_log) = t56_recording_feed_client(|uri| {
+            if uri == "https://example.com/sub.txt" {
+                t48_response(302, Some("https://cdn.example.com/sub.txt"), "")
+            } else {
+                t48_response(200, None, "sub-body")
+            }
+        });
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+            t48_public_resolver,
+        ))
+        .expect("subscription body fetches");
+        assert_eq!(downloaded.body, "sub-body");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![
+                "https://example.com/sub.txt".to_string(),
+                "https://cdn.example.com/sub.txt".to_string(),
+            ],
+            "both hops went out"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+    }
+
+    #[test]
+    fn t57_user_agent_header_on_remote_preset_fetch() {
+        // remote presets refresh through the shared fetch_subscription_body
+        // helper (start_preset_refresh), so this exercises the exact builder
+        // that path owns — a preset-style URL, single non-redirect request
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(200, None, "preset-body"));
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://relay.example.com/presets/throne.json",
+            t48_public_resolver,
+        ))
+        .expect("preset body fetches");
+        assert_eq!(downloaded.body, "preset-body");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec!["https://relay.example.com/presets/throne.json".to_string()],
+            "the preset request went out once"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+    }
+
+    #[test]
+    fn t57_no_device_identifier_headers_anywhere() {
+        // positive match on the UA and a negative match on the hwid/
+        // x-device family across the entire fetch layer: subscription
+        // bodies, remote presets (same helper), and the release feed
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(200, None, "sub-body"));
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+            t48_public_resolver,
+        ))
+        .expect("subscription fetch works");
+        assert_eq!(downloaded.body, "sub-body");
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            1,
+            "the subscription entry point recorded one request"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+        t57_assert_no_device_identifier_headers(&header_log.lock().expect("read works"));
+
+        let (client, fetched, header_log) = t56_recording_feed_client(|_| {
+            t48_response(
+                200,
+                None,
+                r#"{"tag_name":"v0.0.1","prerelease":false,"html_url":"https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.1"}"#,
+            )
+        });
+        let release = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            crate::UPDATE_FEED_URL_DEFAULT,
+            t56_public_resolver,
+        ))
+        .expect("release feed fetches and parses")
+        .expect("the latest endpoint holds one eligible release");
+        assert_eq!(release.tag_name, "v0.0.1");
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            1,
+            "the release-feed entry point recorded one request"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+        t57_assert_no_device_identifier_headers(&header_log.lock().expect("read works"));
     }
 
     fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
@@ -46540,6 +54424,7 @@ mod tests {
             ("Start selected", "F5"),
             ("Stop selected", "Shift-F5"),
             ("Test selected", "Ctrl-T"),
+            ("Stop Testing", "Ctrl-."),
             ("Edit selected", "Ctrl-E"),
             ("Delete selected", "Delete"),
             ("Focus search", "Ctrl-F"),
@@ -46743,6 +54628,431 @@ mod tests {
                 .bulk_label()),
             "1 checked (of 1 visible)",
             "arrows keep the checks"
+        );
+    }
+
+    fn t19_auto_clear_seed(name: &str, port: &str, group: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: group.to_string(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    fn t19_dead_snapshot(id: &str, error: &str) -> HealthSnapshot {
+        HealthSnapshot {
+            config_id: id.to_string(),
+            at: 1,
+            kind: "url-test".to_string(),
+            latency_ms: None,
+            error: Some(error.to_string()),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t69_sweep_clears_only_dead_excluding_running_and_editing(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let live = store
+            .add(t19_auto_clear_seed("Live", "10931", "g"))
+            .expect("add live works");
+        let failing = store
+            .add(t19_auto_clear_seed("Fail", "10932", "g"))
+            .expect("add fail works");
+        let guarded = store
+            .add(t19_auto_clear_seed("Guarded", "10933", "g"))
+            .expect("add guarded works");
+        let followed = store
+            .add(t19_auto_clear_seed("Followed", "10934", "g"))
+            .expect("add followed works");
+        let free = store
+            .add(t19_auto_clear_seed("Free", "10935", "g"))
+            .expect("add free works");
+
+        // Followed belongs to a subscription: stamp it as such through the
+        // export/restore fidelity path so the row-level batch exclusion has a
+        // real subscription to see.
+        let payload = store.export_library_json().expect("export works");
+        let mut value: serde_json::Value = serde_json::from_str(&payload).expect("payload parses");
+        for entry in value
+            .get_mut("library")
+            .and_then(|v| v.as_array_mut())
+            .into_iter()
+            .flatten()
+        {
+            if entry.get("id").and_then(serde_json::Value::as_str) == Some(followed.id.as_str()) {
+                entry["subscription_id"] = serde_json::Value::String("sub-e".to_string());
+            }
+        }
+        let mut store = Store::open_in_memory().expect("re-open works");
+        // T-22: the hand-edited fixture is re-sealed so its checksum matches.
+        let edited = crate::store::seal_library_export(&value);
+        store.restore_library_json(&edited).expect("restore works");
+        // Dead snapshots live only in the source store — export/restore
+        // carries the library, not health state — so seed them on the
+        // restored store the sweep will consume.
+        for id in [&guarded.id, &followed.id, &free.id] {
+            store
+                .save_health_snapshot(&t19_dead_snapshot(id, "upstream refused"))
+                .expect("dead snapshot works");
+        }
+        store
+            .set_auto_clear_group(
+                "g",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 5,
+                    note_seen: true,
+                },
+            )
+            .expect("flag enables");
+
+        let (view, cx) = mount_view(store, cx);
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+                view.refresh_batch_members.insert("sub-e".to_string());
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().set_facet_group(Some("g".to_string()));
+                });
+                view.start_row(&live.id, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&failing.id, window, cx));
+        });
+        cx.run_until_parked();
+        // Simulate the edit dialog for Guarded being open while the sweep
+        // runs: opened after the starts above (commit_start_selected's
+        // reload drops a stale marker before the dialog truly opened).
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.edit_form_open = Some(guarded.id.clone());
+            });
+        });
+        let running = view.read_with(cx, |view, _| view.engine.running_ids());
+        assert!(
+            running.contains(&live.id) && running.contains(&failing.id),
+            "Live and Fail run while Guarded/Followed/Free stay stopped: {running:?}"
+        );
+        handle.script_latency(&live.id, 21);
+        handle.script_failure(&failing.id, "upstream refused");
+
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_group_health(window, cx));
+        });
+        cx.run_until_parked();
+
+        let names: Vec<String> = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        });
+        assert!(
+            !names.contains(&"Free".to_string())
+                && names.contains(&"Live".to_string())
+                && names.contains(&"Fail".to_string())
+                && names.contains(&"Guarded".to_string())
+                && names.contains(&"Followed".to_string()),
+            "auto-clear removed exactly the unprotected dead row: {names:?}"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before + 2,
+            "sweep summary plus ONE auto-clear summary, nothing else"
+        );
+    }
+
+    #[test]
+    fn t69_summary_notification_names_count_and_kept() {
+        use crate::auto_clear_summary_toast;
+
+        // Exact ticket wording: count always named, always plural "rows",
+        // kept reasons named only when non-empty, canonical order.
+        assert_eq!(
+            auto_clear_summary_toast("g", 1, &["running".to_string(), "editing".to_string()],),
+            "Auto-cleared 1 unavailable rows in \"g\" (kept: running, editing)",
+        );
+        assert_eq!(
+            auto_clear_summary_toast(
+                "g",
+                2,
+                &[
+                    "running".to_string(),
+                    "editing".to_string(),
+                    "in-flight batch".to_string(),
+                ],
+            ),
+            "Auto-cleared 2 unavailable rows in \"g\" (kept: running, editing, \
+             in-flight batch)",
+        );
+        assert_eq!(
+            auto_clear_summary_toast("g", 3, &[]),
+            "Auto-cleared 3 unavailable rows in \"g\"",
+            "nothing kept: no kept clause",
+        );
+        assert_eq!(
+            auto_clear_summary_toast("g", 0, &["editing".to_string()]),
+            "Auto-cleared 0 unavailable rows in \"g\" (kept: editing)",
+            "all candidates protected: count names the zero",
+        );
+        assert_eq!(
+            auto_clear_summary_toast("travel", 1, &["running".to_string()]),
+            "Auto-cleared 1 unavailable rows in \"travel\" (kept: running)",
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t69_skip_delete_confirm_is_not_a_bypass(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.set_skip_delete_confirm(true).expect("skip set");
+        let live = store
+            .add(t19_auto_clear_seed("Live", "10941", "g"))
+            .expect("add live works");
+        let stray = store
+            .add(t19_auto_clear_seed("Stray", "10942", "g"))
+            .expect("add stray works");
+        store
+            .save_health_snapshot(&t19_dead_snapshot(&stray.id, "upstream refused"))
+            .expect("dead snapshot works");
+        // Meta AUTO_CLEAR_GROUPS deliberately absent: skip-delete-confirm must
+        // never arm the sweep auto-clear by itself.
+
+        let (view, cx) = mount_view(store, cx);
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&live.id, window, cx));
+        });
+        cx.run_until_parked();
+        handle.script_latency(&live.id, 21);
+
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().set_facet_group(Some("g".to_string()));
+                });
+                view.test_group_health(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "sweep summary only — no auto-clear notice without the opt-in"
+        );
+        let names: Vec<String> = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        });
+        assert!(
+            names.contains(&"Stray".to_string()),
+            "skip-delete-confirm removed nothing: {names:?}"
+        );
+
+        // And the data-layer note gate still refuses with skip-delete-confirm
+        // on: acknowledgment, not bypass.
+        let refused = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store
+                    .set_auto_clear_group(
+                        "g",
+                        AutoClearGroupConfig {
+                            enabled: true,
+                            on_date: 1,
+                            note_seen: false,
+                        },
+                    )
+                    .is_err()
+            })
+        });
+        assert!(
+            refused,
+            "enable without note_seen stays an error while skip-delete-confirm is set"
+        );
+    }
+
+    #[test]
+    fn t69_optin_confirm_note_required() {
+        use crate::auto_clear_opt_in_note;
+
+        // The toggle-on dialog posts this exact ticket wording as its own ACK;
+        // skip-delete-confirm never replaces it.
+        assert_eq!(
+            auto_clear_opt_in_note("g"),
+            "Unavailable rows in \"g\" will be removed automatically after group tests pass \
+             with dead rows. Running rows and the row being edited are never removed.",
+        );
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let refused = store.set_auto_clear_group(
+            "g",
+            AutoClearGroupConfig {
+                enabled: true,
+                on_date: 5,
+                note_seen: false,
+            },
+        );
+        assert!(
+            matches!(refused, Err(StoreError::Invalid(_))),
+            "enable without the note ACK is an Invalid error"
+        );
+        assert!(
+            !store.auto_clear_enabled("g"),
+            "refused enable leaves the flag off"
+        );
+        store
+            .set_auto_clear_group(
+                "g",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 5,
+                    note_seen: true,
+                },
+            )
+            .expect("note ACK enables");
+        assert!(
+            store.auto_clear_enabled("g"),
+            "confirmed opt-in arms the flag"
+        );
+    }
+
+    #[test]
+    fn t67_shortcut_lines_lists_stop_testing_key() {
+        assert!(
+            crate::SHORTCUT_LINES.contains(&("Stop Testing", "Ctrl-.")),
+            "SHORTCUT_LINES lists Stop Testing: Ctrl-."
+        );
+        assert_eq!(
+            crate::SHORTCUT_LINES
+                .iter()
+                .filter(|(action, _)| *action == "Stop Testing")
+                .count(),
+            1,
+            "exactly one Stop Testing line"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t67_ctrl_period_stops_group_test(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        use std::sync::atomic::Ordering;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let press = |cx: &mut VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+        };
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.probe_stop.store(false, Ordering::SeqCst);
+            });
+        });
+        let before = notification_count(cx);
+        press(cx, "ctrl-.");
+        cx.run_until_parked();
+        let idle_flipped = view.read_with(cx, |view, _| view.probe_stop.load(Ordering::SeqCst));
+        assert!(!idle_flipped, "idle press leaves the stop flag untouched");
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "idle press reports through the existing no-op toast"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Ctrl-. stays dialog-free"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.group_test_in_flight = true;
+                view.probe_stop.store(false, Ordering::SeqCst);
+            });
+        });
+        let before = notification_count(cx);
+        press(cx, "ctrl-.");
+        cx.run_until_parked();
+        let flipped = view.read_with(cx, |view, _| view.probe_stop.load(Ordering::SeqCst));
+        assert!(
+            flipped,
+            "Ctrl-. flips probe_stop exactly like the Tools menu item"
+        );
+        assert_eq!(notification_count(cx), before + 1, "stopping toasts once");
+    }
+
+    #[gpui_kit::test]
+    fn t67_menu_item_shows_key_hint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("tools-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let label = cx.update(|window, _| {
+            window
+                .try_find("stop-testing".to_string())
+                .unwrap_or_else(|| panic!("stop-testing renders in the tools menu"))
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(
+            label.as_deref(),
+            Some("Stop Testing (Ctrl-.)"),
+            "Tools ▸ Stop Testing announces the Ctrl-. hint like the Shift-F5 sibling"
         );
     }
 
@@ -47348,6 +55658,2322 @@ mod tests {
             view.read_with(cx, |view, _| view.log_filter.clone()),
             "",
             "commit-on-Apply is unchanged"
+        );
+    }
+
+    /// Serializes the one test that stages real rule-set files: locks the
+    /// process-global `MANYPROXY_RULE_SETS_DIR` override to a test staging
+    /// root for the guard's lifetime and clears it on drop.
+    fn t62_rule_sets_env(dir: &std::path::Path) -> T62RuleSetsEnvGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lease = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("MANYPROXY_RULE_SETS_DIR", dir);
+        T62RuleSetsEnvGuard { _lease: lease }
+    }
+
+    struct T62RuleSetsEnvGuard {
+        _lease: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for T62RuleSetsEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("MANYPROXY_RULE_SETS_DIR");
+        }
+    }
+
+    fn t62_staged_rows(
+        view: &Entity<AppView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<crate::store::RuleSetRow> {
+        view.read_with(cx, |view, _| {
+            view.store.list_rule_sets().expect("list works")
+        })
+    }
+
+    /// Runs the Add-by-URL commit (the add dialog's only meaningful action)
+    /// and reports whether the gate let the flow through to the confirm.
+    fn t62_begin(
+        view: &Entity<AppView>,
+        cx: &mut VisualTestContext,
+        name: &str,
+        url: &str,
+    ) -> bool {
+        let outcome = Rc::new(RefCell::new(false));
+        let recorded = outcome.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                recorded.replace(view.begin_rule_set_download(
+                    name.to_string(),
+                    url.to_string(),
+                    window,
+                    cx,
+                ));
+            });
+        });
+        let value = *outcome.borrow();
+        value
+    }
+
+    #[gpui_kit::test]
+    fn t62_rule_set_download_requires_explicit_confirm(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t62confirm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("staging temp works");
+        let _env = t62_rule_sets_env(&dir);
+        assert_eq!(
+            crate::store::rule_sets_dir(),
+            dir,
+            "the override routes staging into the test root"
+        );
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+
+        // 1. An internal URL is refused wherever the gate runs — and it never
+        //    reaches the confirm, so nothing can be fetched silently.
+        assert!(
+            !t62_begin(&view, cx, "t62-set", "http://127.0.0.1/ads.srs"),
+            "the add flow reports the policy block instead of confirming"
+        );
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "a blocked URL never opens the Download confirm"
+        );
+        assert!(
+            t62_staged_rows(&view, cx).is_empty(),
+            "no staged row from a refused gate"
+        );
+        assert!(
+            !dir.join("t62-set.srs").exists(),
+            "no staged file without a confirmed download"
+        );
+
+        // 2. Plaintext http is a warning, not a block: the gate proceeds to
+        //    the confirm, exactly like subscription policy.
+        assert!(
+            t62_begin(&view, cx, "t62-set", "http://rule-sets.example.com/t62.srs"),
+            "plaintext http warns but does not block"
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the warn path still goes through the explicit confirm"
+        );
+        assert!(t62_staged_rows(&view, cx).is_empty(), "warn stages nothing");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // 3. A real https URL: the confirm offers itself BEFORE any fetch;
+        //    closing it stages nothing, and a second identical request must
+        //    re-offer its own confirmation (no batch, no reuse).
+        let url = "https://rule-sets.example.com/t62.srs";
+        assert!(
+            t62_begin(&view, cx, "t62-set", url),
+            "the gate passes and offers the confirm"
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the confirm dialog is up"
+        );
+        assert!(
+            t62_staged_rows(&view, cx).is_empty(),
+            "staging starts only on the confirm, never at gate time"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "closing the confirm leaves nothing in flight"
+        );
+        assert!(t62_staged_rows(&view, cx).is_empty(), "cancel never stages");
+        cx.run_until_parked();
+        assert!(
+            t62_begin(&view, cx, "t62-set", url),
+            "the re-request re-offers the confirm"
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the second confirm is its own explicit step"
+        );
+        assert!(
+            t62_staged_rows(&view, cx).is_empty(),
+            "two requests, still zero rows: confirms do not batch"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // 4. The confirmed side. The confirm's Download click runs
+        //    start_rule_set_download → fetch_rule_set_body (policy-proven by
+        //    the parity test) → finish; the fetch is faked here so this test
+        //    covers staging exactly, with fixed bytes.
+        let staged_bytes = vec![0x52, 0x53, 0x31, 0x01, 0x02, 0x03, 0xFF, 0x04];
+        let grant = crate::RuleSetDownloadGrant {
+            name: "t62-set".to_string(),
+            file_name: crate::store::rule_set_file_name("t62-set"),
+            url: url.to_string(),
+            dir: dir.clone(),
+        };
+        assert_eq!(grant.file_name, "t62-set.srs");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_rule_set_download(&grant, Ok(staged_bytes.clone()), window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        let staged = t62_staged_rows(&view, cx);
+        assert_eq!(staged.len(), 1, "exactly the confirmed set stages");
+        assert_eq!(staged[0].name, "t62-set");
+        assert_eq!(staged[0].file_name, "t62-set.srs");
+        assert_eq!(staged[0].url, url);
+        assert_eq!(staged[0].bytes, staged_bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(dir.join("t62-set.srs")).expect("staged file reads"),
+            staged_bytes,
+            "the staged bytes are the fetched bytes, verbatim"
+        );
+
+        // The staged catalog renders in the manager's Rule sets section with
+        // per-row Re-Download/Remove actions.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "rule-sets-section-title".to_string(),
+            "rule-set-add".to_string(),
+            format!("rule-set-redownload-{}", staged[0].id),
+            format!("rule-set-remove-{}", staged[0].id),
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.clone()).is_some()),
+                "the manager renders {id}"
+            );
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[test]
+    fn t62_rule_set_fetch_policy_parity_internal_blocked() {
+        // The .srs download rides the same pipeline as subscriptions:
+        // identical policy verdicts, byte-level parity of errors, and zero
+        // requests for blocked targets.
+        use gpui_kit::http_client::AsyncBody;
+
+        // Direct internal URL and rebind-via-resolver both block pre-fetch.
+        for (target, resolver) in [
+            (
+                "http://127.0.0.1/ads.srs",
+                t48_public_resolver as crate::SubscriptionHostResolver,
+            ),
+            ("https://rebind.example.com/ads.srs", t48_internal_resolver),
+        ] {
+            let (client, fetched) = t48_recording_client(|_| {
+                gpui_kit::http_client::http::Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from("must never be reached"))
+                    .expect("response builds")
+            });
+            let subscription = futures::executor::block_on(crate::fetch_subscription_body(
+                client.clone(),
+                target,
+                resolver,
+            ))
+            .expect_err("subscriptions block internal targets");
+            let rule_set = futures::executor::block_on(crate::fetch_rule_set_body(
+                client.clone(),
+                target,
+                resolver,
+            ))
+            .expect_err("rule sets block internal targets the same way");
+            assert_eq!(
+                rule_set, subscription,
+                "one shared policy surface, byte-identical verdicts"
+            );
+            assert!(subscription.contains("internal"), "{subscription}");
+            assert!(
+                fetched.lock().expect("read works").is_empty(),
+                "the gate runs before any request leaves"
+            );
+        }
+
+        // Success parity: the rule-set path keeps raw bytes (a compiled .srs
+        // is binary) where the subscription wrapper refuses non-UTF-8 — both
+        // read the exact same body through the shared pipeline.
+        let raw: Vec<u8> = vec![0x52, 0x53, 0x31, 0xFF, 0x00, 0x7F];
+        let body = raw.clone();
+        let (client, fetched) = t48_recording_client(move |_| {
+            gpui_kit::http_client::http::Response::builder()
+                .status(200)
+                .body(AsyncBody::from(body.clone()))
+                .expect("response builds")
+        });
+        let rule_set = futures::executor::block_on(crate::fetch_rule_set_body(
+            client.clone(),
+            "https://rule-sets.example.com/ads.srs",
+            t48_public_resolver,
+        ))
+        .expect("binary body passes the rule-set fetch");
+        assert_eq!(rule_set, raw, "raw bytes out, modulo nothing");
+        let subscription = futures::executor::block_on(crate::fetch_subscription_body(
+            client.clone(),
+            "https://rule-sets.example.com/ads.srs",
+            t48_public_resolver,
+        ))
+        .expect_err("the same body is not UTF-8");
+        assert!(
+            subscription.contains("not UTF-8"),
+            "subscriptions keep their UTF-8 contract: {subscription}"
+        );
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![
+                "https://rule-sets.example.com/ads.srs".to_string(),
+                "https://rule-sets.example.com/ads.srs".to_string(),
+            ],
+            "both flows request the confirmed URL exactly once"
+        );
+    }
+
+    fn t65_seed(name: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: "travel".to_string(),
+            bind_ip: "127.0.0.1".to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    fn t65_mount_with_failed_probe<'a>(
+        cx: &'a mut TestAppContext,
+        ports: [&str; 3],
+    ) -> (
+        Entity<AppView>,
+        &'a mut VisualTestContext,
+        String,
+        String,
+        crate::store::ProxyConfig,
+    ) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        use gpui_kit::component::IndexPath;
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let failed = store.add(t65_seed("Alpha", ports[0])).expect("seed works");
+        let untested = store.add(t65_seed("Beta", ports[1])).expect("seed works");
+        let gamma = store.add(t65_seed("Gamma", ports[2])).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, handle) = FakeHealthProber::shared();
+                handle.script_failure(&failed.id, "upstream refused");
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let selected = view.read_with(cx, |view, cx| {
+            view.selected_config(cx).map(|config| config.id)
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some(failed.id.as_str()),
+            "row 0 selects the failed probe's row for a targeted test"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_selected_health(window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        (view, cx, failed.id, untested.id, gamma)
+    }
+
+    #[gpui_kit::test]
+    fn t65_failed_tone_distinct_from_unknown_in_row_text(cx: &mut TestAppContext) {
+        use crate::health::{LatencyTone, SpeedtestMode, SpeedtestOutcome};
+        use crate::health_tone_color;
+        use crate::store::now_unix;
+        use gpui_kit::component::ActiveTheme as _;
+
+        cx.update(gpui_kit::init);
+        let (view, cx, failed, untested, gamma) =
+            t65_mount_with_failed_probe(cx, ["10881", "10882", "10883"]);
+
+        assert!(
+            view.read_with(cx, |view, _| view.health_store.row_summary(&failed))
+                .contains("dead"),
+            "the failed probe keeps its cause text"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.health_tone(&failed)),
+            LatencyTone::Failed,
+            "a failed probe tones its row Failed"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.health_tone(&untested)),
+            LatencyTone::Unknown,
+            "an untested row keeps the neutral tone"
+        );
+
+        let delegate_tones = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().health_tone.clone()
+        });
+        assert_eq!(
+            delegate_tones.get(&failed),
+            Some(&LatencyTone::Failed),
+            "the row health map carries the Failed tone for the failed row"
+        );
+        assert_eq!(
+            delegate_tones.get(&untested),
+            None,
+            "the untested row renders without a probe tone, so it stays neutral"
+        );
+        assert_painted(cx, &format!("row-health-{failed}"));
+        assert_painted(cx, &format!("row-health-{untested}"));
+
+        cx.update(|_, cx| {
+            assert_ne!(
+                health_tone_color(LatencyTone::Failed, cx),
+                health_tone_color(LatencyTone::Unknown, cx),
+                "the failed probe renders darker than the neutral unknown tone"
+            );
+            assert_eq!(
+                health_tone_color(LatencyTone::Fast, cx),
+                cx.theme().success,
+                "the fast band keeps the success color"
+            );
+            assert_eq!(
+                health_tone_color(LatencyTone::Slow, cx),
+                cx.theme().warning,
+                "the slow band keeps the warning color"
+            );
+            assert_eq!(
+                health_tone_color(LatencyTone::Poor, cx),
+                cx.theme().danger,
+                "the poor band keeps the danger color"
+            );
+            let failed_color = health_tone_color(LatencyTone::Failed, cx);
+            let poor_color = health_tone_color(LatencyTone::Poor, cx);
+            assert!(
+                failed_color.l < poor_color.l,
+                "the failed tone darkens the poor band: {failed_color:?} vs {poor_color:?}"
+            );
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.health_store.record_speed_sample(
+                    &SpeedtestOutcome {
+                        config_id: gamma.id.clone(),
+                        mode: SpeedtestMode::Download,
+                        latency_ms: Some(2700),
+                        mbps: Some(24.0),
+                        error: None,
+                    },
+                    now_unix(),
+                );
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.row_summary(&gamma.id)),
+            "2.7s",
+            "the speed summary text stays a duration"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.health_tone(&gamma.id)),
+            LatencyTone::Unknown,
+            "a speed-only summary tone stays neutral"
+        );
+        let (failed_row_tone, gamma_row_tone) = view.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            (
+                delegate.health_tone.get(&failed).copied(),
+                delegate.health_tone.get(&gamma.id).copied(),
+            )
+        });
+        assert_eq!(failed_row_tone, Some(LatencyTone::Failed));
+        assert_ne!(
+            failed_row_tone, gamma_row_tone,
+            "a failed probe tones the speed-summary-rendering row text distinctly"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t65_failed_tone_distinct_in_health_tab_detail(cx: &mut TestAppContext) {
+        use crate::health::{sparkline_caption_tone, LatencyTone};
+        use crate::health_tone_color;
+        use crate::store::HealthHistoryEntry;
+        use gpui_kit::point;
+
+        cx.update(gpui_kit::init);
+        let (view, cx, failed, untested, _gamma) =
+            t65_mount_with_failed_probe(cx, ["10891", "10892", "10893"]);
+
+        let (failed_tone, untested_tone) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.health_tone(&failed),
+                view.health_store.health_tone(&untested),
+            )
+        });
+        assert_eq!(failed_tone, LatencyTone::Failed);
+        assert_eq!(untested_tone, LatencyTone::Unknown);
+        let (failed_detail, untested_detail) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.detail_line(&failed),
+                view.health_store.detail_line(&untested),
+            )
+        });
+        assert!(
+            failed_detail.contains("upstream refused"),
+            "the failed detail line keeps its cause text: {failed_detail}"
+        );
+        assert!(
+            untested_detail.contains("never tested"),
+            "the untested detail line keeps its no-probe text: {untested_detail}"
+        );
+        cx.update(|_, cx| {
+            assert_ne!(
+                health_tone_color(failed_tone, cx),
+                health_tone_color(untested_tone, cx),
+                "failed and untested tones render distinctly on the Health tab"
+            );
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector_tab = crate::InspectorTab::Health;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, "config-health");
+        assert_painted(cx, "config-history");
+        assert_painted(cx, "config-history-empty");
+
+        let caption = |at: i64, latency: Option<u64>, error: Option<&str>| HealthHistoryEntry {
+            config_id: "row".to_string(),
+            at,
+            kind: "url-test".to_string(),
+            latency_ms: latency,
+            error: error.map(|cause| cause.to_string()),
+        };
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, Some(90), None)]),
+            LatencyTone::Fast,
+            "one fast probe tones its caption green"
+        );
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, None, Some("upstream refused"))]),
+            LatencyTone::Failed,
+            "one failed probe tones its caption Failed, not neutral"
+        );
+        assert_eq!(sparkline_caption_tone(&[]), LatencyTone::Unknown);
+    }
+
+    // ---- T-27: header sort pickers -------------------------------------
+
+    use crate::store::ProxyConfig;
+    use crate::{LibraryDelegate, LibrarySortKey, SortDirection};
+    use std::collections::HashMap;
+
+    fn t77_row(id: &str, name: &str, protocol: &str, group: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            params: "{}".to_string(),
+            group: group.to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn t77_names(delegate: &LibraryDelegate) -> Vec<String> {
+        delegate
+            .visible
+            .iter()
+            .map(|&index| delegate.rows[index].name.clone())
+            .collect()
+    }
+
+    fn t77_map_u64(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(id, value)| (id.to_string(), *value))
+            .collect()
+    }
+
+    fn t77_map_pair(pairs: &[(&str, u64, u64)]) -> HashMap<String, (u64, u64)> {
+        pairs
+            .iter()
+            .map(|(id, rx, tx)| (id.to_string(), (*rx, *tx)))
+            .collect()
+    }
+
+    fn t77_map_text(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, value)| (id.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn t77_sort(key: LibrarySortKey, direction: SortDirection) -> crate::store::LibrarySort {
+        crate::store::LibrarySort::new(key, direction)
+    }
+
+    /// T-27: every key ranks by its named source, both directions, and `none`
+    /// keeps the pre-feature order byte for byte.
+    #[test]
+    fn t77_sort_keys_order_correctly() {
+        use crate::store::{LibrarySortKey as Key, SortDirection as Dir};
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t77_row("1", "One", "vless", "g", 10801),
+            t77_row("2", "Two", "vless", "g", 10802),
+            t77_row("3", "Three", "vless", "g", 10803),
+            t77_row("4", "Four", "vless", "g", 10804),
+            t77_row("5", "Five", "vless", "g", 10805),
+            t77_row("6", "Six", "vless", "g", 10806),
+        ]);
+        delegate.set_latency(t77_map_u64(&[("1", 120), ("2", 40), ("3", 80)]));
+        delegate.set_data_traffic(t77_map_pair(&[
+            ("1", 100, 10),
+            ("2", 50, 90),
+            ("3", 70, 5),
+            ("4", 300, 1),
+        ]));
+        delegate.set_traffic(t77_map_pair(&[
+            ("1", 1000, 10),
+            ("2", 500, 900),
+            ("3", 700, 5),
+            ("4", 0, 0),
+            ("5", 100, 100),
+        ]));
+        delegate.set_out_ips(t77_map_text(&[
+            ("1", "203.0.113.9"),
+            ("2", "198.51.100.7"),
+            ("3", "203.0.113.10"),
+        ]));
+
+        let base = vec!["One", "Two", "Three", "Four", "Five", "Six"];
+        assert_eq!(t77_names(&delegate), base, "the default order is the base");
+
+        // `none` is the pre-feature order, unchanged by the direction.
+        delegate.set_sort(t77_sort(Key::None, Dir::Descending));
+        assert_eq!(t77_names(&delegate), base, "none ignores the direction");
+        assert_eq!(
+            delegate
+                .rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4", "5", "6"],
+            "sorting never reorders the store rows"
+        );
+
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One", "Four", "Five", "Six"],
+            "latency asc: 40, 80, 120, then the untested rows by row id"
+        );
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Three", "Two", "Four", "Five", "Six"],
+            "latency desc reverses the known values, unknowns stay pinned last"
+        );
+
+        delegate.set_sort(t77_sort(Key::Download, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One", "Four", "Five", "Six"],
+            "download reads the current session rx counter"
+        );
+        delegate.set_sort(t77_sort(Key::Upload, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Three", "One", "Two", "Five", "Six"],
+            "upload reads the current session tx counter"
+        );
+        delegate.set_sort(t77_sort(Key::Download, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "One", "Three", "Two", "Five", "Six"],
+            "download desc"
+        );
+
+        delegate.set_sort(t77_sort(Key::TrafficTotal, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Five", "Three", "One", "Two", "Six"],
+            "traffic total is the accumulated rx+tx of the counting window"
+        );
+        delegate.set_sort(t77_sort(Key::TrafficDown, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Five", "Two", "Three", "One", "Six"],
+            "traffic down is the accumulated rx"
+        );
+        delegate.set_sort(t77_sort(Key::TrafficUp, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Three", "One", "Five", "Two", "Six"],
+            "traffic up is the accumulated tx"
+        );
+        delegate.set_sort(t77_sort(Key::TrafficTotal, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "One", "Three", "Five", "Four", "Six"],
+            "traffic total desc"
+        );
+
+        delegate.set_sort(t77_sort(Key::OutIp, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One", "Four", "Five", "Six"],
+            "out-IP compares the resolved text lexically, 203.0.113.10 < 203.0.113.9"
+        );
+        delegate.set_sort(t77_sort(Key::OutIp, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Three", "Two", "Four", "Five", "Six"],
+            "out-IP desc reverses the resolved text, unresolved rows stay last"
+        );
+    }
+
+    /// T-27: unknown/missing values are pinned last deterministically — row id
+    /// numeric as the secondary — and repeated ticks with the same maps never
+    /// reshuffle the tail.
+    #[test]
+    fn t77_unknown_values_sort_deterministically_last() {
+        use crate::store::{LibrarySortKey as Key, SortDirection as Dir};
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t77_row("100", "Hundred", "vless", "g", 10801),
+            t77_row("10", "Ten", "vless", "g", 10802),
+            t77_row("9", "Nine", "vless", "g", 10803),
+        ]);
+        delegate.set_latency(t77_map_u64(&[("10", 50)]));
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Ten", "Nine", "Hundred"],
+            "unknown values sort by numeric row id (9 before 100), not lexically"
+        );
+
+        // A second tick carrying the same mirrors must not move anything.
+        let first = t77_names(&delegate);
+        for _ in 0..3 {
+            delegate.apply_filter();
+            delegate.set_latency(t77_map_u64(&[("10", 50)]));
+            assert_eq!(t77_names(&delegate), first, "no flicker between ticks");
+        }
+
+        // A dead sample is an absent value: it joins the pinned tail.
+        delegate.set_latency(t77_map_u64(&[("10", 50), ("100", 70)]));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Ten", "Hundred", "Nine"],
+            "the row that gained a sample leaves the pinned tail"
+        );
+
+        // Unresolved out-IP rows are last too, again by numeric row id.
+        delegate.set_out_ips(t77_map_text(&[("100", "203.0.113.7")]));
+        delegate.set_sort(t77_sort(Key::OutIp, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Hundred", "Nine", "Ten"],
+            "only the resolved row ranks; unresolved ones keep the row-id tail"
+        );
+        let tail = t77_names(&delegate);
+        for _ in 0..3 {
+            delegate.apply_filter();
+            assert_eq!(t77_names(&delegate), tail, "out-IP tail is stable too");
+        }
+    }
+
+    /// T-27: the retired toggle became the `type_security` key. Its ordering is
+    /// `compare_type_security` exactly — protocol asc, security rank desc, name
+    /// — and the direction toggle does not move it.
+    #[test]
+    fn t77_type_security_key_matches_old_toggle() {
+        use crate::store::{
+            compare_type_security as compare_old, LibrarySortKey as Key, SortDirection as Dir,
+        };
+        let rows = vec![
+            t77_row("1", "Trojan", "trojan", "g", 10801),
+            t77_row("2", "VlessTls", "vless", "g", 10802),
+            t77_row("3", "VlessReality", "vless", "g", 10803),
+            t77_row("4", "Zeta", "vmess", "g", 10804),
+            t77_row("5", "Alpha", "vmess", "g", 10805),
+            t77_row("6", "Plain", "shadowsocks", "g", 10806),
+        ];
+        let mut with_security = rows.clone();
+        with_security[1].params = r#"{"security":"tls"}"#.to_string();
+        with_security[2].params = r#"{"security":"reality"}"#.to_string();
+
+        let mut sorted_rows = with_security.clone();
+        sorted_rows.sort_by(compare_old);
+        let old_toggle_order: Vec<String> =
+            sorted_rows.iter().map(|row| row.name.clone()).collect();
+        assert_eq!(
+            old_toggle_order,
+            vec![
+                "Plain",
+                "Trojan",
+                "VlessReality",
+                "VlessTls",
+                "Alpha",
+                "Zeta"
+            ],
+            "the retired toggle: protocol asc, security rank desc, name asc"
+        );
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(with_security.clone());
+        delegate.set_sort(t77_sort(Key::TypeSecurity, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            old_toggle_order,
+            "type_security asc == the retired toggle"
+        );
+        delegate.set_sort(t77_sort(Key::TypeSecurity, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            old_toggle_order,
+            "the key keeps the toggle's fixed direction"
+        );
+        assert_eq!(
+            delegate
+                .rows
+                .iter()
+                .map(|row| row.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "Trojan",
+                "VlessTls",
+                "VlessReality",
+                "Zeta",
+                "Alpha",
+                "Plain"
+            ],
+            "the store order survives the sort"
+        );
+    }
+
+    /// T-27: sorting runs after the port predicate and the facets — it reorders
+    /// the kept rows and never reintroduces a filtered-out one.
+    #[test]
+    fn t77_sort_composes_with_facets_and_port_filter() {
+        use crate::store::{LibrarySortKey as Key, SortDirection as Dir};
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t77_row("1", "One", "vless", "travel", 10801),
+            t77_row("2", "Two", "vless", "travel", 10802),
+            t77_row("3", "Three", "vmess", "travel", 10803),
+            t77_row("4", "Four", "vless", "team", 10804),
+            t77_row("5", "Five", "vless", "travel", 19001),
+        ]);
+        delegate.set_latency(t77_map_u64(&[
+            ("1", 90),
+            ("2", 20),
+            ("3", 30),
+            ("4", 10),
+            ("5", 40),
+        ]));
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Two", "Three", "Five", "One"],
+            "no filter: the whole library ranks by latency"
+        );
+
+        delegate.query = "port=10801:10803".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One"],
+            "the port predicate keeps its rows and the sort ranks them"
+        );
+
+        delegate.set_facet_group(Some("travel".to_string()));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One"],
+            "the group facet ANDs with the port predicate before the sort"
+        );
+
+        delegate.set_facet_protocol(Some("vless".to_string()));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "One"],
+            "protocol facet removes Three, latency order holds"
+        );
+
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Two"],
+            "direction change re-ranks only what the filters kept"
+        );
+
+        delegate.clear_facets();
+        delegate.query.clear();
+        delegate.apply_filter();
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Five", "Three", "Two", "Four"],
+            "clearing the filters restores the full sorted set"
+        );
+    }
+
+    /// T-27: both sortable headers paint, right-click opens the picker menu,
+    /// the live choice is marked, and picking a key persists it.
+    #[gpui_kit::test]
+    fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_library_columns("upstream,health,traffic")
+            .expect("column choice writes");
+        store
+            .set_library_sort(crate::store::LibrarySort::new(
+                crate::store::LibrarySortKey::TrafficTotal,
+                crate::store::SortDirection::Ascending,
+            ))
+            .expect("sort choice writes");
+        store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().sort),
+            crate::store::LibrarySort::new(
+                crate::store::LibrarySortKey::TrafficTotal,
+                crate::store::SortDirection::Ascending
+            ),
+            "launch reads the persisted sort beside library_columns"
+        );
+
+        cx.update(|window, _| {
+            assert!(
+                window.try_find("sort-header-health".to_string()).is_some(),
+                "the health header paints when the column is visible"
+            );
+            assert!(
+                window.try_find("sort-header-traffic".to_string()).is_some(),
+                "the traffic header paints when the column is visible"
+            );
+            assert!(
+                window.try_find("sort-header-group".to_string()).is_none(),
+                "hidden columns have no header"
+            );
+        });
+
+        cx.update(|window, cx| {
+            window.right_click("sort-header-traffic".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "sort-header-traffic-none",
+            "sort-header-traffic-traffic_total",
+            "sort-header-traffic-traffic_down",
+            "sort-header-traffic-traffic_up",
+            "sort-header-traffic-direction",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the traffic sort menu"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window
+                .try_find("sort-header-traffic-latency".to_string())
+                .is_none()),
+            "the traffic menu offers only the traffic keys"
+        );
+        let marked = cx.update(|window, _| {
+            window
+                .try_find("sort-header-traffic-traffic_total".to_string())
+                .and_then(|snapshot| snapshot.label().map(str::to_string))
+                .unwrap_or_default()
+        });
+        assert!(
+            marked.contains('✓'),
+            "the persisted key carries the marker: {marked:?}"
+        );
+
+        cx.update(|window, cx| {
+            window.click("sort-header-traffic-direction".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| (
+                view.libraries.read(cx).delegate().sort,
+                view.store.library_sort()
+            )),
+            (
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::TrafficTotal,
+                    crate::store::SortDirection::Descending
+                ),
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::TrafficTotal,
+                    crate::store::SortDirection::Descending
+                ),
+            ),
+            "the direction toggle reaches both the list and the meta row"
+        );
+
+        cx.update(|window, cx| {
+            window.right_click("sort-header-health".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "sort-header-health-none",
+            "sort-header-health-latency",
+            "sort-header-health-download",
+            "sort-header-health-upload",
+            "sort-header-health-out_ip",
+            "sort-header-health-type_security",
+            "sort-header-health-direction",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the health sort menu"
+            );
+        }
+        assert!(
+            !cx.update(|window, _| window
+                .try_find("sort-header-health-none".to_string())
+                .and_then(|snapshot| snapshot.label().map(str::to_string))
+                .unwrap_or_default()
+                .contains('✓')),
+            "a key owned by the other column is not marked here"
+        );
+        let direction = cx.update(|window, _| {
+            window
+                .try_find("sort-header-health-direction".to_string())
+                .and_then(|snapshot| snapshot.label().map(str::to_string))
+                .unwrap_or_default()
+        });
+        assert!(
+            direction.contains("descending"),
+            "the direction item shows the live direction: {direction:?}"
+        );
+
+        cx.update(|window, cx| {
+            window.click("sort-header-health-latency".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| (
+                view.libraries.read(cx).delegate().sort,
+                view.store.library_sort()
+            )),
+            (
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::Latency,
+                    crate::store::SortDirection::Descending
+                ),
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::Latency,
+                    crate::store::SortDirection::Descending
+                ),
+            ),
+            "picking a key keeps the direction and persists the pair"
+        );
+    }
+
+    // ---- T-28: share-dialog QR ------------------------------------------
+
+    const T78_KNOWN_PAYLOAD: &str = "socks5://127.0.0.1:10801";
+    /// Pinned fingerprint of the known payload's grid (quiet zone included) at EC M.
+    const T78_KNOWN_FINGERPRINT: u64 = 0xDD10_7000_ADAB_B569;
+
+    fn t78_row(bind_ip: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            id: format!("t78-{port}"),
+            name: "Lan".to_string(),
+            protocol: "vless".to_string(),
+            params: "{}".to_string(),
+            group: String::new(),
+            enabled: true,
+            bind_ip: bind_ip.to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn t78_new(bind_ip: &str, port: &str) -> NewConfig {
+        NewConfig {
+            bind_ip: bind_ip.to_string(),
+            ..tick12_seed("Lan", port)
+        }
+    }
+
+    #[test]
+    fn t78_qr_content_equals_proxy_urls_lines() {
+        use crate::{proxy_urls, qr_grid, share_qr_payloads};
+
+        for (bind_ip, port) in [
+            ("127.0.0.1", 10801u16),
+            ("0.0.0.0", 10899),
+            ("192.168.1.20", 18081),
+            ("::1", 10900),
+            ("2001:db8::1", 18082),
+            ("a-rather-long-listener-hostname.internal.lan", 10805),
+        ] {
+            let row = t78_row(bind_ip, port);
+            let (socks, http) = proxy_urls(bind_ip, port);
+            let payloads = share_qr_payloads(&row);
+
+            assert_eq!(payloads[0].0, "socks", "socks comes first");
+            assert_eq!(payloads[1].0, "http", "http comes second");
+            assert_eq!(payloads[0].1, socks, "socks line is proxy_urls' line");
+            assert_eq!(payloads[1].1, http, "http line is proxy_urls' line");
+
+            for (label, payload) in &payloads {
+                let scheme = if *label == "socks" {
+                    "socks5://"
+                } else {
+                    "http://"
+                };
+                assert!(
+                    payload.starts_with(scheme),
+                    "{label} keeps its scheme: {payload}"
+                );
+                assert!(
+                    !payload.starts_with("manyproxy://"),
+                    "no share link ever reaches a QR: {payload}"
+                );
+                assert!(!payload.contains('@'), "no credentials in a QR: {payload}");
+                assert!(
+                    !payload.contains('?') && !payload.contains('#'),
+                    "no params or fragment in a QR: {payload}"
+                );
+                assert!(
+                    payload.ends_with(&format!(":{port}")),
+                    "{label} carries the listener port: {payload}"
+                );
+                assert!(
+                    qr_grid(payload).is_ok(),
+                    "{label} payload encodes at any listener length: {payload}"
+                );
+            }
+
+            assert_ne!(
+                qr_grid(&payloads[0].1).expect("socks encodes"),
+                qr_grid(&payloads[1].1).expect("http encodes"),
+                "one grid per scheme, never one two-line code"
+            );
+        }
+
+        // Wildcard binds are transcribed literally, exactly like the dialog text.
+        let wildcard = share_qr_payloads(&t78_row("0.0.0.0", 10801));
+        assert_eq!(wildcard[0].1, "socks5://0.0.0.0:10801");
+        assert_eq!(wildcard[1].1, "http://0.0.0.0:10801");
+        // IPv6 keeps its brackets, as proxy_urls writes them.
+        let v6 = share_qr_payloads(&t78_row("::1", 10801));
+        assert_eq!(v6[0].1, "socks5://[::1]:10801");
+        assert_eq!(v6[1].1, "http://[::1]:10801");
+    }
+
+    #[test]
+    fn t78_qr_grid_known_payload_shape() {
+        use crate::{qr_grid, SHARE_QR_QUIET_ZONE};
+
+        let grid = qr_grid(T78_KNOWN_PAYLOAD).expect("known payload encodes");
+        assert_eq!(
+            grid.side, 33,
+            "version 2 at EC M: 25 core modules + a 4-module quiet zone per side"
+        );
+        assert_eq!(
+            grid.fingerprint(),
+            T78_KNOWN_FINGERPRINT,
+            "known payload keeps its exact module grid"
+        );
+
+        let side = grid.side;
+        let quiet = SHARE_QR_QUIET_ZONE;
+        for i in 0..side {
+            for ring in 0..quiet {
+                assert!(!grid.is_dark(i, ring), "top quiet row {ring} is light");
+                assert!(
+                    !grid.is_dark(i, side - 1 - ring),
+                    "bottom quiet row {ring} is light"
+                );
+                assert!(!grid.is_dark(ring, i), "left quiet column {ring} is light");
+                assert!(
+                    !grid.is_dark(side - 1 - ring, i),
+                    "right quiet column {ring} is light"
+                );
+            }
+        }
+
+        // Finder patterns: 7x7 dark ring, light middle ring, 3x3 dark core.
+        for (x, y) in [
+            (quiet, quiet),
+            (side - 1 - quiet - 6, quiet),
+            (quiet, side - 1 - quiet - 6),
+        ] {
+            assert!(grid.is_dark(x, y), "finder corner ({x},{y}) dark");
+            assert!(grid.is_dark(x + 6, y), "finder corner ({x},{y}) dark");
+            assert!(grid.is_dark(x, y + 6), "finder corner ({x},{y}) dark");
+            assert!(grid.is_dark(x + 6, y + 6), "finder corner ({x},{y}) dark");
+            assert!(!grid.is_dark(x + 1, y + 1), "finder ring ({x},{y}) light");
+            assert!(grid.is_dark(x + 2, y + 2), "finder core ({x},{y}) dark");
+            assert!(grid.is_dark(x + 4, y + 4), "finder core ({x},{y}) dark");
+            assert!(!grid.is_dark(x + 5, y + 5), "finder ring ({x},{y}) light");
+        }
+
+        // A longer listener host grows the version instead of failing.
+        let long = format!("socks5://{}.internal.lan:10801", "a".repeat(150));
+        let grown = qr_grid(&long).expect("long listener URL still encodes");
+        assert!(
+            grown.side > side,
+            "version auto-grows for longer payloads: {}",
+            grown.side
+        );
+
+        // The quiet zone is part of the grid, so it is never a separate, clippable band.
+        assert_eq!(
+            grid.dark.len(),
+            side * side,
+            "every module including the quiet zone lives in the grid"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t78_share_dialog_renders_two_qrs(cx: &mut TestAppContext) {
+        use crate::{QrPlate, SHARE_QR_PLATE_PX};
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(t78_new("127.0.0.1", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_share_for_row(&row.id, window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+
+        let region = cx.update(|window, _| window.find("share-qr-region").bounds());
+        assert!(region.size.width.as_f32() > 0., "the QR region is laid out");
+        let socks = cx.update(|window, _| window.find("share-qr-socks").bounds());
+        let http = cx.update(|window, _| window.find("share-qr-http").bounds());
+        for (label, plate) in [("socks", socks), ("http", http)] {
+            assert!(
+                plate.size.width.as_f32() >= SHARE_QR_PLATE_PX,
+                "{label} plate keeps its minimum size: {}",
+                plate.size.width.as_f32()
+            );
+            assert!(
+                (plate.size.width.as_f32() - plate.size.height.as_f32()).abs() < 0.5,
+                "{label} plate stays square"
+            );
+        }
+        assert_eq!(
+            socks.origin.y, http.origin.y,
+            "both QRs sit on one row, side by side"
+        );
+        assert!(
+            socks.origin.x < http.origin.x,
+            "socks is left of http: {:?} vs {:?}",
+            socks.origin.x,
+            http.origin.x
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find("share-qr-socks-label".to_string())
+                .is_some()),
+            "the socks plate is labeled"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("share-qr-http-label".to_string()).is_some()),
+            "the http plate is labeled"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("share-link-text".to_string()).is_some()),
+            "the link text stays"
+        );
+
+        let warning = cx.update(|window, _| window.find("share-warning").bounds());
+        let link = cx.update(|window, _| window.find("share-link-text").bounds());
+        assert!(
+            warning.origin.y < socks.origin.y,
+            "the credential warning stays above the QRs"
+        );
+        assert!(
+            link.origin.y < socks.origin.y,
+            "the QRs sit below the link text"
+        );
+
+        // Resize discipline: the grid (quiet zone included) always fits its plate, the
+        // cell never shrinks as the plate grows, and cells stay whole pixels above 1:1.
+        let mut last_cell = 0.0_f32;
+        for edge in [
+            0.,
+            12.,
+            25.,
+            40.,
+            96.,
+            120.,
+            SHARE_QR_PLATE_PX,
+            160.,
+            240.,
+            400.,
+        ] {
+            let plate = QrPlate::fit(edge, edge, socks_qr_side());
+            assert!(
+                plate.plate_side() <= edge + 0.001,
+                "the whole grid fits at {edge}px: {}",
+                plate.plate_side()
+            );
+            assert!(plate.x >= 0. && plate.y >= 0., "grid origin stays inside");
+            assert!(
+                plate.cell >= last_cell,
+                "cell size is monotone on resize: {} then {}",
+                last_cell,
+                plate.cell
+            );
+            if edge >= plate.side as f32 {
+                assert_eq!(
+                    plate.cell,
+                    plate.cell.floor(),
+                    "whole-pixel cells keep modules crisp"
+                );
+            }
+            last_cell = plate.cell;
+        }
+        assert!(
+            (SHARE_QR_PLATE_PX / socks_qr_side() as f32) >= 3.,
+            "the plate keeps at least a 3 px module for the known grid"
+        );
+    }
+
+    fn socks_qr_side() -> usize {
+        crate::qr_grid(T78_KNOWN_PAYLOAD)
+            .expect("known payload encodes")
+            .side
+    }
+
+    #[test]
+    fn t78_no_scanner_refusal_untouched() {
+        use crate::import::reject_file_bytes;
+
+        let refusal = "image file (paste the link text instead — this build has no image/QR scan)";
+        let images: [&[u8]; 6] = [
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff\xe0",
+            b"GIF87a",
+            b"GIF89a",
+            b"BM",
+            b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+        ];
+        for bytes in images {
+            assert_eq!(
+                reject_file_bytes(bytes),
+                Some(refusal),
+                "the typed scan refusal stays byte-identical"
+            );
+        }
+        assert_eq!(
+            reject_file_bytes(b"vless://11111111-2222-4333-8444-555555555555@a.example.com:443"),
+            None,
+            "text intake still works"
+        );
+
+        // Encode-only: the wrapper has no decode/scan/camera entry point, and a QR of a
+        // share link is out of scope by decision.
+        assert!(crate::qr_grid("socks5://127.0.0.1:10801").is_ok());
+        assert!(
+            crate::qr_grid(&"x".repeat(3_000)).is_err(),
+            "oversized payloads fail closed instead of panicking"
+        );
+    }
+
+    // ---- T-29: top-9 exits + Other --------------------------------------
+
+    fn t79_exit(id: &str, name: &str, rx: u64, tx: u64) -> ExitTraffic {
+        ExitTraffic {
+            row_id: id.to_string(),
+            name: name.to_string(),
+            bind: "127.0.0.1:10801".to_string(),
+            rx_bytes: rx,
+            tx_bytes: tx,
+        }
+    }
+
+    #[test]
+    fn t79_top9_other_split_math() {
+        use crate::{traffic_top9_split, TRAFFIC_TOP_EXITS};
+
+        let exits: Vec<ExitTraffic> = (0..12u64)
+            .map(|index| {
+                let rank = 12 - index;
+                t79_exit(
+                    &format!("e{index:02}"),
+                    &format!("Exit {index:02}"),
+                    rank * 1_000,
+                    rank * 10,
+                )
+            })
+            .collect();
+
+        let split = traffic_top9_split(&exits);
+        assert_eq!(TRAFFIC_TOP_EXITS, 9);
+        assert_eq!(split.top.len(), 9, "exactly nine rows stay listed");
+        assert_eq!(split.other_exits, 3, "everything below rank 9 rolls up");
+        assert_eq!(split.other_rx, 6_000, "3 + 2 + 1 KB of the tail");
+        assert_eq!(split.other_tx, 60);
+        for pair in split.top.windows(2) {
+            assert!(
+                pair[0].total() >= pair[1].total(),
+                "listed rows stay heaviest-first"
+            );
+        }
+        let listed_rx: u64 = split.top.iter().map(|exit| exit.rx_bytes).sum();
+        let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
+        assert_eq!(listed_rx + split.other_rx, all_rx, "top 9 + other = all");
+        assert_eq!(
+            split.top.iter().map(|exit| exit.tx_bytes).sum::<u64>() + split.other_tx,
+            exits.iter().map(|exit| exit.tx_bytes).sum::<u64>()
+        );
+
+        // Ties break on row_id, then name/bind — never on insertion order.
+        let tied = vec![
+            t79_exit("b", "Beta", 100, 5),
+            t79_exit("a", "Alpha", 100, 5),
+            t79_exit("c", "Gamma", 100, 5),
+        ];
+        let tied_order = traffic_top9_split(&tied);
+        let order: Vec<&str> = tied_order
+            .top
+            .iter()
+            .map(|exit| exit.row_id.as_str())
+            .collect();
+        assert_eq!(order, ["a", "b", "c"]);
+        let mut reversed = tied.clone();
+        reversed.reverse();
+        assert_eq!(
+            traffic_top9_split(&reversed),
+            traffic_top9_split(&tied),
+            "same data paints the same order"
+        );
+
+        // Nine or fewer: no Other line at all.
+        let nine = traffic_top9_split(&exits[..9]);
+        assert_eq!(nine.top.len(), 9);
+        assert_eq!((nine.other_exits, nine.other_rx, nine.other_tx), (0, 0, 0));
+        assert_eq!(nine.other_line(), None);
+    }
+
+    #[gpui_kit::test]
+    fn t79_top9_renders_without_other_when_few_exits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut ids = Vec::new();
+        for (index, port) in ["10861", "10862", "10863"].into_iter().enumerate() {
+            let row = store
+                .add(tick12_seed(&format!("Exit {index}"), port))
+                .expect("seed works");
+            ids.push(row.id);
+        }
+        store
+            .add_traffic_batch(&[
+                (ids[0].clone(), 500, 5),
+                (ids[1].clone(), 7_000, 70),
+                (ids[2].clone(), 3_000, 30),
+            ])
+            .expect("traffic persists");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        for id in &ids {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_some()),
+                "three exits keep every row listed"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("traffic-stats-other").is_none()),
+            "no Other line until a tenth exit exists"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t79_other_line_count_and_bytes_correct(cx: &mut TestAppContext) {
+        use crate::{
+            aggregate_exit_traffic, format_bytes, traffic_bar_max, traffic_other_line_text,
+            traffic_top9_split,
+        };
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut seeded: Vec<(String, u64, u64)> = Vec::new();
+        for index in 0..12u64 {
+            let row = store
+                .add(tick12_seed(
+                    &format!("Exit {index:02}"),
+                    &(10_861 + index).to_string(),
+                ))
+                .expect("seed works");
+            let rx = if index == 0 { 100 } else { 51 - index };
+            seeded.push((row.id, rx, 0));
+        }
+        store.add_traffic_batch(&seeded).expect("traffic persists");
+
+        let rows = store.list().expect("rows list");
+        let totals = store.traffic_totals().expect("totals read");
+        let exits = aggregate_exit_traffic(&rows, &totals);
+        let split = traffic_top9_split(&exits);
+        assert_eq!(split.top.len(), 9);
+        assert_eq!(split.other_exits, 3);
+        let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
+        let top_rx: u64 = split.top.iter().map(|exit| exit.rx_bytes).sum();
+        assert_eq!(split.other_rx, all_rx - top_rx, "Other = total − top 9");
+        assert_eq!(split.other_rx, 123, "42 + 41 + 40 bytes are rolled up");
+        assert_eq!(split.other_tx, 0);
+        let expected = traffic_other_line_text(3, 123, 0);
+        assert_eq!(
+            expected,
+            format!(
+                "Other (3 more · ↓{} ↑{})",
+                format_bytes(123),
+                format_bytes(0)
+            )
+        );
+        assert_eq!(split.other_line().as_deref(), Some(expected.as_str()));
+        assert!(
+            !expected.contains("Exit") && !expected.contains("127.0.0.1"),
+            "aggregate line carries count + bytes only: {expected}"
+        );
+        // Bar denominator is the heaviest raw row (100 B), never the 123 B
+        // aggregate: proportions stay computed over all rows, not the roll-up.
+        assert_eq!(traffic_bar_max(&exits), 100);
+        assert!(split.other_rx > traffic_bar_max(&exits));
+
+        let listed: Vec<String> = split.top.iter().map(|exit| exit.row_id.clone()).collect();
+        let rolled: Vec<String> = seeded
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .filter(|id| !listed.contains(id))
+            .collect();
+        assert_eq!(rolled.len(), 3);
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        for id in &listed {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_some()),
+                "top-9 row {id} paints"
+            );
+        }
+        for id in &rolled {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_none()),
+                "ranked-below-nine row {id} stays nameless"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("traffic-stats-other").is_some()),
+            "the aggregate line paints after rank 9"
+        );
+    }
+
+    #[test]
+    fn t79_periods_compute_independently() {
+        use crate::store::TrafficPeriod;
+        use crate::traffic_top9_split;
+
+        let dataset = |period: TrafficPeriod, rows: u64| -> Vec<ExitTraffic> {
+            let scale = match period {
+                TrafficPeriod::Day => 1_000u64,
+                TrafficPeriod::Week => 2_000,
+                TrafficPeriod::Month => 3_000,
+                TrafficPeriod::Quarter => 4_000,
+            };
+            (0..rows)
+                .map(|index| {
+                    t79_exit(
+                        &format!("{}-{index:02}", period.label()),
+                        &format!("{} exit {index:02}", period.label()),
+                        (rows - index) * scale,
+                        scale,
+                    )
+                })
+                .collect()
+        };
+
+        let mut others = Vec::new();
+        for period in TrafficPeriod::ALL {
+            let exits = dataset(period, 11);
+            let first = traffic_top9_split(&exits);
+            let second = traffic_top9_split(&exits);
+            assert_eq!(first, second, "{} recomputes identically", period.label());
+            assert_eq!(first.top.len(), 9, "{} keeps nine rows", period.label());
+            assert_eq!(first.other_exits, 2, "{} rolls up two", period.label());
+            let scale = match period {
+                TrafficPeriod::Day => 1_000u64,
+                TrafficPeriod::Week => 2_000,
+                TrafficPeriod::Month => 3_000,
+                TrafficPeriod::Quarter => 4_000,
+            };
+            assert_eq!(first.other_rx, 3 * scale, "{}", period.label());
+            assert_eq!(
+                first.other_tx,
+                2 * scale,
+                "two rolled-up rows carry one scale of tx each ({})",
+                period.label()
+            );
+            let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
+            assert_eq!(
+                first.top.iter().map(|exit| exit.rx_bytes).sum::<u64>() + first.other_rx,
+                all_rx,
+                "{} accounts every byte",
+                period.label()
+            );
+            others.push(first.other_rx);
+        }
+        let mut distinct = others.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // Honesty note: `Store::traffic_period_summary` ignores `_period` and
+        // traffic lives in all-time `proxy_configs` columns, so the four
+        // periods receive identical data today (the dialog tooltip says
+        // "all-time totals throughout"). The distinct scales here are fixture
+        // inputs; the split itself is a pure per-render fn over whatever rows
+        // each period hands it.
+        assert_eq!(distinct.len(), 4, "each period splits its own data");
+
+        // The gate is per period too: six Day exits need no Other line while
+        // Quarter's eleven do — and Day recomputed later is unchanged.
+        let day_small = traffic_top9_split(&dataset(TrafficPeriod::Day, 6));
+        assert_eq!(day_small.top.len(), 6);
+        assert_eq!(day_small.other_line(), None);
+        assert!(
+            traffic_top9_split(&dataset(TrafficPeriod::Quarter, 11))
+                .other_line()
+                .is_some(),
+            "Quarter still rolls up"
+        );
+        assert_eq!(
+            day_small,
+            traffic_top9_split(&dataset(TrafficPeriod::Day, 6)),
+            "no split state survives a render"
+        );
+    }
+
+    // --- T-30: shard CPU/RAM sampler (pure math, ring, render) ---------------
+
+    fn shard_pair(label: &str, pid: u32) -> (String, u32) {
+        (label.to_string(), pid)
+    }
+
+    fn sampled(cpu_100ns: u64, ram_bytes: u64) -> impl Fn(u32) -> crate::SampleRead {
+        move |_pid| {
+            crate::SampleRead::Sampled(crate::ProcessSample {
+                cpu_100ns,
+                ram_bytes,
+            })
+        }
+    }
+
+    #[test]
+    fn t80_sampler_delta_calculations() {
+        use crate::cpu_percent_of_one_core;
+        use std::time::Duration;
+
+        let window = Duration::from_secs(5);
+        // 5 s of CPU time inside a 5 s window = one full core.
+        let full_core = 5 * 10_000_000;
+        assert_eq!(cpu_percent_of_one_core(0, full_core, window), Some(100.0));
+        assert_eq!(
+            cpu_percent_of_one_core(7, 7 + full_core / 2, window),
+            Some(50.0)
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(7, 7 + full_core * 2, window),
+            Some(200.0),
+            "two busy threads are 200% of one core"
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(1_000, 1_000, window),
+            Some(0.0),
+            "an idle process reads zero, not absent"
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(5_000, 4_000, window),
+            None,
+            "a backwards counter is no sample at all"
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(0, full_core, Duration::ZERO),
+            None,
+            "an empty window has no rate"
+        );
+
+        let odd = cpu_percent_of_one_core(0, 1_234_567, window).expect("odd delta samples");
+        assert!(
+            (odd - 2.469_135_8).abs() < 0.001,
+            "delta / window, got {odd}"
+        );
+        // Same CPU delta over half the wall time doubles the rate: the
+        // normalization is by elapsed wall time, not by tick count.
+        assert_eq!(
+            cpu_percent_of_one_core(0, full_core / 2, Duration::from_millis(2_500)),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn t80_ring_evicts_dead_shards() {
+        use crate::{
+            fold_shard_samples, push_shard_sample, SampleRead, ShardRing, SHARD_SAMPLE_RING,
+        };
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+
+        let mut rings: BTreeMap<String, ShardRing> = BTreeMap::new();
+        let mut baselines = BTreeMap::new();
+        let t0 = Instant::now();
+        let read = sampled(12_000_000, 64 * 1_048_576);
+        let live = [shard_pair("stock", 41), shard_pair("fork", 42)];
+
+        for step in 0..3u64 {
+            let at = t0 + Duration::from_secs(5 * step);
+            fold_shard_samples(&mut rings, &mut baselines, &live, &read, at);
+        }
+        assert_eq!(
+            rings["stock"].cpu.len(),
+            2,
+            "the first tick only primes the baseline"
+        );
+        assert_eq!(rings["stock"].ram.len(), 2);
+        assert_eq!(rings["fork"].cpu.len(), 2);
+
+        // fork stops: its label leaves the cohort, so its ring goes with it.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("stock", 41)],
+            &read,
+            t0 + Duration::from_secs(20),
+        );
+        assert!(!rings.contains_key("fork"), "dead shard evicted");
+        assert!(!baselines.contains_key("fork"), "no baseline left behind");
+        assert!(rings.contains_key("stock"), "live shard keeps its history");
+
+        // A rename is the same eviction: the old label disappears, the new one
+        // starts with an empty ring.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("stock", 41), shard_pair("extra-9", 43)],
+            &read,
+            t0 + Duration::from_secs(25),
+        );
+        assert!(rings["extra-9"].cpu.is_empty(), "new label starts clean");
+
+        // A pid the sampler reports gone drops silently.
+        let gone = |_pid: u32| SampleRead::Gone;
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("extra-9", 43)],
+            &gone,
+            t0 + Duration::from_secs(30),
+        );
+        assert!(!rings.contains_key("extra-9"), "gone pid drops silently");
+
+        // A refused handle is named, never plotted.
+        let denied = |_pid: u32| SampleRead::Denied;
+        let refused = fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("xray", 44)],
+            &denied,
+            t0 + Duration::from_secs(35),
+        );
+        assert!(refused.contains("xray"), "permission failure is named");
+        assert!(!rings.contains_key("xray"), "nothing is plotted for it");
+
+        // The ring caps at 60: the oldest samples fall off the front.
+        let mut ring = ShardRing::default();
+        for step in 0..(SHARD_SAMPLE_RING as i32 + 10) {
+            push_shard_sample(&mut ring.cpu, step as f32);
+            push_shard_sample(&mut ring.ram, 1.0);
+        }
+        assert_eq!(ring.cpu.len(), SHARD_SAMPLE_RING);
+        assert_eq!(ring.ram.len(), SHARD_SAMPLE_RING);
+        assert_eq!(ring.cpu.first().copied(), Some(10.0), "oldest ten evicted");
+        assert_eq!(
+            ring.cpu.last().copied(),
+            Some((SHARD_SAMPLE_RING + 9) as f32)
+        );
+    }
+
+    #[test]
+    fn t80_no_sampling_race_after_restart() {
+        use crate::{fold_shard_samples, ShardRing};
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+
+        let mut rings: BTreeMap<String, ShardRing> = BTreeMap::new();
+        let mut baselines = BTreeMap::new();
+        let t0 = Instant::now();
+        let first = [shard_pair("stock", 41)];
+
+        // Generation one: prime at 1 s of CPU, then +1 s over a 5 s window.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &first,
+            &sampled(10_000_000, 100 * 1_048_576),
+            t0,
+        );
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &first,
+            &sampled(20_000_000, 101 * 1_048_576),
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(rings["stock"].cpu, vec![20.0]);
+        assert_eq!(rings["stock"].ram, vec![101.0]);
+
+        // The shard restarts under a new pid whose counter starts near zero.
+        // Its CPU time is far below the old baseline: reusing that baseline
+        // would underflow or fabricate a bogus rate.
+        let second = [shard_pair("stock", 55)];
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(500_000, 30 * 1_048_576),
+            t0 + Duration::from_secs(10),
+        );
+        assert!(
+            rings["stock"].cpu.is_empty() && rings["stock"].ram.is_empty(),
+            "respawn starts a fresh ring, got {:?}",
+            rings["stock"]
+        );
+
+        // The next tick deltas against the new generation only.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(3_000_000, 31 * 1_048_576),
+            t0 + Duration::from_secs(15),
+        );
+        assert_eq!(rings["stock"].cpu, vec![5.0], "2.5 s CPU / 5 s window");
+        assert_eq!(rings["stock"].ram, vec![31.0]);
+
+        // A backwards counter for the same pid can never push a sample, and
+        // the baseline re-primes so the next tick stays sane.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(100, 31 * 1_048_576),
+            t0 + Duration::from_secs(20),
+        );
+        assert_eq!(rings["stock"].cpu, vec![5.0], "no negative rate");
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(2_500_100, 32 * 1_048_576),
+            t0 + Duration::from_secs(25),
+        );
+        assert_eq!(rings["stock"].cpu, vec![5.0, 5.0]);
+        assert_eq!(rings["stock"].ram, vec![31.0, 32.0]);
+    }
+
+    #[gpui_kit::test]
+    fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::{shard_stat_rows, ShardRing};
+        use std::collections::{BTreeMap, HashSet};
+
+        let mut rings: BTreeMap<String, ShardRing> = BTreeMap::new();
+        rings.insert(
+            "stock".to_string(),
+            ShardRing {
+                cpu: vec![4.5, 6.0],
+                ram: vec![31.0, 33.5],
+            },
+        );
+        let shards = vec![
+            ("stock".to_string(), Some(41)),
+            ("fork".to_string(), None),
+            ("xray".to_string(), Some(43)),
+            ("extra-9".to_string(), Some(44)),
+        ];
+        let denied: HashSet<String> = ["xray".to_string()].into_iter().collect();
+
+        let rows = shard_stat_rows(&shards, &rings, &denied);
+        assert_eq!(rows.len(), 4, "one row per shard slot");
+        assert_eq!(rows[0].label, "stock");
+        assert_eq!(rows[0].cpu, vec![4.5, 6.0], "series follow the shard label");
+        assert_eq!(rows[0].ram, vec![31.0, 33.5]);
+        assert_eq!(rows[0].caption, None, "samples mean charts");
+        assert_eq!(rows[1].caption, Some(crate::SHARD_NOT_RUNNING));
+        assert_eq!(rows[2].caption, Some(crate::SHARD_SAMPLING_UNAVAILABLE));
+        assert_eq!(rows[3].caption, Some(crate::SHARD_COLLECTING));
+        assert_eq!(
+            crate::shard_stats_summary(&rows),
+            "3 live shard(s), 1 charted, sampling unavailable"
+        );
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, stock) = EngineController::fake();
+                stock.set_pid(Some(41));
+                view.engine = engine;
+                view.shard_rings = rings.clone();
+                view.shard_denied = denied.clone();
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        for id in [
+            "runtime-shard-stats",
+            "shard-stat-stock",
+            "shard-label-stock",
+            "shard-chart-stock",
+            "shard-caption-fork",
+            "shard-caption-extra-0",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} paints"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("shard-chart-fork").is_none()),
+            "a shard with no samples paints no chart"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stat-9").is_some()),
+            "the process summary keeps the ten-line body"
+        );
+    }
+
+    // T-33: the bind picker and the Settings address list.
+
+    fn t83_bind_hosts_of(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
+        cx.update(|_, cx| view.update(cx, |view, _| view.store.bind_hosts()))
+    }
+
+    fn t83_draft_bind(view: &Entity<AppView>, id: &str, cx: &mut VisualTestContext) -> String {
+        view.read_with(cx, |view, cx| {
+            view.libraries
+                .read(cx)
+                .delegate()
+                .endpoint_draft_texts(id, cx)
+                .expect("row inputs exist")
+                .0
+        })
+    }
+
+    fn t83_pending_pick(view: &Entity<AppView>, id: &str, host: &str, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    list.delegate_mut().queue_bind_pick(id, host);
+                    cx.notify();
+                });
+            });
+        });
+        paint_frame(cx);
+    }
+
+    #[gpui_kit::test]
+    fn t83_hostname_rejected_in_list_editor(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Loop", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+
+        let error = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host("example.com", window, cx)
+                })
+            })
+            .expect_err("a hostname never enters the list");
+        assert_eq!(
+            error,
+            Store::BIND_HOST_LITERAL_ONLY,
+            "the inline error is the field's own sentence"
+        );
+        assert_eq!(
+            t83_bind_hosts_of(&view, cx),
+            vec!["127.0.0.1".to_string(), "0.0.0.0".to_string()],
+            "a rejected add leaves the list untouched"
+        );
+
+        let hosts = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host(" 192.168.1.20 ", window, cx)
+                })
+            })
+            .expect("an IPv4 literal is accepted");
+        assert_eq!(
+            hosts,
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+            ],
+            "the literal lands after the constants"
+        );
+        let duplicate = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host("192.168.1.20", window, cx)
+                })
+            })
+            .expect_err("duplicates are refused");
+        assert!(
+            duplicate.contains("already in the list"),
+            "duplicate refusal reads inline: {duplicate}"
+        );
+        let ipv6 = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host("FD00:0::7", window, cx)
+                })
+            })
+            .expect("an IPv6 literal is accepted");
+        assert_eq!(
+            ipv6.last().map(String::as_str),
+            Some("fd00::7"),
+            "IPv6 lands canonical"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "settings-section-addresses",
+            "settings-addresses-note",
+            "settings-bind-host-127.0.0.1",
+            "settings-bind-host-builtin-127.0.0.1",
+            "settings-bind-host-0.0.0.0",
+            "settings-bind-host-builtin-0.0.0.0",
+            "settings-bind-host-192.168.1.20",
+            "settings-bind-host-remove-192.168.1.20",
+            "settings-bind-host-error",
+            "settings-bind-host-add",
+            "field-settings-bind-host",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "the Settings list editor renders {id}"
+            );
+        }
+        assert_absent(cx, "settings-bind-host-remove-127.0.0.1".to_string());
+    }
+
+    #[gpui_kit::test]
+    fn t83_picker_drives_existing_save_gate(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        store.add_bind_host("192.168.1.44").expect("extra accepted");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+
+        assert_painted(cx, &format!("row-bind-picker-{}", alpha.id));
+        assert_absent(cx, format!("row-bind-input-{}", alpha.id));
+        assert_painted(cx, &format!("row-bind-add-{}", alpha.id));
+
+        t83_pending_pick(&view, &alpha.id, "192.168.1.44", cx);
+        assert_eq!(
+            t83_draft_bind(&view, &alpha.id, cx),
+            "192.168.1.44",
+            "the pick writes the row's bind draft"
+        );
+        let selected = view.read_with(cx, |view, cx| {
+            let list = view.libraries.read(cx);
+            list.delegate()
+                .endpoint_inputs
+                .get(&alpha.id)
+                .expect("row inputs exist")
+                .picker
+                .read(cx)
+                .selected_value()
+                .cloned()
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some("192.168.1.44"),
+            "the picker shows the picked host"
+        );
+
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_endpoint(&alpha.id, window, cx)
+            })
+        });
+        assert!(committed, "the ordinary endpoint commit applies the pick");
+        let saved = view
+            .read_with(cx, |view, _| view.store.get(&alpha.id))
+            .expect("store reads")
+            .expect("row survives");
+        assert_eq!(saved.bind_ip, "192.168.1.44");
+        assert_eq!(saved.port, 10951, "the free-text port is untouched");
+
+        // The gate is still the only writer: a draft the picker can never
+        // produce (a hostname) is refused and nothing lands.
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let list = view.libraries.read(cx).delegate().endpoint_inputs[&alpha.id]
+                    .bind
+                    .clone();
+                list.update(cx, |state, cx| state.set_value("example.com", window, cx));
+            });
+        });
+        let refused = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_endpoint(&alpha.id, window, cx)
+            })
+        });
+        assert!(!refused, "save_listen_gate refuses a hostname draft");
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "the refusal toasts the gate's reason"
+        );
+        let kept = view
+            .read_with(cx, |view, _| view.store.get(&alpha.id))
+            .expect("store reads")
+            .expect("row survives");
+        assert_eq!(
+            kept.bind_ip, "192.168.1.44",
+            "the refused draft saves nothing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t83_lan_confirm_unchanged_for_nonloopback_pick(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let lan = store
+            .add(t30_engine_seed("Lan", "10961"))
+            .expect("seed works");
+        let loopback = store
+            .add(t30_engine_seed("Loop", "10962"))
+            .expect("seed works");
+        store.add_bind_host("192.168.1.44").expect("extra accepted");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        paint_frame(cx);
+
+        t83_pending_pick(&view, &lan.id, "192.168.1.44", cx);
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_row_endpoint(&lan.id, window, cx))
+        });
+        assert!(committed);
+        let saved = view
+            .read_with(cx, |view, _| view.store.get(&lan.id))
+            .expect("store reads")
+            .expect("row survives");
+        assert_eq!(saved.bind_ip, "192.168.1.44");
+        assert!(
+            crate::engine::requires_lan_confirm(&saved.bind_ip),
+            "a non-loopback pick still asks"
+        );
+        let text = crate::engine::lan_confirm_text(&saved.name, &saved.bind_ip);
+        assert!(
+            text.contains("Lan") && text.contains("192.168.1.44"),
+            "the unchanged confirm text names the row and bind: {text}"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&lan.id, window, cx));
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Start on a non-loopback bind opens the same LAN confirm"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts before the confirm"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        assert!(
+            !crate::engine::requires_lan_confirm("127.0.0.1"),
+            "loopback keeps its no-confirm path"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&loopback.id, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "a loopback row starts without a dialog"
+        );
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let params = "{\"inbounds\":[{\"type\":\"mixed\",\"listen\":\"0.0.0.0\",\
+            \"listen_port\":10970}]}";
+        let custom = store
+            .add(NewConfig {
+                name: "Custom".to_string(),
+                protocol: "custom-config".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: "10970".to_string(),
+            })
+            .expect("custom-config row seeds");
+        let generated = store
+            .add(t30_engine_seed("Generated", "10971"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+
+        assert!(
+            crate::engine::is_custom_config_protocol(&custom.protocol),
+            "the row is JSON-governed"
+        );
+        assert_painted(cx, &format!("row-bind-input-{}", custom.id));
+        assert_absent(cx, format!("row-bind-picker-{}", custom.id));
+        assert_absent(cx, format!("row-bind-add-{}", custom.id));
+        assert_painted(cx, &format!("row-bind-picker-{}", generated.id));
+
+        let listens = crate::engine::custom_config_listens(
+            &serde_json::from_str::<serde_json::Value>(&custom.params).expect("params are JSON"),
+        );
+        assert_eq!(
+            listens,
+            vec![("0.0.0.0".to_string(), 10970)],
+            "the custom listen still comes from the JSON document"
+        );
+
+        // A list edit reaches the generated rows and leaves the custom row's
+        // free-text bind alone.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_add_bind_host("192.168.1.20", window, cx)
+            })
+        })
+        .expect("extra accepted");
+        paint_frame(cx);
+        assert_painted(cx, &format!("row-bind-input-{}", custom.id));
+        assert_absent(cx, format!("row-bind-picker-{}", custom.id));
+        assert_eq!(
+            t83_draft_bind(&view, &custom.id, cx),
+            "127.0.0.1",
+            "the custom row keeps its own bind draft"
         );
     }
 }

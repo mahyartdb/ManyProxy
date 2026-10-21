@@ -45,3 +45,4 @@ jobs:
           cargo test --locked
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Gated proof family (pinned sing-box): t32 standard rows, t37 preset rules, t58 Throne-country-style route profile — all sing-box check green."

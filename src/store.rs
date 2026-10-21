@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
@@ -387,6 +387,139 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+/// T-22: export envelope identity. A future build reads these two fields to
+/// decide whether an export is ingestible instead of deep-failing inside
+/// restore. The format stays explicit-confirm JSON.
+pub const LIBRARY_EXPORT_SCHEMA: &str = "manyproxy-library";
+pub const LIBRARY_SCHEMA_VERSION: i64 = 1;
+
+const LIBRARY_ENVELOPE_KEYS: [&str; 4] = ["schema", "schema_version", "created", "checksum"];
+
+/// T-22: the envelope keys are metadata, not payload, so the checksum covers
+/// the payload object without them. Rebuilt key by key because `serde_json`'s
+/// `preserve_order` feature is live in this build (gpui-kit pulls it in) and
+/// `Map::remove` there is a swap-remove that would reshuffle the payload.
+fn envelope_free_payload(obj: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let payload = obj
+        .iter()
+        .filter(|(key, _)| !LIBRARY_ENVELOPE_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    serde_json::Value::Object(payload)
+}
+
+/// T-22: canonical form of a payload — object keys sorted at every level, so
+/// the checksum does not depend on key order or whitespace. `serde_json` is
+/// *not* order-stable here (`preserve_order` is active), so the payload is
+/// canonicalized explicitly instead of trusting its serializer.
+fn canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String((*key).clone()).to_string());
+                out.push(':');
+                canonical_json(&map[key.as_str()], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// T-22: FNV-1a 64 over the canonical payload bytes, rendered as 16 hex digits.
+/// An integrity cue, not a crypto claim — same constitution as the cap-name
+/// hash in `preset.rs`.
+fn export_checksum(payload: &serde_json::Value) -> String {
+    let mut text = String::new();
+    canonical_json(payload, &mut text);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// T-22: seal a payload object. The envelope keys lead the JSON so intake can
+/// recognize an export by its first field, and the checksum is computed after
+/// the payload is materialized. Sealing is idempotent: envelope keys already
+/// present are replaced rather than folded into the payload.
+pub fn seal_library_export(payload: &serde_json::Value) -> String {
+    let payload = match payload.as_object() {
+        Some(obj) => envelope_free_payload(obj),
+        None => payload.clone(),
+    };
+    let checksum = export_checksum(&payload);
+    let payload_text = payload.to_string();
+    let body = payload_text
+        .strip_prefix('{')
+        .unwrap_or(payload_text.as_str());
+    format!(
+        "{{\"schema\":\"{LIBRARY_EXPORT_SCHEMA}\",\"schema_version\":{LIBRARY_SCHEMA_VERSION},\
+         \"created\":{},\"checksum\":\"{checksum}\",{body}",
+        now_unix()
+    )
+}
+
+fn envelope_refusal(message: String) -> StoreError {
+    StoreError::Invalid(vec![FieldError::new("export", message)])
+}
+
+/// T-22: pre-write envelope negotiation for a parsed export object. A payload
+/// with no `schema` is a pre-T-22 export and passes through exactly as today
+/// (backward-compat tolerance). A present `schema` must match,
+/// `schema_version` must be ≤ current, and a present `checksum` must match the
+/// payload bytes. Every refusal is returned before any write.
+fn negotiate_library_envelope(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let Some(schema) = obj.get("schema").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    if schema != LIBRARY_EXPORT_SCHEMA {
+        return Err(envelope_refusal(format!(
+            "library export schema not supported (got \"{schema}\", supported {LIBRARY_EXPORT_SCHEMA})"
+        )));
+    }
+    if let Some(raw_version) = obj.get("schema_version") {
+        let version = raw_version.as_i64().ok_or_else(|| {
+            envelope_refusal(format!(
+                "library export schema not supported (schema_version is not a number, supported ≤{LIBRARY_SCHEMA_VERSION})"
+            ))
+        })?;
+        if version > LIBRARY_SCHEMA_VERSION {
+            return Err(envelope_refusal(format!(
+                "library export schema not supported (got version {version}, supported ≤{LIBRARY_SCHEMA_VERSION})"
+            )));
+        }
+    }
+    if let Some(stored) = obj.get("checksum").and_then(serde_json::Value::as_str) {
+        let computed = export_checksum(&envelope_free_payload(obj));
+        if stored != computed {
+            return Err(envelope_refusal(format!(
+                "library export checksum mismatch (envelope {stored}, payload {computed})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn export_payload_full(
     configs: &[ProxyConfig],
     subscriptions: &[Subscription],
@@ -449,13 +582,13 @@ pub fn export_payload_full(
             })
         })
         .collect();
-    serde_json::json!({
+    let payload = serde_json::json!({
         "outbounds": outbounds,
         "library": library,
         "subscriptions": subs,
         "tombstones": tombs,
-    })
-    .to_string()
+    });
+    seal_library_export(&payload)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +611,17 @@ fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot>
         latency_ms: latency_ms.map(|ms| ms.max(0) as u64),
         error: row.get(4)?,
     })
+}
+
+/// T-19: per-group opt-in for auto-clear-unavailable. Groups are free-text
+/// field values (no groups table) and rename_group remaps them, so the flags
+/// live in one JSON meta map keyed by normalized group name and
+/// rename_group migrates its keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoClearGroupConfig {
+    pub enabled: bool,
+    pub on_date: i64,
+    pub note_seen: bool,
 }
 
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
@@ -655,8 +799,163 @@ pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Orde
         })
 }
 
+/// T-27: the keys the library list can rank by. `None` is the pre-feature
+/// order, byte for byte; `TypeSecurity` is the retired `type_security_sort`
+/// toggle and keeps that toggle's fixed direction (protocol ascending, then
+/// transport security descending, then name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibrarySortKey {
+    #[default]
+    None,
+    Latency,
+    Download,
+    Upload,
+    OutIp,
+    TrafficTotal,
+    TrafficDown,
+    TrafficUp,
+    TypeSecurity,
+}
+
+impl LibrarySortKey {
+    /// Every key, in the order the pickers list them. The traffic keys live at
+    /// the end because only the traffic header menu offers them.
+    pub const ALL: [LibrarySortKey; 9] = [
+        LibrarySortKey::None,
+        LibrarySortKey::Latency,
+        LibrarySortKey::Download,
+        LibrarySortKey::Upload,
+        LibrarySortKey::OutIp,
+        LibrarySortKey::TypeSecurity,
+        LibrarySortKey::TrafficTotal,
+        LibrarySortKey::TrafficDown,
+        LibrarySortKey::TrafficUp,
+    ];
+
+    /// Canonical token: both the meta JSON value and the picker item id suffix.
+    pub fn token(self) -> &'static str {
+        match self {
+            LibrarySortKey::None => "none",
+            LibrarySortKey::Latency => "latency",
+            LibrarySortKey::Download => "download",
+            LibrarySortKey::Upload => "upload",
+            LibrarySortKey::OutIp => "out_ip",
+            LibrarySortKey::TrafficTotal => "traffic_total",
+            LibrarySortKey::TrafficDown => "traffic_down",
+            LibrarySortKey::TrafficUp => "traffic_up",
+            LibrarySortKey::TypeSecurity => "type_security",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|key| key.token() == token)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibrarySortKey::None => "None (library order)",
+            LibrarySortKey::Latency => "Latency (latest URL test)",
+            LibrarySortKey::Download => "Download (current session)",
+            LibrarySortKey::Upload => "Upload (current session)",
+            LibrarySortKey::OutIp => "Out-IP (text)",
+            LibrarySortKey::TrafficTotal => "Traffic total (counting window)",
+            LibrarySortKey::TrafficDown => "Traffic down (counting window)",
+            LibrarySortKey::TrafficUp => "Traffic up (counting window)",
+            LibrarySortKey::TypeSecurity => "Type | Security (fixed)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub fn token(self) -> &'static str {
+        match self {
+            SortDirection::Ascending => "asc",
+            SortDirection::Descending => "desc",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "asc" => Some(SortDirection::Ascending),
+            "desc" => Some(SortDirection::Descending),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortDirection::Ascending => "ascending",
+            SortDirection::Descending => "descending",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            SortDirection::Ascending => SortDirection::Descending,
+            SortDirection::Descending => SortDirection::Ascending,
+        }
+    }
+}
+
+/// T-27: one sort concept for the library list — a single key plus a direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LibrarySort {
+    pub key: LibrarySortKey,
+    pub direction: SortDirection,
+}
+
+impl LibrarySort {
+    pub fn new(key: LibrarySortKey, direction: SortDirection) -> Self {
+        Self { key, direction }
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.key == LibrarySortKey::None
+    }
+
+    /// Canonical meta payload: `{"key":"latency","direction":"asc"}`.
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"key\":\"{}\",\"direction\":\"{}\"}}",
+            self.key.token(),
+            self.direction.token()
+        )
+    }
+
+    /// Tolerant read: a payload that is not a sort object reads as the default,
+    /// and an unknown key or direction falls back field by field, so a
+    /// hand-edited meta row can never wedge the list.
+    pub fn from_json(raw: &str) -> Self {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str(raw.trim()) else {
+            return Self::default();
+        };
+        let key = map
+            .get("key")
+            .and_then(|value| value.as_str())
+            .and_then(LibrarySortKey::from_token)
+            .unwrap_or_default();
+        let direction = map
+            .get("direction")
+            .and_then(|value| value.as_str())
+            .and_then(SortDirection::from_token)
+            .unwrap_or_default();
+        Self { key, direction }
+    }
+}
+
+/// T-22: the one clause both the export warning and the restore confirm carry.
+pub const RESTORE_REQUIRES_CLAUSE: &str =
+    "Restore requires a matching ManyProxy export (schema manyproxy-library, version 1).";
+
 pub fn export_warning_text() -> &'static str {
-    "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe."
+    "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe. Restore requires a matching ManyProxy export (schema manyproxy-library, version 1)."
 }
 
 pub fn export_confirm_description() -> &'static str {
@@ -723,6 +1022,10 @@ pub struct RoutePreset {
     pub is_builtin: bool,
 
     pub last_used_at: Option<i64>,
+
+    /// Prevent-modifications lock: protects the *rules* (readonly editor),
+    /// never the attach relationship.
+    pub locked: bool,
 }
 
 impl RoutePreset {
@@ -743,6 +1046,7 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
     let description: Option<String> = row.get(6).ok().flatten();
     let is_builtin: Option<i64> = row.get(7).ok();
     let last_used_at: Option<i64> = row.get(8).ok().flatten();
+    let locked: Option<i64> = row.get(9).ok();
     Ok(RoutePreset {
         id: id.to_string(),
         name: row.get(1)?,
@@ -753,6 +1057,20 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
         description,
         is_builtin: is_builtin.unwrap_or(0) != 0,
         last_used_at,
+        locked: locked.unwrap_or(0) != 0,
+    })
+}
+
+fn map_rule_set_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuleSetRow> {
+    let id: i64 = row.get(0)?;
+    let bytes: i64 = row.get(4)?;
+    Ok(RuleSetRow {
+        id: id.to_string(),
+        name: row.get(1)?,
+        url: row.get(2)?,
+        file_name: row.get(3)?,
+        bytes: bytes.max(0) as u64,
+        downloaded_at: row.get(5)?,
     })
 }
 
@@ -760,6 +1078,22 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
 pub struct QuarantinedRow {
     pub id: String,
     pub cause: String,
+}
+
+/// T-12: one staged rule set. `file_name` mirrors the sanitized name
+/// (`data\rule-sets\<file_name>`); rows never hold the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSetRow {
+    pub id: String,
+    pub name: String,
+
+    pub url: String,
+
+    pub file_name: String,
+
+    pub bytes: u64,
+
+    pub downloaded_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -839,6 +1173,55 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
             ));
             None
         }
+    }
+}
+
+/// T-33: one canonical literal, or `None` for a hostname/malformed value.
+fn canonical_bind_host(raw: &str) -> Option<String> {
+    raw.trim().parse::<IpAddr>().ok().map(|ip| ip.to_string())
+}
+
+/// T-33: trims a typed value to its canonical literal — the list's only gate.
+fn normalize_bind_host(raw: &str) -> Result<String, StoreError> {
+    canonical_bind_host(raw)
+        .ok_or_else(|| bind_host_error(Store::BIND_HOST_LITERAL_ONLY.to_string()))
+}
+
+fn bind_host_error(message: String) -> StoreError {
+    StoreError::Invalid(vec![FieldError::new("bind_hosts", message)])
+}
+
+fn bind_host_in_use_message(host: &str, rows: &[String]) -> String {
+    let named: Vec<String> = rows.iter().map(|name| format!("\"{name}\"")).collect();
+    format!(
+        "{host} is used by {} — rebind those rows first",
+        named.join(", ")
+    )
+}
+
+/// T-33: stored extras only — constants, duplicates, blanks, and non-literals
+/// are dropped so a hand-edited meta row can never widen what may bind.
+fn sanitized_bind_host_extras(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(host) = canonical_bind_host(&entry) else {
+            continue;
+        };
+        if Store::BIND_HOST_CONSTANTS.contains(&host.as_str()) || out.contains(&host) {
+            continue;
+        }
+        out.push(host);
+    }
+    out
+}
+
+fn decode_bind_host_extras(raw: &str) -> Vec<String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2942,6 +3325,12 @@ pub struct RefreshOutcome {
     pub conflicts: usize,
 
     pub in_use: usize,
+    /// Row labels collected exactly where the counts increment; every entry is
+    /// a display label — never params or URL fragments.
+    pub added_names: Vec<String>,
+    pub updated_names: Vec<String>,
+    pub removed_names: Vec<String>,
+    pub kept_in_use_names: Vec<String>,
     pub failures: Vec<crate::import::ImportFailure>,
     pub error: Option<String>,
 }
@@ -3360,11 +3749,161 @@ fn sibling_sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
+pub(crate) const DATA_DIR_NAME: &str = "data";
+
+pub(crate) fn app_data_dir_in(app_dir: Option<&Path>) -> PathBuf {
+    match app_dir {
+        Some(dir) => dir.join(DATA_DIR_NAME),
+        // Unresolvable app dir (edge dev cases): stay cwd-relative — the
+        // AppData and home-dot defaults are banned, never read, never recreated.
+        None => PathBuf::from(DATA_DIR_NAME),
+    }
+}
+
+pub(crate) fn app_data_dir() -> PathBuf {
+    app_data_dir_in(crate::engine::current_app_dir().as_deref())
+}
+
+pub(crate) const RULE_SETS_DIR_NAME: &str = "rule-sets";
+
+/// T-12: staged `.srs` rule sets live beside the app under `data\rule-sets\`
+/// (same T-02 family as the library DB): the folder ships inside the portable
+/// ZIP and the sidecar path points at app-dir files only.
+pub(crate) fn rule_sets_dir_in(app_dir: Option<&Path>) -> PathBuf {
+    app_data_dir_in(app_dir).join(RULE_SETS_DIR_NAME)
+}
+
+pub(crate) fn rule_sets_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MANYPROXY_RULE_SETS_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    rule_sets_dir_in(crate::engine::current_app_dir().as_deref())
+}
+
+/// The staged file for a rule-set name: name sanitized with the same grammar
+/// the engine uses for tags (`sanitize_tag`), so the emission path derived
+/// from a rule reference lands exactly on the file staging wrote.
+pub(crate) fn rule_set_file_stem(name: &str) -> String {
+    crate::engine::sanitize_tag(name.trim())
+}
+
+pub(crate) fn rule_set_file_name(name: &str) -> String {
+    format!("{}.srs", rule_set_file_stem(name))
+}
+
+pub(crate) fn staged_rule_set_path(file_name: &str) -> PathBuf {
+    rule_sets_dir().join(file_name)
+}
+
+/// A tag-sanitizing name can still land on a reserved Windows device name
+/// ("con", "nul", …); such a file cannot be created, so staging rejects it
+/// loudly at name validation instead of failing at first download.
+fn windows_reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
+/// Keeps `<appdir>\data\rule-sets\<stem>.srs` far away from MAX_PATH trouble.
+pub(crate) const RULE_SET_STEM_MAX_CHARS: usize = 80;
+
 static NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn unique_name_suffix(ts: i64) -> String {
     let n = NAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{ts}-{}-{n}", std::process::id())
+}
+
+/// T-32: the persisted window rectangle in gpui logical points — the payload
+/// behind [`Store::META_GEOMETRY`]. Absent or corrupt meta reads as `None`, so
+/// the caller keeps its own default rectangle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl WindowGeometry {
+    /// T-32: the same minimums `app_window_options` hands the window, kept
+    /// here so a restored rectangle can never seed a window below them.
+    pub const MIN_WIDTH: f32 = 880.;
+    pub const MIN_HEIGHT: f32 = 620.;
+
+    /// T-32: the sane position box — anything further out is clamped rather
+    /// than dropped, so even a hand-edited row lands somewhere visible.
+    pub const POSITION_MIN: f32 = -999.;
+    pub const POSITION_MAX: f32 = 9999.;
+
+    /// T-32: the persistence clamp. Non-finite input reads as no geometry at
+    /// all; size bottoms out at the window minimums and position at the box.
+    pub fn clamped(self) -> Option<Self> {
+        if ![self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        Some(Self {
+            x: self.x.clamp(Self::POSITION_MIN, Self::POSITION_MAX),
+            y: self.y.clamp(Self::POSITION_MIN, Self::POSITION_MAX),
+            width: self.width.max(Self::MIN_WIDTH),
+            height: self.height.max(Self::MIN_HEIGHT),
+        })
+    }
+
+    /// Canonical meta payload: `{"x":320,"y":180,"width":1280,"height":900}`.
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+            self.x, self.y, self.width, self.height
+        )
+    }
+
+    /// Tolerant read: anything that is not a complete numeric object, or that
+    /// cannot be made sane, reads as no geometry.
+    pub fn from_json(raw: &str) -> Option<Self> {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str(raw.trim()) else {
+            return None;
+        };
+        let number = |key: &str| {
+            map.get(key)
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+        };
+        Self {
+            x: number("x")?,
+            y: number("y")?,
+            width: number("width")?,
+            height: number("height")?,
+        }
+        .clamped()
+    }
 }
 
 pub struct Store {
@@ -3413,6 +3952,22 @@ impl Store {
     pub fn set_query_only_for_test(&self) -> Result<(), StoreError> {
         self.conn.execute_batch("PRAGMA query_only = ON;")?;
         Ok(())
+    }
+
+    /// T-32: read-only peek at one meta value for startup, before the real
+    /// store opens. Never creates, migrates, or quarantines anything — any
+    /// problem (missing file, corrupt library, locked database) reads as
+    /// `None`, leaving the app's own open path fully in charge of recovery.
+    pub fn peek_meta_readonly(path: &Path, key: &str) -> Option<String> {
+        if !path.exists() {
+            return None;
+        }
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).ok()?;
+        let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1").ok()?;
+        stmt.query_row(params![key], |row| row.get::<_, String>(0))
+            .ok()
     }
 
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
@@ -3500,12 +4055,7 @@ impl Store {
                 return PathBuf::from(path);
             }
         }
-        #[cfg(windows)]
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("ManyProxy").join("library.db");
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".manyproxy").join("library.db")
+        app_data_dir().join("library.db")
     }
 
     fn open_with_path(conn: Connection, db_path: Option<PathBuf>) -> Result<Self, StoreError> {
@@ -3797,11 +4347,20 @@ impl Store {
                 updated_at INTEGER,
                 description TEXT,
                 is_builtin INTEGER NOT NULL DEFAULT 0,
-                last_used_at INTEGER
+                last_used_at INTEGER,
+                locked INTEGER NOT NULL DEFAULT 0
               ) STRICT;
              CREATE TABLE IF NOT EXISTS meta (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL DEFAULT ''
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS rule_sets (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL UNIQUE,
+               url TEXT NOT NULL,
+               file_name TEXT NOT NULL UNIQUE,
+               bytes INTEGER NOT NULL,
+               downloaded_at INTEGER NOT NULL
              ) STRICT;",
         )?;
 
@@ -3833,6 +4392,7 @@ impl Store {
         self.ensure_column("route_presets", "description", "TEXT")?;
         self.ensure_column("route_presets", "is_builtin", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("route_presets", "last_used_at", "INTEGER")?;
+        self.ensure_column("route_presets", "locked", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("subscription_tombstones", "subscription_url", "TEXT")?;
         self.ensure_column("subscription_tombstones", "rotation_core", "TEXT")?;
 
@@ -4325,6 +4885,14 @@ impl Store {
                 self.conn
                     .execute("DELETE FROM meta WHERE key = ?1", params![old_key])?;
             }
+            // T-19: the auto-clear flag follows the renamed group; when the
+            // new name already carries its own entry it wins, and the stale
+            // old key never lingers.
+            let mut auto_clear_groups = self.auto_clear_groups_map();
+            if let Some(migrated) = auto_clear_groups.remove(&old) {
+                auto_clear_groups.entry(new.clone()).or_insert(migrated);
+                self.auto_clear_groups_write(&auto_clear_groups)?;
+            }
         }
         Ok(GroupRenameOutcome {
             rows: changed,
@@ -4540,10 +5108,9 @@ impl Store {
             Ok(rowid) => rowid,
             Err(_) => return Err(StoreError::NotFound(config_id.to_string())),
         };
-        let tx = self.conn.transaction()?;
         if let Some(preset) = preset_id {
             let rowid_preset: i64 = preset.parse().unwrap_or(-1);
-            let rule_count: i64 = tx.query_row(
+            let rule_count: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM route_presets WHERE id = ?1",
                 params![rowid_preset],
                 |row| row.get(0),
@@ -4552,7 +5119,7 @@ impl Store {
                 return Err(StoreError::NotFound(preset.to_string()));
             }
 
-            let rules_json: String = tx.query_row(
+            let rules_json: String = self.conn.query_row(
                 "SELECT rules_json FROM route_presets WHERE id = ?1",
                 params![rowid_preset],
                 |row| row.get(0),
@@ -4567,7 +5134,25 @@ impl Store {
                     "preset has no rules yet — refresh it before attaching",
                 )]));
             }
+
+            // T-12 attachment-time validation: every `rule_set` reference must
+            // name a staged set at the moment the preset attaches to a row.
+            // Same loudness taste as unknown exits — loud here, loud again at
+            // config generation, never silent.
+            let staged = self.staged_rule_set_names()?;
+            let rules: Vec<serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(&rules_json)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default();
+            if let Err(error) = crate::preset::validate_rule_set_refs_staged(&rules, &staged) {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "preset",
+                    error.message,
+                )]));
+            }
         }
+        let tx = self.conn.transaction()?;
         let changed = tx.execute(
             "UPDATE proxy_configs SET preset_id = ?1 WHERE id = ?2",
             params![preset_id, rowid],
@@ -4639,9 +5224,14 @@ impl Store {
         rules: &[serde_json::Value],
     ) -> Result<RoutePreset, StoreError> {
         let name = Self::validated_preset_name(name)?;
-        Self::check_preset_rules(rules)?;
+        let rules = {
+            let mut rules = rules.to_vec();
+            crate::preset::cap_rule_names(&mut rules);
+            rules
+        };
+        Self::check_preset_rules(&rules)?;
         let source = Self::validated_preset_source(source);
-        let rules_json = serde_json::Value::Array(rules.to_vec()).to_string();
+        let rules_json = serde_json::Value::Array(rules).to_string();
         let now = now_unix();
         match self.conn.execute(
             "INSERT INTO route_presets (name, source, source_url, rules_json, updated_at)
@@ -4693,15 +5283,40 @@ impl Store {
         id: &str,
         rules: &[serde_json::Value],
     ) -> Result<RoutePreset, StoreError> {
-        Self::check_preset_rules(rules)?;
+        let rules = {
+            let mut rules = rules.to_vec();
+            crate::preset::cap_rule_names(&mut rules);
+            rules
+        };
+        Self::check_preset_rules(&rules)?;
+
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Err(StoreError::NotFound(id.to_string())),
         };
-        let rules_json = serde_json::Value::Array(rules.to_vec()).to_string();
+        let rules_json = serde_json::Value::Array(rules).to_string();
         let changed = self.conn.execute(
             "UPDATE route_presets SET rules_json = ?1, updated_at = ?2 WHERE id = ?3",
             params![rules_json, now_unix(), rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// T-10 prevent-modifications lock. An additive-column toggle: locking
+    /// protects the preset's rules (the editor renders readonly), never the
+    /// attach relationship — attach/detach are unaffected.
+    pub fn set_preset_locked(&mut self, id: &str, locked: bool) -> Result<RoutePreset, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let changed = self.conn.execute(
+            "UPDATE route_presets SET locked = ?1 WHERE id = ?2",
+            params![locked as i64, rowid],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(id.to_string()));
@@ -4794,7 +5409,7 @@ impl Store {
     pub fn list_presets(&self) -> Result<Vec<RoutePreset>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at
+                    description, is_builtin, last_used_at, locked
              FROM route_presets ORDER BY id",
         )?;
         let rows = stmt
@@ -4810,7 +5425,7 @@ impl Store {
         };
         let mut stmt = self.conn.prepare(
             "SELECT id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at
+                    description, is_builtin, last_used_at, locked
              FROM route_presets WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_preset_row)?;
@@ -4891,6 +5506,177 @@ impl Store {
         Ok(rows)
     }
 
+    /// T-12: staged `.srs` rule-set catalog rows. The binary file is cache
+    /// state under `data\rule-sets\` (never DPAPI-sealed — a compiled rule
+    /// catalog carries no credentials, like a subscription body); this table
+    /// only tracks what was staged, from where, and when.
+    pub fn list_rule_sets(&self) -> Result<Vec<RuleSetRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, url, file_name, bytes, downloaded_at
+             FROM rule_sets ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], map_rule_set_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_rule_set(&self, id: &str) -> Result<Option<RuleSetRow>, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(None),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, url, file_name, bytes, downloaded_at
+             FROM rule_sets WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![rowid], map_rule_set_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Records a freshly downloaded `.srs` back as a row. The file itself is
+    /// written by the confirmed download flow (`main.rs`) BEFORE this call;
+    /// `file_name` mirrors the sanitized name so the engine derivation
+    /// (`crate::store::rule_set_file_name`) and the table agree.
+    pub fn create_rule_set(
+        &self,
+        name: &str,
+        url: &str,
+        bytes: u64,
+    ) -> Result<RuleSetRow, StoreError> {
+        let name = Self::validated_rule_set_name(name)?;
+        let url = url.trim().to_string();
+        if bytes > SUBSCRIPTION_MAX_BYTES as u64 {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "bytes",
+                format!(
+                    "rule set is {} bytes — the staging cap is {SUBSCRIPTION_MAX_BYTES} bytes",
+                    bytes
+                ),
+            )]));
+        }
+        let file_name = rule_set_file_name(&name);
+        match self.conn.execute(
+            "INSERT INTO rule_sets (name, url, file_name, bytes, downloaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, url, file_name, bytes as i64, now_unix()],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "name",
+                    format!("rule set \"{name}\" is already staged"),
+                )]));
+            }
+            Err(error) => return Err(StoreError::Sql(error)),
+        }
+        let id = self.conn.last_insert_rowid();
+        self.get_rule_set(&id.to_string())?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Explicit re-Download on the same entry: bytes/URL are refreshed, the
+    /// file overwrite itself is the user-confirmed step done by the flow.
+    pub fn touch_rule_set(
+        &self,
+        id: &str,
+        url: &str,
+        bytes: u64,
+    ) -> Result<RuleSetRow, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        if bytes > SUBSCRIPTION_MAX_BYTES as u64 {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "bytes",
+                format!(
+                    "rule set is {} bytes — the staging cap is {SUBSCRIPTION_MAX_BYTES} bytes",
+                    bytes
+                ),
+            )]));
+        }
+        let changed = self.conn.execute(
+            "UPDATE rule_sets SET url = ?1, bytes = ?2, downloaded_at = ?3 WHERE id = ?4",
+            params![url.trim(), bytes as i64, now_unix(), rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_rule_set(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Rule sets a preset's rules currently reference (the ticket-named
+    /// `rule_sets_in_use(preset_id)` helper). Used by the Remove guard and the
+    /// list's "used by" column.
+    pub fn rule_sets_in_use(&self, preset_id: &str) -> Result<Vec<String>, StoreError> {
+        let Some(preset) = self.get_preset(preset_id)? else {
+            return Ok(Vec::new());
+        };
+        let rules = preset.rules().map_err(|message| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )))
+        })?;
+        Ok(crate::preset::collect_rule_set_refs(&rules))
+    }
+
+    /// Presets whose rules reference the given rule set by name. Remove is
+    /// blocked while this is non-empty: used sets must be detached first, so
+    /// removal never leaves naming rules silently pointing at nothing.
+    pub fn rule_set_used_by(&self, name: &str) -> Result<Vec<String>, StoreError> {
+        let mut used = Vec::new();
+        for preset in self.list_presets()? {
+            if self
+                .rule_sets_in_use(&preset.id)?
+                .iter()
+                .any(|set| set == name)
+            {
+                used.push(preset.name);
+            }
+        }
+        Ok(used)
+    }
+
+    /// Removes the row once nothing references it. Returns the staged
+    /// `file_name` so the caller deletes the cache file (no silent orphans:
+    /// the flow unlinks it right after, and a failed unlink is loud).
+    pub fn delete_rule_set(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let Some(row) = self.get_rule_set(id)? else {
+            return Ok(None);
+        };
+        let used = self.rule_set_used_by(&row.name)?;
+        if !used.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "rule set",
+                crate::preset::rule_set_in_use_message(&row.name, &used),
+            )]));
+        }
+        self.conn
+            .execute("DELETE FROM rule_sets WHERE id = ?1", params![rowid])?;
+        Ok(Some(row.file_name))
+    }
+
+    /// Names currently staged — the attachment-time source of truth for the
+    /// `rule_set` reference check in `set_config_preset` below.
+    fn staged_rule_set_names(&self) -> Result<BTreeSet<String>, StoreError> {
+        let mut names = BTreeSet::new();
+        for row in self.list_rule_sets()? {
+            names.insert(row.name);
+        }
+        Ok(names)
+    }
+
     fn validated_preset_name(raw: &str) -> Result<String, StoreError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -4901,6 +5687,43 @@ impl Store {
         }
 
         Ok(crate::preset::cap_name(trimmed.to_string()))
+    }
+
+    /// T-12 staging name validation: the name is both the row label and (via
+    /// `rule_set_file_name`) the staged file base, so it must survive the tag
+    /// sanitizer with at least one letter/digit left.
+    pub(crate) fn validated_rule_set_name(raw: &str) -> Result<String, StoreError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                "rule set name must not be empty",
+            )]));
+        }
+        let stem = rule_set_file_stem(trimmed);
+        if !stem.chars().any(|c| c.is_ascii_alphanumeric()) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                "rule set name must contain a letter or digit",
+            )]));
+        }
+        if windows_reserved_stem(&stem) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                format!(
+                    "rule set name \"{trimmed}\" sanitizes to the reserved Windows device name \"{stem}\" — pick another name"
+                ),
+            )]));
+        }
+        if stem.len() > RULE_SET_STEM_MAX_CHARS {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                format!(
+                    "rule set name must sanitize to at most {RULE_SET_STEM_MAX_CHARS} file-name characters"
+                ),
+            )]));
+        }
+        Ok(trimmed.to_string())
     }
 
     fn validated_preset_source(raw: &str) -> String {
@@ -5404,6 +6227,7 @@ impl Store {
                                 key: key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         }
                     }
                     Some(base) => {
@@ -5420,12 +6244,14 @@ impl Store {
                                 key: key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         } else {
                             if follow_group {
                                 ops.push(Op::GroupFollow {
                                     id: view.row.id.clone(),
                                 });
                                 outcome.updated += 1;
+                                outcome.updated_names.push(view.row.name.clone());
                             }
                             if upstream_changed && user_changed {
                                 outcome.conflicts += 1;
@@ -5445,6 +6271,7 @@ impl Store {
                         params: config.params.clone(),
                     });
                     outcome.added += 1;
+                    outcome.added_names.push(view.row.name.clone());
                 } else {
                     outcome.duplicates += 1;
                 }
@@ -5463,6 +6290,7 @@ impl Store {
                         params: config.params.clone(),
                     });
                     outcome.added += 1;
+                    outcome.added_names.push(view.row.name.clone());
                 } else {
                     outcome.duplicates += 1;
                 }
@@ -5492,6 +6320,7 @@ impl Store {
             }
             if running.contains(view.row.id.as_str()) {
                 outcome.in_use += 1;
+                outcome.kept_in_use_names.push(view.row.name.clone());
                 continue;
             }
             let mut paired = false;
@@ -5512,6 +6341,7 @@ impl Store {
                                 key: candidate_key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         }
                         paired = true;
                         break;
@@ -5535,6 +6365,7 @@ impl Store {
                                 key: candidate_key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         }
                         paired = true;
                         break;
@@ -5547,6 +6378,7 @@ impl Store {
                 });
                 deleted_ids.push(view.row.id.clone());
                 outcome.removed += 1;
+                outcome.removed_names.push(view.row.name.clone());
             }
         }
 
@@ -5577,6 +6409,7 @@ impl Store {
                         port,
                     });
                     outcome.added += 1;
+                    outcome.added_names.push(config.name.clone());
                 }
                 None => {
                     outcome.failures.push(crate::import::ImportFailure {
@@ -5897,8 +6730,14 @@ impl Store {
                 );
             }
         }
-        let mut value: serde_json::Value = serde_json::from_str(base_payload)
+        let parsed: serde_json::Value = serde_json::from_str(base_payload)
             .map_err(|error| Self::schema_error(format!("export serialization broke ({error})")))?;
+        // T-22: the base payload arrives sealed; enrichment mutates it, so the
+        // envelope is stripped here and re-sealed (fresh checksum) at the end.
+        let mut value = match parsed {
+            serde_json::Value::Object(obj) => envelope_free_payload(&obj),
+            other => other,
+        };
         if let Some(entries) = value.get_mut("library").and_then(|v| v.as_array_mut()) {
             let good_ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
             entries.retain(|e| {
@@ -5940,6 +6779,7 @@ impl Store {
                         "description": p.description,
                         "is_builtin": p.is_builtin,
                         "last_used_at": p.last_used_at,
+                        "locked": p.locked,
                     })
                 })
                 .collect();
@@ -5990,7 +6830,7 @@ impl Store {
                 obj.insert("tombstones".to_string(), serde_json::Value::Array(enriched));
             }
         }
-        Ok(value.to_string())
+        Ok(seal_library_export(&value))
     }
 
     pub fn commit_export(
@@ -6046,6 +6886,10 @@ impl Store {
         let obj = value
             .as_object()
             .ok_or_else(|| invalid("top level must be an object".to_string()))?;
+        // T-22: envelope negotiation sits between parse and the write pipeline
+        // (parse → negotiate → dry-run → backup → swap), so every refusal here
+        // leaves the library and any backup untouched.
+        negotiate_library_envelope(obj)?;
         let library = obj
             .get("library")
             .and_then(|v| v.as_array())
@@ -6283,6 +7127,7 @@ impl Store {
             description: Option<String>,
             is_builtin: bool,
             last_used_at: Option<i64>,
+            locked: bool,
         }
         let mut preset_rows: Vec<PresetRow> = Vec::with_capacity(presets_json.len());
         for (index, entry) in presets_json.iter().enumerate() {
@@ -6328,6 +7173,10 @@ impl Store {
                 last_used_at: entry
                     .get("last_used_at")
                     .and_then(serde_json::Value::as_i64),
+                locked: entry
+                    .get("locked")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             });
         }
 
@@ -6407,8 +7256,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO route_presets
                    (id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    description, is_builtin, last_used_at, locked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     preset.id,
                     preset.name,
@@ -6419,6 +7268,7 @@ impl Store {
                     preset.description,
                     preset.is_builtin as i64,
                     preset.last_used_at,
+                    preset.locked as i64,
                 ],
             )?;
         }
@@ -6778,6 +7628,10 @@ impl Store {
 
     pub const META_RUNNING_IDS: &str = "running_ids";
 
+    /// T-34: `"1"` only when the previous session reached an orderly exit.
+    /// Boot writes `"0"` before anything else, so a kill/crash leaves `"0"`.
+    pub const META_LAST_CLEAN_EXIT: &str = "last_clean_exit";
+
     pub const META_TEST_URL: &str = "test_url";
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -6858,6 +7712,103 @@ impl Store {
         }
     }
 
+    pub const META_AUTO_CLEAR_GROUPS: &str = "auto_clear_groups";
+
+    /// T-19: normalized group name → opt-in config; absent or malformed meta
+    /// reads as off everywhere.
+    fn auto_clear_groups_map(&self) -> BTreeMap<String, AutoClearGroupConfig> {
+        match self.get_meta(Self::META_AUTO_CLEAR_GROUPS) {
+            Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .filter_map(|(group, entry)| {
+                            Some((
+                                group,
+                                AutoClearGroupConfig {
+                                    enabled: entry.get("enabled")?.as_bool()?,
+                                    on_date: entry.get("on_date")?.as_i64()?,
+                                    note_seen: entry.get("note_seen")?.as_bool()?,
+                                },
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    fn auto_clear_groups_write(
+        &mut self,
+        map: &BTreeMap<String, AutoClearGroupConfig>,
+    ) -> Result<(), StoreError> {
+        let entries: serde_json::Map<String, serde_json::Value> = map
+            .iter()
+            .map(|(group, config)| {
+                (
+                    group.clone(),
+                    serde_json::json!({
+                        "enabled": config.enabled,
+                        "on_date": config.on_date,
+                        "note_seen": config.note_seen,
+                    }),
+                )
+            })
+            .collect();
+        self.set_meta(
+            Self::META_AUTO_CLEAR_GROUPS,
+            &serde_json::Value::Object(entries).to_string(),
+        )
+    }
+
+    pub fn auto_clear_group(&self, group: &str) -> Option<AutoClearGroupConfig> {
+        self.auto_clear_groups_map()
+            .get(&normalized_group(group))
+            .cloned()
+    }
+
+    pub fn auto_clear_enabled(&self, group: &str) -> bool {
+        self.auto_clear_groups_map()
+            .get(&normalized_group(group))
+            .is_some_and(|config| config.enabled)
+    }
+
+    pub fn auto_clear_enabled_groups(&self) -> Vec<String> {
+        self.auto_clear_groups_map()
+            .into_iter()
+            .filter(|(_, config)| config.enabled)
+            .map(|(group, _)| group)
+            .collect()
+    }
+
+    /// Enabling without `note_seen` is rejected here — skip-delete-confirm
+    /// cannot act as a bypass for auto-clear's own acknowledgment.
+    pub fn set_auto_clear_group(
+        &mut self,
+        group: &str,
+        config: AutoClearGroupConfig,
+    ) -> Result<(), StoreError> {
+        let group = normalized_group(group);
+        if group.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "group",
+                "Group name cannot be empty",
+            )]));
+        }
+        if config.enabled && !config.note_seen {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "auto_clear",
+                "auto-clear opt-in note not confirmed",
+            )]));
+        }
+        let mut map = self.auto_clear_groups_map();
+        map.insert(group, config);
+        self.auto_clear_groups_write(&map)
+    }
+
     pub fn save_running_snapshot(&mut self, ids: &[String]) -> Result<(), StoreError> {
         let known: HashSet<String> = {
             let mut stmt = self.conn.prepare("SELECT id FROM proxy_configs")?;
@@ -6883,6 +7834,18 @@ impl Store {
             params![Self::META_RUNNING_IDS],
         )?;
         Ok(())
+    }
+
+    /// T-34: did the previous session quit through an orderly path? An absent
+    /// key (fresh install, legacy store) or any value but `"1"` is unclean.
+    pub fn last_clean_exit(&self) -> bool {
+        self.get_meta(Self::META_LAST_CLEAN_EXIT)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_last_clean_exit(&mut self, clean: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LAST_CLEAN_EXIT, if clean { "1" } else { "0" })
     }
 
     pub fn test_url(&self) -> Option<String> {
@@ -6923,6 +7886,27 @@ impl Store {
         self.conn.execute(
             "DELETE FROM meta WHERE key = ?1",
             params![Self::row_test_url_key(id)],
+        )?;
+        Ok(())
+    }
+
+    pub const META_UPDATE_FEED_URL: &str = "update_feed_url";
+
+    pub fn update_feed_url(&self) -> Option<String> {
+        match self.get_meta(Self::META_UPDATE_FEED_URL) {
+            Ok(Some(url)) if !url.trim().is_empty() => Some(url),
+            _ => None,
+        }
+    }
+
+    pub fn set_update_feed_url(&mut self, url: &str) -> Result<(), StoreError> {
+        self.set_meta(Self::META_UPDATE_FEED_URL, url.trim())
+    }
+
+    pub fn clear_update_feed_url(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_UPDATE_FEED_URL],
         )?;
         Ok(())
     }
@@ -6972,6 +7956,210 @@ impl Store {
             )]));
         }
         self.set_meta(Self::META_LIBRARY_COLUMNS, value.trim())
+    }
+
+    /// T-27: the persisted library sort, additive beside `library_columns`. A
+    /// missing key (or a corrupt payload) reads as `none`/ascending — the
+    /// pre-feature order.
+    pub const META_LIBRARY_SORT: &str = "library_sort";
+
+    pub fn library_sort(&self) -> LibrarySort {
+        match self.get_meta(Self::META_LIBRARY_SORT) {
+            Ok(Some(raw)) => LibrarySort::from_json(&raw),
+            _ => LibrarySort::default(),
+        }
+    }
+
+    pub fn set_library_sort(&mut self, sort: LibrarySort) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LIBRARY_SORT, &sort.to_json())
+    }
+
+    pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";
+
+    /// T-23: the library search query string of the previous session. A missing
+    /// or whitespace-only value reads as "no remembered filter".
+    pub fn library_last_query(&self) -> Option<String> {
+        match self.get_meta(Self::META_LIBRARY_LAST_QUERY) {
+            Ok(Some(value)) if !value.trim().is_empty() => Some(value),
+            _ => None,
+        }
+    }
+
+    /// T-23: remembering an empty query clears the key instead of storing a
+    /// blank one, so an untouched search field never writes a meta row.
+    pub fn set_library_last_query(&mut self, value: &str) -> Result<(), StoreError> {
+        if value.trim().is_empty() {
+            return self.clear_library_last_query();
+        }
+        self.set_meta(Self::META_LIBRARY_LAST_QUERY, value.trim())
+    }
+
+    pub fn clear_library_last_query(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_LIBRARY_LAST_QUERY],
+        )?;
+        Ok(())
+    }
+
+    /// T-31: the kept-log ring cap, additive beside the other meta keys.
+    pub const META_LOG_MAX_LINES: &str = "log_max_lines";
+
+    /// T-31: absent, unparsable, or out-of-window values read as the 5,000-line
+    /// default — the pre-feature shape — and in-window values clamp to
+    /// `500..=50_000`.
+    pub fn log_max_lines(&self) -> usize {
+        match self.get_meta(Self::META_LOG_MAX_LINES) {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<usize>()
+                .map(crate::health::clamp_log_max_lines)
+                .unwrap_or(crate::health::MAX_LOG_RECORDS),
+            _ => crate::health::MAX_LOG_RECORDS,
+        }
+    }
+
+    pub fn set_log_max_lines(&mut self, cap: usize) -> Result<(), StoreError> {
+        self.set_meta(
+            Self::META_LOG_MAX_LINES,
+            &crate::health::clamp_log_max_lines(cap).to_string(),
+        )
+    }
+
+    /// T-32: the last clean-exit window rectangle, additive beside the other
+    /// meta keys. Absent or corrupt reads as `None` — the pre-feature default.
+    pub const META_GEOMETRY: &str = "geometry";
+
+    pub fn window_geometry(&self) -> Option<WindowGeometry> {
+        match self.get_meta(Self::META_GEOMETRY) {
+            Ok(Some(raw)) => WindowGeometry::from_json(&raw),
+            _ => None,
+        }
+    }
+
+    /// T-32: stores the clamped rectangle; a geometry that cannot be made sane
+    /// writes nothing, so the next launch keeps the previous or default shape.
+    pub fn set_window_geometry(&mut self, geometry: WindowGeometry) -> Result<(), StoreError> {
+        match geometry.clamped() {
+            Some(sane) => self.set_meta(Self::META_GEOMETRY, &sane.to_json()),
+            None => Ok(()),
+        }
+    }
+
+    /// T-33: the bind-address menu the per-row picker draws from — a JSON array
+    /// of user-added host literals. The constants are implicit: they are never
+    /// written here, never removable, and always lead the accessor's result.
+    pub const META_BIND_HOSTS: &str = "bind_hosts";
+
+    /// T-33: the two addresses every list carries, in this order, ahead of the
+    /// user extras. Removing them is impossible by construction.
+    pub const BIND_HOST_CONSTANTS: [&str; 2] = [DEFAULT_BIND, "0.0.0.0"];
+
+    /// T-33: the one reason the list editor refuses a typed value — also the
+    /// inline text the Settings field shows for it.
+    pub const BIND_HOST_LITERAL_ONLY: &str = "addresses only — no hostnames";
+
+    /// T-33: constants first, then the stored extras in insertion order.
+    ///
+    /// Seeding is one-time by construction: only a *missing* meta key seeds, and
+    /// the seed unions the two constants with every row's current `bind_ip`
+    /// before writing the extras. Once the key exists, later rows never widen
+    /// the list — additions go through [`Store::add_bind_host`] alone.
+    pub fn bind_hosts(&mut self) -> Vec<String> {
+        let mut out: Vec<String> = Self::BIND_HOST_CONSTANTS
+            .iter()
+            .map(|host| host.to_string())
+            .collect();
+        out.extend(self.bind_host_extras());
+        out
+    }
+
+    /// T-33: extras only, seeding on a missing key (see [`Store::bind_hosts`]).
+    fn bind_host_extras(&mut self) -> Vec<String> {
+        match self.get_meta(Self::META_BIND_HOSTS) {
+            Ok(Some(raw)) => sanitized_bind_host_extras(decode_bind_host_extras(&raw)),
+            Ok(None) => {
+                let seeded = sanitized_bind_host_extras(self.current_row_binds());
+                let _ = self.write_bind_host_extras(&seeded);
+                seeded
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn current_row_binds(&self) -> Vec<String> {
+        match self.list() {
+            Ok(rows) => rows.into_iter().map(|row| row.bind_ip).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn write_bind_host_extras(&mut self, extras: &[String]) -> Result<(), StoreError> {
+        let value = serde_json::Value::Array(
+            extras
+                .iter()
+                .map(|host| serde_json::Value::from(host.clone()))
+                .collect(),
+        )
+        .to_string();
+        self.set_meta(Self::META_BIND_HOSTS, &value)
+    }
+
+    /// T-33: which binds the library currently uses, as bind → row names. The
+    /// Settings editor consults this before removing an extra.
+    ///
+    /// Literal binds are canonicalized so `FD00:0::7` and `fd00::7` count as the
+    /// same use; anything the store lets through but the list never holds
+    /// (`localhost`) keeps its raw text.
+    pub fn bind_host_usage(&self) -> Result<BTreeMap<String, Vec<String>>, StoreError> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in self.list()? {
+            let bind = row.bind_ip.trim();
+            if bind.is_empty() {
+                continue;
+            }
+            let key = canonical_bind_host(bind).unwrap_or_else(|| bind.to_string());
+            out.entry(key).or_default().push(row.name);
+        }
+        for names in out.values_mut() {
+            names.sort();
+        }
+        Ok(out)
+    }
+
+    /// T-33: appends one validated literal to the extras and returns the whole
+    /// list. Hostnames, malformed literals, and duplicates are refused.
+    pub fn add_bind_host(&mut self, raw: &str) -> Result<Vec<String>, StoreError> {
+        let host = normalize_bind_host(raw)?;
+        let mut extras = self.bind_host_extras();
+        if Self::BIND_HOST_CONSTANTS.contains(&host.as_str()) || extras.contains(&host) {
+            return Err(bind_host_error(format!("{host} is already in the list")));
+        }
+        extras.push(host);
+        self.write_bind_host_extras(&extras)?;
+        Ok(self.bind_hosts())
+    }
+
+    /// T-33: removes one extra. The constants and any bind a row still uses are
+    /// refused; the in-use refusal names the blocking row(s).
+    pub fn remove_bind_host(&mut self, host: &str) -> Result<Vec<String>, StoreError> {
+        let host = host.trim();
+        if Self::BIND_HOST_CONSTANTS
+            .iter()
+            .any(|constant| constant.eq_ignore_ascii_case(host))
+        {
+            return Err(bind_host_error(format!(
+                "{host} is built in and cannot be removed"
+            )));
+        }
+        let host = canonical_bind_host(host).unwrap_or_else(|| host.to_string());
+        if let Some(names) = self.bind_host_usage()?.get(&host) {
+            return Err(bind_host_error(bind_host_in_use_message(&host, names)));
+        }
+        let mut extras = self.bind_host_extras();
+        extras.retain(|entry| entry != &host);
+        self.write_bind_host_extras(&extras)?;
+        Ok(self.bind_hosts())
     }
 
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
@@ -7205,6 +8393,13 @@ mod tests {
         }
     }
 
+    /// T-22: byte-identity assertions compare the payload, because the
+    /// envelope's `created` stamp is wall-clock at export time.
+    fn payload_without_envelope(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("export parses");
+        envelope_free_payload(value.as_object().expect("export is an object")).to_string()
+    }
+
     #[test]
     fn t44_rename_group_moves_rows_and_rejects_empty() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -7288,6 +8483,179 @@ mod tests {
             other.group_skip_refresh("team"),
             "skip flag survives export/restore"
         );
+    }
+
+    #[test]
+    fn t69_auto_clear_groups_meta_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(!store.auto_clear_enabled("travel"), "absent meta is off");
+        assert!(store.auto_clear_enabled_groups().is_empty());
+        assert_eq!(store.auto_clear_group("travel"), None);
+
+        // Enabling without the note ACK never reaches the meta map.
+        let error = store
+            .set_auto_clear_group(
+                "travel",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 111,
+                    note_seen: false,
+                },
+            )
+            .expect_err("note_seen=false cannot enable");
+        assert!(
+            error.to_string().contains("opt-in note"),
+            "guard names the note, got {error}"
+        );
+        assert_eq!(store.auto_clear_group("travel"), None);
+
+        // The confirmed opt-in persists; lookups trim the key like every
+        // other group-level op.
+        store
+            .set_auto_clear_group(
+                "  travel  ",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 222,
+                    note_seen: true,
+                },
+            )
+            .expect("confirmed opt-in writes");
+        assert!(store.auto_clear_enabled("travel"));
+        assert_eq!(
+            store.auto_clear_enabled_groups(),
+            vec!["travel".to_string()]
+        );
+
+        // Toggling off keeps the entry (and its audit fields) so the rename
+        // migration carries extinguished flags too.
+        store
+            .set_auto_clear_group(
+                "travel",
+                AutoClearGroupConfig {
+                    enabled: false,
+                    on_date: 222,
+                    note_seen: true,
+                },
+            )
+            .expect("off writes");
+        assert!(!store.auto_clear_enabled("travel"));
+        assert!(store.auto_clear_group("travel").is_some());
+
+        store
+            .set_auto_clear_group(
+                "travel",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 333,
+                    note_seen: true,
+                },
+            )
+            .expect("re-enable writes");
+        let empty = store
+            .set_auto_clear_group(
+                " ",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 1,
+                    note_seen: true,
+                },
+            )
+            .expect_err("blank group name rejected");
+        let StoreError::Invalid(fields) = empty else {
+            panic!("expected Invalid for blank group")
+        };
+        assert!(fields.iter().any(|e| e.field == "group"));
+
+        // Malformed or incomplete JSON means off, never enabled.
+        store
+            .set_meta(Store::META_AUTO_CLEAR_GROUPS, "not-json")
+            .expect("meta overwrite works");
+        assert!(!store.auto_clear_enabled("travel"));
+        assert!(store.auto_clear_enabled_groups().is_empty());
+        assert_eq!(store.auto_clear_group("travel"), None);
+        store
+            .set_meta(
+                Store::META_AUTO_CLEAR_GROUPS,
+                r#"{"travel": {"enabled": true, "on_date": 5}}"#,
+            )
+            .expect("meta overwrite works");
+        assert!(
+            !store.auto_clear_enabled("travel"),
+            "entries missing note_seen never enable"
+        );
+    }
+
+    #[test]
+    fn t69_group_rename_carries_flag() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_auto_clear_group(
+                "alpha",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 10,
+                    note_seen: true,
+                },
+            )
+            .expect("enable alpha");
+        store.rename_group("alpha", "beta").expect("rename works");
+        assert!(!store.auto_clear_enabled("alpha"), "old label unflagged");
+        assert!(store.auto_clear_enabled("beta"), "flag follows rename");
+        let config = store.auto_clear_group("beta").expect("entry moved");
+        assert_eq!(config.on_date, 10, "opt-in date rides along");
+        assert!(config.note_seen, "note ACK rides along");
+
+        // Extinguished flags migrate too, so no stale key lingers and the
+        // opt-in history survives the rename.
+        store
+            .set_auto_clear_group(
+                "beta",
+                AutoClearGroupConfig {
+                    enabled: false,
+                    on_date: 10,
+                    note_seen: true,
+                },
+            )
+            .expect("disable keeps entry");
+        store.rename_group("beta", "gamma").expect("rename works");
+        assert!(
+            store.auto_clear_group("gamma").is_some(),
+            "off entry carries too"
+        );
+        assert!(!store.auto_clear_enabled("gamma"));
+        assert_eq!(store.auto_clear_group("beta"), None);
+
+        // When both names already carry entries the target's own wins and the
+        // stale source key is dropped outright.
+        store
+            .set_auto_clear_group(
+                "delta",
+                AutoClearGroupConfig {
+                    enabled: false,
+                    on_date: 7,
+                    note_seen: true,
+                },
+            )
+            .expect("delta off entry");
+        store
+            .set_auto_clear_group(
+                "epsilon",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 9,
+                    note_seen: true,
+                },
+            )
+            .expect("epsilon on entry");
+        store
+            .rename_group("delta", "epsilon")
+            .expect("merge rename works");
+        let kept = store
+            .auto_clear_group("epsilon")
+            .expect("target entry kept");
+        assert!(kept.enabled && kept.on_date == 9, "target's own entry wins");
+        assert!(!store.auto_clear_enabled("delta"), "source key dropped");
     }
 
     #[test]
@@ -8111,6 +9479,92 @@ mod tests {
     }
 
     #[test]
+    fn t70_outcome_named_lists_match_counts() {
+        use std::collections::HashSet;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 2);
+        let mut added = outcome.added_names.clone();
+        added.sort();
+        assert_eq!(
+            added,
+            vec!["one".to_string(), "two".to_string()],
+            "inserts name their rows"
+        );
+        assert_eq!(outcome.updated_names.len(), outcome.updated);
+        assert_eq!(outcome.removed_names.len(), outcome.removed);
+        assert_eq!(outcome.kept_in_use_names.len(), outcome.in_use);
+
+        let host_move =
+            format!("vless://{SUB_UUID}@c.example.com:443#one\ntrojan://pw@b.example.com:443#two");
+        let outcome = store
+            .refresh_with_body(&sub.id, &host_move, 200)
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 1, "host move counts updated");
+        assert_eq!(
+            outcome.updated_names,
+            vec!["one".to_string()],
+            "updates name their rows"
+        );
+        assert_eq!(outcome.added_names.len(), outcome.added);
+        assert_eq!(outcome.removed_names.len(), outcome.removed);
+        assert_eq!(outcome.kept_in_use_names.len(), outcome.in_use);
+
+        let outcome = store
+            .refresh_with_body(&sub.id, &host_move, 250)
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 0, "same nodes, only order moves");
+        assert!(
+            outcome.added_names.is_empty()
+                && outcome.updated_names.is_empty()
+                && outcome.removed_names.is_empty()
+                && outcome.kept_in_use_names.is_empty(),
+            "no churn, no names"
+        );
+
+        let one_id = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "one")
+            .expect("seeded member one")
+            .id;
+        let running: HashSet<String> = [one_id].into_iter().collect();
+        let outcome = store
+            .refresh_with_body_running(
+                &sub.id,
+                "trojan://pw3@c.example.com:443#three",
+                300,
+                &running,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.in_use, 1);
+        assert_eq!(
+            outcome.kept_in_use_names,
+            vec!["one".to_string()],
+            "running rows land in the kept list"
+        );
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.removed_names, vec!["two".to_string()]);
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.added_names, vec!["three".to_string()]);
+        assert_eq!(outcome.updated, 0);
+        assert!(outcome.updated_names.is_empty());
+        assert_eq!(
+            outcome.added_names.len(),
+            outcome.added,
+            "lists match counts as a property"
+        );
+        assert_eq!(outcome.updated_names.len(), outcome.updated);
+        assert_eq!(outcome.removed_names.len(), outcome.removed);
+        assert_eq!(outcome.kept_in_use_names.len(), outcome.in_use);
+    }
+
+    #[test]
     fn subscription_refresh_reorders_members_to_remote_order() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let sub = add_sub(&mut store, "travel");
@@ -8548,7 +10002,8 @@ mod tests {
             .export_library_json_with_quarantine()
             .expect("quarantine export works");
         assert_eq!(
-            payload, quarantined_payload,
+            payload_without_envelope(&payload),
+            payload_without_envelope(&quarantined_payload),
             "single pipeline: both exports agree"
         );
         assert!(skipped.is_empty(), "nothing to skip when empty");
@@ -8566,8 +10021,8 @@ mod tests {
             }
         );
         assert_eq!(
-            restored.export_library_json().expect("re-export works"),
-            payload,
+            payload_without_envelope(&restored.export_library_json().expect("re-export works")),
+            payload_without_envelope(&payload),
             "empty round-trip is byte-identical"
         );
     }
@@ -9799,8 +11254,8 @@ mod tests {
             }
         );
         assert_eq!(
-            second.export_library_json().expect("re-export works"),
-            payload,
+            payload_without_envelope(&second.export_library_json().expect("re-export works")),
+            payload_without_envelope(&payload),
             "restore is byte-identical"
         );
         let kept = second.get(&keeper.id).expect("get works").expect("kept");
@@ -9821,6 +11276,217 @@ mod tests {
         assert_eq!(refresh.added, 0);
         assert_eq!(refresh.skipped, 1);
         assert_eq!(second.list().expect("list works").len(), 1);
+    }
+
+    #[test]
+    fn t72_export_envelope_fields_present() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+        let payload = store.export_library_json().expect("export works");
+
+        assert!(
+            payload
+                .starts_with("{\"schema\":\"manyproxy-library\",\"schema_version\":1,\"created\":"),
+            "envelope keys lead the payload: {payload}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("export parses");
+        assert_eq!(value["schema"], "manyproxy-library");
+        assert_eq!(value["schema_version"], 1);
+        let created = value["created"].as_i64().expect("created is unix seconds");
+        assert!(
+            created > 1_600_000_000,
+            "created is a real stamp, got {created}"
+        );
+        let checksum = value["checksum"].as_str().expect("checksum is a string");
+        assert_eq!(checksum.len(), 16, "fnv-1a 64 as hex, got {checksum}");
+        assert!(
+            checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "checksum is hex, got {checksum}"
+        );
+        for key in ["outbounds", "library", "subscriptions", "tombstones"] {
+            assert!(value.get(key).is_some(), "payload key {key} survives");
+        }
+        let after_envelope = payload
+            .split_once("\"checksum\":\"")
+            .expect("checksum key present")
+            .1
+            .split_once("\",")
+            .expect("checksum value ends")
+            .1;
+        assert!(
+            after_envelope.starts_with("\"outbounds\":["),
+            "payload keys follow the envelope in the documented order: {after_envelope}"
+        );
+        assert_eq!(
+            checksum,
+            export_checksum(&envelope_free_payload(
+                value.as_object().expect("export is an object")
+            )),
+            "checksum covers the envelope-free payload bytes"
+        );
+    }
+
+    #[test]
+    fn t72_restore_accepts_enveloped_export() {
+        let mut source = Store::open_in_memory().expect("source opens");
+        export_seed(&mut source);
+        let payload = source.export_library_json().expect("export works");
+        assert!(payload.contains("manyproxy-library"), "export is enveloped");
+
+        let mut target = Store::open_in_memory().expect("target opens");
+        let outcome = target
+            .restore_library_json(&payload)
+            .expect("enveloped restore works");
+        assert_eq!(outcome.configs, 3, "all seeded rows restore");
+        assert_eq!(outcome.subscriptions, 1);
+        assert_eq!(
+            payload_without_envelope(&target.export_library_json().expect("re-export works")),
+            payload_without_envelope(&payload),
+            "payload survives the enveloped round trip"
+        );
+    }
+
+    #[test]
+    fn t72_checksum_mismatch_refuses_without_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t72sum-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let tampered = {
+            let mut source = Store::open_in_memory().expect("source opens");
+            source.add(valid_input("Work")).expect("row seeds");
+            source
+                .export_library_json()
+                .expect("export works")
+                .replace("\"Work\"", "\"W0rk\"")
+        };
+        {
+            let mut live = Store::open_file(&path).expect("live opens");
+            live.add(valid_input("Live")).expect("live seeds");
+        }
+        let before = std::fs::read(&path).expect("live bytes");
+        let entries_before = std::fs::read_dir(&dir).expect("dir reads").count();
+
+        let error = Store::restore_library_file(&path, &tampered, now_unix())
+            .expect_err("tampered export refuses");
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "refusal names the mismatch: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("live bytes"),
+            before,
+            "live database untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir reads").count(),
+            entries_before,
+            "no backup and no swap temp written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t72_version_mismatch_refuses_without_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t72ver-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let enveloped = {
+            let mut source = Store::open_in_memory().expect("source opens");
+            source.add(valid_input("Work")).expect("row seeds");
+            source.export_library_json().expect("export works")
+        };
+        {
+            let mut live = Store::open_file(&path).expect("live opens");
+            live.add(valid_input("Live")).expect("live seeds");
+        }
+        let before = std::fs::read(&path).expect("live bytes");
+        let entries_before = std::fs::read_dir(&dir).expect("dir reads").count();
+
+        let future = enveloped.replace("\"schema_version\":1", "\"schema_version\":2");
+        let error = Store::restore_library_file(&path, &future, now_unix())
+            .expect_err("future schema version refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("library export schema not supported"),
+            "typed refusal: {text}"
+        );
+        assert!(
+            text.contains("supported ≤1"),
+            "names the supported version: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("live bytes"),
+            before,
+            "live database untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir reads").count(),
+            entries_before,
+            "no backup and no swap temp written"
+        );
+
+        let foreign = enveloped.replace(
+            "\"schema\":\"manyproxy-library\"",
+            "\"schema\":\"thrn-archive\"",
+        );
+        let error = Store::restore_library_file(&path, &foreign, now_unix())
+            .expect_err("foreign schema refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("library export schema not supported"),
+            "foreign schema refuses loudly: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("live bytes"),
+            before,
+            "still untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir reads").count(),
+            entries_before,
+            "still no writes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t72_legacy_unenveloped_export_still_restores() {
+        let mut source = Store::open_in_memory().expect("source opens");
+        export_seed(&mut source);
+        let payload = source.export_library_json().expect("export works");
+        let legacy = payload_without_envelope(&payload);
+        assert!(
+            !legacy.contains("\"schema\""),
+            "legacy payload carries no envelope: {legacy}"
+        );
+
+        let mut target = Store::open_in_memory().expect("target opens");
+        let outcome = target
+            .restore_library_json(&legacy)
+            .expect("legacy export restores as today");
+        assert_eq!(outcome.configs, 3);
+        assert_eq!(outcome.subscriptions, 1);
+        assert!(
+            target
+                .restore_library_json("{\"library\": [], \"subscriptions\": []}")
+                .is_ok(),
+            "hand-written pre-envelope payloads still restore"
+        );
     }
 
     #[test]
@@ -13627,6 +15293,7 @@ mod tests {
             ("route_presets", "description"),
             ("route_presets", "is_builtin"),
             ("route_presets", "last_used_at"),
+            ("route_presets", "locked"),
             ("subscription_tombstones", "subscription_url"),
         ] {
             assert!(
@@ -14618,6 +16285,135 @@ mod tests {
     }
 
     #[test]
+    fn t60_preset_locked_column_round_trip() {
+        let dir = t52_temp_root("t60locked");
+        let path = dir.join("library.db");
+        let preset_id = {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            let preset = store
+                .create_preset(
+                    "t60-locked",
+                    "manual",
+                    None,
+                    &[serde_json::json!({"action": "direct"})],
+                )
+                .expect("preset seeds");
+            assert!(
+                !preset.locked,
+                "presets start unlocked (no auto-lock on import)"
+            );
+            let locked = store
+                .set_preset_locked(&preset.id, true)
+                .expect("lock works");
+            assert!(locked.locked, "toggle locks in memory");
+            assert!(
+                store
+                    .column_exists("route_presets", "locked")
+                    .expect("probe works"),
+                "additive ensure_column added route_presets.locked"
+            );
+            preset.id.clone()
+        };
+        // The lock survives a restart (column round trip), and attaching a
+        // locked preset is allowed: the lock protects the rules, never the
+        // attach relationship.
+        {
+            let mut store = Store::open_file(&path).expect("reopen works");
+            let preset = store
+                .get_preset(&preset_id)
+                .expect("read works")
+                .expect("preset kept");
+            assert!(preset.locked, "locked persists across restarts");
+            let row = store.add(valid_input("Target")).expect("row seeds");
+            let attached = store
+                .set_config_preset(&row.id, Some(&preset_id))
+                .expect("attach works");
+            assert_eq!(
+                attached.preset_id.as_deref(),
+                Some(preset_id.as_str()),
+                "locked presets attach"
+            );
+            let detached = store
+                .set_config_preset(&row.id, None)
+                .expect("detach works");
+            assert!(detached.preset_id.is_none(), "locked presets detach");
+        }
+        // Export carries the lock as plain additive state...
+        let source_store = Store::open_file(&path).expect("source store opens");
+        let exported = source_store.export_library_json().expect("export works");
+        assert!(exported.contains("\"locked\":true"), "{exported}");
+        // ...and restore keeps it without touching the source file.
+        {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            store
+                .restore_library_json(&exported)
+                .expect("restore works");
+            let restored = store
+                .get_preset(&preset_id)
+                .expect("read works")
+                .expect("preset restored");
+            assert!(restored.locked, "restore keeps the lock");
+            let unlocked = store
+                .set_preset_locked(&preset_id, false)
+                .expect("unlock works");
+            assert!(!unlocked.locked, "toggle unlocks");
+        }
+        let preset = source_store
+            .get_preset(&preset_id)
+            .expect("read works")
+            .expect("preset kept");
+        assert!(preset.locked, "the source file was never touched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t60_store_caps_rule_names() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        // create_preset condenses over-long rule names with the cap_name
+        // taste; short names stay byte-exact.
+        let preset = store
+            .create_preset(
+                "t60-caps",
+                "manual",
+                None,
+                &[
+                    serde_json::json!({"action": "route", "name": "a".repeat(300)}),
+                    serde_json::json!({"action": "direct", "name": "Office exit"}),
+                ],
+            )
+            .expect("preset seeds");
+        let rules = preset.rules().expect("rules decode");
+        let long = rules[0]["name"].as_str().expect("name stays a string");
+        assert_eq!(
+            long.chars().count(),
+            crate::preset::MAX_RULE_NAME_CHARS,
+            "stored name capped to 128 chars"
+        );
+        assert!(long.starts_with(&"a".repeat(100)), "{long}");
+        assert_eq!(
+            rules[1]["name"],
+            serde_json::json!("Office exit"),
+            "short name byte-exact"
+        );
+        let set = store
+            .set_preset_rules(
+                &preset.id,
+                &[serde_json::json!({"action": "direct", "name": "b".repeat(300)})],
+            )
+            .expect("set works");
+        let rules = set.rules().expect("rules decode");
+        assert_eq!(
+            rules[0]["name"]
+                .as_str()
+                .expect("name stays a string")
+                .chars()
+                .count(),
+            crate::preset::MAX_RULE_NAME_CHARS,
+            "set_preset_rules caps too"
+        );
+    }
+
+    #[test]
     fn delete_running_confirm_promises_stop_first() {
         let stopped = super::delete_confirm_text("Work");
         assert!(
@@ -14684,5 +16480,911 @@ mod tests {
         let padded = parse_port_field("  abc  ").expect_err("padded word rejects");
         assert_eq!(padded.field, "port");
         assert_eq!(padded.message, "port must be 1-65535, got 'abc'");
+    }
+
+    fn t52_temp_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp root works");
+        dir
+    }
+
+    #[test]
+    fn t52_default_path_is_exe_relative_data() {
+        let path = Store::default_path();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("library.db"),
+            "db file name unchanged, got {path:?}"
+        );
+        let exe_dir = std::env::current_exe()
+            .expect("test exe resolves")
+            .parent()
+            .map(Path::to_path_buf)
+            .expect("exe dir resolves");
+        assert_eq!(
+            path.parent().map(Path::to_path_buf),
+            Some(app_data_dir()),
+            "db default is the shared app-data helper"
+        );
+        assert_eq!(
+            app_data_dir(),
+            exe_dir.join(DATA_DIR_NAME),
+            "data folder sits beside the exe, never elsewhere"
+        );
+
+        let base = t52_temp_root("t52apps");
+        let a = base.join("install-a");
+        let b = base.join("install-b");
+        assert_eq!(
+            app_data_dir_in(Some(&a))
+                .file_name()
+                .map(|n| n.to_os_string()),
+            Some(std::ffi::OsString::from(DATA_DIR_NAME)),
+            "every app dir gets a data subfolder"
+        );
+        assert_ne!(
+            app_data_dir_in(Some(&a)),
+            app_data_dir_in(Some(&b)),
+            "two app dirs yield independent defaults"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn t52_export_and_logs_defaults_inside_data() {
+        let data = app_data_dir();
+        assert_eq!(
+            Store::default_export_path(),
+            data.join("manyproxy-export.json"),
+            "export default derives into the data folder"
+        );
+        assert_eq!(
+            Store::default_logs_path(),
+            data.join("manyproxy-logs.txt"),
+            "logs default derives into the data folder"
+        );
+        assert_eq!(
+            Store::default_export_path().parent().map(Path::to_path_buf),
+            Store::default_path().parent().map(Path::to_path_buf),
+            "export and db share one parent"
+        );
+        assert_eq!(
+            Store::default_logs_path().parent().map(Path::to_path_buf),
+            Store::default_path().parent().map(Path::to_path_buf),
+            "logs and db share one parent"
+        );
+    }
+
+    #[test]
+    fn t52_backup_and_quarantine_beside_db() {
+        let base = t52_temp_root("t52backup");
+        let data = app_data_dir_in(Some(&base));
+        let db = data.join("library.db");
+        std::fs::create_dir_all(&data).expect("data dir works");
+        std::fs::write(&db, b"this is not sqlite at all").expect("garbage writes");
+
+        let error = match Store::open_file(&db) {
+            Ok(_) => panic!("corrupt open must fail"),
+            Err(err) => err,
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("corrupt") || text.contains("integrity"),
+            "loud failure at the new location, got {text}"
+        );
+
+        let kept: Vec<_> = std::fs::read_dir(&data)
+            .expect("data dir reads")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "quarantine lands beside the db, got {kept:?}"
+        );
+
+        let store = Store::open_file(&db).expect("fresh db opens after quarantine");
+        drop(store);
+        let backup = Store::backup_db_file(&db, 12345).expect("backup works");
+        assert_eq!(
+            backup.parent().map(Path::to_path_buf),
+            Some(data.clone()),
+            "backup lands beside the db"
+        );
+        assert!(
+            backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("library.db.bak-")),
+            "backup file name is the .bak sibling, got {backup:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn t52_fresh_default_store_at_exe_relative_data() {
+        let base = t52_temp_root("t52fresh");
+        let data = app_data_dir_in(Some(&base));
+        let db = data.join("library.db");
+        assert!(!data.exists(), "fresh install starts without a data folder");
+
+        let payload = {
+            let mut store = Store::open_file(&db).expect("first open creates the data folder");
+            assert!(data.exists(), "<appdir> data folder created on first use");
+            store.add(valid_input("t52-fresh")).expect("row seeds");
+            store.export_library_json().expect("export works")
+        };
+        let reopened = Store::open_file(&db).expect("second open works");
+        let rows = reopened.list().expect("list works");
+        assert_eq!(rows.len(), 1, "open twice keeps the library, no migration");
+        assert_eq!(rows[0].name, "t52-fresh", "row survives the reopen");
+
+        let mut dry = Store::open_in_memory().expect("in-memory opens");
+        dry.restore_library_json(&payload)
+            .expect("restore round trip works");
+        let restored = dry.list().expect("restored list works");
+        assert_eq!(restored.len(), 1, "row survives export/restore in memory");
+        assert_eq!(restored[0].name, "t52-fresh", "restored row intact");
+
+        let other = t52_temp_root("t52fresh-second");
+        let other_db = app_data_dir_in(Some(&other)).join("library.db");
+        let fresh = Store::open_file(&other_db).expect("second app dir opens");
+        assert!(
+            fresh.list().expect("fresh list works").is_empty(),
+            "another app dir starts a new library, nothing carried over"
+        );
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn t52_no_default_paths_reference_appdata() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Needles are assembled at runtime so this guard never matches its own source.
+        let appdata = ["APP", "DATA"].concat();
+        let dot = '.';
+        let legacy_home = format!("{dot}{}{}", "many", "proxy");
+
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("src dir reads") {
+            let path = entry.expect("entry reads").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let text = std::fs::read_to_string(&path).expect("source reads");
+            if text.contains(&appdata) {
+                offenders.push(format!("{name}: {appdata}"));
+            }
+            if text.contains(&legacy_home) {
+                offenders.push(format!("{name}: {legacy_home}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "default storage must never reference the legacy homes, got {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn t62_rule_set_staged_under_data_rule_sets() {
+        // The staging root is the T-02 family: `<appdir>\data\rule-sets\`,
+        // derived from the same app-dir helper as the DB — nothing else.
+        let base = t52_temp_root("t62staged");
+        let app = base.join("install");
+        assert_eq!(
+            rule_sets_dir_in(Some(&app)),
+            app.join(DATA_DIR_NAME).join(RULE_SETS_DIR_NAME),
+            "rule sets stage under the command data folder"
+        );
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(store.list_rule_sets().expect("list works").is_empty());
+
+        let row = store
+            .create_rule_set("Block Ads", "https://s.example.com/z.srs", 512)
+            .expect("stage records");
+        assert_eq!(row.name, "Block Ads");
+        assert_eq!(row.url, "https://s.example.com/z.srs");
+        assert_eq!(
+            row.file_name,
+            crate::store::rule_set_file_name("Block Ads"),
+            "the file name mirrors the sanitized name the engine derives"
+        );
+        assert_eq!(row.file_name, "Block-Ads.srs");
+        assert_eq!(row.bytes, 512);
+        assert!(row.downloaded_at > 0);
+
+        // The same entry again is the UNIQUE guard: overwriting happens only
+        // through the confirmed re-Download flow (touch), never at intake.
+        let error = store
+            .create_rule_set("Block Ads", "https://s.example.com/z.srs", 512)
+            .expect_err("duplicate name is refused");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        assert!(
+            fields.iter().any(|e| e.message.contains("already staged")),
+            "{fields:?}"
+        );
+
+        // Re-download refreshes bytes/URL and shifts downloaded_at forward.
+        let first_touched = row.downloaded_at;
+        let touched = store
+            .touch_rule_set(&row.id, "https://mirror.example.com/z.srs", 640)
+            .expect("touch refreshes");
+        assert_eq!(touched.bytes, 640);
+        assert_eq!(touched.url, "https://mirror.example.com/z.srs");
+        assert!(touched.downloaded_at >= first_touched);
+
+        let error = store
+            .create_rule_set(
+                "Too much",
+                "https://s.example.com/z.srs",
+                (SUBSCRIPTION_MAX_BYTES + 1) as u64,
+            )
+            .expect_err("over-cap refuse");
+        assert!(error.to_string().contains("staging cap"), "{error}");
+
+        // Name validation: the name doubles as the staged file base, so a
+        // name must survive the tag sanitizer with a letter/digit, never be a
+        // Windows device name, and stay bounded.
+        for (bad, cause) in [
+            ("   ", "empty"),
+            ("///", "no letter or digit"),
+            ("名", "no letter or digit"),
+            ("con", "reserved Windows device name"),
+        ] {
+            let error = store
+                .create_rule_set(bad, "https://s.example.com/z.srs", 10)
+                .expect_err("this name must not stage");
+            let StoreError::Invalid(fields) = error else {
+                panic!("expected Invalid for {bad}, got {error:?}");
+            };
+            let field = fields.first().expect("field error present");
+            match cause {
+                "empty" => assert_eq!(field.message, "rule set name must not be empty"),
+                "no letter or digit" => assert_eq!(
+                    field.message, "rule set name must contain a letter or digit",
+                    "raw name {bad} sanitizes to no usable stem"
+                ),
+                "reserved Windows device name" => {
+                    let message = field.message.clone();
+                    assert!(
+                        message.contains("reserved"),
+                        "device-name refusal: {message}"
+                    );
+                }
+                other => panic!("unknown cause {other}"),
+            }
+        }
+
+        // An unused row deletes clean and hands back the file name so the flow
+        // can unlink the cache bytes (no silent orphan cache survives).
+        let file_name = store
+            .delete_rule_set(&row.id)
+            .expect("delete works")
+            .expect("the staged file name comes back");
+        assert_eq!(file_name, "Block-Ads.srs");
+        assert!(store.list_rule_sets().expect("list works").is_empty());
+        assert_eq!(
+            store.delete_rule_set(&row.id).expect("ghost delete"),
+            None,
+            "deleting twice is a no-op, not an error"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn t62_rule_set_used_guard_blocks_remove() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("Row")).expect("row seeds");
+        let ads = store
+            .create_rule_set("ads", "https://s.example.com/ads.srs", 11)
+            .expect("stage records");
+        let preset = store
+            .create_preset(
+                "t62-guard",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "proxy", "rule_set": ["ads"]})],
+            )
+            .expect("preset seeds");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works — the set is staged");
+        assert_eq!(
+            store.rule_sets_in_use(&preset.id).expect("in-use works"),
+            vec!["ads".to_string()],
+            "the helper names the sets a preset references"
+        );
+        assert_eq!(
+            store.rule_set_used_by("ads").expect("used-by works"),
+            vec![preset.name.clone()],
+            "the guard names every preset still using the set"
+        );
+        assert!(store.rule_set_used_by("none").expect("works").is_empty());
+
+        // Remove is blocked while the preset still references the set — the
+        // inline error names both the count and the preset names.
+        let error = store
+            .delete_rule_set(&ads.id)
+            .expect_err("used set refuses removal");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        assert!(
+            fields.iter().any(|e| {
+                e.message
+                    == crate::preset::rule_set_in_use_message(
+                        "ads",
+                        std::slice::from_ref(&preset.name),
+                    )
+            }),
+            "{fields:?}"
+        );
+        assert!(store.get_rule_set(&ads.id).expect("get works").is_some());
+
+        // Detaching frees removal — and the detach surface is the preset's
+        // rules, not the row link: the guard counts rule_set references that
+        // presets still name.
+        store
+            .set_preset_rules(
+                &preset.id,
+                &[serde_json::json!({"action": "proxy", "ip_cidr": ["10.0.0.0/8"]})],
+            )
+            .expect("rule rewrite works");
+        assert!(store
+            .rule_sets_in_use(&preset.id)
+            .expect("works")
+            .is_empty());
+        let file_name = store
+            .delete_rule_set(&ads.id)
+            .expect("delete works")
+            .expect("file name comes back");
+        assert_eq!(file_name, "ads.srs", "the file name can be unlinked");
+        assert!(store.list_rule_sets().expect("list works").is_empty());
+    }
+
+    #[test]
+    fn t62_attach_rejects_unstaged_rule_set() {
+        // Attachment-time validation is at the row attach (not preset save):
+        // the T-61 anchor saves a `ruleset:` ref unstaged — saving stays
+        // tolerant, attaching to a row is where the loud name check lives.
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("Row")).expect("row seeds");
+        let preset = store
+            .create_preset(
+                "t62-attach",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "proxy", "rule_set": ["ghost-set"]})],
+            )
+            .expect("preset save stays tolerant");
+        store
+            .create_preset("plain", "manual", None, &[])
+            .expect("empty preset seeds");
+        let error = store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect_err("unstaged ref must fail the attach");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        let unstaged = fields
+            .iter()
+            .any(|e| e.message.contains("\"ghost-set\"") && e.message.contains("is not staged"));
+        assert!(unstaged, "names the missing set: {fields:?}");
+        assert!(
+            store
+                .get(&row.id)
+                .expect("get works")
+                .expect("kept")
+                .preset_id
+                .is_none(),
+            "a refused attach leaves the row unattached"
+        );
+
+        // Staging the named set clears the gate.
+        store
+            .create_rule_set("ghost-set", "https://s.example.com/g.srs", 5)
+            .expect("stage records");
+        let attached = store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works once the set is staged");
+        assert_eq!(attached.preset_id.as_deref(), Some(preset.id.as_str()));
+
+        // And attach refuses a named-but-empty reference too.
+        let empty = store
+            .create_preset(
+                "t62-blank",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "direct", "rule_set": [" "]})],
+            )
+            .expect("tolerant save");
+        let error = store
+            .set_config_preset(&row.id, Some(&empty.id))
+            .expect_err("blank ref must fail");
+        assert!(error.to_string().contains("empty set name"), "{error}");
+    }
+
+    /// T-27: `library_sort` rides the meta family beside `library_columns`: a
+    /// fresh store reads the default, every key/direction round-trips through a
+    /// reopen, and the `none` choice persists as the untouched order.
+    #[test]
+    fn t77_sort_model_meta_round_trip() {
+        let path = std::env::temp_dir().join("manyproxy-t77-sort.db");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::default(),
+                "a fresh store sorts by nothing"
+            );
+            assert_eq!(
+                store.get_meta(Store::META_LIBRARY_SORT).expect("meta read"),
+                None,
+                "the default writes no meta row"
+            );
+
+            for key in LibrarySortKey::ALL {
+                for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                    let sort = LibrarySort::new(key, direction);
+                    store.set_library_sort(sort).expect("sort writes");
+                    assert_eq!(store.library_sort(), sort, "{} round-trips", key.token());
+                }
+            }
+
+            assert_eq!(
+                LibrarySort::new(LibrarySortKey::Latency, SortDirection::Descending).to_json(),
+                r#"{"key":"latency","direction":"desc"}"#,
+                "the meta payload has one canonical shape"
+            );
+            for key in LibrarySortKey::ALL {
+                assert_eq!(
+                    LibrarySortKey::from_token(key.token()),
+                    Some(key),
+                    "{} parses back from its token",
+                    key.token()
+                );
+            }
+
+            // A hand-edited payload never wedges the list: the object as a whole
+            // falls back to the default, and one unknown field keeps the other.
+            store
+                .set_meta(Store::META_LIBRARY_SORT, "not json at all")
+                .expect("corrupt meta writes");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::default(),
+                "garbage reads as the untouched order"
+            );
+            store
+                .set_meta(
+                    Store::META_LIBRARY_SORT,
+                    r#"{"key":"nope","direction":"desc"}"#,
+                )
+                .expect("unknown key writes");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::new(LibrarySortKey::None, SortDirection::Descending),
+                "an unknown key falls back to none, the direction survives"
+            );
+            store
+                .set_meta(
+                    Store::META_LIBRARY_SORT,
+                    r#"{"key":"latency","direction":"sideways"}"#,
+                )
+                .expect("unknown direction writes");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
+                "an unknown direction falls back to ascending"
+            );
+
+            store
+                .set_library_sort(LibrarySort::default())
+                .expect("none writes");
+        }
+
+        let store = Store::open_file(&path).expect("reopen works");
+        assert_eq!(
+            store.library_sort(),
+            LibrarySort::default(),
+            "the none choice survives a restart"
+        );
+        assert_eq!(
+            store
+                .get_meta(Store::META_LIBRARY_SORT)
+                .expect("meta read")
+                .as_deref(),
+            Some(r#"{"key":"none","direction":"asc"}"#),
+            "none persists explicitly instead of clearing the key"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// T-31: `log_max_lines` rides the meta family with a `500..=50_000` window
+    /// and today's 5,000-line default for an absent, corrupt, or reset key.
+    #[test]
+    fn t81_log_caps_round_trip_reset_and_default() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.log_max_lines(),
+            crate::health::MAX_LOG_RECORDS,
+            "absent meta reads as today's 5,000-line ring"
+        );
+        assert_eq!(
+            store
+                .get_meta(Store::META_LOG_MAX_LINES)
+                .expect("meta read"),
+            None,
+            "the default writes no meta row"
+        );
+
+        for cap in [500usize, 1_234, 50_000] {
+            store.set_log_max_lines(cap).expect("cap writes");
+            assert_eq!(store.log_max_lines(), cap, "{cap} round-trips");
+        }
+
+        store.set_log_max_lines(1).expect("low cap writes");
+        assert_eq!(store.log_max_lines(), 500, "low caps clamp to 500");
+        store
+            .set_log_max_lines(usize::MAX)
+            .expect("high cap writes");
+        assert_eq!(store.log_max_lines(), 50_000, "high caps clamp to 50,000");
+
+        store
+            .set_meta(Store::META_LOG_MAX_LINES, "not-a-number")
+            .expect("junk writes");
+        assert_eq!(store.log_max_lines(), 5_000, "junk reads as the default");
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![Store::META_LOG_MAX_LINES],
+            )
+            .expect("meta row clears");
+        assert_eq!(store.log_max_lines(), 5_000, "a reset reads as the default");
+
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t81-cap-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(store.log_max_lines(), 5_000, "a fresh file store defaults");
+            store.set_log_max_lines(777).expect("cap writes");
+        }
+        let store = Store::open_file(&path).expect("reopen works");
+        assert_eq!(store.log_max_lines(), 777, "cap survives a restart");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// T-32: the window rectangle rides the meta family as
+    /// `{x,y,width,height}` logical points; an absent key writes nothing.
+    #[test]
+    fn t82_geometry_meta_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "absent meta reads as no geometry"
+        );
+        assert_eq!(
+            store.get_meta(Store::META_GEOMETRY).expect("meta read"),
+            None,
+            "the default writes no meta row"
+        );
+
+        let geometry = WindowGeometry {
+            x: 320.,
+            y: 180.,
+            width: 1280.,
+            height: 900.,
+        };
+        store
+            .set_window_geometry(geometry)
+            .expect("geometry writes");
+        assert_eq!(
+            store.window_geometry(),
+            Some(geometry),
+            "geometry round-trips"
+        );
+        assert_eq!(
+            store.window_geometry().expect("geometry reads").to_json(),
+            r#"{"x":320,"y":180,"width":1280,"height":900}"#,
+            "the payload is the plain JSON rectangle"
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t82-geometry-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(store.window_geometry(), None, "a fresh file store defaults");
+            store
+                .set_window_geometry(geometry)
+                .expect("geometry writes");
+        }
+        let store = Store::open_file(&path).expect("reopen works");
+        assert_eq!(
+            store.window_geometry(),
+            Some(geometry),
+            "geometry survives a restart"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// T-32: width/height never read back below the 880×620 window minimum and
+    /// x/y land inside the -999..9999 sane box, whichever side wrote the row.
+    #[test]
+    fn t82_geometry_clamps_respect_mins() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+
+        let tiny_far_away = WindowGeometry {
+            x: -50_000.,
+            y: 42_000.,
+            width: 100.,
+            height: 50.,
+        };
+        store
+            .set_window_geometry(tiny_far_away)
+            .expect("geometry writes");
+        assert_eq!(
+            store.window_geometry(),
+            Some(WindowGeometry {
+                x: WindowGeometry::POSITION_MIN,
+                y: WindowGeometry::POSITION_MAX,
+                width: WindowGeometry::MIN_WIDTH,
+                height: WindowGeometry::MIN_HEIGHT,
+            }),
+            "the setter clamps before writing"
+        );
+
+        store
+            .set_meta(
+                Store::META_GEOMETRY,
+                r#"{"x":-99999,"y":99999,"width":10,"height":10}"#,
+            )
+            .expect("hand-edited row writes");
+        assert_eq!(
+            store.window_geometry(),
+            Some(WindowGeometry {
+                x: WindowGeometry::POSITION_MIN,
+                y: WindowGeometry::POSITION_MAX,
+                width: WindowGeometry::MIN_WIDTH,
+                height: WindowGeometry::MIN_HEIGHT,
+            }),
+            "the getter clamps a row that bypassed the setter"
+        );
+
+        store
+            .set_meta(Store::META_GEOMETRY, r#"{"x":0,"y":0,"width":1280}"#)
+            .expect("partial row writes");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "a partial rectangle reads as no geometry"
+        );
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![Store::META_GEOMETRY],
+            )
+            .expect("meta row clears");
+        store
+            .set_window_geometry(WindowGeometry {
+                x: f32::NAN,
+                y: 0.,
+                width: 1280.,
+                height: 900.,
+            })
+            .expect("a non-finite write is refused, not stored");
+        assert_eq!(
+            store.get_meta(Store::META_GEOMETRY).expect("meta read"),
+            None,
+            "a non-finite rectangle leaves no row behind"
+        );
+    }
+
+    // T-33: the bind-address list the per-row picker draws from.
+
+    fn bind_host_seed(name: &str, bind_ip: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: String::new(),
+            group: String::new(),
+            bind_ip: bind_ip.to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    fn stored_bind_hosts(store: &Store) -> serde_json::Value {
+        let raw = store
+            .get_meta(Store::META_BIND_HOSTS)
+            .expect("meta read")
+            .expect("seed wrote the key");
+        serde_json::from_str(&raw).expect("extras decode")
+    }
+
+    #[test]
+    fn t83_bind_hosts_meta_round_trip_and_seed() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(bind_host_seed("Loop", "127.0.0.1", "10951"))
+            .expect("seed works");
+        store
+            .add(bind_host_seed("Lan", "192.168.1.20", "10952"))
+            .expect("seed works");
+
+        assert_eq!(
+            store.bind_hosts(),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+            ],
+            "constants lead, then every row bind, loopback deduped"
+        );
+        assert_eq!(
+            stored_bind_hosts(&store),
+            serde_json::json!(["192.168.1.20"]),
+            "constants are implicit — only extras are written"
+        );
+
+        store
+            .add(bind_host_seed("Late", "10.9.9.9", "10953"))
+            .expect("add works");
+        assert!(
+            !store.bind_hosts().contains(&"10.9.9.9".to_string()),
+            "seeding happened once; a later row does not widen the list"
+        );
+
+        store.add_bind_host("fd00::7").expect("extra accepted");
+        assert_eq!(
+            store.bind_hosts(),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+                "fd00::7".to_string(),
+            ],
+            "extras keep insertion order after the constants"
+        );
+        assert_eq!(
+            stored_bind_hosts(&store),
+            serde_json::json!(["192.168.1.20", "fd00::7"]),
+            "round trip keeps extras only"
+        );
+
+        store
+            .set_meta(Store::META_BIND_HOSTS, "not json")
+            .expect("meta write works");
+        assert_eq!(
+            store.bind_hosts(),
+            vec!["127.0.0.1".to_string(), "0.0.0.0".to_string()],
+            "a corrupt payload reads as no extras and never re-seeds"
+        );
+    }
+
+    #[test]
+    fn t83_constants_never_removable() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add_bind_host("192.168.1.20").expect("extra accepted");
+        for constant in Store::BIND_HOST_CONSTANTS {
+            let error = store
+                .remove_bind_host(constant)
+                .expect_err("constants cannot be removed");
+            assert!(
+                error.to_string().contains(constant),
+                "refusal names {constant}: {error}"
+            );
+            let duplicate = store
+                .add_bind_host(constant)
+                .expect_err("constants are already listed");
+            assert!(
+                duplicate.to_string().contains("already in the list"),
+                "duplicate refusal: {duplicate}"
+            );
+        }
+        assert_eq!(
+            store.bind_hosts(),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+            ],
+            "constants stay present and first"
+        );
+        assert_eq!(
+            store.remove_bind_host("192.168.1.20").expect("extra goes"),
+            vec!["127.0.0.1".to_string(), "0.0.0.0".to_string()],
+            "an unused extra removes"
+        );
+    }
+
+    #[test]
+    fn t83_remove_blocked_while_used_by_rows() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(bind_host_seed("Alpha", "127.0.0.1", "10951"))
+            .expect("seed works");
+        store
+            .add(bind_host_seed("Beta", "127.0.0.1", "10952"))
+            .expect("seed works");
+        store
+            .add(bind_host_seed("Gamma", "10.1.2.3", "10953"))
+            .expect("seed works");
+        store.add_bind_host("10.9.9.9").expect("extra accepted");
+
+        assert_eq!(
+            store
+                .bind_host_usage()
+                .expect("usage reads")
+                .get("127.0.0.1")
+                .cloned(),
+            Some(vec!["Alpha".to_string(), "Beta".to_string()]),
+            "the used-hosts query names every row on the bind"
+        );
+
+        let error = store
+            .remove_bind_host("127.0.0.1")
+            .expect_err("constants never remove, even when unused");
+        assert!(error.to_string().contains("built in"), "{error}");
+        let error = store
+            .remove_bind_host("10.1.2.3")
+            .expect_err("a used extra cannot be removed");
+        let text = error.to_string();
+        assert!(
+            text.contains("10.1.2.3") && text.contains("\"Gamma\""),
+            "the refusal names the blocking row: {text}"
+        );
+        assert!(
+            store.bind_hosts().contains(&"10.1.2.3".to_string()),
+            "a refused remove leaves the list untouched"
+        );
+
+        assert_eq!(
+            store
+                .remove_bind_host("10.9.9.9")
+                .expect("unused extra goes"),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "10.1.2.3".to_string(),
+            ],
+            "only the unused extra leaves"
+        );
     }
 }

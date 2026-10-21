@@ -1,0 +1,595 @@
+name: release
+
+# CI-CONSENT NOTE (sidecar fetch discipline)
+# This WORKFLOW downloads the three pinned sidecar binaries on the
+# MAINTAINER'S BEHALF — it is the *packaging step* loading shipped files from
+# their official upstream release URLs, executed by CI acting as the
+# maintainer (per AGENTS.md this is the user publishing, not silent
+# downloads). ManyProxy-the-app itself keeps the never-download /
+# never-PATH constraints untouched (assert_no_system_mutation family stays
+# green; the app has zero download capability). No tokens beyond the default
+# GITHUB_TOKEN are used; every sidecar URL below is a public constant.
+#
+# PIN DISCIPLINE (each pin verified at ticket T-03 execution time)
+# - sing-box 1.14.2 — SagerNet's official release asset (zip). Same version
+#   as .github/workflows/live.yml:29-31 pins; workflows cannot share env
+#   across files, so the value is duplicated here with this comment as the
+#   cross-link. SagerNet publishes no checksum asset for that release, so the
+#   identity check is the binary reporting the pinned version (the same
+#   check live.yml performs).
+# - sing-box-awg (AmneziaWG+XHTTP fork — research: .planning/research/
+#   02-amnezia-xray.md) — the fork's own release page is the upstream for
+#   this binary: Leadaxe/sing-box-lx, tag v1.14.3-lx.21, asset
+#   sing-box-1.14.3-lx.21-windows-amd64.zip, which the SAME release covers
+#   with a SHA256SUMS manifest (verified at ticket time: the windows-amd64
+#   zip line exists and is checked below; anything else fails the job loudly
+#   rather than substituting a mirror).
+# - xray 26.3.27 — XTLS/Xray-core official release, asset Xray-windows-64.zip
+#   with a `.dgst` checksum sidecar on the same release (SHA2-256 line checked
+#   below; missing or mismatching checksum = loud failure, no substitution).
+#
+# ARM64 note: the windows-arm64 row is ticket T-04 (job `windows-arm64`
+# below plus the `release-body` coordination job). Same pin discipline, arm64
+# assets — each verified at ticket T-04 execution time to resolve 200 on
+# release-assets.githubusercontent.com:
+# - sing-box 1.14.2 — SagerNet publishes sing-box-1.14.2-windows-arm64.zip as
+#   an official release asset. No checksum asset exists for the release, so
+#   identity checks stay the binary's version probe (same as amd64).
+# - sing-box-awg fork arm64 — Leadaxe/sing-box-lx v1.14.3-lx.21 publishes
+#   sing-box-1.14.3-lx.21-windows-arm64.zip and the SAME SHA256SUMS manifest
+#   covers both arches (the windows-arm64 line was verified at ticket time).
+#   Per T-04 the workflow PROBES existence at execution time: if the fork
+#   ever loses the arm64 asset, the arm64 row ships NO zip and says so in the
+#   step summary — never a four-file partial bundle, never stock-sing-box
+#   substitution, never a faked fork.
+# - xray 26.3.27 — XTLS names the arm64 asset Xray-windows-arm64-v8a.zip and
+#   ships Xray-windows-arm64-v8a.zip.dgst on the same release (SHA2-256=
+#   line checked).
+#
+# Runner caveat (ticket T-04): the free windows-11-arm runner is available to
+# public repos (release-time property — human step T-05). Until the repo is
+# public this job is drafted but rehearses nowhere; the amd64 row is
+# unaffected either way.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Rehearsal tag for bundle/file naming (builds and verifies only; no release is created)"
+        required: false
+        default: "v0.0.0-test.1"
+
+permissions:
+  contents: write
+
+env:
+  SINGBOX_VERSION: "1.14.2"
+  SINGBOX_URL: "https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-windows-amd64.zip"
+  AWG_FORK_VERSION: "1.14.3-lx.21"
+  AWG_FORK_URL: "https://github.com/Leadaxe/sing-box-lx/releases/download/v1.14.3-lx.21/sing-box-1.14.3-lx.21-windows-amd64.zip"
+  AWG_FORK_SUMS_URL: "https://github.com/Leadaxe/sing-box-lx/releases/download/v1.14.3-lx.21/SHA256SUMS"
+  XRAY_VERSION: "26.3.27"
+  XRAY_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip"
+  XRAY_DGST_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip.dgst"
+  # ARM64 release row pins (T-04; the same pinned versions as the amd64 row,
+  # arm64 assets verified at ticket T-04 execution time):
+  SINGBOX_ARM64_URL: "https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-windows-arm64.zip"
+  AWG_FORK_ARM64_URL: "https://github.com/Leadaxe/sing-box-lx/releases/download/v1.14.3-lx.21/sing-box-1.14.3-lx.21-windows-arm64.zip"
+  # The fork's SHA256SUMS manifest (AWG_FORK_SUMS_URL above) covers both
+  # arches; the arm64 fetch verifies the windows-arm64 line of the SAME file.
+  XRAY_ARM64_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-arm64-v8a.zip"
+  XRAY_ARM64_DGST_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-arm64-v8a.zip.dgst"
+
+jobs:
+  windows-amd64:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve bundle version from tag
+        shell: pwsh
+        run: |
+          # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
+          $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
+          "TAG=$ref" >> $env:GITHUB_ENV
+          "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      - name: Build (release, locked)
+        shell: pwsh
+        run: |
+          # MANYPROXY_GIT_HASH is stamped by build.rs (best-effort `git rev-parse`),
+          # so a tag-pushed build carries the tagged commit's hash naturally.
+          cargo build --release --locked
+
+      - name: Fetch pinned sing-box (print URL, download, verify)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:SINGBOX_VERSION
+          $url = $env:SINGBOX_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: sing-box $version | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("sing-box pin unverifiable: pinned URL $url returned a zip without sing-box.exe (no mirror substitution allowed; failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "sing-box version output: $probe"
+          if ($probe -notmatch [regex]::Escape($version)) {
+            throw ("sing-box pin unverifiable: downloaded binary reported `"$probe`", expected version $version (URL was $url; no mirror substitution allowed)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box.exe" -Force
+
+      - name: Fetch pinned sing-box-awg fork (print URL, download, verify against upstream SHA256SUMS)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:AWG_FORK_VERSION
+          $url = $env:AWG_FORK_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-amd64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-amd64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: sing-box-awg (Leadaxe/sing-box-lx fork) $version | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          # Verify against the SAME release's own SHA256SUMS manifest.
+          $sums = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:AWG_FORK_SUMS_URL -UseBasicParsing).Content)
+          $line = ($sums -split "`r?`n") | Where-Object { $_.EndsWith("  sing-box-$version-windows-amd64.zip") } | Select-Object -First 1
+          if (-not $line) {
+            throw ("sing-box-awg pin unverifiable: upstream SHA256SUMS ($env:AWG_FORK_SUMS_URL) has no line for sing-box-$version-windows-amd64.zip (failing loudly; no mirror substitution allowed)")
+          }
+          $expected = ($line -split " " | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
+          $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw ("sing-box-awg pin unverifiable: downloaded zip sha256 $actual does not match the upstream SHA256SUMS line $expected (failing loudly; no mirror substitution allowed)")
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("sing-box-awg pin unverifiable: pinned URL $url returned a zip without sing-box.exe (failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "sing-box-awg version output: $probe"
+          # Identity has already been proven by the checksum above; the version
+          # probe is print evidence (fork version spellings may vary per build).
+          if ([string]::IsNullOrWhiteSpace($probe)) {
+            throw ("sing-box-awg pin unverifiable: pinned binary produced no version output (failing loudly)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box-awg.exe" -Force
+
+      - name: Fetch pinned xray (print URL, download, verify against upstream .dgst checksum)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:XRAY_VERSION
+          $url = $env:XRAY_URL
+          $zip = "$env:RUNNER_TEMP\Xray-windows-64-$version.zip"
+          $dir = "$env:RUNNER_TEMP\xray-$version-windows-amd64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: xray $version | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          # Verify against the SAME release's .dgst sidecar (SHA2-256= line).
+          $dgst = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:XRAY_DGST_URL -UseBasicParsing).Content)
+          $line = ($dgst -split "`r?`n") | Where-Object { $_ -match "^SHA2-256=" } | Select-Object -First 1
+          if (-not $line) {
+            throw ("xray pin unverifiable: upstream .dgst ($env:XRAY_DGST_URL) has no SHA2-256= line (failing loudly; no mirror substitution allowed)")
+          }
+          if ($line -notmatch "^SHA2-256=\s*([0-9a-fA-F]+)") {
+            throw ("xray pin unverifiable: upstream .dgst SHA2-256= line is not parseable hex: `"$line`" (failing loudly; no mirror substitution allowed)")
+          }
+          $expected = $Matches[1].ToLowerInvariant()
+          $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw ("xray pin unverifiable: downloaded zip sha256 $actual does not match the upstream .dgst SHA2-256= line $expected (failing loudly; no mirror substitution allowed)")
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "xray.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("xray pin unverifiable: pinned URL $url returned a zip without xray.exe (failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "xray version output: $probe"
+          if ([string]::IsNullOrWhiteSpace($probe)) {
+            throw ("xray pin unverifiable: pinned binary produced no version output (failing loudly)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\xray.exe" -Force
+
+      - name: Assemble bundle (exactly five files) and guard the layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "manyproxy-v$env:VER-windows-amd64"
+          $zip = "manyproxy-v$env:VER-windows-amd64.zip"
+          if ($env:TAG -notmatch "^v") {
+            throw ("bundle naming guard: tag `"$env:TAG`" must match v* (naming convention requires it for release assets)")
+          }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "target\release\manyproxy.exe" -Destination "$stage\manyproxy.exe" -Force
+          Copy-Item -Path "THIRD-PARTY-NOTICES.md" -Destination "$stage\THIRD-PARTY-NOTICES.md" -Force
+          foreach ($bin in "sing-box.exe", "sing-box-awg.exe", "xray.exe") {
+            Copy-Item -Path "$env:RUNNER_TEMP\bins\$bin" -Destination "$stage\$bin" -Force
+          }
+          $expectedFiles = @(
+            "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
+          ) | Sort-Object
+          $actualFiles = (Get-ChildItem -Path $stage -File | Sort-Object -Property Name).Name
+          if ((@($actualFiles) -join "`n") -ne (@($expectedFiles) -join "`n")) {
+            throw ("bundle layout guard: staging must contain EXACTLY the five bundle files; found: " + (@($actualFiles) -join ", "))
+          }
+          Write-Output ("Staged exactly the five bundle files: " + (@($actualFiles) -join ", "))
+          Compress-Archive -Path $stage -DestinationPath $zip
+          # SHA256SUMS.txt: the zip + each staged binary (no signature this beta —
+          # hashes are the honesty floor).
+          $hashItems = @($zip, "$stage\manyproxy.exe", "$stage\sing-box.exe", "$stage\sing-box-awg.exe", "$stage\xray.exe")
+          $hashes = $hashItems | ForEach-Object {
+            "{0}  {1}" -f ((Get-FileHash -Path $_ -Algorithm SHA256).Hash).ToLowerInvariant(), (Split-Path $_ -Leaf)
+          }
+          Set-Content -Path "SHA256SUMS.txt" -Value $hashes -Encoding utf8NoBOM
+          Write-Output "SHA256SUMS.txt:"
+          Write-Output (Get-Content -Path "SHA256SUMS.txt")
+
+      - name: Upload bundle as build artifact (rehearsal runs deliver here)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-amd64"
+          path: |
+            manyproxy-v${{ env.VER }}-windows-amd64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create the GitHub release (tag pushes only; rehearsals skip this)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "manyproxy-v$env:VER-windows-amd64.zip"
+          $prereleaseFlag = @()
+          if ($env:TAG -match "-") { $prereleaseFlag += "--prerelease" }
+          $notes = @"
+          ManyProxy $env:TAG — first beta for the windows-amd64 portable bundle.
+
+          - Unzip anywhere; `manyproxy.exe` + the three sidecar engines sit beside it; no installer, no admin needed (loopback defaults).
+          - Sidecar pins shipped as-is: sing-box $env:SINGBOX_VERSION (SagerNet), sing-box-awg $env:AWG_FORK_VERSION (Leadaxe/sing-box-lx AmneziaWG fork), xray $env:XRAY_VERSION (XTLS/Xray-core).
+          - windows-amd64 gate: fmt → clippy → test enforced per commit in ci.yml (see the checks on the tagged commit); sidecar pins shipped as listed above; live proofs stay opt-in in live.yml and out of the release path (amd64-only — accepted asymmetry).
+          - ``SHA256SUMS.txt`` covers the zip and the four binaries (the beta has no code-signing story; hashes are the honesty floor).
+          - No auto-update: the app never downloads or replaces executables. Updating = replacing the folder by hand. Data lives in ``data\`` beside the exe; deleting the folder uninstalls cleanly.
+          "@
+          Set-Content -Path "release-notes.md" -Value $notes -Encoding utf8NoBOM
+          gh release create $env:TAG $zip "SHA256SUMS.txt" `
+            --title "ManyProxy $env:TAG (windows-amd64)" `
+            --notes-file "release-notes.md" `
+            --generate-notes `
+            @prereleaseFlag
+
+  # T-04 — ARM64 release row (gated): the full fmt → clippy → test gate runs
+  # on the windows-11-arm runner UN-SKIPPABLY and never behind
+  # continue-on-error; the arm64 zip is produced ONLY when (a) the gate is
+  # green and (b) every pinned arm64 sidecar verifies against its official
+  # upstream release asset. A red gate ships no arm64 asset and the release
+  # still ships (amd64 unaffected); an unverifiable fork pin skips the asset
+  # row with an explicit step summary line instead of a partial bundle.
+  windows-arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    outputs:
+      awg: ${{ steps.probe-awg.outputs.awg }}
+      awg_reason: ${{ steps.probe-awg.outputs.awg_reason }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve bundle version from tag
+        shell: pwsh
+        run: |
+          # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
+          $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
+          "TAG=$ref" >> $env:GITHUB_ENV
+          "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      - name: Detect the arm64 toolchain form (rustc -vV echo/probe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Output "----- rustc -vV (windows-11-arm pre-installed toolchain probe) -----"
+          $vv = ((& rustc -vV 2>&1) | ForEach-Object { "$_" }) -join "`n"
+          Write-Output $vv
+          $hostTriple = (("$vv" -split "`n") | Where-Object { $_ -match "^host:" } | Select-Object -First 1) -replace "^host:\s*", ""
+          Write-Output "Detected toolchain host triple: $hostTriple"
+          if ($hostTriple -eq "aarch64-pc-windows-msvc") {
+            Write-Output "Runner defaults to the NATIVE arm64 toolchain — building in native form (no --target override; nothing installed)."
+            "RUST_TARGET_FLAG=" >> $env:GITHUB_ENV
+            "RUST_OUT_DIR=target/release" >> $env:GITHUB_ENV
+          } elseif ($hostTriple -eq "x86_64-pc-windows-msvc") {
+            Write-Output "Pre-installed toolchain host is x86_64-pc-windows-msvc — using the ticket's cross form (--target aarch64-pc-windows-msvc). This adds only the std TARGET for the EXISTING toolchain (rustup target add), not a second toolchain."
+            rustup target add aarch64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { throw "rustup target add aarch64-pc-windows-msvc failed (exit $LASTEXITCODE); the pre-installed toolchain cannot support the arm64 target — failing loudly" }
+            "RUST_TARGET_FLAG=--target aarch64-pc-windows-msvc" >> $env:GITHUB_ENV
+            "RUST_OUT_DIR=target/aarch64-pc-windows-msvc/release" >> $env:GITHUB_ENV
+          } else {
+            throw "arm64 toolchain probe: pre-installed toolchain reports host '$hostTriple' — expected aarch64-pc-windows-msvc (native form) or x86_64-pc-windows-msvc (cross form). Failing loudly; no second toolchain will be installed."
+          }
+
+      - name: Gate 1/3 — cargo fmt --check (un-skippable; Q29)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE) — the arm64 row ships no asset when the full gate is red" }
+
+      - name: Gate 2/3 — cargo clippy --all-targets --locked -- -D warnings (arm64 target)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cargs = @("clippy", "--all-targets", "--locked")
+          if ($env:RUST_TARGET_FLAG) { $cargs += ($env:RUST_TARGET_FLAG -split "\s+") }
+          $cargs += @("--", "-D", "warnings")
+          Write-Output ("Run: cargo " + ($cargs -join " "))
+          & cargo @cargs
+          if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed for the arm64 target (exit $LASTEXITCODE) — the arm64 row ships no asset when the full gate is red" }
+
+      - name: Gate 3/3 — cargo test --locked (arm64 target)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cargs = @("test", "--locked")
+          if ($env:RUST_TARGET_FLAG) { $cargs += ($env:RUST_TARGET_FLAG -split "\s+") }
+          Write-Output ("Run: cargo " + ($cargs -join " "))
+          & cargo @cargs
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed for the arm64 target (exit $LASTEXITCODE) — the arm64 row ships no asset when the full gate is red" }
+
+      - name: Build (release, locked, arm64 target — only after the full gate)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # MANYPROXY_GIT_HASH is stamped by build.rs (best-effort `git rev-parse`),
+          # so a tag-pushed build carries the tagged commit's hash naturally.
+          $cargs = @("build", "--release", "--locked")
+          if ($env:RUST_TARGET_FLAG) { $cargs += ($env:RUST_TARGET_FLAG -split "\s+") }
+          Write-Output ("Run: cargo " + ($cargs -join " "))
+          & cargo @cargs
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed for the arm64 target (exit $LASTEXITCODE)" }
+
+      - name: Fetch pinned sing-box arm64 (print URL, download, verify)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:SINGBOX_VERSION
+          $url = $env:SINGBOX_ARM64_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-$version-windows-arm64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-arm64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: sing-box $version windows-arm64 | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("sing-box arm64 pin unverifiable: pinned URL $url returned a zip without sing-box.exe (no mirror substitution allowed; failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "sing-box version output: $probe"
+          if ($probe -notmatch [regex]::Escape($version)) {
+            throw ("sing-box arm64 pin unverifiable: downloaded binary reported `"$probe`", expected version $version (URL was $url; no mirror substitution allowed)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box.exe" -Force
+
+      - name: Probe pinned sing-box-awg arm64 (same checks as amd64; loud skip of the asset row if the fork stops shipping arm64)
+        id: probe-awg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:AWG_FORK_VERSION
+          $url = $env:AWG_FORK_ARM64_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-arm64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-arm64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: sing-box-awg (Leadaxe/sing-box-lx fork) $version windows-arm64 | URL: $url"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            # Verify against the SAME release's SHA256SUMS manifest (arm64 line).
+            $sums = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:AWG_FORK_SUMS_URL -UseBasicParsing).Content)
+            $line = ($sums -split "`r?`n") | Where-Object { $_.EndsWith("  sing-box-$version-windows-arm64.zip") } | Select-Object -First 1
+            if (-not $line) {
+              throw ("upstream SHA256SUMS ($env:AWG_FORK_SUMS_URL) has no line for sing-box-$version-windows-arm64.zip")
+            }
+            $expected = ($line -split " " | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
+            $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+            if ($actual -ne $expected) {
+              throw ("downloaded zip sha256 $actual does not match the upstream SHA256SUMS line $expected")
+            }
+            Expand-Archive -Path $zip -DestinationPath $dir -Force
+            $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+            if (-not $exe) {
+              throw ("pinned URL $url returned a zip without sing-box.exe")
+            }
+            $probe = (& $exe.FullName version) -join " "
+            Write-Output "sing-box-awg version output: $probe"
+            # Identity has already been proven by the checksum above; the version
+            # probe is print evidence (fork version spellings may vary per build).
+            if ([string]::IsNullOrWhiteSpace($probe)) {
+              throw ("pinned binary produced no version output")
+            }
+            Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box-awg.exe" -Force
+            "awg=present" >> $env:GITHUB_OUTPUT
+          } catch {
+            $detail = (((("{0}" -f $_.Exception.Message)) -replace "\r?\n", " ")).Trim()
+            $reason = "pinned sing-box-awg $version has no verifiable upstream windows-arm64 asset (probed URL: $url; probe failure: $detail) — the pin discipline refuses stock-sing-box substitution and fork faking, so the arm64 zip is not produced"
+            Write-Output "sing-box-awg arm64 pin unverifiable — loud skip (never a silent partial bundle): $reason"
+            "awg=absent" >> $env:GITHUB_OUTPUT
+            "awg_reason=$reason" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Fetch pinned xray arm64 (print URL, download, verify against upstream .dgst checksum)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:XRAY_VERSION
+          $url = $env:XRAY_ARM64_URL
+          $zip = "$env:RUNNER_TEMP\Xray-windows-arm64-v8a-$version.zip"
+          $dir = "$env:RUNNER_TEMP\xray-$version-windows-arm64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: xray $version windows-arm64-v8a | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          # Verify against the SAME release's .dgst sidecar (SHA2-256= line).
+          $dgst = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:XRAY_ARM64_DGST_URL -UseBasicParsing).Content)
+          $line = ($dgst -split "`r?`n") | Where-Object { $_ -match "^SHA2-256=" } | Select-Object -First 1
+          if (-not $line) {
+            throw ("xray arm64 pin unverifiable: upstream .dgst ($env:XRAY_ARM64_DGST_URL) has no SHA2-256= line (failing loudly; no mirror substitution allowed)")
+          }
+          if ($line -notmatch "^SHA2-256=\s*([0-9a-fA-F]+)") {
+            throw ("xray arm64 pin unverifiable: upstream .dgst SHA2-256= line is not parseable hex: `"$line`" (failing loudly; no mirror substitution allowed)")
+          }
+          $expected = $Matches[1].ToLowerInvariant()
+          $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw ("xray arm64 pin unverifiable: downloaded zip sha256 $actual does not match the upstream .dgst SHA2-256= line $expected (failing loudly; no mirror substitution allowed)")
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "xray.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("xray arm64 pin unverifiable: pinned URL $url returned a zip without xray.exe (failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "xray version output: $probe"
+          if ([string]::IsNullOrWhiteSpace($probe)) {
+            throw ("xray arm64 pin unverifiable: pinned binary produced no version output (failing loudly)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\xray.exe" -Force
+
+      - name: Assemble the arm64 bundle (exact five files) and guard the layout; withhold loudly when sing-box-awg arm64 is absent upstream
+        shell: pwsh
+        env:
+          AWG_PRESENT: ${{ steps.probe-awg.outputs.awg }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "manyproxy-v$env:VER-windows-arm64"
+          $zip = "manyproxy-v$env:VER-windows-arm64.zip"
+          if ($env:AWG_PRESENT -ne "present") {
+            $reason = "arm64 asset withheld: pinned sing-box-awg $env:AWG_FORK_VERSION has no verifiable upstream windows-arm64 asset (probed this run). The fmt → clippy → test gate ran un-skipped on windows-11-arm, but T-04 forbids a four-file partial bundle, stock-sing-box substitution, and faking the fork — so no arm64 zip ships and the finding is recorded for the owner."
+            Write-Output $reason
+            "---" >> $env:GITHUB_STEP_SUMMARY
+            "### windows-arm64 release row — asset withheld" >> $env:GITHUB_STEP_SUMMARY
+            "" >> $env:GITHUB_STEP_SUMMARY
+            "- The full gate (fmt → clippy → test) ran un-skipped on the windows-11-arm runner." >> $env:GITHUB_STEP_SUMMARY
+            "- **No arm64 zip is produced** because the pinned sing-box-awg fork ($env:AWG_FORK_VERSION, Leadaxe/sing-box-lx) has no verifiable windows-arm64 upstream asset — loud refusal, never a silent partial bundle, never a substituted engine." >> $env:GITHUB_STEP_SUMMARY
+            "" >> $env:GITHUB_STEP_SUMMARY
+            "Finding for the owner: re-check <https://github.com/Leadaxe/sing-box-lx/releases> for an upstream windows-arm64 asset at or past the pinned fork version, then bump the arm64 pins." >> $env:GITHUB_STEP_SUMMARY
+            return
+          }
+          if ($env:TAG -notmatch "^v") {
+            throw ("bundle naming guard: tag `"$env:TAG`" must match v* (naming convention requires it for release assets)")
+          }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "$env:RUST_OUT_DIR\manyproxy.exe" -Destination "$stage\manyproxy.exe" -Force
+          Copy-Item -Path "THIRD-PARTY-NOTICES.md" -Destination "$stage\THIRD-PARTY-NOTICES.md" -Force
+          foreach ($bin in "sing-box.exe", "sing-box-awg.exe", "xray.exe") {
+            Copy-Item -Path "$env:RUNNER_TEMP\bins\$bin" -Destination "$stage\$bin" -Force
+          }
+          $expectedFiles = @(
+            "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
+          ) | Sort-Object
+          $actualFiles = (Get-ChildItem -Path $stage -File | Sort-Object -Property Name).Name
+          if ((@($actualFiles) -join "`n") -ne (@($expectedFiles) -join "`n")) {
+            throw ("bundle layout guard: staging must contain EXACTLY the five bundle files; found: " + (@($actualFiles) -join ", "))
+          }
+          Write-Output ("Staged exactly the five bundle files: " + (@($actualFiles) -join ", "))
+          Compress-Archive -Path $stage -DestinationPath $zip
+          # SHA256SUMS-windows-arm64.txt: the arm64 row's own per-arch sums file
+          # (its own block: zip + each staged arm64 binary). NOT merged into the
+          # amd64 SHA256SUMS.txt — one sums file per arch keeps each arch's sums
+          # unambiguous, and the generic exe names would collide across arches.
+          $hashItems = @($zip, "$stage\manyproxy.exe", "$stage\sing-box.exe", "$stage\sing-box-awg.exe", "$stage\xray.exe")
+          $hashes = $hashItems | ForEach-Object {
+            "{0}  {1}" -f ((Get-FileHash -Path $_ -Algorithm SHA256).Hash).ToLowerInvariant(), (Split-Path $_ -Leaf)
+          }
+          Set-Content -Path "SHA256SUMS-windows-arm64.txt" -Value $hashes -Encoding utf8NoBOM
+          Write-Output "SHA256SUMS-windows-arm64.txt:"
+          Write-Output (Get-Content -Path "SHA256SUMS-windows-arm64.txt")
+
+      - name: Upload the arm64 bundle as a build artifact (rehearsal runs deliver here; nothing uploads on gate-red or withheld rows)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-arm64"
+          path: |
+            manyproxy-v${{ env.VER }}-windows-arm64.zip
+            SHA256SUMS-windows-arm64.txt
+          if-no-files-found: ignore
+
+  # T-04 — coordination job: the amd64 job creates the release (T-03), the
+  # arm64 job runs its gate/bundle in parallel, and THIS job (needs: both)
+  # attaches the arm64 bundle to the release and appends the arm64 green/red
+  # gate line to the body — race-free, and it states the arm64 row's red
+  # result even when the arm64 job failed (that statement cannot come from
+  # inside a failed job). Rehearsal dispatches never reach it.
+  release-body:
+    name: release-body (attach arm64 asset + arm64 gate line)
+    needs: [windows-amd64, windows-arm64]
+    if: ${{ always() && github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve release tag names
+        shell: bash
+        run: |
+          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "VER=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Download the arm64 bundle artifact (only when the arm64 row shipped it)
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        uses: actions/download-artifact@v4
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-arm64"
+          path: arm64-assets
+
+      - name: Attach the arm64 zip and its sums to the release
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" \
+            "arm64-assets/manyproxy-v${TAG#v}-windows-arm64.zip" \
+            "arm64-assets/SHA256SUMS-windows-arm64.txt" \
+            --clobber
+
+      - name: Append the windows-arm64 green/red gate line to the release body
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ARM_RESULT: ${{ needs.windows-arm64.result }}
+          AWG_PRESENT: ${{ needs.windows-arm64.outputs.awg }}
+          AWG_REASON: ${{ needs.windows-arm64.outputs.awg_reason }}
+          SBV: ${{ env.SINGBOX_VERSION }}
+          AWGV: ${{ env.AWG_FORK_VERSION }}
+          XRV: ${{ env.XRAY_VERSION }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json body --jq .body > body-pre.md
+          if [ -z "$(cat body-pre.md | tr -d '[:space:]')" ]; then
+            echo "release body is empty — the amd64 release step likely never ran (amd64 job failed); failing loudly" >&2
+            exit 1
+          fi
+          if [ "$ARM_RESULT" != "success" ]; then
+            LINE="- windows-arm64 row: **gate red** (the full fmt → clippy → test gate on the windows-11-arm runner did not pass un-skipped) — no arm64 asset is published for $TAG and the windows-amd64 release is unaffected. Pinned arm64 references for this row: sing-box $SBV (SagerNet), sing-box-awg $AWGV (Leadaxe/sing-box-lx fork), xray $XRV (XTLS/Xray-core)."
+          elif [ "$AWG_PRESENT" = "present" ]; then
+            LINE="- windows-arm64 row: **gate green** (fmt → clippy → test, un-skipped, on the windows-11-arm runner) and the asset is published with pinned sidecars — sing-box $SBV (SagerNet official windows-arm64 zip), sing-box-awg $AWGV (Leadaxe/sing-box-lx windows-arm64 zip, verified against the same release's SHA256SUMS), xray $XRV (Xray-windows-arm64-v8a.zip, verified against the same release's .dgst). Hashes: SHA256SUMS-windows-arm64.txt."
+          else
+            LINE="- windows-arm64 row: **gate green, asset withheld** — $AWG_REASON"
+          fi
+          printf '%s\n' "" "$LINE" >> body-pre.md
+          gh release edit "$TAG" --notes-file body-pre.md

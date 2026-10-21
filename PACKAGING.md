@@ -8,17 +8,19 @@ name, path, and search-order claim below is verified against `src/`
 ## 1. Version + binary-name source (read-only)
 
 - Package name and version come from `Cargo.toml` (READ ONLY, owned by
-  feature work): `name = "manyproxy"`, `version = "0.1.0"`
+  feature work): `name = "manyproxy"`, `version = "0.0.1"`
   (`Cargo.toml:1-4`). Verified via `cargo metadata --no-deps`
-  (reports `manyproxy 0.1.0`; no build was run).
+  (reports `manyproxy 0.0.1`; no build was run).
 - The release exe is therefore `manyproxy.exe` on Windows
   (cargo names the exe after the package; no `[[bin]]` rename exists
   in `Cargo.toml`).
-- No in-app version string is derived from the package version:
-  `src/` contains zero uses of `CARGO_PKG_VERSION` / `env!("CARGO...")`
-  (grep-verified). So the version stamp for a release is the
-  `Cargo.toml [package] version` value plus the git commit hash —
-  record both in the release notes by hand.
+- The in-app version string does derive from the package version:
+  `src/main.rs` defines `APP_VERSION = env!("CARGO_PKG_VERSION")`
+  (`src/main.rs:184`, pinned by the `t55_app_version_is_plain_semver`
+  test), and the About dialog prints it next to the stamped git hash.
+  So the in-app version always matches the `Cargo.toml [package]
+  version`; still record the version and the git commit hash in the
+  release notes by hand when packaging.
 
 ## 2. Portable layout
 
@@ -64,19 +66,34 @@ Fork smoke check: `<binary> version`, first stdout line
 (`probe_fork_version`, `src/engine.rs:2506-2535`). A wrong/plain
 binary fails fast here instead of serving exotic rows badly.
 
-## 4. Data paths (NOT in the portable dir)
+## 4. Data paths (inside the portable dir)
 
-- Library DB default: `%APPDATA%\ManyProxy\library.db` on Windows,
-  `$HOME/.manyproxy/library.db` elsewhere; `MANYPROXY_DB` overrides
-  (`Store::default_path`, `src/store.rs:726-737`).
-- Export default: `manyproxy-export.json` sibling of the library file;
-  `MANYPROXY_EXPORT` overrides (`Store::default_export_path`,
-  `src/store.rs:1348-1361`). Export writes only after explicit
-  confirm; cancel writes nothing.
-- Consequence for packaging: uninstall is delete-app-folder plus
-  optionally the data file above — no registry keys, services,
-  drivers, or system proxy/DNS/route writes exist to roll back
-  (per `PACKAGING-NOTES.md`, unchanged).
+- All runtime data lives in a `data\` subfolder **beside the running exe**:
+  `app_data_dir()` resolves `<app-dir>\data` (`DATA_DIR_NAME = "data"`,
+  `src/store.rs:3363-3376`; exe-relative via `engine::current_app_dir`,
+  asserted by `t52_default_path_is_exe_relative_data` and
+  `t52_export_and_logs_defaults_inside_data`).
+  The old `%APPDATA%\ManyProxy` / `$HOME/.manyproxy` defaults are banned —
+  never read, never recreated (`src/store.rs:3368-3370`).
+- Files created in `data\`:
+  - `library.db` — the SQLite library (`Store::default_path`,
+    `src/store.rs:3512-3519`; `MANYPROXY_DB` overrides).
+  - `manyproxy-export.json` — export default, a sibling of the library file;
+    `MANYPROXY_EXPORT` overrides (`Store::default_export_path`,
+    `src/store.rs:5774-5787`). Export writes only after an explicit
+    confirm; cancel writes nothing.
+  - `manyproxy-logs.txt` — visible session logs; `MANYPROXY_LOGS`
+    overrides (`Store::default_logs_path`, `src/store.rs:5789-5801`).
+  - `library.db.bak-*` / `library.db.corrupt-*` — automatic backups
+    (`backup_db_file`, `src/store.rs:3572-3588`) and quarantine renames
+    (`quarantine_corrupt_file`, `src/store.rs:3550-3570`) land in the same
+    data folder.
+- No migration ever: stores there are fresh installs only (beta app,
+  no users); a legacy store outside the data folder is never read or copied.
+- Consequence for packaging: uninstall is delete-app-folder — the data
+  lives inside it, so nothing is left behind; no registry keys (beyond the
+  opt-in HKCU autostart), services, drivers, or system proxy/DNS/route
+  writes exist to roll back (per `PACKAGING-NOTES.md`, unchanged).
 
 ## 5. Release checklist (clean checkout → runnable portable dir)
 
@@ -98,8 +115,10 @@ binary fails fast here instead of serving exotic rows badly.
 6. Publish SHA-256 hashes for `manyproxy.exe` + each shipped sidecar
    (unsigned-binary AV/SmartScreen expectations per
    `PACKAGING-NOTES.md`: sign when a cert exists, never pack/obfuscate).
-7. Record `Cargo.toml` version + git hash in the release notes (see
-   section 1: no in-app version string exists to do this automatically).
+7. Record `Cargo.toml` version + git hash in the release notes (the
+   in-app About text already derives the version via `APP_VERSION` and
+   prints the build hash; the notes restating both keeps the shipped
+   package self-describing).
 
 ## 6. Non-goals (reaffirmed, not changed)
 

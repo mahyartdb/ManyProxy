@@ -2,9 +2,19 @@
 
 Local-only proxy library: store configs, import share links, refresh subscriptions, and serve each config on its own `127.0.0.1:<port>` endpoint (SOCKS5 + HTTP). No system proxy, TUN, DNS, or routing changes — ever.
 
+## Design posture
+
+- **Portable folder (ZIP):** ManyProxy ships and runs as a single self-contained folder. No AppData, no Program Files, no installers; engines and data live beside the exe and the folder can be moved anywhere.
+- **App-dir only:** sidecar binary lookup never consults `PATH` and never downloads binaries.
+- **Opt-in only:** autostart (HKCU Run) and session restore are opt-in; no auto-update that replaces binaries.
+- **Secrets sealed:** DPAPI-sealed secrets at rest; redacted logs/URLs/labels; clipboard carries `bind:port` only.
+- **Supported matrix:** supported now — windows-amd64 (`windows-arm64` lands gated via T-04); tracked-aspiration (not supported) — linux/macOS via the port epic (`EPIC-linux-macos-port.md`).
+
+Route-profile importers: `throne://route` links are accepted into the presets manager; unknown actions fail loudly at intake.
+
 ## Install / run
 
-Windows 10/11 64-bit (v1 platform).
+Windows 10/11 64-bit (v1 platform). Download the ZIP from [GitHub Releases](https://github.com/QMahyar/ManyProxy/releases) — each release ships `manyproxy-v<tag>-windows-amd64.zip` plus `SHA256SUMS.txt`; unzip anywhere and run `manyproxy.exe` (sidecar binaries and `data\` live beside it).
 
 1. Put the app exe plus sidecar binaries **in the same folder** (portable or installed, either works as long as they sit together): `sing-box`, `sing-box-awg` (AmneziaWG/Noise/XHTTP rows only), `xray` (Xray-only VLESS bridge only), plus at most one user-supplied extra-core executable (app dir only). Resolution is app-dir ONLY, never `PATH` (ticket 23, `resolve_*_binary_in`, `src/engine.rs`). Verified by `missing_binaries_state_never_downloads`.
 2. Run: `cargo run` (dev) or launch the built exe. No admin needed for default (loopback) use; no registry keys, services, or drivers (`PACKAGING-NOTES.md`).

@@ -2,8 +2,14 @@ include!(concat!(env!("OUT_DIR"), "/tray_icon_rgba.rs"));
 
 use crate::store::ProxyConfig;
 
+/// T-26: the tray tooltip shares the window title's `· N running` suffix
+/// helper (`crate::running_title_suffix`), so the two surfaces cannot drift.
 pub fn tray_tooltip(running: usize) -> String {
-    format!("ManyProxy · {running} running")
+    format!(
+        "{}{}",
+        crate::APP_TITLE,
+        crate::running_title_suffix(running)
+    )
 }
 
 pub mod menu_id {
@@ -381,7 +387,7 @@ mod tests {
 
     #[test]
     fn tooltip_carries_running_count() {
-        assert_eq!(tray_tooltip(0), "ManyProxy · 0 running");
+        assert_eq!(tray_tooltip(0), "ManyProxy");
         assert_eq!(tray_tooltip(3), "ManyProxy · 3 running");
     }
 
@@ -410,6 +416,32 @@ mod tests {
         assert!(
             db.starts_with(&folder),
             "folder contains the db path ({db} vs {folder})"
+        );
+        assert_eq!(
+            std::path::Path::new(&folder)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .as_deref(),
+            Some(crate::store::DATA_DIR_NAME),
+            "folder is the app-relative data dir"
+        );
+    }
+
+    #[test]
+    fn t52_tray_config_folder_cascades() {
+        let folder = config_folder();
+        let data = crate::store::app_data_dir();
+        assert_eq!(
+            folder,
+            data.display().to_string(),
+            "open-config copies the app-relative data folder"
+        );
+        assert_eq!(
+            std::path::Path::new(&folder)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .as_deref(),
+            Some(crate::store::DATA_DIR_NAME)
         );
     }
 
