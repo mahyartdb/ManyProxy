@@ -4555,6 +4555,18 @@ pub(crate) fn current_app_dir() -> Option<PathBuf> {
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn spawn_hidden(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 fn resolve_bundled_in(app_dir: Option<&Path>, file: &str) -> Result<PathBuf, String> {
     match app_dir {
         Some(dir) => {
@@ -4623,18 +4635,18 @@ pub fn probe_fork_version_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<String, String> {
     use std::io::Read as _;
-    let mut child = std::process::Command::new(binary)
-        .arg("version")
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "fork version probe failed for {} ({error})",
-                binary.display()
-            )
-        })?;
+        .stderr(std::process::Stdio::null());
+    spawn_hidden(&mut cmd);
+    let mut child = cmd.spawn().map_err(|error| {
+        format!(
+            "fork version probe failed for {} ({error})",
+            binary.display()
+        )
+    })?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait().map_err(|error| {
@@ -5719,11 +5731,10 @@ impl EngineBackend for RealEngineBackend {
             return Ok(());
         }
         let path = self.write_config(config_json)?;
-        let output = std::process::Command::new(&binary)
-            .arg("check")
-            .arg("-c")
-            .arg(&path)
-            .output();
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("check").arg("-c").arg(&path);
+        spawn_hidden(&mut cmd);
+        let output = cmd.output();
         self.remove_config_file();
         let output = output.map_err(|error| format!("engine check could not run ({error})"))?;
 
@@ -5742,13 +5753,14 @@ impl EngineBackend for RealEngineBackend {
         self.stop_child();
         let path = self.write_config(config_json)?;
 
-        let spawn = std::process::Command::new(&binary)
-            .args(self.start_args())
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.args(self.start_args())
             .arg(&path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
+            .stderr(std::process::Stdio::piped());
+        spawn_hidden(&mut cmd);
+        let spawn = cmd.spawn();
         let mut child = match spawn {
             Ok(child) => child,
 
@@ -8003,12 +8015,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, &injected).expect("temp config writes");
-        let check = std::process::Command::new(&binary)
-            .arg("check")
-            .arg("-c")
-            .arg(&path)
-            .output()
-            .expect("check runs");
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("check").arg("-c").arg(&path);
+        spawn_hidden(&mut cmd);
+        let check = cmd.output().expect("check runs");
         let _ = std::fs::remove_file(&path);
         assert!(
             check.status.success(),
@@ -8016,15 +8026,15 @@ mod tests {
             String::from_utf8_lossy(&check.stderr)
         );
         std::fs::write(&path, &injected).expect("temp config writes");
-        let mut child = std::process::Command::new(&binary)
-            .arg("run")
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("run")
             .arg("-c")
             .arg(&path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("sidecar runs");
+            .stderr(std::process::Stdio::null());
+        spawn_hidden(&mut cmd);
+        let mut child = cmd.spawn().expect("sidecar runs");
         let result = (|| -> Result<String, String> {
             use std::io::{Read as _, Write as _};
 
@@ -13997,13 +14007,13 @@ Active Connections\r
 
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
 
-        let mut exiter = std::process::Command::new(&comspec)
-            .args(["/c", "(echo line-one>&2 & echo line-two>&2 & exit 3)"])
+        let mut cmd = std::process::Command::new(&comspec);
+        cmd.args(["/c", "(echo line-one>&2 & echo line-two>&2 & exit 3)"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("stub spawns");
+            .stderr(std::process::Stdio::piped());
+        spawn_hidden(&mut cmd);
+        let mut exiter = cmd.spawn().expect("stub spawns");
         let pipe = exiter.stderr.take().expect("stderr piped");
         let reader = std::io::BufReader::new(pipe);
 
@@ -14035,13 +14045,13 @@ Active Connections\r
         assert_eq!(backend.drain_log_lines(), vec!["sidecar-hello"]);
         assert!(backend.drain_log_lines().is_empty(), "drain takes");
 
-        let sleeper = std::process::Command::new(&comspec)
-            .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+        let mut cmd = std::process::Command::new(&comspec);
+        cmd.args(["/c", "ping -n 30 127.0.0.1 >NUL"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("sleeper spawns");
+            .stderr(std::process::Stdio::null());
+        spawn_hidden(&mut cmd);
+        let sleeper = cmd.spawn().expect("sleeper spawns");
         let pid = sleeper.id();
         backend.child = Some(sleeper);
         push_pipe_line(&buffer, backend.reader_gen, "stale-line".to_string());
