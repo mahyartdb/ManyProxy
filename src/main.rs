@@ -1626,12 +1626,19 @@ impl LibraryDelegate {
 }
 
 /// T-31: the tone each level paints in, from the active theme. `Info` keeps the
-/// default text color, `Debug` recedes to muted, `Warn` is the theme amber, and
-/// `Error` the theme danger red; both theme modes resolve these tokens.
+/// default text color, `Debug` recedes to muted. `Warn`/`Error` are theme
+/// *background* tokens (amber, danger red): legible behind white text on a dark
+/// surface, but well under WCAG AA as text on the light theme's white — so in
+/// light mode both are backed off toward black along their own hue (the T-30
+/// `danger.blend(...)` precedent). Dark mode keeps the raw tokens.
 fn log_level_text_color(level: LogLevel, theme: &Theme) -> Hsla {
+    let text_safe = |color: Hsla, darken: f32| match theme.mode {
+        ThemeMode::Light => color.blend(hsla(0., 0., 0., darken)),
+        ThemeMode::Dark => color,
+    };
     match level {
-        LogLevel::Error => theme.danger,
-        LogLevel::Warn => theme.warning,
+        LogLevel::Error => text_safe(theme.danger, 0.35),
+        LogLevel::Warn => text_safe(theme.warning, 0.45),
         LogLevel::Info => theme.foreground,
         LogLevel::Debug => theme.muted_foreground,
     }
@@ -28942,7 +28949,7 @@ mod tests {
     use gpui_kit::component::dialog::Dialog;
     use gpui_kit::component::{Root, WindowExt};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{point, px, size, AppContext, Entity, TestAppContext};
+    use gpui_kit::{point, px, size, AppContext, Entity, Hsla, TestAppContext};
 
     fn seed_input(name: &str) -> NewConfig {
         NewConfig {
@@ -29205,8 +29212,39 @@ mod tests {
         );
     }
 
+    /// WCAG 2.1 relative luminance of `color` composited over `background`.
+    fn log_relative_luminance(color: Hsla, background: Hsla) -> f32 {
+        let front = color.to_rgb();
+        let back = background.to_rgb();
+        let channel = |value: f32| {
+            if value <= 0.039_28 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let alpha = front.a.clamp(0., 1.);
+        let mix = |front: f32, back: f32| front.mul_add(alpha, back * (1. - alpha));
+        0.2126 * channel(mix(front.r, back.r))
+            + 0.7152 * channel(mix(front.g, back.g))
+            + 0.0722 * channel(mix(front.b, back.b))
+    }
+
+    /// WCAG 2.1 contrast ratio of a text tone against the surface behind it.
+    fn log_contrast_ratio(color: Hsla, background: Hsla) -> f32 {
+        let text = log_relative_luminance(color, background);
+        let surface = log_relative_luminance(background, background);
+        let (lighter, darker) = if text >= surface {
+            (text, surface)
+        } else {
+            (surface, text)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
     /// T-31: every level resolves to its own theme tone, in both theme modes,
-    /// and the visible `[level]` prefix maps back to the ingested level.
+    /// clears WCAG AA (4.5:1) against that mode's background, and the visible
+    /// `[level]` prefix maps back to the ingested level.
     #[gpui_kit::test]
     fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
         use gpui_kit::component::ThemeMode;
@@ -29223,26 +29261,16 @@ mod tests {
                 crate::Theme::change(mode, None, cx);
                 let theme = crate::Theme::global(cx);
                 assert_eq!(theme.mode, mode, "the tone check runs in {mode:?}");
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Error, theme),
-                    theme.danger,
-                    "error paints the theme danger red"
-                );
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Warn, theme),
-                    theme.warning,
-                    "warn paints the theme amber"
-                );
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Info, theme),
-                    theme.foreground,
-                    "info keeps the default text color"
-                );
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Debug, theme),
-                    theme.muted_foreground,
-                    "debug recedes to muted"
-                );
+                for level in levels {
+                    let ratio = log_contrast_ratio(
+                        crate::log_level_text_color(level, theme),
+                        theme.background,
+                    );
+                    assert!(
+                        ratio >= 4.5,
+                        "{level:?} text reaches WCAG AA in {mode:?}, got {ratio:.2}:1"
+                    );
+                }
                 for (index, left) in levels.iter().enumerate() {
                     for right in levels.iter().skip(index + 1) {
                         assert_ne!(
