@@ -26,19 +26,21 @@ first lets those tickets edit dedicated small files instead of relocating rewrit
 
 ## Visibility strategy (the cost lever)
 
-Slice 0 widens every `AppView` method, field, and free helper the tests reference to
-`pub(crate)`, without moving anything. Later slices are then pure text moves. At the crate
-root add `use <module>::*;` per module; a private `use` at the crate root is visible to
-descendants, so the 868 `crate::X` paths keep resolving. Add explicit imports for the two
-cfg-split duplicate names (`open_url_shell_execute`, `win32_process_sample`).
+Visibility is widened lazily: each item becomes `pub(crate)` at the moment it moves, and
+nothing else changes in that slice. A separate visibility-only sweep of all ~370 `AppView`
+methods was rejected — it churns every method to make later diffs readable, but most of those
+methods do not move for many slices, so the sweep is pure noise and hides the real move.
+
+At the crate root add `use <module>::*;` per module; a private `use` at the crate root is
+visible to descendants, so the 868 `crate::X` paths keep resolving. Add explicit imports for
+the two cfg-split duplicate names (`open_url_shell_execute`, `win32_process_sample`).
 
 ## Phase 1 — UI-facing slices, then stop
 
 | # | Cluster moved | New file(s) | Notes |
 |---|---|---|---|
-| 0 | visibility only | none | 369 `AppView` methods + test-reached fields/helpers → `pub(crate)` |
-| 1 | consts, keys, appearance, text | `consts.rs` `keys.rs` `appearance.rs` `text.rs` | ~150 items |
-| 2 | `mod tests` verbatim | `tests.rs` | ~29.6k lines; retarget `include_str!` / `file!()` |
+| 1 | consts, keys, appearance, text | `consts.rs` `keys.rs` `appearance.rs` `text.rs` | DONE `eb09b33` |
+| 2 | `mod tests` verbatim | `tests.rs` | DONE `605f3c1` |
 | 3 | library list + columns + match | `library/mod.rs` `library/columns.rs` `library/match.rs` | move `RowMetrics` with both impls |
 | 4 | shell + toolbar + render | `app/shell.rs` `app/toolbar.rs` `app/render.rs` | |
 | 5 | detail/inspector + status + search/bulk | `app/detail.rs` `app/status.rs` `app/search.rs` `app/bulk.rs` | |
@@ -60,6 +62,8 @@ Forms, fetch/update, subs, presets, import, health, logs, io, ticks, models, dia
    set. Never weaken, skip, or delete the guard. `BOOT_FUNCTIONS` names `new`, `with_store`,
    `create_tray`, `restore_on_launch`, `commit_restore_subset`, `open_restore_lan_confirm`,
    `handle_launch_intake`, `reload`.
+   **Slices 3–6 move none of those eight**, so the scan stays untouched there — leave it
+   exactly as it is. The bootstrap cluster moves in phase 2, and the scan is re-pointed then.
 2. **`std::fs::read_to_string(file!())`** (`29247`) asserts the source contains
    `const APP_VERSION` + `env!("CARGO_PKG_VERSION")`. Moving tests breaks it: retarget to
    `consts.rs` and keep that const on one line.
