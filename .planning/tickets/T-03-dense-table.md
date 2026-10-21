@@ -1,78 +1,92 @@
 # T-03 — Dense table + right inspector (Variant A)
 
-Owner: implementer (UI). Depends on: T-02. Reference: `.planning/prototypes/variant-a.png`.
-Design authority: `DESIGN.md` (update it in the same change where noted).
-
-## The row bug, root cause
-
+Owner: implementer (UI). Depends on: T-02. Reference: `.planning/prototypes/variant-a.png`
+(approximate: four tabs; this ticket keeps six). Update `DESIGN.md` in the same commit.
+## Row bug, root cause
 `List` measures one item at `AvailableSpace::MinContent` (gpui-component `list.rs:434`) and
-applies that height to every row (`cache.rs:216`). The row at `src/main.rs:1979-1984` is
-`.flex_wrap()`, so at min width it stacks into a column, and every row inherits ~104-120px
-of height.
+applies that height to every row (`cache.rs:216`). The row at `src/main.rs:2000` is
+`.flex_wrap()`, so at min width it stacks into a column and every row inherits ~104-120px.
+Fix: single-line, non-wrapping, definite-height rows; text truncates; target 30px pitch.
+## One geometry spec, used twice
+Header (`26548-26660`) and row (`1753-2160`) hardcode widths twice and disagree. Add
+`RowMetrics` (not `RowColumns` — visibility flags at `9469`) with
+`widths(show_group, show_protocol)`; both read it. Header labels sit at the value's x.
 
-Fix: rows are a single line, non-wrapping, definite height. No `flex_wrap`. Text columns
-truncate. Target 30px row pitch, so ~21 rows fit at 1032px.
-
-## One column spec, used twice
-
-The header (`render_library_column_headers`, `26530-26582`) and the row (`render_item`,
-`1735-2119`) currently hardcode the same widths in two places and disagree. Introduce one
-struct (e.g. `RowColumns { lead, name, group, protocol, upstream, endpoint, health, action }`)
-with `fn widths(&self, show_group: bool, show_protocol: bool) -> ...`; both the header and the
-row read it. Header labels must render at exactly the same x as their values.
-
-Column order: `[lamp+check 28] [name flex] [group 100 opt] [protocol 110 opt] [upstream 180]
-[endpoint 140] [health 150] [copy 96]`.
-
+Order: `[lamp+check 28] [name flex min 160] [group 100 opt] [protocol 90 opt]
+[upstream 140] [endpoint 120] [health 110] [copy 72]`.
+Hide protocol, then group, when the table falls under the 640px floor; name, endpoint,
+health and copy never hide.
 ## Row contents
+- Keep: lamp, checkbox, check chip, name (truncate, full-route tooltip). Port stays as the
+  DESIGN.md "port pill": `row-port-<id>` is quiet mono text with a tooltip;
+  `row-port-input-<id>` leaves.
+- Add `Copy proxy` (72px) calling new `copy_row_socks(id, window, cx)`.
+  `copy_single_endpoint_url` (`15019`) reads `self.selected_config(cx)` and takes no id, so
+  reusing it would copy the wrong row. `copy_row_socks` reads by id and uses
+  `store::proxy_urls(&config.bind_ip, config.port)` — stored bind host, not loopback.
+- One SOCKS path: the inspector's SOCKS control calls `copy_row_socks(selected_id, …)`;
+  `EndpointUrl::Socks` leaves `copy_single_endpoint_url` (HTTP/Upstream stay). Update
+  `45390-45413`.
+- Move `Start`/`Edit` and bind/port editors into the inspector operate row. A 30px row
+  cannot hold five framed controls; `row-bind-*`, `row-port-input-*`, `row-serve-*`,
+  `row-edit-*` leave the row.
+## Inspector: bottom → right
+`28908-28919` is `v_resizable("main-split")` with a 240px bottom panel. Make it horizontal:
+list left, inspector right, default 260px, range 240–360, session-only (the current split
+persists no width — do not claim it remembers).
 
-- Keep: occupancy lamp, checkbox, check chip, name (truncating, tooltip full route).
-- Add: `Copy proxy` button (96px) copying `socks5://127.0.0.1:<port>` — reuse the existing
-  `copy-socks` handler (`15018-15048`), do not invent a second clipboard path.
-- Move `Start/Edit` and the bind/port editors OUT of the row into the inspector. A 30px row
-  cannot hold five framed controls. The row keeps: check, name, metadata columns, copy.
-  Update `DESIGN.md` §"Library Row" accordingly — this is a deliberate contract change.
-- Port must remain visible at a glance: render `:10813` as quiet mono text inside the
-  endpoint column, not an input.
+Minimum stays 880×620 (`29117-29139`), default 1000×700. The table keeps ≥ 640px only when
+the window is ≥ 1080px. **Decision:** below 1080px the inspector collapses to a slide-over
+drawer (Esc closes it, focus returns to the list); the table is never squeezed under 640px.
+Do not raise the minimum window width.
 
-## Inspector: bottom panel → right panel
-
-`src/main.rs:28908-28919` builds `v_resizable(...)` (Axis::Vertical) with a 240px bottom
-panel. Change to a horizontal split: list left, inspector right at 340px
-(range 300–440, resizable, remembered like the current split).
-- Empty state: one sentence, centered in the pane, with `Add configuration` / `Import
-  configurations` — but only when the library itself is empty. When the library has rows and
-  nothing is selected, show a single muted line: `Select a configuration`.
-- Inspector must not force horizontal scrolling at 340px: the operate row wraps to two lines
-  (DESIGN.md No-Sideways-Scroll rule).
-- Keep all existing panes: Details / Health / Presets / Logs / Connections / Traffic.
-
+- Empty state: centered `Add configuration` / `Import configurations` only for an empty
+  library; rows but no selection → `Select a configuration`.
+- At 260px the operate row wraps; no horizontal scroll (No-Sideways-Scroll rule).
+- Keep six panes: Details / Health / Presets / Logs / Connections / Traffic. The four-tab
+  prototype is approximate; T-02 and DESIGN.md:212 pin Ctrl-1..6.
 ## Chrome
-
-- Nav (`28007-28859`): these are dropdown menus, not pages, so drop the fake tab styling.
-  Render them as a flat menu bar (text items, hover tint, no borders), Program first. Remove
-  the duplicate `Groups` button on the facet row; rename any remaining manage button to
-  `Manage groups…`.
-- One primary action per screen: `+ Add configuration` at top right, primary fill; `Import`
-  secondary beside it.
-- Search width capped at 380px; `N of M` beside it; the three facet pickers right-aligned on
-  the same row.
-- Bulk bar: count left (`56 of 59 selected`, singular-safe), then grouped actions with
-  vertical separators: `[Check all visible] [Uncheck all] | [Start checked] [Stop checked] |
-  [Enable] [Disable] [Move to group] | [Delete]`, Delete last and danger-tinted.
+- Nav (`28007-28859`) is dropdown menus, not pages: flat menu bar, Program first. Remove the
+  duplicate `Groups` button on the facet row; rename the survivor to `Manage groups…`.
+- `+ Add configuration` top right, primary; `Import` secondary beside it.
+- Search keeps its `flex_1`/`min_w(140)` behaviour (no new fixed cap unless measured);
+  `N of M` beside it; facet pickers right-aligned on that row.
+- Bulk bar: `N checked (of M visible)` — never "selected"; selected is one row (wash),
+  checked is a set (rim + numeral chip). Then `[Check all visible] [Uncheck all] |
+  [Start checked] [Stop checked] | [Enable] [Disable] [Move to group] | [Delete]`.
 - Status bar: one grammar, `·` separators only, no unlabeled `:10801 :10802` pairs.
-
 ## Health string bug
-
-`Running :10801` (stray space before colon, no host). Format must read
-`Running · 127.0.0.1:10801 · 1078 ms` and must not be clipped by the neighbouring control.
-Fix the format string at its source, and add a unit test pinning it.
-
+`serving_badge(is_running, port, health)` (`9252`) has no bind host, so it only prints
+`Running :10801`. Change to `serving_badge(is_running, bind: &str, port, health)` and format
+`Running · 127.0.0.1:10801 · 87ms` (the summary already carries `ms`). Update calls `9767`,
+`9790`, `25430`, `25432` and the tests pinning the old string: `48099-48107`, `48155`,
+`55866`. The 110px row cell truncates with a full tooltip; the inspector shows it unclipped.
+## Corrections (reviewer)
+- 340px inspector was impossible at the 880px minimum → 260px (240–360), drawer below 1080.
+- "Reuse the copy-socks handler" was wrong: it copies the selected row; add
+  `copy_row_socks(id, …)`.
+- Bulk label stays `N checked (of M visible)`; keep six panes (the four-tab prototype is
+  approximate) and keep the port in the row as quiet `row-port-<id>` text.
+## Tests to update, not delete
+- `r3_row_endpoint_controls_paint` (`48253-48313`) pins `row-bind-`, `row-port-`,
+  `row-serve-`, `row-edit-` in the row, widths 118/76 and `Start "Alpha" (F5)`. Rewrite:
+  `row-port-<id>` is the pill; bind/serve/edit are absent; assertions move to the inspector.
+  T-02 already changed the name; this ticket moves the control.
+- `r3_row_serve_button_starts_that_row` (`48320`), escape tests (`48535`, `48621`),
+  bind-picker tests (`58486`, `58654`) follow the moved editors.
+- Bulk-label pins: `t44_checked_set_honest_label_and_prune`,
+  `t01_checked_positions_and_selection_stay_distinct`, `t44_ui_bars_and_row_checks_paint`,
+  `t01_selection_grammar_paints`, plus the bulk-bar/reduce-motion/keyboard tests at
+  `45282`, `45915`, `55345`.
+- `serving_badge_copy` and the canary test at `55866`.
+## DESIGN.md, same commit
+"Layout" (vertical split, 240-480 panel), "Library Row", "Endpoints module", "The
+Endpoints-Above-Fold Rule", "Chips" (port pill), "Row editors" (`205`), "Inspector tabs"
+(`212`), and the Do bullets pinning row editors.
 ## Acceptance
-
-- 20+ rows visible at 1920×1032; row pitch measured from UIA frames ≤ 32px.
-- Every header label sits within 8px of its column's first character.
-- No `flex_wrap` on the row container; no row taller than 32px at minimum window width.
-- Right inspector resizes 300–440px and remembers its width; list keeps ≥ 640px.
-- Nothing in the row is a framed control except the checkbox and Copy.
-- `cargo test --locked` green; existing containment tests still pass.
+- 20+ rows at 1920×1032; UIA-measured row pitch ≤ 32px.
+- Header labels within 8px of their column's first character.
+- No `flex_wrap` on the row; no row taller than 32px at the 880px minimum.
+- Inspector 260 default, 240–360; drawer below 1080px; table ≥ 640px at 1080px+.
+- Row framed controls: checkbox and Copy only.
+- `cargo test --locked` green; updated containment and bulk-label tests pass.

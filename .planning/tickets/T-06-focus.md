@@ -4,33 +4,43 @@ Owner: implementer. Depends on: T-04 (overlay teardown).
 
 ## Defect
 
-After an overlay (Settings, Add, Import, palette) is dismissed with `Esc`, the shell holds no
-focused element: `Ctrl-N`, `Ctrl-O`, `Ctrl-F` and typing all silently no-op until the user
-clicks something. Independently, `Ctrl-N` / `Ctrl-O` no-op silently when an overlay is already
-open. There is exactly one `track_focus` in 58k lines (`src/main.rs:27850`) and no
-focus-ring styling anywhere.
+After an overlay (Settings, Add, Import, palette) is dismissed with `Esc`, the shell can hold
+no focused element: `Ctrl-N`, `Ctrl-O`, `Ctrl-F` and typing silently no-op until a click.
+`Ctrl-N`/`Ctrl-O` also no-op silently while an overlay is open. There is one `track_focus`
+in 58k lines (`src/main.rs:27868`) and custom controls paint no focus treatment.
 
 ## Fix
 
-1. Root shell element (the one carrying `track_focus(&self.focus)` at `27850`) must reclaim
-   focus whenever an overlay is dismissed — every path: Esc, Cancel, commit, backdrop click,
-   and the close-confirm. Put the reclaim in one place (an overlay-dismissed helper), not at
-   five call sites.
-2. When a shortcut is refused because an overlay is open, do not swallow it: either route the
-   key into the overlay (Esc closes, Enter commits) or toast
-   `Close the open dialog first`. Silent no-op is the defect.
-3. `Esc` must dismiss every modal, including the Add dialog (currently it does not).
-4. Visible focus: add one theme-level focus treatment (2px accent rim, drawn inside the
-   control's radius) and apply it to buttons, row cards, inputs, tabs, and the checkbox.
-   Use `is_focused`; do not invent a second color — `theme().accent` or `selection-rim`.
-5. Tab reachability: the library list must be traversable with Up/Down once focused, and the
-   selected row must set `ListItem::selected(true)` so assistive tech reads it (currently
-   selection is paint-only).
+1. One overlay-dismissed helper, called at the END of every dismiss path (Esc, Cancel,
+   commit, backdrop, close-confirm). Reclaim focus only when
+   `!overlay_open(window, cx) && window.focused(cx).is_none()`, then focus `self.focus`.
+   The end matters: `run_palette_op` (`17484-17520`) closes all dialogs and opens a second
+   overlay in the same handler; reclaiming earlier steals focus from it.
+   (gpui 0.3.6 exposes `Window::focused(cx)`; use the kit equivalent if it offers
+   `focused_handle()`.)
+2. A refused shortcut must not be silent: route the key into the overlay (Esc closes the
+   top layer, Enter commits) or toast `Close the open dialog first`.
+3. `Esc` pops exactly one overlay layer. Advanced over Add: the first Esc closes Advanced
+   and Add stays; the second closes Add. Pinned around `30078-30091`; do not "close every
+   modal".
+4. Visible focus uses the kit focus ring (`DESIGN.md:207`) with real focus handles on the
+   custom controls. No hand-rolled 2px accent rim and no second color.
+5. List: Up/Down traverses once focused; the selected row sets `ListItem::selected(true)`,
+   so UIA reads it (selection is paint-only today).
+
+## Corrections (reviewer)
+
+- Added the exact predicate and the "evaluate at the end" rule; the palette's second overlay
+  is why.
+- "Esc dismisses every modal" was wrong; it pops one layer.
+- The focus ring is the kit's, not a custom accent rim.
 
 ## Acceptance
 
-- Open Settings → Esc → press Ctrl-N: the Add dialog opens without a click.
-- Open the palette with an overlay already open: no silent no-op.
-- Every focusable control paints a visible ring when tabbed to.
+- Settings → Esc → Ctrl-N opens Add without a click.
+- Palette opened over an overlay: no silent no-op; focus lands in the new overlay, not the
+  shell.
+- Esc on Advanced leaves Add open; the next Esc closes Add.
+- Every focusable control paints the kit ring when tabbed to.
 - UIA reports the selected row as selected.
-- Tests: one for focus reclaim after overlay dismissal, one for Esc dismissing Add.
+- Tests: focus reclaim after dismissal; one-layer Esc; palette second overlay.
