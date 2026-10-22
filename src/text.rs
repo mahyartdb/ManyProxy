@@ -617,6 +617,32 @@ pub(crate) fn bulk_start_enable_flag_failed_message(names: &[String]) -> String 
         names.join(", ")
     )
 }
+
+/// T-05: the batch start named the rows it refused. ONE line, one reason
+/// per row — a batch that started twenty rows and lost one says so.
+pub(crate) fn bulk_start_failed_message(started: usize, failed: &[(String, String)]) -> String {
+    let joined = failed
+        .iter()
+        .map(|(name, reason)| format!("{name}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Started {started}, {} failed: {joined}", failed.len())
+}
+
+/// T-05: the ONE apply refused the batch. Nothing new started, so the
+/// message never claims that the rest carried on.
+pub(crate) fn bulk_start_refused_message(
+    requested: usize,
+    reason: &str,
+    failed: &[(String, String)],
+) -> String {
+    let mut detail = vec![reason.to_string()];
+    detail.extend(failed.iter().map(|(name, why)| format!("{name}: {why}")));
+    format!(
+        "Could not start {requested} configuration(s): {} (nothing new started)",
+        detail.join("; ")
+    )
+}
 pub(crate) fn no_selection_message() -> String {
     "Select a configuration first".to_string()
 }

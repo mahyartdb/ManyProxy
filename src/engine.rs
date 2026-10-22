@@ -448,7 +448,19 @@ pub enum EngineError {
         detail: String,
     },
 
-    PortUnavailable {
+    /// T-05: the ROW's own listen port is held by something else. Only
+    /// this one is row-local: that row cannot start there, the rest of the
+    /// batch still can.
+    RowPortUnavailable {
+        bind: String,
+        port: u16,
+        name: String,
+    },
+
+    /// T-05: a SHARED port (the clash-controller range, the xray-bridge
+    /// range) is held. It belongs to no row, so it is never row-local: the
+    /// whole apply is refused and the port is named, not a row.
+    SharedPortUnavailable {
         bind: String,
         port: u16,
         name: String,
@@ -606,9 +618,13 @@ impl std::fmt::Display for EngineError {
             EngineError::SpawnFailed { detail } => {
                 write!(f, "engine failed to start ({detail})")
             }
-            EngineError::PortUnavailable { bind, port, name } => write!(
+            EngineError::RowPortUnavailable { bind, port, name } => write!(
                 f,
                 "port unavailable: {bind}:{port} is already in use (\"{name}\" cannot start there; another process may hold it)"
+            ),
+            EngineError::SharedPortUnavailable { bind, port, name } => write!(
+                f,
+                "shared port unavailable: {bind}:{port} is already in use ({name} needs it; another process may hold it)"
             ),
             EngineError::LanConfirmRequired { names } => write!(
                 f,
@@ -5294,6 +5310,7 @@ pub fn is_row_local_error(error: &EngineError) -> bool {
             | EngineError::BadPort { .. }
             | EngineError::ReservedPort { .. }
             | EngineError::DnsFailure { .. }
+            | EngineError::RowPortUnavailable { .. }
     )
 }
 
@@ -6656,10 +6673,41 @@ impl EngineController {
 
         let mut candidates: Vec<ProxyConfig> = Vec::with_capacity(configs.len());
         for row in configs {
+            // 1. the row on its own.
             if let Err(error) = validate_activation(std::slice::from_ref(row)) {
                 outcome.failed.push((row.name.clone(), error.to_string()));
                 continue;
             }
+            // 2. the socket: the DB knows which ports are ASSIGNED, the
+            // socket knows which are HELD. A row whose port another process
+            // holds is named and left out of the union, so the batch
+            // survives one occupied port and the ONE apply only carries
+            // the free rows.
+            if !is_custom_config_protocol(&row.protocol)
+                && !self.serves_this_endpoint(row)
+                && probe_bind_available(&row.bind_ip, row.port).is_err()
+            {
+                let reason = match self.own_port_holder(row.port) {
+                    // Our own sidecar holds it under another bind: that
+                    // is a conflict with a serving row, not a stranger.
+                    Some(first) => EngineError::PortConflict {
+                        bind: row.bind_ip.clone(),
+                        port: row.port,
+                        first: first.to_string(),
+                        second: row.name.clone(),
+                    }
+                    .to_string(),
+                    None => EngineError::RowPortUnavailable {
+                        bind: row.bind_ip.clone(),
+                        port: row.port,
+                        name: row.name.clone(),
+                    }
+                    .to_string(),
+                };
+                outcome.failed.push((row.name.clone(), reason));
+                continue;
+            }
+            // 3. the port another row already serves.
             let key = (normalize_bind_key(&row.bind_ip), row.port);
             if let Some(first) = taken.get(&key) {
                 let error = EngineError::PortConflict {
@@ -6718,6 +6766,29 @@ impl EngineController {
             }
         }
         outcome
+    }
+
+    /// T-05: is this row already serving on exactly this endpoint? Our own
+    /// listener holds that port, so there is nothing to probe — and probing
+    /// would report our own row as "another process holds it".
+    fn serves_this_endpoint(&self, row: &ProxyConfig) -> bool {
+        let key = normalize_bind_key(&row.bind_ip);
+        self.active.iter().any(|active| {
+            active.id == row.id
+                && active.port == row.port
+                && normalize_bind_key(&active.bind_ip) == key
+        })
+    }
+
+    /// T-05: the name of an active row that already serves `port` (under
+    /// any bind). It tells "our own sidecar holds it" from "a stranger
+    /// holds it" — the first is a conflict, the second is a row-local
+    /// refusal.
+    fn own_port_holder(&self, port: u16) -> Option<&str> {
+        self.active
+            .iter()
+            .find(|active| active.port == port)
+            .map(|active| active.name.as_str())
     }
 
     fn prune_lan_confirmed(&mut self) {
@@ -7030,7 +7101,7 @@ impl EngineController {
                 continue;
             }
             let port = reserve_clash_port(&mut clash_holds).ok_or_else(|| {
-                let error = EngineError::PortUnavailable {
+                let error = EngineError::SharedPortUnavailable {
                     bind: "127.0.0.1".to_string(),
                     port: CLASH_PORT_START,
                     name: format!("clash controller ({core}, range exhausted)"),
@@ -7146,7 +7217,7 @@ impl EngineController {
                 match std::net::TcpListener::bind(format!("127.0.0.1:{}", egress.bridge_port)) {
                     Ok(listener) => bridge_holds.push(listener),
                     Err(error) => {
-                        let failure = EngineError::PortUnavailable {
+                        let failure = EngineError::SharedPortUnavailable {
                             bind: "127.0.0.1".to_string(),
                             port: egress.bridge_port,
                             name: format!("xray bridge ({})", egress.owner),
@@ -7225,7 +7296,7 @@ impl EngineController {
                 match probe_bind_available(bind, *port) {
                     Ok(listener) => probe_holds.push(listener),
                     Err(_) => {
-                        let error = EngineError::PortUnavailable {
+                        let error = EngineError::RowPortUnavailable {
                             bind: bind.clone(),
                             port: *port,
                             name: name.clone(),
@@ -10770,7 +10841,7 @@ mod tests {
             .start_all(std::slice::from_ref(&squatter))
             .expect_err("held port fails");
         assert!(
-            matches!(error, EngineError::PortUnavailable { .. }),
+            matches!(error, EngineError::RowPortUnavailable { .. }),
             "typed, got {error}"
         );
         let text = error.to_string();
@@ -12149,6 +12220,82 @@ Active Connections\r
         );
     }
 
+    /// T-05: a checked row whose port is occupied is NAMED and skipped, and
+    /// the rest of the batch still starts. One occupied port must not sink
+    /// the batch, and it must not report every row as failed.
+    #[test]
+    fn t05_start_many_additive_names_an_occupied_row_and_starts_the_rest() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = held.local_addr().expect("addr").port();
+        let (mut controller, stock) = EngineController::fake();
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10841,
+            ),
+            fixture(
+                "2",
+                "Squatter",
+                "shadowsocks",
+                ss_params("pass2"),
+                "127.0.0.1",
+                port,
+            ),
+            fixture("3", "Gamma", "vless", vless_params(), "127.0.0.1", 10843),
+        ];
+        let outcome = controller.start_many_additive(&rows, true);
+        assert!(outcome.error.is_none(), "the batch survived: {outcome:?}");
+        assert_eq!(
+            outcome.applied,
+            vec!["1".to_string(), "3".to_string()],
+            "the two free rows applied: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.failed.len(),
+            1,
+            "only the occupied row is named, not every row: {outcome:?}"
+        );
+        assert_eq!(outcome.failed[0].0, "Squatter");
+        let reason = &outcome.failed[0].1;
+        assert!(
+            reason.contains("port unavailable"),
+            "names the port: {reason}"
+        );
+        assert!(reason.contains(&port.to_string()), "names it: {reason}");
+        assert!(reason.contains("Squatter"), "names the row: {reason}");
+        assert_eq!(controller.running_count(), 2, "the free rows serve");
+        assert_eq!(stock.check_calls(), 1, "one apply for the batch");
+        drop(held);
+    }
+
+    /// T-05: the shared ports (clash controller, xray bridge) are not
+    /// row-local — they belong to no row, so they are never named as one.
+    #[test]
+    fn t05_shared_port_unavailable_is_not_row_local() {
+        let error = EngineError::SharedPortUnavailable {
+            bind: "127.0.0.1".to_string(),
+            port: 18501,
+            name: "clash controller (stock, range exhausted)".to_string(),
+        };
+        assert!(!is_row_local_error(&error), "shared is union-level");
+        let text = error.to_string();
+        assert!(text.contains("18501"), "names the port: {text}");
+        assert!(text.contains("shared port unavailable"), "{text}");
+        let row = EngineError::RowPortUnavailable {
+            bind: "127.0.0.1".to_string(),
+            port: 10801,
+            name: "Alpha".to_string(),
+        };
+        assert!(is_row_local_error(&row), "the row's own port is row-local");
+        let text = row.to_string();
+        assert!(text.contains("10801"), "names the port: {text}");
+        assert!(text.contains("Alpha"), "names the row: {text}");
+    }
+
     #[test]
     fn t41_start_all_subset_single_apply() {
         let (mut controller, stock) = EngineController::fake();
@@ -12292,10 +12439,20 @@ Active Connections\r
                 field: "exe".to_string(),
                 detail: "missing".to_string(),
             },
+            EngineError::RowPortUnavailable {
+                bind: "127.0.0.1".to_string(),
+                port: 10801,
+                name: "R".to_string(),
+            },
         ] {
             assert!(is_row_local_error(&error), "row-local: {error}");
         }
         for error in [
+            EngineError::SharedPortUnavailable {
+                bind: "127.0.0.1".to_string(),
+                port: 18501,
+                name: "clash controller (stock, range exhausted)".to_string(),
+            },
             EngineError::PortConflict {
                 bind: "127.0.0.1".to_string(),
                 port: 10801,

@@ -323,21 +323,20 @@ impl AppView {
             );
         }
         let started = outcome.applied.len();
-        let failed: Vec<String> = outcome
+        let failed: Vec<(String, String)> = outcome
             .failed
             .iter()
-            .map(|(name, reason)| format!("{name}: {}", redact_secrets(reason)))
+            .map(|(name, reason)| (name.clone(), redact_secrets(reason).to_string()))
             .collect();
         match outcome.error.as_deref() {
             // The one apply refused the batch: nothing new started, and the
             // refusal names the row (or the shared port) that caused it.
             Some(reason) => {
-                let mut detail = vec![redact_secrets(reason).to_string()];
-                detail.extend(failed.iter().cloned());
                 window.push_notification(
-                    Notification::error(format!(
-                        "Could not start {requested} configuration(s): {}",
-                        detail.join("; ")
+                    Notification::error(bulk_start_refused_message(
+                        requested,
+                        &redact_secrets(reason),
+                        &failed,
                     )),
                     cx,
                 );
@@ -350,11 +349,7 @@ impl AppView {
             }
             None => {
                 window.push_notification(
-                    Notification::error(format!(
-                        "Started {started}, {} failed: {}",
-                        failed.len(),
-                        failed.join("; ")
-                    )),
+                    Notification::error(bulk_start_failed_message(started, &failed)),
                     cx,
                 );
             }

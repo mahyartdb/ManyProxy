@@ -12382,6 +12382,65 @@ fn bulk_start_twenty_rows_applies_once(cx: &mut TestAppContext) {
     );
 }
 
+/// T-05: a checked row whose port is occupied is NAMED and skipped while
+/// the rest start. The batch is not refused and no every-row failure is
+/// reported.
+#[gpui_kit::test]
+fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    let port = held.local_addr().expect("addr").port();
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10981"))
+        .expect("seed works");
+    let squatter = store
+        .add(t30_engine_seed("Squatter", &port.to_string()))
+        .expect("seed works");
+    let gamma = store
+        .add(t30_engine_seed("Gamma", "10983"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let (engine, stock) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.engine = engine;
+        });
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                for id in [&alpha.id, &squatter.id, &gamma.id] {
+                    delegate.toggle_checked(id);
+                }
+                list_cx.notify();
+            });
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+    });
+    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    assert_eq!(serving.len(), 2, "the two free rows serve: {serving:?}");
+    assert!(
+        serving.contains(&alpha.id) && serving.contains(&gamma.id),
+        "the free rows are up: {serving:?}"
+    );
+    assert!(
+        !serving.contains(&squatter.id),
+        "the occupied row is skipped: {serving:?}"
+    );
+    assert_eq!(stock.check_calls(), 1, "one apply for the batch");
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "one toast — the refusal names the row, not every row"
+    );
+    drop(held);
+}
+
 #[test]
 fn r01_row_columns_defaults_parse_and_display() {
     use crate::RowColumns;
@@ -27915,6 +27974,37 @@ fn bug28_bulk_start_failure_messages_name_skips() {
     assert!(flag.contains('1'), "{flag}");
     assert!(flag.contains("Alpha"), "{flag}");
     assert!(flag.to_lowercase().contains("started"), "{flag}");
+}
+
+/// T-05: the batch start names the row it refused — and only that row.
+#[test]
+fn t05_bulk_start_messages_name_the_refused_row() {
+    use crate::{bulk_start_failed_message, bulk_start_refused_message};
+    let failed = vec![(
+        "Squatter".to_string(),
+        "port unavailable: 127.0.0.1:10982 is already in use".to_string(),
+    )];
+    let message = bulk_start_failed_message(19, &failed);
+    assert!(message.contains("19"), "{message}");
+    assert!(message.contains("1 failed"), "{message}");
+    assert!(message.contains("Squatter"), "{message}");
+    assert!(message.contains("10982"), "{message}");
+    assert!(
+        !message.contains("Alpha") && !message.contains("Gamma"),
+        "only the refused row is named: {message}"
+    );
+
+    let refused = bulk_start_refused_message(
+        20,
+        "port unavailable: 127.0.0.1:10982 is already in use (\"Squatter\" cannot start there; another process may hold it)",
+        &failed,
+    );
+    assert!(refused.contains("20"), "{refused}");
+    assert!(refused.contains("Squatter"), "{refused}");
+    assert!(
+        refused.to_lowercase().contains("nothing new started"),
+        "the refusal never claims the rest carried on: {refused}"
+    );
 }
 
 #[gpui_kit::test]
