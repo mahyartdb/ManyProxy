@@ -76,8 +76,17 @@ pub(crate) fn sort_header_keys(column: &str) -> &'static [LibrarySortKey] {
     }
 }
 
-pub(crate) fn column_header_label(label: &'static str, width: f32, cx: &App) -> AnyElement {
+/// T-03: a labeled header cell. The id is the column's anchor, so a test can
+/// measure the label against the row cell it names.
+pub(crate) fn column_header_label(
+    id: &str,
+    label: &'static str,
+    width: f32,
+    cx: &App,
+) -> AnyElement {
     div()
+        .id(id.to_string())
+        .test_support()
         .w(px(width))
         .flex_shrink_0()
         .truncate()

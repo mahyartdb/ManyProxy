@@ -3,9 +3,11 @@ use crate::*;
 mod columns;
 #[path = "match.rs"]
 mod matching;
+mod metrics;
 
 pub(crate) use columns::*;
 pub(crate) use matching::*;
+pub(crate) use metrics::*;
 
 pub(crate) struct LibraryDelegate {
     pub(crate) rows: Vec<ProxyConfig>,
@@ -50,6 +52,11 @@ pub(crate) struct LibraryDelegate {
     pub(crate) out_ips: HashMap<String, String>,
 
     pub(crate) row_columns: RowColumns,
+
+    /// T-03: the geometry the header strip and the row both read. The owner
+    /// decides it once per frame (the table's width decides which optional
+    /// columns fit) and hands it to both readers.
+    pub(crate) row_metrics: RowMetrics,
 
     pub(crate) app_view: Option<Entity<AppView>>,
 
@@ -192,6 +199,7 @@ impl LibraryDelegate {
             data_traffic: HashMap::new(),
             out_ips: HashMap::new(),
             row_columns: RowColumns::default(),
+            row_metrics: RowMetrics::widths(false, false, RowColumns::default()),
             app_view: None,
             endpoint_inputs: HashMap::new(),
             pending_endpoint_commits: Vec::new(),
@@ -430,6 +438,11 @@ impl LibraryDelegate {
 
     pub(crate) fn set_row_columns(&mut self, columns: RowColumns) {
         self.row_columns = columns;
+    }
+
+    /// T-03: the owner hands both readers the same geometry.
+    pub(crate) fn set_row_metrics(&mut self, metrics: RowMetrics) {
+        self.row_metrics = metrics;
     }
 
     pub(crate) fn revert_row_inputs(
@@ -837,10 +850,23 @@ impl ListDelegate for LibraryDelegate {
     fn set_selected_index(
         &mut self,
         index: Option<IndexPath>,
-        _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
     ) {
         self.selected = index;
+        // T-03: picking a row opens the inspector drawer again — it is the
+        // only way back to the row's controls once Esc closed it. The update
+        // is deferred: the selection often changes inside the shell's own
+        // update, and an entity cannot be updated while it is updating.
+        if index.is_some() {
+            if let Some(app_view) = self.app_view.clone() {
+                window.defer(cx, move |_, cx| {
+                    app_view.update(cx, |view, _| {
+                        view.open_inspector_drawer();
+                    });
+                });
+            }
+        }
     }
 
     fn perform_search(
@@ -915,41 +941,37 @@ impl ListDelegate for LibraryDelegate {
                 });
             }
         }
-        let (bind_state, port_state, bind_picker) = self
-            .endpoint_inputs
-            .get(&row_id)
-            .map(|inputs| {
-                (
-                    inputs.bind.clone(),
-                    inputs.port.clone(),
-                    inputs.picker.clone(),
-                )
-            })
-            .expect("R3: row editors ensured above");
-        // T-33: custom-config rows stay JSON-governed — their listen comes from
-        // the document, so they keep the free-text bind field (no picker).
-        let custom_config_row = is_custom_config_protocol(&row.protocol);
 
         let item = ListItem::new(format!("library-row-{}", row.id))
             .selected(selected)
-            .px_1();
+            .px_1()
+            // T-03: the row carries a definite height and the card leaves a
+            // hairline of room above and below it, so the pitch is fixed and
+            // two cards never touch.
+            .py(px(RowMetrics::CARD_GAP))
+            .h(px(RowMetrics::ROW_PITCH));
 
         let selected_bg = if cx.theme().list.active_highlight {
             cx.theme().list_active
         } else {
             cx.theme().accent
         };
+        // T-03: one line per config. The card carries a definite height, so
+        // a long name or a crowded column truncates instead of stacking the
+        // row into a column of cards.
         let mut card = div()
             .id(format!("row-card-{row_id}"))
             .test_support()
+            .h(px(RowMetrics::CARD_HEIGHT))
             .px_2()
-            .py_1()
             .rounded(cx.theme().radius)
+            .overflow_hidden()
             .bg(if selected {
                 selected_bg
             } else {
                 cx.theme().group_box
             });
+
         if is_checked {
             card = card.border_2().border_color(cx.theme().accent);
         } else {
@@ -977,8 +999,6 @@ impl ListDelegate for LibraryDelegate {
         let check_chip = self.checked_position(&row_id);
         let checked_total = self.checked.len();
         let lamp_label = lamp_access_label(tone, &row.name);
-        let columns = self.row_columns;
-        let dirty = self.endpoint_is_dirty(&row_id, cx);
         let full_route = library_row_full_route(&row, &upstream);
         let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
             &row,
@@ -990,6 +1010,7 @@ impl ListDelegate for LibraryDelegate {
         );
         {
             let name = row.name.clone();
+            let metrics = self.row_metrics;
             let mut leading: Vec<AnyElement> = Vec::new();
             if let Some(position) = check_chip {
                 let chip_tip = check_chip_tip(position, checked_total);
@@ -1012,34 +1033,42 @@ impl ListDelegate for LibraryDelegate {
                         .into_any_element(),
                 );
             }
-            if dirty {
-                let dirty_tip = format!(
-                    "\"{}\" has unapplied endpoint edits — Enter applies, Esc reverts",
-                    row.name
-                );
-                leading.push(
+            let mut cells: Vec<AnyElement> = Vec::new();
+            if metrics.show_group {
+                cells.push(
                     div()
-                        .id(format!("row-dirty-{row_id}"))
+                        .id(format!("row-group-{row_id}"))
                         .test_support()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(cx.theme().accent)
-                        .tooltip({
-                            let tip = dirty_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(dirty_tip)
+                        .w(px(metrics.group))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(group_text.clone())
                         .into_any_element(),
                 );
             }
-            let mut cells: Vec<AnyElement> = Vec::new();
-            if columns.upstream {
+            if metrics.show_protocol {
+                cells.push(
+                    div()
+                        .id(format!("row-protocol-{row_id}"))
+                        .test_support()
+                        .w(px(metrics.protocol))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(row.protocol.clone())
+                        .into_any_element(),
+                );
+            }
+            if metrics.show_upstream {
                 let tip = upstream_text.clone();
                 cells.push(
                     div()
                         .id(format!("row-upstream-{row_id}"))
                         .test_support()
-                        .w(px(180.))
+                        .w(px(metrics.upstream))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
@@ -1052,13 +1081,60 @@ impl ListDelegate for LibraryDelegate {
                         .into_any_element(),
                 );
             }
-            if columns.health {
+            // T-03: the endpoint is read, not edited — the bind rides as
+            // muted small text and the port as the quiet `row-port-<id>` pill.
+            cells.push(
+                div()
+                    .id(format!("row-endpoint-{row_id}"))
+                    .test_support()
+                    .w(px(metrics.endpoint))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id(format!("row-bind-text-{row_id}"))
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .tooltip({
+                                let tip = format!("Serve bind address {}", row.bind_ip);
+                                move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                            })
+                            .child(row.bind_ip.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(format!("row-port-{row_id}"))
+                            .test_support()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .tooltip({
+                                let tip = format!(
+                                    "Local endpoint {}:{} — edit it in the inspector",
+                                    row.bind_ip, row.port
+                                );
+                                move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                            })
+                            .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
+                            .child(format!(":{}", row.port)),
+                    )
+                    .into_any_element(),
+            );
+            if metrics.show_health {
                 let tip = health_text.clone();
                 cells.push(
                     div()
                         .id(format!("row-health-{row_id}"))
                         .test_support()
-                        .w(px(150.))
+                        .w(px(metrics.health))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
@@ -1071,26 +1147,12 @@ impl ListDelegate for LibraryDelegate {
                         .into_any_element(),
                 );
             }
-            if columns.group {
-                cells.push(
-                    div()
-                        .id(format!("row-group-{row_id}"))
-                        .test_support()
-                        .w(px(100.))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(group_text.clone())
-                        .into_any_element(),
-                );
-            }
-            if columns.traffic {
+            if metrics.show_traffic {
                 cells.push(
                     div()
                         .id(format!("row-traffic-{row_id}"))
                         .test_support()
-                        .w(px(120.))
+                        .w(px(metrics.traffic))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
@@ -1099,30 +1161,60 @@ impl ListDelegate for LibraryDelegate {
                         .into_any_element(),
                 );
             }
+            // The trailing cell holds the row-scoped copy action; the header
+            // strip reserves the same width, so the columns line up.
+            cells.push(
+                div()
+                    .id(format!("row-copy-{row_id}"))
+                    .test_support()
+                    .w(px(metrics.copy))
+                    .flex_shrink_0()
+                    .into_any_element(),
+            );
             let header = div()
                 .flex()
                 .flex_row()
-                .flex_wrap()
+                .flex_nowrap()
                 .items_center()
                 .gap_2()
+                .w_full()
+                .h_full()
                 .child(
                     div()
-                        .id(format!("row-dot-{row_id}"))
-                        .test_support()
-                        .size(px(12.))
-                        .rounded_full()
-                        .bg(lamp_color)
-                        .tooltip({
-                            let tip = lamp_label.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(lamp_label.clone()),
+                        .w(px(metrics.lamp_check))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .id(format!("row-dot-{row_id}"))
+                                .test_support()
+                                .size(px(12.))
+                                .rounded_full()
+                                .bg(lamp_color)
+                                .tooltip({
+                                    let tip = lamp_label.clone();
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .aria_label(lamp_label.clone()),
+                        )
+                        .child(checkbox),
                 )
-                .child(checkbox)
-                .children(leading)
+                // The check chip's slot is always reserved, so checking a row
+                // never shifts its name out of the header's alignment.
+                .child(
+                    div()
+                        .w(px(metrics.check_slot))
+                        .flex_shrink_0()
+                        .children(leading),
+                )
                 .child(
                     div()
                         .id(format!("row-name-{row_id}"))
+                        .test_support()
                         .flex_1()
                         .min_w_0()
                         .truncate()
@@ -1132,206 +1224,8 @@ impl ListDelegate for LibraryDelegate {
                         })
                         .child(Label::new(name)),
                 )
-                .children(cells)
-
-
-
-
-
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .flex_shrink_0()
-                        .key_context("row-endpoint")
-                        .on_key_down(cx.listener({
-                            let revert_id = row_id.clone();
-                            move |list: &mut ListState<LibraryDelegate>,
-                                  event: &KeyDownEvent,
-                                  window: &mut Window,
-                                  cx: &mut Context<ListState<LibraryDelegate>>| {
-                                if event.keystroke.key != "escape" {
-                                    return;
-                                }
-
-
-
-
-                                let reverted = {
-                                    let delegate = list.delegate_mut();
-                                    delegate.row_inputs_focused(&revert_id, window, cx)
-                                        && delegate.revert_row_inputs(&revert_id, window, cx)
-                                };
-                                if reverted {
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }
-                        }))
-                        .child(if custom_config_row {
-                            div()
-                                .id(format!("row-bind-{row_id}"))
-                                .test_support()
-                                .w(px(118.))
-                                .tooltip({
-                                    let tip = format!(
-                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts \
-                                         (custom config: listens come from the JSON)",
-                                        row.name
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .child(
-                                    Input::new(&bind_state)
-                                        .id(format!("row-bind-input-{row_id}"))
-                                        .small()
-                                        .aria_label(format!("Serve bind address for {}", row.name)),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .id(format!("row-bind-{row_id}"))
-                                .test_support()
-                                .w(px(118.))
-                                .tooltip({
-                                    let tip = format!(
-                                        "Serve bind address for \"{}\" — pick one from the address \
-                                         list (Settings → Addresses); port stays free-text",
-                                        row.name
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .child(
-                                    Select::new(&bind_picker)
-                                        .id(format!("row-bind-picker-{row_id}"))
-                                        .small()
-                                        .placeholder("pick address")
-                                        .accessibility_label(format!(
-                                            "Serve bind address for {}",
-                                            row.name
-                                        )),
-                                )
-                                .into_any_element()
-                        })
-                        .children((!custom_config_row).then(|| {
-                            let add_app = self.app_view.clone();
-                            let add_tip = format!(
-                                "Add address… — opens Settings → Addresses; the list is the only \
-                                 source for row binds, \"{}\"",
-                                row.name
-                            );
-                            Button::new(format!("row-bind-add-{row_id}"))
-                                .small()
-                                .label("Add…")
-                                .accessibility_label("Add address…")
-                                .tooltip(add_tip)
-                                .on_click(move |_, window, cx| {
-                                    if let Some(app) = add_app.clone() {
-                                        app.update(cx, |view, cx| {
-                                            view.open_settings_dialog(window, cx);
-                                        });
-                                    }
-                                })
-                        }))
-                        .child(
-                            div()
-                                .id(format!("row-port-{row_id}"))
-                                .test_support()
-                                .w(px(76.))
-                                .tooltip({
-                                    let tip = format!(
-                                        "Local endpoint {}:{} — Enter commits, Esc reverts",
-                                        row.bind_ip, row.port
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
-                                .child(Input::new(&port_state).id(format!("row-port-input-{row_id}")).small().aria_label(format!(
-                                    "Local port for {}",
-                                    row.name
-                                ))),
-                        )
-                        .child(
-                            Button::new(format!("row-serve-{row_id}"))
-                                .small()
-                                .label(if is_running { "■ Stop" } else { "Start" })
-                                .accessibility_label(if is_running {
-                                    format!("Stop \"{}\"", row.name)
-                                } else {
-                                    format!("Start \"{}\"", row.name)
-                                })
-                                .tooltip(if is_running {
-                                    format!("Stop \"{}\"", row.name)
-                                } else {
-                                    format!("Start \"{}\" (F5)", row.name)
-                                })
-                                .on_click({
-                                    let act_app = self.app_view.clone();
-                                    let act_id = row_id.clone();
-                                    let act_running = is_running;
-                                    move |_, window, cx| {
-                                        if let Some(app) = act_app.clone() {
-                                            let id = act_id.clone();
-                                            app.update(cx, |view, cx| {
-                                                if act_running {
-                                                    view.stop_row(&id, window, cx);
-                                                } else {
-                                                    view.start_row(&id, window, cx);
-                                                }
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                        .child(
-                            Button::new(format!("row-edit-{row_id}"))
-                                .small()
-                                .label("Edit")
-                                .accessibility_label(format!("Edit \"{}\"", row.name))
-                                .tooltip(format!("Edit \"{}\"", row.name))
-                                .on_click({
-                                    let edit_app = self.app_view.clone();
-                                    let edit_id = row_id.clone();
-                                    move |_, window, cx| {
-                                        if let Some(app) = edit_app.clone() {
-                                            let id = edit_id.clone();
-                                            app.update(cx, |view, cx| {
-                                                view.commit_row_endpoint(&id, window, cx);
-                                                view.open_edit_for_row(&id, window, cx);
-                                            });
-                                        }
-                                    }
-                                }),
-                        ),
-                );
+                .children(cells);
             card = card.child(header);
-        }
-
-        if let Some((bind_text, port_text)) = self.endpoint_draft_texts(&row_id, cx) {
-            if let Some(warning) =
-                bind_port_collision_warning(&self.rows, Some(&row_id), &bind_text, &port_text)
-            {
-                card = card.child(
-                    div()
-                        .id(format!("row-endpoint-warn-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .truncate()
-                        .child(warning),
-                );
-            } else if let Some(hint) = lan_hint_for_bind(bind_text.trim()) {
-                card = card.child(
-                    div()
-                        .id(format!("row-endpoint-warn-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .truncate()
-                        .child(hint),
-                );
-            }
         }
 
         let rendered = match self.app_view.clone() {

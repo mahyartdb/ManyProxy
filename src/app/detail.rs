@@ -8,14 +8,94 @@ pub(crate) const OPERATE_STOP_TOOLTIP: &str = "Stop the selected endpoint (Shift
 pub(crate) const OPERATE_TEST_TOOLTIP: &str = "Test the selected endpoint (Ctrl-T)";
 
 impl AppView {
-    pub(crate) fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// T-03: below the breakpoint the inspector slides OVER the table as a
+    /// drawer. It is an overlay: the table keeps its full width underneath,
+    /// so the list is never squeezed under its floor.
+    pub(crate) fn render_inspector_drawer(
+        &self,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let close_view = cx.entity();
+        div()
+            .id("inspector-drawer")
+            .test_support()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(width))
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .flex()
+            .flex_col()
+            .child(self.render_detail(window, cx))
+            .child(
+                div()
+                    .id("inspector-drawer-bar")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("inspector-drawer-close")
+                            .small()
+                            .label("Close inspector")
+                            .tooltip("Close the inspector drawer (Esc)")
+                            .on_click(move |_, window, cx| {
+                                close_view.update(cx, |view, cx| {
+                                    view.close_inspector_drawer(window, cx);
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// T-03: picking a row opens the drawer again.
+    pub(crate) fn open_inspector_drawer(&mut self) {
+        self.inspector_drawer_open = true;
+    }
+
+    /// T-03: Esc closes the drawer and hands focus back to the list. It
+    /// reports whether it closed anything, so the caller can leave the
+    /// checked set alone — one overlay layer per Esc.
+    pub(crate) fn close_inspector_drawer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if window.viewport_size().width.as_f32() >= INSPECTOR_DRAWER_BREAKPOINT {
+            return false;
+        }
+        if !self.inspector_drawer_open {
+            return false;
+        }
+        self.inspector_drawer_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn render_detail(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
             if self.config_count(cx) == 0 {
                 return div().id("config-detail").test_support().into_any_element();
             }
             return self.render_detail_empty(cx).into_any_element();
         };
-        self.render_detail_selected(cx, &config).into_any_element()
+        self.render_detail_selected(window, cx, &config)
+            .into_any_element()
     }
 
     pub(crate) fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -84,6 +164,7 @@ impl AppView {
 
     pub(crate) fn render_detail_selected(
         &self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
@@ -135,6 +216,10 @@ impl AppView {
                         cx,
                     )),
             )
+            // T-03: the selected row's endpoint editors ride their own line
+            // above the operate row — the operate row keeps its two-line
+            // budget, and the editors keep their room.
+            .child(self.render_row_editors(window, cx, config))
             .child(self.render_detail_actions(cx, config))
             .into_any_element()
     }
@@ -566,6 +651,35 @@ impl AppView {
             .child(Tag::new().child(config.protocol.clone()))
             .child(Tag::new().child(config.group.clone()))
             .child(format!("{}:{}", config.bind_ip, config.port))
+            .child({
+                // T-03: the dirty marker rides the inspector's row header —
+                // the row is one line and has no room for it.
+                let dirty = self
+                    .libraries
+                    .read(cx)
+                    .delegate()
+                    .endpoint_is_dirty(&config.id, cx);
+                if !dirty {
+                    div().id("row-dirty-idle").test_support().into_any_element()
+                } else {
+                    let dirty_tip = format!(
+                        "\"{}\" has unapplied endpoint edits — Enter applies, Esc reverts",
+                        config.name
+                    );
+                    div()
+                        .id(format!("row-dirty-{}", config.id))
+                        .test_support()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(cx.theme().accent)
+                        .tooltip({
+                            let tip = dirty_tip.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .aria_label(dirty_tip)
+                        .into_any_element()
+                }
+            })
             .child(
                 div().id("detail-serving").test_support().child(
                     Badge::new()
@@ -744,6 +858,254 @@ impl AppView {
         )
     }
 
+    /// T-03: the row's endpoint editors live in the inspector now — a 30px
+    /// row cannot hold five framed controls. The per-row ids stay stable
+    /// (`row-bind-<id>`, `row-port-input-<id>`, `row-serve-<id>`,
+    /// `row-edit-<id>`), so the row and the inspector speak the same names.
+    pub(crate) fn render_row_editors(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> AnyElement {
+        let row_id = config.id.clone();
+        let port_stored = config.port.to_string();
+        // The drafts live per row in the delegate; the inspector makes sure
+        // the selected row's editors exist before it draws them.
+        let editors = self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().ensure_row_inputs(
+                &row_id,
+                &config.bind_ip,
+                &port_stored,
+                window,
+                list_cx,
+            );
+            state.delegate().endpoint_inputs.get(&row_id).map(|inputs| {
+                (
+                    inputs.bind.clone(),
+                    inputs.port.clone(),
+                    inputs.picker.clone(),
+                )
+            })
+        });
+        let Some((bind_state, port_state, bind_picker)) = editors else {
+            return div().id("row-editors").test_support().into_any_element();
+        };
+        // T-33: custom-config rows stay JSON-governed — their listen comes
+        // from the document, so they keep the free-text bind field.
+        let custom_config_row = is_custom_config_protocol(&config.protocol);
+        let name = config.name.clone();
+        let is_running = self.engine.is_running(&config.id);
+        let bind_cell = if custom_config_row {
+            div()
+                .id(format!("row-bind-{}", config.id))
+                .test_support()
+                .w(px(118.))
+                .tooltip({
+                    let tip = format!(
+                        "Serve bind address for \"{name}\" — Enter commits, Esc reverts \
+                         (custom config: listens come from the JSON)"
+                    );
+                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                })
+                .child(
+                    Input::new(&bind_state)
+                        .id(format!("row-bind-input-{}", config.id))
+                        .small()
+                        .aria_label(format!("Serve bind address for {name}")),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id(format!("row-bind-{}", config.id))
+                .test_support()
+                .w(px(118.))
+                .tooltip({
+                    let tip = format!(
+                        "Serve bind address for \"{name}\" — pick one from the address list \
+                         (Settings → Addresses); port stays free-text"
+                    );
+                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                })
+                .child(
+                    Select::new(&bind_picker)
+                        .id(format!("row-bind-picker-{}", config.id))
+                        .small()
+                        .placeholder("pick address")
+                        .accessibility_label(format!("Serve bind address for {name}")),
+                )
+                .into_any_element()
+        };
+        let add_button = (!custom_config_row).then(|| {
+            let add_view = cx.entity();
+            Button::new(format!("row-bind-add-{}", config.id))
+                .small()
+                .label("Add…")
+                .accessibility_label("Add address…")
+                .tooltip(format!(
+                    "Add address… — opens Settings → Addresses; the list is the only source \
+                     for row binds, \"{name}\""
+                ))
+                .on_click(move |_, window, cx| {
+                    add_view.update(cx, |view, cx| {
+                        view.open_settings_dialog(window, cx);
+                    });
+                })
+                .into_any_element()
+        });
+        div()
+            .id("row-editors")
+            .test_support()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .key_context("row-endpoint")
+            .on_key_down(cx.listener({
+                let revert_id = row_id.clone();
+                move |view: &mut AppView,
+                      event: &KeyDownEvent,
+                      window: &mut Window,
+                      cx: &mut Context<AppView>| {
+                    if event.keystroke.key != "escape" {
+                        return;
+                    }
+                    let reverted = {
+                        let focused = view
+                            .libraries
+                            .read(cx)
+                            .delegate()
+                            .row_inputs_focused(&revert_id, window, cx);
+                        if !focused {
+                            false
+                        } else {
+                            let mut reverted = false;
+                            view.libraries.update(cx, |state, list_cx| {
+                                reverted = state
+                                    .delegate_mut()
+                                    .revert_row_inputs(&revert_id, window, list_cx);
+                            });
+                            reverted
+                        }
+                    };
+                    if reverted {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }))
+            .child(bind_cell)
+            .children(add_button)
+            .child(
+                div()
+                    .id(format!("row-port-editor-{}", config.id))
+                    .test_support()
+                    .w(px(76.))
+                    .tooltip({
+                        let tip = format!(
+                            "Local endpoint {}:{} — Enter commits, Esc reverts",
+                            config.bind_ip, config.port
+                        );
+                        move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                    })
+                    .child(
+                        Input::new(&port_state)
+                            .id(format!("row-port-input-{}", config.id))
+                            .small()
+                            .aria_label(format!("Local port for {name}")),
+                    ),
+            )
+            .child(
+                Button::new(format!("row-serve-{}", config.id))
+                    .small()
+                    .label(if is_running { "■ Stop" } else { "Start" })
+                    .accessibility_label(if is_running {
+                        format!("Stop \"{name}\"")
+                    } else {
+                        format!("Start \"{name}\"")
+                    })
+                    .tooltip(if is_running {
+                        format!("Stop \"{name}\"")
+                    } else {
+                        format!("Start \"{name}\" (F5)")
+                    })
+                    .on_click({
+                        let serve_view = cx.entity();
+                        let serve_id = config.id.clone();
+                        move |_, window, cx| {
+                            serve_view.update(cx, |view, cx| {
+                                if is_running {
+                                    view.stop_row(&serve_id, window, cx);
+                                } else {
+                                    view.start_row(&serve_id, window, cx);
+                                }
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new(format!("row-edit-{}", config.id))
+                    .small()
+                    .label("Edit")
+                    .accessibility_label(format!("Edit \"{name}\""))
+                    .tooltip(format!("Edit \"{name}\""))
+                    .on_click({
+                        let edit_view = cx.entity();
+                        let edit_id = config.id.clone();
+                        move |_, window, cx| {
+                            edit_view.update(cx, |view, cx| {
+                                view.commit_row_endpoint(&edit_id, window, cx);
+                                view.open_edit_for_row(&edit_id, window, cx);
+                            });
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// T-03: the draft's live warning — a colliding endpoint or a bind that
+    /// leaves loopback — rides with the editors that caused it.
+    pub(crate) fn render_row_endpoint_warning(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> Option<AnyElement> {
+        let delegate = self.libraries.read(cx).delegate();
+        let (bind_text, port_text) = delegate.endpoint_draft_texts(&config.id, cx)?;
+        if let Some(warning) =
+            bind_port_collision_warning(&delegate.rows, Some(&config.id), &bind_text, &port_text)
+        {
+            return Some(
+                div()
+                    .id(format!("row-endpoint-warn-{}", config.id))
+                    .test_support()
+                    .w_full()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .truncate()
+                    .child(warning)
+                    .into_any_element(),
+            );
+        }
+        let hint = lan_hint_for_bind(bind_text.trim())?;
+        Some(
+            div()
+                .id(format!("row-endpoint-warn-{}", config.id))
+                .test_support()
+                .w_full()
+                .text_sm()
+                .truncate()
+                .child(hint)
+                .into_any_element(),
+        )
+    }
+
     pub(crate) fn render_detail_actions(
         &self,
         cx: &mut Context<Self>,
@@ -882,6 +1244,7 @@ impl AppView {
                     })),
             )
             .child(self.render_row_menu(cx))
+            .children(self.render_row_endpoint_warning(cx, config))
     }
 
     pub(crate) fn row_menu_item(
@@ -1219,5 +1582,191 @@ impl AppView {
                 .x_axis(false)
                 .grid(false),
         )
+    }
+}
+
+impl AppView {
+    pub(crate) fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+
+        div().id("inspector-tabs").test_support().child(
+            TabBar::new("inspector-tabs")
+                .segmented()
+                .small()
+                .selected_index(self.inspector_tab.index())
+                .on_click(move |index, _, cx| {
+                    view.update(cx, |view, _| {
+                        view.set_inspector_tab(InspectorTab::from_index(*index));
+                    });
+                })
+                .child(
+                    Tab::new()
+                        .label("Details")
+                        .aria_label(InspectorTab::Details.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-1", "(Ctrl-1)"))
+                        .child(div().id("inspector-tab-details").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Health")
+                        .aria_label(InspectorTab::Health.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-2", "(Ctrl-2)"))
+                        .child(div().id("inspector-tab-health").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Presets")
+                        .aria_label(InspectorTab::Presets.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-3", "(Ctrl-3)"))
+                        .child(div().id("inspector-tab-presets").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Logs")
+                        .aria_label(InspectorTab::Logs.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-4", "(Ctrl-4)"))
+                        .child(div().id("inspector-tab-logs").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Connections")
+                        .aria_label(InspectorTab::Connections.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-5", "(Ctrl-5)"))
+                        .child(div().id("inspector-tab-connections").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Traffic")
+                        .aria_label(InspectorTab::Traffic.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-6", "(Ctrl-6)"))
+                        .child(div().id("inspector-tab-traffic").test_support()),
+                ),
+        )
+    }
+
+    pub(crate) fn render_inspector_overview(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        let mut overview = div()
+            .id("inspector-overview")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.render_detail_header(cx, config));
+        if self.detail_failed(config) {
+            overview = overview.child(
+                div().id("config-health-alert").test_support().child(
+                    Alert::error(
+                        "config-health-alert-box",
+                        self.health_store.detail_line(&config.id),
+                    )
+                    .title("Endpoint failed"),
+                ),
+            );
+        }
+        overview.child(self.render_detail_endpoints(cx, config))
+    }
+
+    pub(crate) fn render_inspector_details(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.render_detail_usage(cx, config))
+    }
+
+    pub(crate) fn render_inspector_health(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.render_detail_health(cx, config))
+            .child(self.render_detail_history(cx, config))
+    }
+
+    pub(crate) fn render_inspector_presets(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div().flex().flex_col().gap_1().child({
+            let preset_line = match self.preset_summary_for(config.preset_id.as_deref()) {
+                Some((name, count)) => {
+                    format!("{name} ({count} rule(s))")
+                }
+                None => match self.preset_name_for(config.preset_id.as_deref()) {
+                    Some(name) => name,
+                    None => "no routing preset".to_string(),
+                },
+            };
+            div().id("config-preset").test_support().child(
+                GroupBox::new().title("Routing preset").gap_1().child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child({
+                            let tip = preset_line.clone();
+                            div()
+                                .id("preset-line-tip")
+                                .test_support()
+                                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                                .child(
+                                    DescriptionList::new()
+                                        .bordered(false)
+                                        .small()
+                                        .columns(1)
+                                        .label_width(px(72.))
+                                        .item("Preset", preset_line, 1),
+                                )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("preset-open")
+                                        .small()
+                                        .label("Preset")
+                                        .tooltip("Attach a routing preset")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            if let Some(config) = view.selected_config(cx) {
+                                                view.open_preset_attach_dialog(config, window, cx);
+                                            }
+                                        })),
+                                )
+                                .child(if config.preset_id.is_some() {
+                                    let detach_id = config.id.clone();
+                                    Button::new("preset-detach-inline")
+                                        .small()
+                                        .label("Detach")
+                                        .tooltip("Detach the routing preset from this row")
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.commit_preset_attach(&detach_id, None, window, cx);
+                                        }))
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .id("preset-detach-idle")
+                                        .test_support()
+                                        .into_any_element()
+                                }),
+                        ),
+                ),
+            )
+        })
     }
 }

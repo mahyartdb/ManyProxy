@@ -6989,6 +6989,24 @@ fn notification_count(cx: &mut VisualTestContext) -> usize {
     cx.update(|window, cx| window.notifications(cx).len())
 }
 
+/// T-03: the inspector carries the SELECTED row's editors, so a test that
+/// needs them selects the row first — the same way a click does.
+fn select_library_row(view: &Entity<AppView>, cx: &mut VisualTestContext, id: &str) {
+    cx.update(|window, cx| {
+        window.click(format!("library-row-{id}"), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let selected = view.read_with(cx, |view, cx| {
+        view.libraries
+            .read(cx)
+            .delegate()
+            .selected_row()
+            .map(|row| row.id)
+    });
+    assert_eq!(selected.as_deref(), Some(id), "the row is selected");
+}
+
 #[test]
 fn redact_subscription_url_strips_userinfo() {
     use crate::redact_subscription_url;
@@ -12141,6 +12159,9 @@ fn r05_dirty_start_gates_and_clean_launches(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
+    // T-03: the dirty marker rides the inspector's row header, so the row is
+    // selected first.
+    select_library_row(&view, cx, &dirty.id);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let bind = view.libraries.read(cx).delegate().endpoint_inputs[&dirty.id]
@@ -15919,8 +15940,9 @@ fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
     );
 
     assert!(
-        operate_bounds.size.height <= start_height * 2. + px(12.),
-        "operate row fits two wrapped lines: row {operate_bounds:?} vs button {start_height:?}"
+        operate_bounds.size.height <= start_height * 4. + px(24.),
+        "operate row wraps inside the inspector's width (four lines at 240px): \
+         row {operate_bounds:?} vs button {start_height:?}"
     );
 
     assert!(
@@ -16087,9 +16109,10 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
         "grouped operate row never scrolls horizontally: {operate_bounds:?}"
     );
     assert!(
-            operate_bounds.size.height <= start_height * 2. + px(12.),
-            "grouped operate row fits two wrapped lines: row {operate_bounds:?} vs button {start_height:?}"
-        );
+        operate_bounds.size.height <= start_height * 4. + px(24.),
+        "grouped operate row wraps inside the inspector's width (four lines at 240px): \
+             row {operate_bounds:?} vs button {start_height:?}"
+    );
 }
 
 #[gpui_kit::test]
@@ -19221,17 +19244,24 @@ fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
     let beta = store
         .add(t30_engine_seed("Beta", "10952"))
         .expect("seed works");
-    let (_view, cx) = mount_view(store, cx);
+    let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
+
+    // T-03: the row is one line. It keeps the quiet `row-port-<id>` pill and
+    // nothing else framed — the editors moved to the inspector.
     for id in [&alpha.id, &beta.id] {
-        for slot in ["row-bind-", "row-port-", "row-serve-", "row-edit-"] {
-            let element = format!("{slot}{id}");
-            assert!(
-                cx.update(|window, _| window.try_find(element.clone()).is_some()),
-                "{element} renders in the row"
-            );
+        assert_painted(cx, &format!("row-port-{id}"));
+        for slot in ["row-bind-", "row-port-input-", "row-serve-", "row-edit-"] {
+            assert_absent(cx, format!("{slot}{id}"));
         }
     }
+
+    // The inspector carries the selected row's editors — and only that row's.
+    select_library_row(&view, cx, &alpha.id);
+    for slot in ["row-bind-", "row-port-input-", "row-serve-", "row-edit-"] {
+        assert_painted(cx, &format!("{slot}{}", alpha.id));
+    }
+    assert_absent(cx, format!("row-serve-{}", beta.id));
 
     let (bind_w, port_w) = cx.update(|window, _| {
         // T-33: generated-config rows bind through the picker; the port
@@ -19275,6 +19305,108 @@ fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let mut ids = Vec::new();
+    for index in 0..24 {
+        let row = store
+            .add(seed_input(&format!("row-{index:02}")))
+            .expect("seed works");
+        ids.push(row.id);
+    }
+    let (_view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    // The wide frame the acceptance names: 20+ rows must paint and the
+    // MEASURED pitch must stay inside the 32px budget.
+    cx.simulate_resize(size(px(1920.), px(1032.)));
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+
+    let measured: Vec<(f32, f32)> = cx.update(|window, _| {
+        let mut rows: Vec<(f32, f32)> = Vec::new();
+        for id in &ids {
+            let card = window.try_find(format!("row-card-{id}"));
+            let name = window.try_find(format!("row-name-{id}"));
+            if let (Some(card), Some(name)) = (card, name) {
+                let card = card.bounds();
+                let name = name.bounds();
+                rows.push((card.origin.y.as_f32(), card.size.height.as_f32()));
+                assert!(
+                    (name.origin.y.as_f32() - card.origin.y.as_f32()).abs() < 32.,
+                    "the name sits on the row's line"
+                );
+            }
+        }
+        rows
+    });
+    assert!(
+        measured.len() >= 20,
+        "20+ rows paint at 1920x1032, got {}",
+        measured.len()
+    );
+    let mut pitch: f32 = 0.;
+    for pair in measured.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(
+            gap > 0. && gap <= 32.,
+            "the row pitch stays inside the 32px budget, got {gap}"
+        );
+        pitch = pitch.max(gap);
+    }
+    for (_, height) in &measured {
+        assert!(*height <= 32., "no row is taller than 32px, got {height}");
+    }
+    assert!(pitch > 0., "the pitch is measurable");
+
+    // Every header label sits at its column's first character.
+    let pairs: [(&str, &str); 7] = [
+        ("header-name", "row-name"),
+        ("header-group", "row-group"),
+        ("header-protocol", "row-protocol"),
+        ("header-upstream", "row-upstream"),
+        ("header-endpoint", "row-endpoint"),
+        ("sort-header-health", "row-health"),
+        ("sort-header-traffic", "row-traffic"),
+    ];
+    let mut checked = 0;
+    for (header_id, cell_prefix) in pairs {
+        let header_x = cx.update(|window, _| {
+            window
+                .try_find(header_id.to_string())
+                .map(|snapshot| snapshot.bounds().origin.x.as_f32())
+        });
+        let Some(header_x) = header_x else {
+            continue;
+        };
+        let cell_x = cx.update(|window, _| {
+            ids.iter().find_map(|id| {
+                window
+                    .try_find(format!("{cell_prefix}-{id}"))
+                    .map(|snapshot| snapshot.bounds().origin.x.as_f32())
+            })
+        });
+        let Some(cell_x) = cell_x else {
+            continue;
+        };
+        let drift = (header_x - cell_x).abs();
+        assert!(
+            drift <= 8.,
+            "{header_id} sits within 8px of {cell_prefix}'s first character, got {drift}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 4, "several columns are checked, got {checked}");
+}
+
+#[gpui_kit::test]
 fn r3_row_serve_button_starts_that_row(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
@@ -19293,6 +19425,9 @@ fn r3_row_serve_button_starts_that_row(cx: &mut TestAppContext) {
         });
     });
     paint_frame(cx);
+    // T-03: the per-row Start lives in the inspector, so the row is selected
+    // first — the inspector edits the selected row.
+    select_library_row(&view, cx, &alpha.id);
     let before = notification_count(cx);
     cx.update(|window, cx| {
         window.click(format!("row-serve-{}", alpha.id), cx);
@@ -19413,6 +19548,9 @@ fn r3_row_endpoint_collision_warns_inline(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
+    // T-03: the collision warning rides the inspector's editor row, so the
+    // row is selected first.
+    select_library_row(&view, cx, &alpha.id);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.libraries.update(cx, |list, cx| {
@@ -19494,6 +19632,9 @@ fn r3_row_endpoint_enter_key_commits(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
+    // T-03: the draft's Esc handler rides the inspector's editor row, so the
+    // row is selected first.
+    select_library_row(&view, cx, &alpha.id);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.libraries.update(cx, |list, cx| {
@@ -19538,6 +19679,9 @@ fn r3_row_endpoint_escape_key_reverts(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
+    // T-03: the draft's Esc handler rides the inspector's editor row, so the
+    // row is selected first.
+    select_library_row(&view, cx, &alpha.id);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.libraries.update(cx, |list, cx| {
@@ -29381,6 +29525,8 @@ fn t83_picker_drives_existing_save_gate(cx: &mut TestAppContext) {
     store.add_bind_host("192.168.1.44").expect("extra accepted");
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
+    // T-03: the bind editor rides the inspector, for the selected row.
+    select_library_row(&view, cx, &alpha.id);
 
     assert_painted(cx, &format!("row-bind-picker-{}", alpha.id));
     assert_absent(cx, format!("row-bind-input-{}", alpha.id));
@@ -29550,9 +29696,12 @@ fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
         crate::engine::is_custom_config_protocol(&custom.protocol),
         "the row is JSON-governed"
     );
+    // T-03: the bind editor rides the inspector, for the selected row.
+    select_library_row(&view, cx, &custom.id);
     assert_painted(cx, &format!("row-bind-input-{}", custom.id));
     assert_absent(cx, format!("row-bind-picker-{}", custom.id));
     assert_absent(cx, format!("row-bind-add-{}", custom.id));
+    select_library_row(&view, cx, &generated.id);
     assert_painted(cx, &format!("row-bind-picker-{}", generated.id));
 
     let listens = crate::engine::custom_config_listens(
@@ -29573,6 +29722,7 @@ fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
     })
     .expect("extra accepted");
     paint_frame(cx);
+    select_library_row(&view, cx, &custom.id);
     assert_painted(cx, &format!("row-bind-input-{}", custom.id));
     assert_absent(cx, format!("row-bind-picker-{}", custom.id));
     assert_eq!(

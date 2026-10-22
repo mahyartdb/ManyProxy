@@ -46,7 +46,7 @@ use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMe
 use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
-use gpui_kit::component::resizable::{resizable_panel, v_resizable};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel, ResizableState};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::separator::Separator;
@@ -116,6 +116,16 @@ use store::{
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// T-03: the inspector docks to the RIGHT of the library. Below this window
+/// width it collapses to a slide-over drawer, so the table never loses the
+/// width it needs.
+pub(crate) const INSPECTOR_DRAWER_BREAKPOINT: f32 = 1080.;
+/// The inspector's default width. The user may drag it inside the range
+/// below; the width is session-only — nothing about it is persisted.
+pub(crate) const INSPECTOR_WIDTH: f32 = 260.;
+pub(crate) const INSPECTOR_WIDTH_MIN: f32 = 240.;
+pub(crate) const INSPECTOR_WIDTH_MAX: f32 = 360.;
 
 /// Spawn a console executable with no visible console window. `creation_flags`
 /// REPLACES the whole flag word (std does `self.flags = flags`), so a future
@@ -10522,6 +10532,16 @@ struct AppView {
 
     inspector_tab: InspectorTab,
 
+    /// T-03: the split's own state. The inspector's width is session-only —
+    /// nothing about it is persisted — but the table's column budget has to
+    /// follow the drag, so the owner reads the live size from here.
+    split_state: Entity<ResizableState>,
+
+    /// T-03: below the drawer breakpoint the inspector slides over the table
+    /// instead of squeezing it. Esc closes it and hands focus back to the
+    /// list; picking a row opens it again.
+    inspector_drawer_open: bool,
+
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
 
     /// T-25: counts derived from `conn_snapshot` on the traffic tick, so the
@@ -10726,10 +10746,13 @@ impl AppView {
         .map(|(file, found)| sidecar_presence_line(&file, found))
         .collect::<Vec<_>>();
         let log_cap = store.log_max_lines();
+        let split_state = cx.new(|_| ResizableState::default());
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
             detail_scroll: ScrollHandle::new(),
+            split_state,
+            inspector_drawer_open: true,
             store,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
@@ -20527,190 +20550,6 @@ impl AppView {
     fn set_inspector_tab(&mut self, tab: InspectorTab) {
         self.inspector_tab = tab;
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
-    }
-
-    fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
-
-        div().id("inspector-tabs").test_support().child(
-            TabBar::new("inspector-tabs")
-                .segmented()
-                .small()
-                .selected_index(self.inspector_tab.index())
-                .on_click(move |index, _, cx| {
-                    view.update(cx, |view, _| {
-                        view.set_inspector_tab(InspectorTab::from_index(*index));
-                    });
-                })
-                .child(
-                    Tab::new()
-                        .label("Details")
-                        .aria_label(InspectorTab::Details.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-1", "(Ctrl-1)"))
-                        .child(div().id("inspector-tab-details").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Health")
-                        .aria_label(InspectorTab::Health.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-2", "(Ctrl-2)"))
-                        .child(div().id("inspector-tab-health").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Presets")
-                        .aria_label(InspectorTab::Presets.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-3", "(Ctrl-3)"))
-                        .child(div().id("inspector-tab-presets").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Logs")
-                        .aria_label(InspectorTab::Logs.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-4", "(Ctrl-4)"))
-                        .child(div().id("inspector-tab-logs").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Connections")
-                        .aria_label(InspectorTab::Connections.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-5", "(Ctrl-5)"))
-                        .child(div().id("inspector-tab-connections").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Traffic")
-                        .aria_label(InspectorTab::Traffic.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-6", "(Ctrl-6)"))
-                        .child(div().id("inspector-tab-traffic").test_support()),
-                ),
-        )
-    }
-
-    fn render_inspector_overview(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        let mut overview = div()
-            .id("inspector-overview")
-            .test_support()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(self.render_detail_header(cx, config));
-        if self.detail_failed(config) {
-            overview = overview.child(
-                div().id("config-health-alert").test_support().child(
-                    Alert::error(
-                        "config-health-alert-box",
-                        self.health_store.detail_line(&config.id),
-                    )
-                    .title("Endpoint failed"),
-                ),
-            );
-        }
-        overview.child(self.render_detail_endpoints(cx, config))
-    }
-
-    fn render_inspector_details(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(self.render_detail_usage(cx, config))
-    }
-
-    fn render_inspector_health(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(self.render_detail_health(cx, config))
-            .child(self.render_detail_history(cx, config))
-    }
-
-    fn render_inspector_presets(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        div().flex().flex_col().gap_1().child({
-            let preset_line = match self.preset_summary_for(config.preset_id.as_deref()) {
-                Some((name, count)) => {
-                    format!("{name} ({count} rule(s))")
-                }
-                None => match self.preset_name_for(config.preset_id.as_deref()) {
-                    Some(name) => name,
-                    None => "no routing preset".to_string(),
-                },
-            };
-            div().id("config-preset").test_support().child(
-                GroupBox::new().title("Routing preset").gap_1().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child({
-                            let tip = preset_line.clone();
-                            div()
-                                .id("preset-line-tip")
-                                .test_support()
-                                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                                .child(
-                                    DescriptionList::new()
-                                        .bordered(false)
-                                        .small()
-                                        .columns(1)
-                                        .label_width(px(72.))
-                                        .item("Preset", preset_line, 1),
-                                )
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("preset-open")
-                                        .small()
-                                        .label("Preset")
-                                        .tooltip("Attach a routing preset")
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            if let Some(config) = view.selected_config(cx) {
-                                                view.open_preset_attach_dialog(config, window, cx);
-                                            }
-                                        })),
-                                )
-                                .child(if config.preset_id.is_some() {
-                                    let detach_id = config.id.clone();
-                                    Button::new("preset-detach-inline")
-                                        .small()
-                                        .label("Detach")
-                                        .tooltip("Detach the routing preset from this row")
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.commit_preset_attach(&detach_id, None, window, cx);
-                                        }))
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .id("preset-detach-idle")
-                                        .test_support()
-                                        .into_any_element()
-                                }),
-                        ),
-                ),
-            )
-        })
     }
 
     /// Writes the cell value to the clipboard (bind:port-safe display strings

@@ -284,10 +284,16 @@ impl AppView {
     /// T-27: the library list's column header strip. The visible columns come
     /// from `library_columns`; the health and traffic cells are sortable and
     /// carry the picker menu, the rest are labels that keep the strip lined up.
+    ///
+    /// T-03: the strip reads the same `RowMetrics` the row reads, so every
+    /// label sits at its column's first character instead of at a second,
+    /// disagreeing set of widths.
     pub(crate) fn render_library_column_headers(&self, cx: &mut Context<Self>) -> AnyElement {
-        let columns = self.row_columns;
-        let sort = self.libraries.read(cx).delegate().sort;
-        let has_rows = !self.libraries.read(cx).delegate().rows.is_empty();
+        let libraries = self.libraries.read(cx);
+        let delegate = libraries.delegate();
+        let metrics = delegate.row_metrics;
+        let sort = delegate.sort;
+        let has_rows = !delegate.rows.is_empty();
         let view = cx.entity();
         if !has_rows {
             // An empty library keeps today's empty-state clean: a header strip
@@ -302,16 +308,35 @@ impl AppView {
             .test_support()
             .flex()
             .flex_row()
+            .flex_nowrap()
             .items_center()
             .gap_2()
-            .px_2()
+            // The row's content starts after the list item's 4px inset and
+            // the card's 8px padding — the strip starts at the same place.
+            .px_3()
             .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
             // The gutter the row cards spend on the serving lamp and checkbox.
-            .child(div().w(px(28.)).flex_shrink_0())
             .child(
                 div()
+                    .id("header-lamp-check")
+                    .test_support()
+                    .w(px(metrics.lamp_check))
+                    .flex_shrink_0(),
+            )
+            // The numeral check chip's reserved slot.
+            .child(
+                div()
+                    .id("header-check-slot")
+                    .test_support()
+                    .w(px(metrics.check_slot))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .id("header-name")
+                    .test_support()
                     .flex_1()
                     .min_w_0()
                     .truncate()
@@ -319,25 +344,65 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child("Name"),
             );
-        if columns.upstream {
-            strip = strip.child(column_header_label("Upstream", 180., cx));
+        if metrics.show_group {
+            strip = strip.child(column_header_label(
+                "header-group",
+                "Group",
+                metrics.group,
+                cx,
+            ));
         }
-        if columns.health {
+        if metrics.show_protocol {
+            strip = strip.child(column_header_label(
+                "header-protocol",
+                "Protocol",
+                metrics.protocol,
+                cx,
+            ));
+        }
+        if metrics.show_upstream {
+            strip = strip.child(column_header_label(
+                "header-upstream",
+                "Upstream",
+                metrics.upstream,
+                cx,
+            ));
+        }
+        strip = strip.child(column_header_label(
+            "header-endpoint",
+            "Endpoint",
+            metrics.endpoint,
+            cx,
+        ));
+        if metrics.show_health {
             strip = strip.child(sort_header_cell(
                 "health",
                 "Health",
-                150.,
+                metrics.health,
                 sort,
                 view.clone(),
                 cx,
             ));
         }
-        if columns.group {
-            strip = strip.child(column_header_label("Group", 100., cx));
+        if metrics.show_traffic {
+            strip = strip.child(sort_header_cell(
+                "traffic",
+                "Traffic",
+                metrics.traffic,
+                sort,
+                view,
+                cx,
+            ));
         }
-        if columns.traffic {
-            strip = strip.child(sort_header_cell("traffic", "Traffic", 120., sort, view, cx));
-        }
+        // The row's trailing cell holds the copy action; the strip keeps the
+        // same width so the columns stay lined up.
+        strip = strip.child(
+            div()
+                .id("header-copy")
+                .test_support()
+                .w(px(metrics.copy))
+                .flex_shrink_0(),
+        );
         strip.into_any_element()
     }
 
