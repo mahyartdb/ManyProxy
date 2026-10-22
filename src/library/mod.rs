@@ -3,13 +3,19 @@ use crate::*;
 use gpui_kit::component::ThemeStyled as _;
 
 mod columns;
+mod host;
 #[path = "match.rs"]
 mod matching;
 mod metrics;
+mod rows;
+mod tone;
 
 pub(crate) use columns::*;
+pub(crate) use host::*;
 pub(crate) use matching::*;
 pub(crate) use metrics::*;
+pub(crate) use rows::*;
+pub(crate) use tone::*;
 
 pub(crate) struct LibraryDelegate {
     pub(crate) rows: Vec<ProxyConfig>,
