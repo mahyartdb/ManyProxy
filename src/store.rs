@@ -3892,6 +3892,37 @@ pub(crate) fn app_data_dir() -> PathBuf {
     app_data_dir_in(crate::engine::current_app_dir().as_deref())
 }
 
+/// T-08: one probe, against one folder. Split out from `Store::write_probe`
+/// so the store's in-memory case stays outside the filesystem path entirely.
+fn write_probe_in(dir: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let seq = WRITE_PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = format!(".mp-write-probe-{}-{stamp}-{seq}", std::process::id());
+    let temp = dir.join(format!("{stem}.tmp"));
+    let renamed = dir.join(format!("{stem}.ok"));
+
+    let outcome = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(b"manyproxy write probe\n")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &renamed)?;
+        std::fs::remove_file(&renamed)?;
+        Ok(())
+    })();
+
+    // Never leave a probe file behind, whichever step failed.
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_file(&renamed);
+
+    outcome.map_err(|error| format!("cannot write in {}: {error}", dir.display()))
+}
+
 pub(crate) const RULE_SETS_DIR_NAME: &str = "rule-sets";
 
 /// T-12: staged `.srs` rule sets live beside the app under `data\rule-sets\`
@@ -4040,6 +4071,11 @@ pub struct Store {
     db_path: Option<PathBuf>,
 }
 
+/// T-08: probe file names carry a process-wide sequence as well as a clock
+/// stamp, so two probes in the same nanosecond (tick plus save) never share a
+/// path.
+static WRITE_PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn swap_tmp_over_live(tmp: &Path, db_path: &Path) -> std::io::Result<()> {
     if std::fs::rename(tmp, db_path).is_ok() {
         return Ok(());
@@ -4184,6 +4220,29 @@ impl Store {
             }
         }
         app_data_dir().join("library.db")
+    }
+
+    /// T-08: the folder the library writes into. `None` for an in-memory
+    /// store — it has no folder, so it has nothing to lose.
+    pub(crate) fn data_dir(&self) -> Option<PathBuf> {
+        self.db_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+    }
+
+    /// T-08: the only honest test of writability is a write. The probe creates
+    /// a temp file inside the data folder, writes bytes, flushes them to the
+    /// OS, renames the file, then removes it. Metadata and a successful read
+    /// are not evidence: a read-only folder still reads. An in-memory store has
+    /// no folder to probe and answers `Ok(())` — the test suite and the
+    /// no-persistence fallback run on it, and a false banner there would be a
+    /// defect.
+    pub fn write_probe(&self) -> Result<(), String> {
+        match self.data_dir() {
+            Some(dir) => write_probe_in(&dir),
+            None => Ok(()),
+        }
     }
 
     fn open_with_path(conn: Connection, db_path: Option<PathBuf>) -> Result<Self, StoreError> {
@@ -17623,5 +17682,77 @@ mod tests {
             ],
             "only the unused extra leaves"
         );
+    }
+
+    fn probe_temp(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "manyproxy-t08-{tag}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    /// T-08: the probe is a write, not a metadata guess. A writable folder
+    /// answers clean and the probe file never survives the round trip.
+    #[test]
+    fn t08_write_probe_writes_and_cleans_up() {
+        let in_memory = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            in_memory.data_dir(),
+            None,
+            "an in-memory store has no data folder"
+        );
+        assert!(
+            in_memory.write_probe().is_ok(),
+            "an in-memory store probes clean — a false banner would be a defect"
+        );
+
+        let dir = probe_temp("probe");
+        std::fs::create_dir_all(&dir).expect("temp dir created");
+        let store = Store::open_file(&dir.join("library.db")).expect("file store opens");
+        assert_eq!(
+            store.data_dir().as_deref(),
+            Some(dir.as_path()),
+            "the probe folder is the database's own folder"
+        );
+        store
+            .write_probe()
+            .expect("a writable data folder probes clean");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("temp dir reads")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".mp-write-probe"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the probe removes its temp and renamed files: {leftovers:?}"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-08: a folder that refuses a write must say so, with the path, and must
+    /// not be inferred writable from anything else. A regular file is the
+    /// cheapest reliable refusal on every platform.
+    #[test]
+    fn t08_write_probe_reports_a_refused_write_with_the_path() {
+        let file = probe_temp("probe-file").with_extension("bin");
+        std::fs::write(&file, b"not a folder").expect("temp file writes");
+        let error = write_probe_in(&file).expect_err("a file path refuses the probe");
+        assert!(
+            error.contains(&file.display().to_string()),
+            "the reason names the folder path: {error}"
+        );
+        assert!(
+            file.is_file(),
+            "a failed probe never deletes anything it did not create"
+        );
+        let _ = std::fs::remove_file(&file);
     }
 }
