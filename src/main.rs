@@ -11968,6 +11968,19 @@ impl AppView {
         self.commit_enabled_flag(&id, enabled, window, cx);
     }
 
+    /// T-03: the one SOCKS copy. It reads the row by id and uses the STORED
+    /// bind host, so the row's own `Copy proxy` and the inspector's SOCKS
+    /// control always copy the row they belong to — never the selection.
+    pub(crate) fn copy_row_socks(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        let (socks, _) = proxy_urls(&config.bind_ip, config.port);
+        cx.write_to_clipboard(ClipboardItem::new_string(socks));
+        window.push_notification(Notification::success("Copied SOCKS URL"), cx);
+    }
+
     fn copy_single_endpoint_url(
         &mut self,
         which: EndpointUrl,
@@ -11975,9 +11988,14 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if let Some(config) = self.selected_config(cx) {
-            let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+            // T-03: SOCKS has one path — the row-scoped copy.
+            if matches!(which, EndpointUrl::Socks) {
+                self.copy_row_socks(&config.id, window, cx);
+                return;
+            }
+            let (_, http) = proxy_urls(&config.bind_ip, config.port);
             let (url, name) = match which {
-                EndpointUrl::Socks => (Some(socks), "SOCKS"),
+                EndpointUrl::Socks => (None, "SOCKS"),
                 EndpointUrl::Http => (Some(http), "HTTP"),
 
                 EndpointUrl::Upstream => (upstream_host_port(&config), "upstream"),

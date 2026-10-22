@@ -19366,6 +19366,29 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
     }
     assert!(pitch > 0., "the pitch is measurable");
 
+    // The row's only framed control besides the checkbox is Copy, and it
+    // holds its 72px cell.
+    let copy_label = cx.update(|window, _| {
+        window
+            .try_find(format!("row-copy-{}", ids[0]))
+            .and_then(|snapshot| snapshot.label().map(str::to_string))
+    });
+    assert!(
+        copy_label
+            .as_deref()
+            .is_some_and(|label| label.starts_with("Copy proxy")),
+        "the row carries a Copy proxy action, got {copy_label:?}"
+    );
+    let copy_width = cx.update(|window, _| {
+        window
+            .try_find(format!("row-copy-{}", ids[0]))
+            .map(|snapshot| snapshot.bounds().size.width.as_f32())
+    });
+    assert!(
+        copy_width.is_some_and(|width| width <= 72.),
+        "Copy holds its 72px cell, got {copy_width:?}"
+    );
+
     // Every header label sits at its column's first character.
     let pairs: [(&str, &str); 7] = [
         ("header-name", "row-name"),
@@ -19404,6 +19427,48 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
         checked += 1;
     }
     assert!(checked >= 4, "several columns are checked, got {checked}");
+}
+
+#[gpui_kit::test]
+fn t03_row_copy_proxy_copies_that_row(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10951"))
+        .expect("seed works");
+    let beta = store
+        .add(t30_engine_seed("Beta", "10952"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    // The OTHER row is selected: a selection-scoped copy would carry Beta.
+    select_library_row(&view, cx, &beta.id);
+    let alpha_bind = view.read_with(cx, |view, _| {
+        view.store
+            .get(&alpha.id)
+            .expect("store reads")
+            .expect("row")
+            .bind_ip
+    });
+    cx.update(|window, cx| {
+        window.click(format!("row-copy-{}", alpha.id), cx);
+    });
+    cx.run_until_parked();
+    let clip = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+            .to_string()
+    });
+    assert_eq!(
+        clip,
+        format!("socks5://{alpha_bind}:10951"),
+        "the row's own proxy URL is copied"
+    );
+    assert!(
+        !clip.contains("10952"),
+        "the selection's row never leaks into the copy: {clip}"
+    );
 }
 
 #[gpui_kit::test]

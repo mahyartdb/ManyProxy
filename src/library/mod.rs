@@ -1161,14 +1161,35 @@ impl ListDelegate for LibraryDelegate {
                         .into_any_element(),
                 );
             }
-            // The trailing cell holds the row-scoped copy action; the header
-            // strip reserves the same width, so the columns line up.
+            // T-03: the trailing cell holds the row-scoped copy action; the
+            // header strip reserves the same width, so the columns line up.
+            let copy_view = self.app_view.clone();
+            let copy_id = row_id.clone();
+            let copy_name = row.name.clone();
+            let copy_bind = row.bind_ip.clone();
+            let copy_port = row.port;
             cells.push(
                 div()
-                    .id(format!("row-copy-{row_id}"))
+                    .id(format!("row-copy-cell-{row_id}"))
                     .test_support()
                     .w(px(metrics.copy))
                     .flex_shrink_0()
+                    .child(
+                        Button::new(format!("row-copy-{row_id}"))
+                            .small()
+                            .label("Copy proxy")
+                            .accessibility_label(format!("Copy proxy URL for {copy_name}"))
+                            .tooltip(format!(
+                                "Copy this row's proxy URL — socks5://{copy_bind}:{copy_port}"
+                            ))
+                            .on_click(move |_, window, cx| {
+                                if let Some(app) = copy_view.clone() {
+                                    app.update(cx, |view, cx| {
+                                        view.copy_row_socks(&copy_id, window, cx);
+                                    });
+                                }
+                            }),
+                    )
                     .into_any_element(),
             );
             let header = div()

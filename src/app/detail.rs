@@ -712,6 +712,7 @@ impl AppView {
                     .max_w(px(620.))
                     .child(Self::endpoint_row(
                         cx,
+                        &config.id,
                         "upstream",
                         upstream,
                         "endpoint-value-upstream",
@@ -719,6 +720,7 @@ impl AppView {
                     ))
                     .child(Self::endpoint_row(
                         cx,
+                        &config.id,
                         "SOCKS",
                         socks_url,
                         "endpoint-value-socks",
@@ -726,6 +728,7 @@ impl AppView {
                     ))
                     .child(Self::endpoint_row(
                         cx,
+                        &config.id,
                         "HTTP",
                         http_url,
                         "endpoint-value-http",
@@ -737,6 +740,7 @@ impl AppView {
 
     pub(crate) fn endpoint_row(
         cx: &mut Context<Self>,
+        row_id: &str,
         label: &'static str,
         value: String,
         value_id: &'static str,
@@ -781,6 +785,9 @@ impl AppView {
                     "Copy upstream endpoint",
                 ),
             };
+            // T-03: SOCKS has one path — the row-scoped copy, which reads the
+            // row by id and never the selection.
+            let row_id = row_id.to_string();
             value_row = value_row.child(
                 div().flex_shrink_0().child(
                     Button::new(id)
@@ -789,7 +796,11 @@ impl AppView {
                         .accessibility_label(a11y)
                         .tooltip(tip)
                         .on_click(cx.listener(move |view, _, window, cx| {
-                            view.copy_single_endpoint_url(which, window, cx);
+                            if matches!(which, EndpointUrl::Socks) {
+                                view.copy_row_socks(&row_id, window, cx);
+                            } else {
+                                view.copy_single_endpoint_url(which, window, cx);
+                            }
                         })),
                 ),
             );
