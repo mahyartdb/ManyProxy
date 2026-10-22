@@ -11,6 +11,10 @@ pub(crate) const GIT_HASH: &str = match option_env!("MANYPROXY_GIT_HASH") {
     Some(hash) => hash,
     None => "unknown (dev build)",
 };
+/// T-04: the complete shortcut reference. Every entry here mirrors one
+/// `KeyBinding` in `bind_app_keys` (`src/keys.rs`) — the Settings → Shortcuts
+/// section and the reference below read from this ONE list, so the two can
+/// never drift apart. The order follows the binding table.
 pub(crate) const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Add configuration", "Ctrl-N"),
     ("Import configurations", "Ctrl-O"),
@@ -25,7 +29,11 @@ pub(crate) const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Inspector details", "Ctrl-1"),
     ("Inspector health", "Ctrl-2"),
     ("Inspector presets", "Ctrl-3"),
+    ("Inspector logs", "Ctrl-4"),
+    ("Inspector connections", "Ctrl-5"),
+    ("Inspector traffic", "Ctrl-6"),
     ("Uncheck all", "Esc"),
     ("Copy URLs", "Ctrl-U"),
     ("Command palette", "Ctrl-K"),
+    ("Update the group in focus", "Ctrl-R"),
 ];

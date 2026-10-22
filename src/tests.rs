@@ -26389,9 +26389,13 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Inspector details", "Ctrl-1"),
         ("Inspector health", "Ctrl-2"),
         ("Inspector presets", "Ctrl-3"),
+        ("Inspector logs", "Ctrl-4"),
+        ("Inspector connections", "Ctrl-5"),
+        ("Inspector traffic", "Ctrl-6"),
         ("Uncheck all", "Esc"),
         ("Copy URLs", "Ctrl-U"),
         ("Command palette", "Ctrl-K"),
+        ("Update the group in focus", "Ctrl-R"),
     ];
     assert_eq!(crate::SHORTCUT_LINES.len(), expected.len());
     for (line, want) in crate::SHORTCUT_LINES.iter().zip(expected) {
@@ -26929,6 +26933,71 @@ fn t67_shortcut_lines_lists_stop_testing_key() {
         1,
         "exactly one Stop Testing line"
     );
+}
+
+/// Every key the app binds in its own context, in the canonical form
+/// `KeyBinding::unparse` writes: lower-case modifiers, then the key.
+fn bound_key_strings(cx: &mut TestAppContext) -> Vec<String> {
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let map = keymap.borrow();
+        map.bindings()
+            .filter(|binding| {
+                binding
+                    .predicate()
+                    .map(|predicate| predicate.to_string() == crate::keys::APP_KEY_CONTEXT)
+                    .unwrap_or(false)
+            })
+            .map(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(|keystroke| keystroke.unparse())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    })
+}
+
+/// T-04: the reference form of a displayed key: `Ctrl-N` → `ctrl-n`,
+/// `Esc` → `escape`.
+fn canonical_shortcut(display: &str) -> String {
+    let lower = display.to_lowercase();
+    match lower.as_str() {
+        "esc" => "escape".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// T-04: the Shortcuts section lists EVERY binding `bind_app_keys` installs.
+/// The test reads the live keymap, so the list cannot silently drop a key —
+/// the old 16-line subset lost Ctrl-4/5/6 and Ctrl-R.
+#[gpui_kit::test]
+fn t04_shortcut_lines_cover_every_bound_key(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let added = bound_key_strings(cx);
+
+    assert_eq!(
+        added.len(),
+        crate::SHORTCUT_LINES.len(),
+        "the reference lists every binding: {added:?} vs {:?}",
+        crate::SHORTCUT_LINES
+    );
+    for (action, keys) in crate::SHORTCUT_LINES.iter() {
+        let canonical = canonical_shortcut(keys);
+        assert!(
+            added.contains(&canonical),
+            "{action} is bound as {canonical}: {added:?}"
+        );
+    }
+    for key in ["ctrl-4", "ctrl-5", "ctrl-6", "ctrl-r"] {
+        assert!(
+            added.contains(&key.to_string()),
+            "{key} is bound and must be listed"
+        );
+    }
 }
 
 #[gpui_kit::test]
