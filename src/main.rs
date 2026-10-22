@@ -1426,74 +1426,6 @@ impl AppView {
         self.store.get(id).ok().flatten()
     }
 
-    /// T-03: the one SOCKS copy. It reads the row by id and uses the STORED
-    /// bind host, so the row's own `Copy proxy` and the inspector's SOCKS
-    /// control always copy the row they belong to — never the selection.
-    pub(crate) fn copy_row_socks(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
-            return;
-        };
-        let (socks, _) = proxy_urls(&config.bind_ip, config.port);
-        cx.write_to_clipboard(ClipboardItem::new_string(socks));
-        window.push_notification(Notification::success("Copied SOCKS URL"), cx);
-    }
-
-    fn copy_single_endpoint_url(
-        &mut self,
-        which: EndpointUrl,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(config) = self.selected_config(cx) {
-            // T-03: SOCKS has one path — the row-scoped copy.
-            if matches!(which, EndpointUrl::Socks) {
-                self.copy_row_socks(&config.id, window, cx);
-                return;
-            }
-            let (_, http) = proxy_urls(&config.bind_ip, config.port);
-            let (url, name) = match which {
-                EndpointUrl::Socks => (None, "SOCKS"),
-                EndpointUrl::Http => (Some(http), "HTTP"),
-
-                EndpointUrl::Upstream => (upstream_host_port(&config), "upstream"),
-            };
-            match url {
-                Some(url) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(url));
-                    window
-                        .push_notification(Notification::success(format!("Copied {name} URL")), cx);
-                }
-                None => {
-                    window.push_notification(
-                        Notification::info(format!("No upstream endpoint for \"{}\"", config.name)),
-                        cx,
-                    );
-                }
-            }
-        } else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-        }
-    }
-
-    fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.selected_config(cx) else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        };
-        self.copy_row_urls(&config.id, window, cx);
-    }
-
-    fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
-            return;
-        };
-        let (socks, http) = proxy_urls(&config.bind_ip, config.port);
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
-        window.push_notification(Notification::success("Copied proxy URLs"), cx);
-    }
-
     /// Surfaces at most one engine-crash notification and drives the auto-restart
     /// policy. The pending cause lives in the controller, so this still sees a
     /// crash the 5 s tick already drained from the backend.
@@ -1578,37 +1510,6 @@ impl AppView {
         self.mark_clean_exit();
         self.save_window_geometry(window);
         self.close_confirmed = true;
-    }
-
-    /// T-32: mirrors the window rectangle into meta on the same orderly-exit
-    /// paths `snapshot_running_set` already uses. A killed process keeps the
-    /// last clean-exit save — the snapshot's own tolerance. Maximized
-    /// rectangles are not persisted (out of scope): the pre-maximize windowed
-    /// rect from the previous clean exit stays current.
-    fn save_window_geometry(&mut self, window: &Window) {
-        if !matches!(window.window_bounds(), WindowBounds::Windowed(_)) {
-            return;
-        }
-        let bounds = window.bounds();
-        let geometry = WindowGeometry {
-            x: f32::from(bounds.origin.x),
-            y: f32::from(bounds.origin.y),
-            width: f32::from(bounds.size.width),
-            height: f32::from(bounds.size.height),
-        };
-        if let Err(error) = self.store.set_window_geometry(geometry) {
-            eprintln!("window geometry save failed: {error}");
-        }
-    }
-
-    fn snapshot_running_set(&mut self, running: &[String]) {
-        if self.last_snapshot.as_slice() == running {
-            return;
-        }
-        self.last_snapshot = running.to_vec();
-        if let Err(error) = self.store.save_running_snapshot(running) {
-            eprintln!("running snapshot failed: {error}");
-        }
     }
 
     /// T-34: every orderly exit writes the marker right after its snapshot
@@ -1717,15 +1618,6 @@ impl AppView {
             }
             crate::tray::TrayAction::Quit => self.quit_from_tray(window),
         }
-    }
-
-    fn copy_config_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let folder = crate::tray::config_folder();
-        cx.write_to_clipboard(ClipboardItem::new_string(folder.clone()));
-        window.push_notification(
-            Notification::success(format!("Copied config folder path ({folder})")),
-            cx,
-        );
     }
 
     fn quit_from_tray(&mut self, window: &Window) {
@@ -2325,55 +2217,6 @@ impl AppView {
         lines
     }
 
-    fn write_visible_logs_to(&self, path: &std::path::Path, cx: &App) -> Result<(), String> {
-        let body = self.visible_log_lines(cx).join("\n");
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, body).map_err(|error| format!("Cannot save logs: {error}"))?;
-        std::fs::rename(&tmp, path).map_err(|error| format!("Cannot save logs: {error}"))?;
-        Ok(())
-    }
-
-    fn save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = Store::default_logs_path();
-        if path.exists() {
-            let view = cx.entity();
-            let description = logs_overwrite_text(&path);
-            open_app_alert_dialog(window, cx, move |alert, _, _| {
-                let view = view.clone();
-                let description = description.clone();
-                alert
-                    .confirm()
-                    .button_props(
-                        DialogButtonProps::default()
-                            .show_cancel(true)
-                            .ok_text("Overwrite")
-                            .ok_variant(ButtonVariant::Danger),
-                    )
-                    .title("Overwrite saved logs?")
-                    .description(description)
-                    .on_ok(move |_, window, cx| {
-                        view.update(cx, |view, cx| view.commit_save_visible_logs(window, cx));
-                        true
-                    })
-            });
-            return;
-        }
-        self.commit_save_visible_logs(window, cx);
-    }
-
-    fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let lines = self.visible_log_lines(cx);
-        if lines.is_empty() {
-            window.push_notification(Notification::warning("No log lines to copy"), cx);
-            return;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
-        window.push_notification(
-            Notification::success(format!("Copied {} log line(s)", lines.len())),
-            cx,
-        );
-    }
-
     fn set_log_level(
         &mut self,
         level: Option<LogLevel>,
@@ -2423,18 +2266,6 @@ impl AppView {
         })
     }
 
-    fn wipe_library_for_restore(&mut self) -> Result<(), StoreError> {
-        let subs = self.store.list_subscriptions()?;
-        for sub in &subs {
-            self.store.remove_subscription(&sub.id)?;
-        }
-        let rows = self.store.list()?;
-        for row in &rows {
-            self.store.remove(&row.id)?;
-        }
-        Ok(())
-    }
-
     fn set_row_column(
         &mut self,
         column: &'static str,
@@ -2461,104 +2292,6 @@ impl AppView {
             );
         }
         cx.notify();
-    }
-
-    fn paste_intake_refusal(text: &str) -> Option<&'static str> {
-        use crate::preset::{is_remote_route_attempt, is_route_attempt, looks_like_preset_json};
-        if text.trim().is_empty() {
-            return Some("Clipboard has no text to import");
-        }
-        if is_library_export(text) {
-            return None;
-        }
-        let trimmed = text.trim();
-        let single_line = !trimmed.contains('\n');
-        if single_line && is_addsub_attempt(trimmed) {
-            return None;
-        }
-        if single_line && (is_route_attempt(trimmed) || is_remote_route_attempt(trimmed)) {
-            return None;
-        }
-        if looks_like_preset_json(trimmed) {
-            return None;
-        }
-        if import_text(text).configs.is_empty() {
-            return Some(
-                "Clipboard text is not importable — nothing imported (paste a share link, JSON, conf, or preset link)",
-            );
-        }
-        None
-    }
-
-    fn import_dropped_files(
-        &mut self,
-        paths: &ExternalPaths,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if overlay_open(window, cx) {
-            window.push_notification(
-                Notification::warning(
-                    "Close the open dialog first — dropped files were not imported",
-                ),
-                cx,
-            );
-            return;
-        }
-        let mut merged = String::new();
-        let mut names: Vec<String> = Vec::new();
-        let mut files: Vec<(String, String)> = Vec::new();
-        let mut unreadable: Vec<String> = Vec::new();
-
-        for path in paths.0.iter() {
-            let display = path.to_string_lossy().into_owned();
-            match read_import_file(path) {
-                ImportFileRead::Text(content) => {
-                    if !merged.is_empty() {
-                        merged.push('\n');
-                    }
-                    merged.push_str(&content);
-                    names.push(display.clone());
-                    files.push((display, content));
-                }
-                ImportFileRead::Unreadable => {
-                    unreadable.push(file_basename(&display));
-                }
-                ImportFileRead::Refused(reason) => {
-                    unreadable.push(format!("{} ({reason})", file_basename(&display)));
-                }
-            }
-        }
-        if merged.trim().is_empty() {
-            if unreadable.is_empty() {
-                window.push_notification(Notification::warning("No readable files dropped"), cx);
-            } else {
-                window.push_notification(
-                    Notification::warning(unreadable_drop_message(&unreadable)),
-                    cx,
-                );
-            }
-            return;
-        }
-        if !unreadable.is_empty() {
-            window.push_notification(
-                Notification::warning(unreadable_drop_message(&unreadable)),
-                cx,
-            );
-        }
-        if names.len() == 1 {
-            let file_hint = names.into_iter().next();
-            self.open_import_dialog(&merged, DEFAULT_GROUP, file_hint, window, cx);
-        } else {
-            self.open_import_dialog_with_files(
-                &merged,
-                DEFAULT_GROUP,
-                None,
-                Some(files),
-                window,
-                cx,
-            );
-        }
     }
 
     fn browse_for_import_files(
@@ -2769,15 +2502,6 @@ impl AppView {
         cx.notify();
     }
 
-    fn import_parse_cancelled(&mut self, epoch: u64) -> bool {
-        if self.import_cancel_epoch == Some(epoch) {
-            self.import_cancel_epoch = None;
-            true
-        } else {
-            false
-        }
-    }
-
     fn try_addsub_commit(
         &mut self,
         resolved: &ResolvedImport,
@@ -2904,60 +2628,6 @@ impl AppView {
         } else {
             window.push_notification(notice, cx);
         }
-    }
-
-    fn take_batch_name_lists(&mut self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-        (
-            std::mem::take(&mut self.refresh_batch_added_names),
-            std::mem::take(&mut self.refresh_batch_updated_names),
-            std::mem::take(&mut self.refresh_batch_removed_names),
-            std::mem::take(&mut self.refresh_batch_in_use_names),
-        )
-    }
-
-    fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize, usize) {
-        self.refresh_batch_members.clear();
-        let total = std::mem::take(&mut self.refresh_batch_total);
-        let added = std::mem::take(&mut self.refresh_batch_added);
-        let updated = std::mem::take(&mut self.refresh_batch_updated);
-        let removed = std::mem::take(&mut self.refresh_batch_removed);
-        let failed = std::mem::take(&mut self.refresh_batch_failed);
-        let conflicts = std::mem::take(&mut self.refresh_batch_conflicts);
-        let in_use = std::mem::take(&mut self.refresh_batch_in_use);
-        self.refresh_batch_added_names.clear();
-        self.refresh_batch_updated_names.clear();
-        self.refresh_batch_removed_names.clear();
-        self.refresh_batch_in_use_names.clear();
-        (total, added, updated, removed, failed, conflicts, in_use)
-    }
-
-    fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
-        let (added_names, updated_names, removed_names, kept_in_use_names) =
-            self.take_batch_name_lists();
-        let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
-        let (warn, mut text) =
-            coalesced_refresh_message(total, added, updated, removed, failed, conflicts, in_use)
-                .unwrap_or((false, String::new()));
-        if text.is_empty() {
-            return;
-        }
-        if let Some(report) = refresh_named_report_block(
-            &added_names,
-            &updated_names,
-            &removed_names,
-            &kept_in_use_names,
-        ) {
-            text.push('\n');
-            text.push_str(&report);
-        }
-        window.push_notification(
-            if warn {
-                Notification::warning(text)
-            } else {
-                Notification::success(text)
-            },
-            cx,
-        );
     }
 
     fn refresh_subscription_by_id(
@@ -3261,39 +2931,6 @@ impl AppView {
         Ok(())
     }
 
-    /// Post-download staging shared by both finish variants: write the staged
-    /// bytes, then record the row (or refresh the identical row on re-download).
-    fn stage_rule_set_bytes(
-        &mut self,
-        grant: &RuleSetDownloadGrant,
-        bytes: Vec<u8>,
-    ) -> Result<PathBuf, String> {
-        std::fs::create_dir_all(&grant.dir)
-            .map_err(|error| format!("cannot create {}: {error}", grant.dir.display()))?;
-        let path = grant.dir.join(&grant.file_name);
-        std::fs::write(&path, &bytes)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        let existing = self
-            .store
-            .list_rule_sets()
-            .ok()
-            .and_then(|rows| rows.into_iter().find(|row| row.name == grant.name));
-        let recorded = match existing {
-            Some(row) => self
-                .store
-                .touch_rule_set(&row.id, &grant.url, bytes.len() as u64),
-            None => self
-                .store
-                .create_rule_set(&grant.name, &grant.url, bytes.len() as u64),
-        };
-        if let Err(error) = recorded {
-            let _ = std::fs::remove_file(&path);
-            return Err(error.to_string());
-        }
-        self.sync_presets_to_engine()?;
-        Ok(path)
-    }
-
     fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
         for sub in self.due_subscriptions() {
             self.start_subscription_refresh(sub, false, cx);
@@ -3559,57 +3196,6 @@ impl AppView {
     fn set_inspector_tab(&mut self, tab: InspectorTab) {
         self.inspector_tab = tab;
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
-    }
-
-    /// Writes the cell value to the clipboard (bind:port-safe display strings
-    /// only). Returns `false` without touching the clipboard for an empty value.
-    fn copy_connection_dest(
-        &mut self,
-        dest: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if dest.is_empty() {
-            window.push_notification(Notification::warning("No destination to copy"), cx);
-            return false;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(dest.to_string()));
-        true
-    }
-
-    /// Click-to-copy for a Connections cell: clipboard write plus a transient
-    /// inline `Copied!` marker anchored at the clicked cell. Repeat clicks reuse
-    /// the generation guard so the newest marker survives its full window.
-    fn copy_conn_cell(
-        &mut self,
-        target: ConnCopyTarget,
-        value: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.copy_connection_dest(value, window, cx) {
-            return;
-        }
-        self.conn_copied = Some(target);
-        self.conn_copied_generation = self.conn_copied_generation.wrapping_add(1);
-        let generation = self.conn_copied_generation;
-        cx.notify();
-        let weak = cx.entity().downgrade();
-        cx.spawn(async move |_entity, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(Self::CONN_COPIED_TOOLTIP_MS))
-                .await;
-            cx.update(|cx| {
-                weak.update(cx, |view, cx| {
-                    if view.conn_copied_generation == generation {
-                        view.conn_copied = None;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            });
-        })
-        .detach();
     }
 
     fn adjust_conn_column_widths(

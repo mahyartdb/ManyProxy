@@ -5,6 +5,7 @@ pub(crate) mod commit_engine;
 pub(crate) mod commit_forms;
 pub(crate) mod detail;
 pub(crate) mod engine_ops;
+pub(crate) mod io_ops;
 pub(crate) mod open;
 pub(crate) mod render;
 pub(crate) mod search;
