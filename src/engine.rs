@@ -5419,7 +5419,17 @@ pub(crate) fn normalize_bind_key(bind: &str) -> String {
     }
 }
 
-fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, String> {
+/// T-05: the bind probe with an explicit attempt cap.
+///
+/// The engine's apply path can afford ten tries with a short sleep
+/// between them (a port that was just released may still be settling).
+/// The store's auto-assignment cannot: it asks for ONE try and moves on,
+/// because a slow add is its own defect.
+pub(crate) fn probe_bind_available_with(
+    bind: &str,
+    port: u16,
+    attempts: u32,
+) -> Result<std::net::TcpListener, String> {
     static PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = PROBE_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
@@ -5433,17 +5443,24 @@ fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, 
             bind.trim().to_string()
         }
     };
+    let attempts = attempts.max(1);
     let mut last = format!("probe failed for {host}:{port}");
-    for _ in 0..10 {
+    for attempt in 0..attempts {
         match std::net::TcpListener::bind(format!("{host}:{port}")) {
             Ok(listener) => return Ok(listener),
             Err(error) => {
                 last = format!("{host}:{port} is already in use ({error})");
-                std::thread::sleep(Duration::from_millis(10));
+                if attempt + 1 < attempts {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
     }
     Err(last)
+}
+
+fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, String> {
+    probe_bind_available_with(bind, port, 10)
 }
 
 fn find_system_mutation_key(document: &serde_json::Value) -> Option<(String, String)> {

@@ -142,6 +142,45 @@ pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
     (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
 }
 
+/// T-05: how many bind attempts the auto-assignment's probe makes. The
+/// engine's own bind probe retries TEN times with a sleep between them; the
+/// store cannot afford that — a slow add is its own defect — so it tries
+/// ONCE and moves to the next candidate.
+pub const AUTO_PORT_PROBE_ATTEMPTS: u32 = 1;
+
+/// T-05: the auto-assignment asks the SOCKET, not only the DB. The DB knows
+/// which ports are ASSIGNED; the socket knows which are HELD. A port
+/// another process holds is skipped, so a new row never lands on a port
+/// that is already busy.
+///
+/// `taken` carries the ports the DB already assigns (the picked port joins
+/// it). The walk is bounded by the auto range itself, and every candidate
+/// costs one bind attempt.
+fn take_free_auto_port(
+    candidates: impl Iterator<Item = u16>,
+    taken: &mut HashSet<i64>,
+) -> Result<u16, &'static str> {
+    let mut held = false;
+    for port in candidates {
+        if taken.contains(&(port as i64)) {
+            continue;
+        }
+        if crate::engine::probe_bind_available_with(DEFAULT_BIND, port, AUTO_PORT_PROBE_ATTEMPTS)
+            .is_err()
+        {
+            held = true;
+            continue;
+        }
+        taken.insert(port as i64);
+        return Ok(port);
+    }
+    Err(if held {
+        "no automatic port left in the auto range (every free port is held by another process)"
+    } else {
+        "no automatic port left in the auto range"
+    })
+}
+
 pub fn is_auto_port(port: u16) -> bool {
     (AUTO_PORT_START..=AUTO_PORT_END).contains(&port)
         || (AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END).contains(&port)
@@ -4702,24 +4741,12 @@ impl Store {
         for item in fields {
             let port = match item.port {
                 Some(port) => port,
-                None => {
-                    let mut free = None;
-                    for candidate in auto_port_candidates() {
-                        if !taken.contains(&(candidate as i64)) {
-                            free = Some(candidate);
-                            break;
-                        }
+                None => match take_free_auto_port(auto_port_candidates(), &mut taken) {
+                    Ok(port) => port,
+                    Err(reason) => {
+                        return Err(StoreError::Invalid(vec![FieldError::new("port", reason)]));
                     }
-                    match free {
-                        Some(port) => port,
-                        None => {
-                            return Err(StoreError::Invalid(vec![FieldError::new(
-                                "port",
-                                "no automatic port left in the auto range",
-                            )]));
-                        }
-                    }
-                }
+                },
             };
             taken.insert(port as i64);
             assigned.push(ValidatedConfig {
@@ -6477,21 +6504,15 @@ impl Store {
             .filter(|row| !deleted_set.contains(row.id.as_str()))
             .map(|row| row.port as i64)
             .collect();
-        let mut next_free_port = || -> Option<u16> {
-            for port in auto_port_candidates() {
-                if !taken.contains(&(port as i64)) {
-                    taken.insert(port as i64);
-                    return Some(port);
-                }
-            }
-            None
+        let mut next_free_port = || -> Result<u16, &'static str> {
+            take_free_auto_port(auto_port_candidates(), &mut taken)
         };
         for (key, index, config) in &candidates {
             if consumed.contains(key) {
                 continue;
             }
             match next_free_port() {
-                Some(port) => {
+                Ok(port) => {
                     ops.push(Op::Insert {
                         key: key.clone(),
                         config: config.clone(),
@@ -6500,12 +6521,11 @@ impl Store {
                     outcome.added += 1;
                     outcome.added_names.push(config.name.clone());
                 }
-                None => {
+                Err(reason) => {
                     outcome.failures.push(crate::import::ImportFailure {
                         index: *index,
                         label: crate::import::redact_link(&config.name),
-                        reason: "port-exhausted: no automatic port left in the auto range"
-                            .to_string(),
+                        reason: format!("port-exhausted: {reason}"),
                         code: crate::import::ImportErrorKind::BadPort,
                     });
                 }
@@ -8482,15 +8502,8 @@ impl Store {
         if let Some(own) = exclude {
             taken.remove(&(own as i64));
         }
-        for port in auto_port_candidates() {
-            if !taken.contains(&(port as i64)) {
-                return Ok(port);
-            }
-        }
-        Err(StoreError::Invalid(vec![FieldError::new(
-            "port",
-            "no automatic port left in the auto range",
-        )]))
+        take_free_auto_port(auto_port_candidates(), &mut taken)
+            .map_err(|reason| StoreError::Invalid(vec![FieldError::new("port", reason)]))
     }
 
     fn validate_patch(
@@ -9284,6 +9297,50 @@ mod tests {
                 .expect("add works");
             assert!(ports.insert(created.port), "port reused: {}", created.port);
         }
+    }
+
+    /// T-05: the auto-assignment asks the SOCKET. A port held by a
+    /// listening temp socket is skipped, never handed out.
+    #[test]
+    fn t05_auto_assignment_skips_a_port_held_by_a_listening_socket() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let held_port = held.local_addr().expect("addr").port();
+        let spare = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let free_port = spare.local_addr().expect("addr").port();
+        drop(spare);
+        let mut taken: HashSet<i64> = HashSet::new();
+        let picked = take_free_auto_port(
+            std::iter::once(held_port).chain(std::iter::once(free_port)),
+            &mut taken,
+        )
+        .expect("a free port is still picked");
+        assert_eq!(picked, free_port, "the held port is skipped");
+        assert!(
+            taken.contains(&(free_port as i64)),
+            "the pick joins the taken set"
+        );
+        assert!(
+            !taken.contains(&(held_port as i64)),
+            "the held port is never handed out"
+        );
+    }
+
+    /// T-05: the add path skips a held port too — the row lands on the
+    /// next free auto port, never on the one the socket holds.
+    #[test]
+    fn t05_add_auto_port_skips_the_held_first_candidate() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let held = std::net::TcpListener::bind(format!("127.0.0.1:{AUTO_PORT_START}")).ok();
+        let created = store
+            .add(valid_input("Auto"))
+            .expect("the auto port still assigns");
+        assert_ne!(created.port, AUTO_PORT_START, "the held port is skipped");
+        assert!(
+            is_auto_port(created.port),
+            "still an auto port: {}",
+            created.port
+        );
+        drop(held);
     }
 
     #[test]
