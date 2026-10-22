@@ -45,6 +45,95 @@ pub const AUTO_PORT_END: u16 = 10999;
 pub const AUTO_PORT_SPILL_START: u16 = 18081;
 pub const AUTO_PORT_SPILL_END: u16 = 18380;
 
+/// T-04: the probe timeout's default, in seconds. It mirrors
+/// `health::URL_TEST_TIMEOUT`, and a test pins the two together.
+pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 3;
+/// T-04: the shortest probe timeout a user may pick. One second is the floor
+/// below which a slow endpoint could never answer at all.
+pub const MIN_PROBE_TIMEOUT_SECS: u64 = 1;
+/// T-04: the longest probe timeout a user may pick.
+pub const MAX_PROBE_TIMEOUT_SECS: u64 = 60;
+
+/// T-04: what the window's close button does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CloseAction {
+    /// Hide the window to the tray; the proxies keep running.
+    #[default]
+    Tray,
+    /// Stop every running profile and exit the app.
+    Quit,
+}
+
+impl CloseAction {
+    /// The value written to the store's meta table.
+    pub fn stored(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "tray",
+            CloseAction::Quit => "quit",
+        }
+    }
+
+    /// Reads a stored value back. Anything unknown is `None`, so the caller
+    /// falls back to the default instead of guessing.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "tray" => Some(CloseAction::Tray),
+            "quit" => Some(CloseAction::Quit),
+            _ => None,
+        }
+    }
+
+    /// The label the Settings radio shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "Close to tray",
+            CloseAction::Quit => "Quit the app",
+        }
+    }
+
+    /// The one-line explanation under the selected radio.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "The window closes and the proxies keep running in the tray.",
+            CloseAction::Quit => "Quitting stops every running profile and exits ManyProxy.",
+        }
+    }
+}
+
+/// T-04: which rows a "Test all" run covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TestAllScope {
+    /// Every running endpoint — the behaviour the app shipped with.
+    #[default]
+    Running,
+    /// Only the endpoints whose rows are checked.
+    Checked,
+}
+
+impl TestAllScope {
+    pub fn stored(self) -> &'static str {
+        match self {
+            TestAllScope::Running => "running",
+            TestAllScope::Checked => "checked",
+        }
+    }
+
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "running" => Some(TestAllScope::Running),
+            "checked" => Some(TestAllScope::Checked),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TestAllScope::Running => "Every running endpoint",
+            TestAllScope::Checked => "Checked endpoints only",
+        }
+    }
+}
+
 #[cfg(test)]
 pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
     + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize;
@@ -7944,6 +8033,93 @@ impl Store {
 
     pub fn set_skip_delete_confirm(&mut self, skip: bool) -> Result<(), StoreError> {
         self.set_meta(Self::META_SKIP_DELETE_CONFIRM, if skip { "1" } else { "0" })
+    }
+
+    pub const META_CLOSE_ACTION: &str = "close_action";
+
+    /// T-04: what the window's close button does. `Tray` hides the window and
+    /// leaves the proxies running; `Quit` stops every profile and exits. A
+    /// missing or corrupt value reads as `Tray` — the long-standing behaviour.
+    pub fn close_action(&self) -> CloseAction {
+        match self.get_meta(Self::META_CLOSE_ACTION) {
+            Ok(Some(raw)) => CloseAction::from_stored(&raw).unwrap_or_default(),
+            _ => CloseAction::default(),
+        }
+    }
+
+    pub fn set_close_action(&mut self, action: CloseAction) -> Result<(), StoreError> {
+        self.set_meta(Self::META_CLOSE_ACTION, action.stored())
+    }
+
+    pub const META_SEEN_TRAY_HINT: &str = "seen_tray_hint";
+
+    /// T-04: the one-time "still running in the tray" hint. Absent or corrupt
+    /// reads as not-seen, so the hint shows exactly once per library.
+    pub fn seen_tray_hint(&self) -> bool {
+        self.get_meta(Self::META_SEEN_TRAY_HINT)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_seen_tray_hint(&mut self, seen: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_SEEN_TRAY_HINT, if seen { "1" } else { "0" })
+    }
+
+    pub const META_PROBE_TIMEOUT_SECS: &str = "probe_timeout_secs";
+
+    /// T-04: how long one URL probe may take. A missing or out-of-range value
+    /// reads as the default, so a corrupt meta row never stalls a probe.
+    pub fn probe_timeout_secs(&self) -> u64 {
+        match self.get_meta(Self::META_PROBE_TIMEOUT_SECS) {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|secs| (MIN_PROBE_TIMEOUT_SECS..=MAX_PROBE_TIMEOUT_SECS).contains(secs))
+                .unwrap_or(DEFAULT_PROBE_TIMEOUT_SECS),
+            _ => DEFAULT_PROBE_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn set_probe_timeout_secs(&mut self, secs: u64) -> Result<(), StoreError> {
+        if !(MIN_PROBE_TIMEOUT_SECS..=MAX_PROBE_TIMEOUT_SECS).contains(&secs) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "probe_timeout_secs",
+                format!(
+                    "probe timeout must be {MIN_PROBE_TIMEOUT_SECS}-{MAX_PROBE_TIMEOUT_SECS} seconds"
+                ),
+            )]));
+        }
+        self.set_meta(Self::META_PROBE_TIMEOUT_SECS, &secs.to_string())
+    }
+
+    pub const META_TEST_ALL_SCOPE: &str = "test_all_scope";
+
+    /// T-04: which rows a "Test all" run covers. A missing or corrupt value
+    /// reads as `Running` — the behaviour the app shipped with.
+    pub fn test_all_scope(&self) -> TestAllScope {
+        match self.get_meta(Self::META_TEST_ALL_SCOPE) {
+            Ok(Some(raw)) => TestAllScope::from_stored(&raw).unwrap_or_default(),
+            _ => TestAllScope::default(),
+        }
+    }
+
+    pub fn set_test_all_scope(&mut self, scope: TestAllScope) -> Result<(), StoreError> {
+        self.set_meta(Self::META_TEST_ALL_SCOPE, scope.stored())
+    }
+
+    pub const META_LAST_UPDATE_CHECK: &str = "last_update_check";
+
+    /// T-04: when the update feed was last checked, as a Unix timestamp.
+    pub fn last_update_check(&self) -> Option<i64> {
+        match self.get_meta(Self::META_LAST_UPDATE_CHECK) {
+            Ok(Some(raw)) => raw.trim().parse::<i64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn set_last_update_check(&mut self, at: i64) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LAST_UPDATE_CHECK, &at.to_string())
     }
 
     pub const META_LIBRARY_COLUMNS: &str = "library_columns";

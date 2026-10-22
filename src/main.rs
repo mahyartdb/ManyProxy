@@ -106,12 +106,13 @@ use store::{
     prune_duplicates_confirm_text, prune_invalid_confirm_text, prune_unavailable_confirm_text,
     rewrite_server_to_ip, row_security_label, row_server_hostname, validate_extra_params,
     vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, AutoClearGroupConfig,
-    ChainHopSlot, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold,
-    HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig, ProxyConfig,
-    RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SortDirection, SshFold, Store, StoreError,
-    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
-    WindowGeometry, WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
-    VALID_PROTOCOLS,
+    ChainHopSlot, CloseAction, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot,
+    HttpFold, HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig,
+    ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SortDirection, SshFold,
+    Store, StoreError, Subscription as ProxySubscription, TestAllScope, TlsForcedFold,
+    TlsOptionalFold, TransportFold, TuicFold, WindowGeometry, WireguardFold, XrayFold,
+    DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROBE_TIMEOUT_SECS, DEFAULT_PROTOCOL,
+    MAX_PROBE_TIMEOUT_SECS, MIN_PROBE_TIMEOUT_SECS, VALID_PROTOCOLS,
 };
 
 #[cfg(windows)]
@@ -441,7 +442,8 @@ fn sheet_footer(
 
 fn footer_commit_label(dialog: &str) -> &'static str {
     match dialog {
-        "settings" | "groups" | "preset-attach" => "Close",
+        "settings" => "Done",
+        "groups" | "preset-attach" => "Close",
         "logs" => "Apply filter",
         "presets" | "subscriptions" | "add" => "Add",
         "edit" | "preset-edit" | "subscription-edit" => "Save",
@@ -10437,6 +10439,14 @@ struct AppView {
     log_inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
     log_cap_input: Option<Entity<InputState>>,
 
+    /// T-04: the Settings dialog's Enter-commit subscriptions. The dialog owns
+    /// its text fields, so the subscriptions live as long as it does.
+    settings_subscriptions: Vec<Subscription>,
+
+    /// T-04: the timestamp of the last update check, mirrored into the open
+    /// Settings dialog so the Updates section can show it.
+    settings_last_check: Option<Rc<RefCell<Option<i64>>>>,
+
     /// Captured just before a control-driven sheet swap. The live input text
     /// wins over the committed filter fields so typed-but-unapplied text
     /// survives the swap, then is consumed once on the next open.
@@ -10685,6 +10695,8 @@ impl AppView {
         // T-33: the first read seeds the address list once (constants + every
         // row's current bind); every later read is the stored extras alone.
         let bind_hosts = store.bind_hosts();
+        // T-04: the probe budget is the persisted one, not the built-in default.
+        let probe_timeout_secs = store.probe_timeout_secs();
         let libraries = cx.new(|cx| {
             ListState::new(LibraryDelegate::new(), window, cx)
                 .searchable(false)
@@ -10767,6 +10779,8 @@ impl AppView {
 
             log_inputs: None,
             log_cap_input: None,
+            settings_subscriptions: Vec::new(),
+            settings_last_check: None,
             log_reopen_draft: None,
 
             log_list: None,
@@ -10775,7 +10789,9 @@ impl AppView {
             traffic_last_seen: TrafficSeenMap::default(),
             traffic_tick_in_flight: false,
             traffic_mirror_hydrated: false,
-            prober: Box::new(RealHealthProber::default()),
+            prober: Box::new(RealHealthProber::new(std::time::Duration::from_secs(
+                probe_timeout_secs,
+            ))),
             ticks_enabled: true,
             refresh_batch_total: 0,
             refresh_batch_members: HashSet::new(),
@@ -13251,6 +13267,9 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.update_check_in_flight = false;
+        // T-04: the check happened — remember when, so the Settings → Updates
+        // section can say so.
+        self.record_update_check();
         cx.notify();
         match update_check_outcome(fetched) {
             Ok(outcome) => self.open_update_check_dialog(outcome, window, cx),
@@ -13262,6 +13281,18 @@ impl AppView {
                     cx,
                 );
             }
+        }
+    }
+
+    /// T-04: writes the check's timestamp into the store and mirrors it into
+    /// the open Settings dialog.
+    fn record_update_check(&mut self) {
+        let now = crate::store::now_unix();
+        if let Err(error) = self.store.set_last_update_check(now) {
+            eprintln!("update-check timestamp failed: {error}");
+        }
+        if let Some(cell) = &self.settings_last_check {
+            *cell.borrow_mut() = Some(now);
         }
     }
 
@@ -13618,6 +13649,22 @@ impl AppView {
     fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let Some(rows) = self.running_rows_or_notify(window, cx) else {
             return 0;
+        };
+        // T-04: the scope decides which running rows the run covers.
+        let rows = if self.store.test_all_scope() == TestAllScope::Checked {
+            let checked: HashSet<String> = self
+                .libraries
+                .read(cx)
+                .delegate()
+                .checked_rows()
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            rows.into_iter()
+                .filter(|row| checked.contains(&row.id))
+                .collect()
+        } else {
+            rows
         };
         if rows.is_empty() {
             window.push_notification(Notification::warning("No running endpoints to test"), cx);
@@ -19304,6 +19351,15 @@ impl AppView {
             let view_for_rows = view.clone();
             let close_view = close_view.clone();
             let mut body = div().flex().flex_col().gap_2();
+            // T-04: the preset inventory left Settings — it lives here, in the
+            // manager the Routing menu and the inspector pane link to.
+            body = body.child(
+                div()
+                    .id("presets-summary")
+                    .test_support()
+                    .text_sm()
+                    .child(preset_summary_text(Some(presets.len()))),
+            );
             if presets.is_empty() {
                 body = body.child(
                     "No routing presets yet — paste a throne://route link in Import, or create one below",
@@ -20785,9 +20841,16 @@ fn main() {
                         return true;
                     };
 
+                    // T-04: the close button does what the user chose in
+                    // Settings → General → Window behaviour. `Tray` hides the
+                    // window and leaves the proxies running; `Quit` stops
+                    // every profile and exits.
+                    let close_action = view.read_with(cx, |view, _| view.store.close_action());
                     let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
-                    if has_tray {
+                    if close_action == CloseAction::Tray && has_tray {
                         view.update(cx, |view, cx| view.hide_to_tray(window, cx));
+                        // T-04: the one-time hint that the app is still running.
+                        view.update(cx, |view, cx| view.show_tray_hint_once(window, cx));
                         return false;
                     };
                     match view.read_with(cx, |view, _| view.close_veto_text()) {

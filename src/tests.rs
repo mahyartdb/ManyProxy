@@ -9753,7 +9753,7 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
             "routing-menu",
             &[
                 ("routing-presets", "Routing presets"),
-                ("routing-open-settings", "Routing settings"),
+                ("routing-open-settings", "Settings"),
             ][..],
         ),
         (
@@ -10680,20 +10680,37 @@ fn ticket43_chrome_paints(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
+    // T-04: one modal, six sections, one visible at a time.
+    assert_painted(cx, "settings-rail-general");
+    assert_painted(cx, "settings-body-general");
+    assert_painted(cx, "settings-row-appearance");
+    assert_painted(cx, "settings-dialog-done");
+    assert_absent(cx, "settings-body-probing".to_string());
+    cx.update(|window, cx| {
+        window.click("settings-rail-probing", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
     assert_painted(cx, "field-settings-test-url");
     assert_painted(cx, "settings-save-test-url");
-    assert_painted(cx, "settings-section-startup");
-    assert_painted(cx, "settings-section-probe");
-
+    assert_absent(cx, "settings-body-general".to_string());
+    cx.update(|window, cx| {
+        window.click("settings-rail-engine", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_painted(cx, "settings-ticks");
+    assert_painted(cx, "settings-section-addresses");
+    cx.update(|window, cx| {
+        window.click("settings-rail-maintenance", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
     for id in [
-        "settings-ticks",
-        "settings-section-paths",
-        "settings-section-maintenance",
-        "settings-copy-db-path",
-        "settings-copy-export-path",
         "settings-clear-traffic",
         "settings-clear-health",
         "settings-clear-snapshot",
+        "settings-reset-library",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
@@ -13319,7 +13336,7 @@ fn honest_footer_labels_name_their_effect() {
             "Ticket 05: no bare OK footer ({dialog})"
         );
     }
-    assert_eq!(footer_commit_label("settings"), "Close");
+    assert_eq!(footer_commit_label("settings"), "Done");
     assert_eq!(footer_commit_label("groups"), "Close");
     assert_eq!(footer_commit_label("preset-attach"), "Close");
     assert_eq!(footer_commit_label("runtime-stats"), "Close");
@@ -13356,8 +13373,8 @@ fn single_close_footers_render_one_close_and_esc_closes(cx: &mut TestAppContext)
     paint_dialog_open(cx);
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     assert!(
-        cx.update(|window, _| window.try_find("settings-dialog-ok").is_some()),
-        "Settings renders its Close"
+        cx.update(|window, _| window.try_find("settings-dialog-done").is_some()),
+        "Settings renders its Done"
     );
     assert!(
         cx.update(|window, _| window.try_find("settings-dialog-cancel").is_none()),
@@ -13429,7 +13446,7 @@ fn honest_footers_close_silently_without_side_effects(cx: &mut TestAppContext) {
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     let before = notification_count(cx);
     cx.update(|window, cx| {
-        window.click("settings-dialog-ok", cx);
+        window.click("settings-dialog-done", cx);
     });
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -21949,7 +21966,7 @@ fn appearance_mapping_and_summaries() {
 }
 
 #[gpui_kit::test]
-fn settings_dialog_has_four_sections_and_appearance(cx: &mut TestAppContext) {
+fn settings_dialog_has_six_sections_and_appearance(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     assert_eq!(store.appearance(), "dark", "fresh store reads dark");
@@ -21959,52 +21976,100 @@ fn settings_dialog_has_four_sections_and_appearance(cx: &mut TestAppContext) {
     });
     paint_dialog_open(cx);
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-    let sections = [
-        "settings-section-basic",
-        "settings-section-routing",
-        "settings-section-preset",
-        "settings-section-hotkey",
+    // T-04: six named sections in the left rail.
+    let rail = [
+        "settings-rail-general",
+        "settings-rail-probing",
+        "settings-rail-updates",
+        "settings-rail-engine",
+        "settings-rail-maintenance",
+        "settings-rail-shortcuts",
     ];
-    for id in sections {
+    for id in rail {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
             "{id} renders"
         );
     }
-    let tops: Vec<f32> = sections
+    let tops: Vec<f32> = rail
         .iter()
         .map(|id| cx.update(|window, _| window.find(*id).bounds().origin.y.as_f32()))
         .collect();
     assert!(
         tops.windows(2).all(|pair| pair[0] < pair[1]),
-        "sections read Basic | Routing | Preset | Hotkey top to bottom: {tops:?}"
+        "the rail reads General | Probing | Updates | Engine | Maintenance | Shortcuts top to bottom: {tops:?}"
+    );
+    // T-04: the body shows ONE section at a time.
+    assert!(
+        cx.update(|window, _| window.try_find("settings-body-general").is_some()),
+        "General is the section that opens"
     );
     for id in [
-        "settings-appearance-caption",
+        "settings-body-probing",
+        "settings-body-updates",
+        "settings-body-engine",
+        "settings-body-maintenance",
+        "settings-body-shortcuts",
+    ] {
+        assert_absent(cx, id.to_string());
+    }
+    for id in [
+        "settings-row-appearance",
         "settings-appearance-group",
-        "settings-appearance-note",
-        "settings-section-startup",
-        "settings-section-probe",
-        "settings-section-paths",
-        "settings-section-maintenance",
-        "settings-routing-summary",
-        "settings-open-routing-presets",
-        "settings-routing-note",
-        "settings-preset-summary",
-        "settings-preset-note",
-        "settings-hotkey-list",
+        "settings-row-window-behaviour",
+        "settings-row-autostart",
+        "settings-row-restore",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
             "{id} renders"
         );
     }
+    // T-04: the Routing and Preset summaries left Settings; the presets
+    // manager is reached from the Routing menu and the inspector pane.
+    for id in [
+        "settings-routing-summary",
+        "settings-open-routing-presets",
+        "settings-preset-summary",
+        "settings-section-hotkey",
+    ] {
+        assert_absent(cx, id.to_string());
+    }
+    // T-04: each rail entry opens its own section.
+    for (rail_id, body_id) in [
+        ("settings-rail-probing", "settings-body-probing"),
+        ("settings-rail-updates", "settings-body-updates"),
+        ("settings-rail-engine", "settings-body-engine"),
+        ("settings-rail-maintenance", "settings-body-maintenance"),
+        ("settings-rail-shortcuts", "settings-body-shortcuts"),
+    ] {
+        cx.update(|window, cx| {
+            window.click(rail_id, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find(body_id).is_some()),
+            "{rail_id} opens {body_id}"
+        );
+        assert_absent(cx, "settings-body-general".to_string());
+    }
+    // T-04: the Shortcuts section reads the one reference list.
+    assert!(
+        cx.update(|window, _| window.try_find("settings-shortcuts-list").is_some()),
+        "the Shortcuts section renders its list"
+    );
+    assert_eq!(
+        crate::SHORTCUT_LINES.len(),
+        20,
+        "the reference lists every binding the app installs"
+    );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
 }
 
 #[gpui_kit::test]
-fn routing_menu_links_into_settings(cx: &mut TestAppContext) {
+fn routing_menu_links_into_the_presets_manager(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
@@ -22016,9 +22081,42 @@ fn routing_menu_links_into_settings(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert!(
+        cx.update(|window, _| window.try_find("routing-presets").is_some()),
+        "routing-presets renders in the Routing menu"
+    );
+    assert!(
         cx.update(|window, _| window.try_find("routing-open-settings").is_some()),
         "routing-open-settings renders in the Routing menu"
     );
+    // T-04: the routing summary left Settings — the Routing menu links into
+    // the presets manager instead, and the link is not dead.
+    cx.update(|window, cx| {
+        window.click("routing-presets", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "the Routing menu opens the presets manager"
+    );
+    assert!(
+        cx.update(|window, _| window.try_find("presets-dialog-ok").is_some()),
+        "the presets manager renders its own footer"
+    );
+    assert!(
+        cx.update(|window, _| window.try_find("presets-summary").is_some()),
+        "the presets manager carries the inventory the Settings dialog gave up"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        window.click("routing-menu", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
     cx.update(|window, cx| {
         window.click("routing-open-settings", cx);
     });
@@ -22029,8 +22127,8 @@ fn routing_menu_links_into_settings(cx: &mut TestAppContext) {
         "Routing settings opens the Settings dialog"
     );
     assert!(
-        cx.update(|window, _| window.try_find("settings-section-routing").is_some()),
-        "the dialog carries the Routing section"
+        cx.update(|window, _| window.try_find("settings-rail-general").is_some()),
+        "the dialog carries the section rail"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -24314,22 +24412,40 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
     });
 
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    // T-04: General carries appearance, startup and the close behaviour; the
+    // engine rows live in the Engine section.
     for id in [
-        "settings-autostart",
+        "settings-row-autostart",
         "settings-autostart-switch",
-        "settings-autostart-note",
-        "settings-restore",
+        "settings-row-autostart-help",
+        "settings-row-restore",
         "settings-restore-switch",
-        "settings-restore-note",
-        "settings-section-engine",
-        "settings-auto-restart",
-        "settings-auto-restart-switch",
-        "settings-auto-restart-note",
-        "settings-tray-note",
+        "settings-row-restore-help",
+        "settings-row-window-behaviour",
+        "settings-row-skip-delete",
+        "settings-skip-delete-switch",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
             "settings dialog renders {id}"
+        );
+    }
+    cx.update(|window, cx| {
+        window.click("settings-rail-engine", cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    for id in [
+        "settings-row-auto-restart",
+        "settings-auto-restart-switch",
+        "settings-row-auto-restart-help",
+    ] {
+        assert!(
+            cx.update(|window, _| window.try_find(id).is_some()),
+            "the Engine section renders {id}"
         );
     }
 }
@@ -27337,7 +27453,6 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
-    use gpui_kit::point;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -27353,56 +27468,65 @@ fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
         });
         paint_dialog_open(cx);
 
-        assert_painted(cx, "settings-section-startup");
-        assert_painted(cx, "settings-section-probe");
-        let (startup_top, probe_top) = cx.update(|window, _| {
+        // T-04: the rail reads top to bottom and the body carries one section.
+        let (general_top, probing_top) = cx.update(|window, _| {
             (
                 window
-                    .try_find("settings-section-startup".to_string())
-                    .expect("startup renders")
+                    .try_find("settings-rail-general".to_string())
+                    .expect("general renders")
                     .bounds()
                     .origin
                     .y,
                 window
-                    .try_find("settings-section-probe".to_string())
-                    .expect("probe renders")
+                    .try_find("settings-rail-probing".to_string())
+                    .expect("probing renders")
                     .bounds()
                     .origin
                     .y,
             )
         });
         assert!(
-            startup_top < probe_top,
-            "Startup keeps its fold slot above Probe"
+            general_top < probing_top,
+            "General keeps its slot above Probing"
         );
-
         assert!(
-            cx.update(|window, _| window.try_find("settings-ticks".to_string()).is_some()),
-            "Timers renders"
+            cx.update(|window, _| window.try_find("settings-ticks".to_string()).is_none()),
+            "the Engine section is not painted while General is open"
         );
 
+        // Maintenance is the longest section; its last row must clear the
+        // footer button in every frame.
+        cx.update(|window, cx| {
+            window.click("settings-rail-maintenance", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        // Maintenance is the longest section; its tail scrolls into view and
+        // must still clear the footer in every frame.
         cx.update(|window, cx| {
             window.scroll(
-                "settings-section-probe",
-                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                "settings-body",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-100_000.))),
                 cx,
             );
         });
         cx.run_until_parked();
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            window.render_frame(cx);
-        });
-        assert_painted(cx, "settings-tray-note");
-        let (tail_bottom, footer_top) = cx.update(|window, _| {
+        paint_dialog_open(cx);
+        assert_painted(cx, "settings-reset-library");
+        let (tail_bottom, body_bottom, footer_top) = cx.update(|window, _| {
             (
                 window
-                    .try_find("settings-tray-note".to_string())
+                    .try_find("settings-reset-library".to_string())
                     .expect("tail renders")
                     .bounds()
                     .bottom(),
                 window
-                    .try_find("settings-dialog-ok".to_string())
+                    .try_find("settings-body".to_string())
+                    .expect("the body renders")
+                    .bounds()
+                    .bottom(),
+                window
+                    .try_find("settings-dialog-done".to_string())
                     .expect("footer renders")
                     .bounds()
                     .origin
@@ -27410,8 +27534,12 @@ fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
             )
         });
         assert!(
-            tail_bottom + px(24.) <= footer_top,
-            "tail clears the footer by the body pad: tail {tail_bottom:?} vs footer {footer_top:?}"
+            tail_bottom <= body_bottom,
+            "the tail sits inside the scrolling body: tail {tail_bottom:?} vs body {body_bottom:?}"
+        );
+        assert!(
+            body_bottom <= footer_top,
+            "the section body clears the footer: body {body_bottom:?} vs footer {footer_top:?}"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
@@ -29602,6 +29730,193 @@ fn t80_no_sampling_race_after_restart() {
     assert_eq!(rings["stock"].ram, vec![31.0, 32.0]);
 }
 
+/// T-04: the close behaviour is a persisted setting. A fresh store reads the
+/// default (`Tray` — the window closes and the proxies keep running), and the
+/// choice survives a round trip through the meta table.
+#[test]
+fn t04_close_action_round_trips_and_defaults_to_tray() {
+    use crate::store::{CloseAction, Store};
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    assert_eq!(
+        store.close_action(),
+        CloseAction::Tray,
+        "a fresh library closes to the tray"
+    );
+    store
+        .set_close_action(CloseAction::Quit)
+        .expect("the choice stores");
+    assert_eq!(
+        store.close_action(),
+        CloseAction::Quit,
+        "the choice round-trips"
+    );
+    assert_eq!(
+        store
+            .get_meta(Store::META_CLOSE_ACTION)
+            .expect("meta reads"),
+        Some("quit".to_string()),
+        "the meta row carries the choice"
+    );
+    store
+        .set_close_action(CloseAction::Tray)
+        .expect("the choice stores back");
+    assert_eq!(store.close_action(), CloseAction::Tray);
+    // A corrupt meta row reads as the default, never as a guess.
+    store
+        .set_meta(Store::META_CLOSE_ACTION, "nonsense")
+        .expect("meta writes");
+    assert_eq!(
+        store.close_action(),
+        CloseAction::Tray,
+        "a corrupt value reads as the default"
+    );
+}
+
+/// T-04: the tray hint shows exactly once. The flag is written before the
+/// toast goes out, so a second hide never repeats it.
+#[gpui_kit::test]
+fn t04_tray_hint_shows_exactly_once(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.store.seen_tray_hint()),
+        "a fresh library has not seen the hint"
+    );
+    let before = notification_count(cx);
+    let first =
+        cx.update(|window, cx| view.update(cx, |view, cx| view.show_tray_hint_once(window, cx)));
+    assert!(first, "the first hide shows the hint");
+    assert_eq!(notification_count(cx), before + 1, "one toast");
+    assert!(
+        view.read_with(cx, |view, _| view.store.seen_tray_hint()),
+        "the flag is persisted"
+    );
+    let second =
+        cx.update(|window, cx| view.update(cx, |view, cx| view.show_tray_hint_once(window, cx)));
+    assert!(!second, "the second hide stays quiet");
+    assert_eq!(notification_count(cx), before + 1, "no second toast");
+}
+
+/// T-04: the Settings dialog's Window behaviour row writes the persisted
+/// choice, and the radio shows it.
+#[gpui_kit::test]
+fn t04_settings_window_behaviour_saves_the_choice(cx: &mut TestAppContext) {
+    use crate::store::CloseAction;
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    assert_painted(cx, "settings-row-window-behaviour");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_close_action(CloseAction::Quit, window, cx),
+                "the choice commits"
+            );
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.close_action()),
+        CloseAction::Quit,
+        "the choice is persisted"
+    );
+}
+
+/// T-04: the dialog's geometry, measured. The update-feed URL shapes to
+/// 520.8 px at the input's 14 px text size; the field is wider than that, so
+/// the value renders in full instead of clipping mid-URL. Buttons size to
+/// their content and sit against the body's right edge.
+#[gpui_kit::test]
+fn t04_settings_dialog_geometry_holds_the_feed_url(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+
+    // The feed URL's own width at the text size the input paints.
+    let feed = crate::UPDATE_FEED_URL_DEFAULT.to_string();
+    let shaped = cx.update(|window, _| {
+        let style = window.text_style();
+        let mut font = gpui_kit::font(style.font_family.clone());
+        font.weight = style.font_weight;
+        font.style = style.font_style;
+        let runs = vec![gpui_kit::TextRun {
+            len: feed.len(),
+            font,
+            color: gpui_kit::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        window
+            .text_system()
+            .shape_line(feed.clone().into(), px(14.), &runs, None)
+            .width
+    });
+    assert!(shaped > px(400.), "the feed URL really is long: {shaped:?}");
+
+    cx.update(|window, cx| {
+        window.click("settings-rail-updates", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+
+    let dialog_width = cx
+        .debug_bounds("dialog-0")
+        .map(|bounds| bounds.size.width)
+        .expect("the dialog paints");
+    assert_eq!(
+        dialog_width,
+        px(820.),
+        "the dialog keeps its measured width"
+    );
+
+    let (field_width, body_width) = cx.update(|window, _| {
+        (
+            window
+                .try_find("field-settings-update-feed".to_string())
+                .map(|snapshot| snapshot.bounds().size.width),
+            window
+                .try_find("settings-body".to_string())
+                .map(|snapshot| snapshot.bounds().size.width),
+        )
+    });
+    let field_width = field_width.expect("the feed field renders");
+    let body_width = body_width.expect("the body renders");
+    // The kit's input adds 10 px of padding on each side.
+    assert!(
+        field_width >= shaped + px(20.),
+        "the feed URL renders in full: field {field_width:?} vs text {shaped:?}"
+    );
+
+    // The commit button sizes to its content and sits against the right edge.
+    let (save_width, save_right, body_right) = cx.update(|window, _| {
+        let save = window
+            .try_find("settings-save-update-feed".to_string())
+            .expect("the Save button renders")
+            .bounds();
+        let body = window
+            .try_find("settings-body".to_string())
+            .expect("the body renders")
+            .bounds();
+        (save.size.width, save.right(), body.right())
+    });
+    assert!(
+        save_width < body_width,
+        "the button does not stretch: {save_width:?} vs body {body_width:?}"
+    );
+    assert_eq!(save_right, body_right, "the button is right-aligned");
+}
+
 #[gpui_kit::test]
 fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
@@ -29779,8 +30094,13 @@ fn t83_hostname_rejected_in_list_editor(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
+    // T-04: the address list lives in the Engine section.
+    cx.update(|window, cx| {
+        window.click("settings-rail-engine", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
     for id in [
-        "settings-section-addresses",
         "settings-addresses-note",
         "settings-bind-host-127.0.0.1",
         "settings-bind-host-builtin-127.0.0.1",

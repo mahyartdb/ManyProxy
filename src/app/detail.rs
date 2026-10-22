@@ -1738,6 +1738,30 @@ impl AppView {
                                         .test_support()
                                         .into_any_element()
                                 }),
+                        )
+                        // T-04: the routing inventory left Settings — the pane
+                        // that talks about presets now carries it, next to the
+                        // link into the manager that edits the rules.
+                        .child({
+                            let presets = self.store.list_presets().ok().map(|list| list.len());
+                            let attached = self.store.list().ok().map(|rows| {
+                                rows.iter().filter(|row| row.preset_id.is_some()).count()
+                            });
+                            div()
+                                .id("preset-inventory")
+                                .test_support()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(routing_summary_text(presets, attached))
+                        })
+                        .child(
+                            Button::new("preset-open-manager")
+                                .small()
+                                .label("Manage presets")
+                                .tooltip("Open the routing presets manager")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.open_presets_dialog(window, cx);
+                                })),
                         ),
                 ),
             )

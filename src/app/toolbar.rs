@@ -385,9 +385,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "routing-open-settings",
-                                    "Routing settings",
-                                    "Routing settings",
-                                    "Open Settings at the Routing section",
+                                    "Settings",
+                                    "Settings",
+                                    "Open Settings",
                                     None,
                                 )
                             })
