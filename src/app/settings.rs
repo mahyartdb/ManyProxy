@@ -1469,7 +1469,9 @@ impl AppView {
             }
         }
         self.libraries.update(cx, |state, cx| {
-            state.delegate_mut().clear_selection();
+            // T-06: the reset clears the list's own selection too, so UIA
+            // stops naming a row that no longer exists.
+            state.set_selected_index(None, window, cx);
             state.delegate_mut().clear_checked();
             cx.notify();
         });

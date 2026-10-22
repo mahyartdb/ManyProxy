@@ -11851,7 +11851,7 @@ fn t01_checked_positions_and_selection_stay_distinct() {
     delegate.toggle_checked("1");
     assert_eq!(delegate.checked_position("3"), Some(1));
     assert_eq!(delegate.bulk_label(), "1 checked (of 3 visible)");
-    delegate.clear_selection();
+    delegate.selected = None;
     assert_eq!(
         delegate.checked.len(),
         1,
@@ -23805,7 +23805,7 @@ fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().clear_selection();
+                state.delegate_mut().selected = None;
                 list_cx.notify();
             });
         });
@@ -30905,4 +30905,115 @@ fn t06_selected_row_wears_the_kit_focus_ring(cx: &mut TestAppContext) {
         "the shell can take the keyboard back"
     );
     assert_painted(cx, &format!("row-card-{}", seeded.id));
+}
+
+/// T-06: once the list holds the keyboard, Up/Down walk the rows, and the
+/// selection the kit reports to UIA is the one the delegate renders.
+#[gpui_kit::test]
+fn t06_list_arrows_traverse_and_report_the_selected_row(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Beta", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // Anchor the selection at the first row, then give the list the keyboard.
+    let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, state_cx| {
+                state.set_selected_index(Some(IndexPath::new(0)), window, state_cx);
+            });
+        });
+        window.focus(&list_handle, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    fn press(cx: &mut VisualTestContext, key: &str) {
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        cx.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
+
+    press(cx, "down");
+    let (kit_index, delegate_index, second_id) = view.read_with(cx, |view, cx| {
+        let state = view.libraries.read(cx);
+        let delegate = state.delegate();
+        let second = delegate
+            .visible
+            .get(1)
+            .and_then(|&row| delegate.rows.get(row))
+            .map(|row| row.id.clone());
+        (state.selected_index(), delegate.selected, second)
+    });
+    assert_eq!(
+        kit_index,
+        Some(IndexPath::new(1)),
+        "Down moves the list's own selection - the value aria_selected and ListItem::selected are computed from"
+    );
+    assert_eq!(
+        delegate_index,
+        Some(IndexPath::new(1)),
+        "the delegate renders the row the kit selected"
+    );
+    let second_id = second_id.expect("second row exists");
+    assert_painted(cx, &format!("row-card-{second_id}"));
+
+    press(cx, "up");
+    let kit_index = view.read_with(cx, |view, cx| view.libraries.read(cx).selected_index());
+    assert_eq!(kit_index, Some(IndexPath::new(0)), "Up walks back");
+}
+
+/// T-06: removing the selected row clears the list's own selection too, so UIA
+/// stops naming a row that no longer exists.
+#[gpui_kit::test]
+fn t06_removing_the_selected_row_clears_the_lists_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let doomed = store
+        .add(facet_seed("Doomed", "vless", "team", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Keeper", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    select_library_row(&view, cx, &doomed.id);
+    let before = view.read_with(cx, |view, cx| view.libraries.read(cx).selected_index());
+    assert!(
+        before.is_some(),
+        "the click selects the row in the list itself"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_remove(&doomed.id, window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let (kit_index, delegate_index) = view.read_with(cx, |view, cx| {
+        let state = view.libraries.read(cx);
+        (state.selected_index(), state.delegate().selected)
+    });
+    assert_eq!(
+        kit_index, None,
+        "the removed row is no longer the list's selection"
+    );
+    assert_eq!(delegate_index, None, "the delegate agrees");
+    assert_absent(cx, format!("row-card-{}", doomed.id));
 }

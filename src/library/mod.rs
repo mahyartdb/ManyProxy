@@ -738,10 +738,6 @@ impl LibraryDelegate {
         self.selected.and_then(|index| self.row_at(index))
     }
 
-    pub(crate) fn clear_selection(&mut self) {
-        self.selected = None;
-    }
-
     pub(crate) fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
         self.refresh_search_words();

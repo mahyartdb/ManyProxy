@@ -11548,7 +11548,9 @@ impl AppView {
             Ok(true) => {
                 if self.selected_config(cx).map(|row| row.id).as_deref() == Some(id) {
                     self.libraries.update(cx, |state, list_cx| {
-                        state.delegate_mut().clear_selection();
+                        // T-06: clear through the list so the kit's own index
+                        // (and the UIA selection it reports) drops the row too.
+                        state.set_selected_index(None, window, list_cx);
 
                         list_cx.notify();
                     });
@@ -17175,18 +17177,30 @@ impl AppView {
                 if !outcome.imported_ids.is_empty() {
                     let first = outcome.imported_ids.clone();
                     self.libraries.update(cx, |list_state, list_cx| {
-                        let delegate = list_state.delegate_mut();
-                        delegate.check_ids(&first);
-                        if let Some(pos) = first.iter().find_map(|id| {
-                            delegate.visible.iter().position(|&visible_ix| {
-                                delegate
-                                    .rows
-                                    .get(visible_ix)
-                                    .map(|row| &row.id == id)
-                                    .unwrap_or(false)
+                        let picked = {
+                            let delegate = list_state.delegate_mut();
+                            delegate.check_ids(&first);
+                            first.iter().find_map(|id| {
+                                delegate.visible.iter().position(|&visible_ix| {
+                                    delegate
+                                        .rows
+                                        .get(visible_ix)
+                                        .map(|row| &row.id == id)
+                                        .unwrap_or(false)
+                                })
                             })
-                        }) {
-                            delegate.selected = Some(IndexPath::new(pos));
+                        };
+                        // T-06: selection belongs to the list, not to a
+                        // delegate field the kit never sees. Routing it
+                        // through the list's own setter is what makes
+                        // `ListItem::selected` and `aria_selected` name the
+                        // imported row.
+                        if let Some(pos) = picked {
+                            list_state.set_selected_index(
+                                Some(IndexPath::new(pos)),
+                                window,
+                                list_cx,
+                            );
                         }
                         list_cx.notify();
                     });
