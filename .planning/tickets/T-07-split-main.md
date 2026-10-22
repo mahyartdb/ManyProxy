@@ -69,6 +69,27 @@ After 2g, `main.rs` holds only: the inner attributes (`#![recursion_limit]`,
 `#![cfg_attr(windows, windows_subsystem = "windows")]`), the `mod` declarations, the crate-root
 `use …::*;` seams, `fn main`, and the crash hook — target ≈150 lines.
 
+### Slice 2g's scan re-point (do it exactly this way)
+
+`direct_overlay_calls` asserts `stripped.matches(marker).count() == 1` — exactly once, per
+marker, inside whatever source it is handed. Moving the eight boot functions out of `main.rs`
+therefore fails loudly with `marker names exactly one function` (count 0), which is correct.
+
+Re-point by composing the scanned set, not by dropping markers and not by scanning only one file:
+
+```rust
+let source = format!(
+    "{}\n{}",
+    include_str!("main.rs"),
+    include_str!("app/bootstrap.rs"),
+);
+let found = direct_overlay_calls(&source, &BOOT_FUNCTIONS);
+```
+
+The exactly-once assertion stays byte-for-byte as it is. The CRLF pin composes the SAME set
+before converting endings. If a later slice moves a boot function again, add its file to the
+same `format!` — never split the assertion, never scope it per file.
+
 ## Traps (verified — do not skip)
 
 1. **Boot-path source scan.** `include_str!("main.rs")` ×2 (`52547`, `52562`);
