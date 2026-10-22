@@ -1,5 +1,8 @@
 pub(crate) mod bootstrap;
 pub(crate) mod bulk;
+pub(crate) mod commit_async;
+pub(crate) mod commit_engine;
+pub(crate) mod commit_forms;
 pub(crate) mod detail;
 pub(crate) mod open;
 pub(crate) mod render;
