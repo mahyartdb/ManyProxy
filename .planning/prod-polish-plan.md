@@ -32,18 +32,30 @@ Status: planning. Evidence sources: live UIA screenshots of build `66e33ff`, cod
 
 ## Steps
 
-1. [ ] Console subsystem + sidecar `CREATE_NO_WINDOW`; verify PE subsystem = 2 on a fresh
+1. [x] Console subsystem + sidecar `CREATE_NO_WINDOW`; verify PE subsystem = 2 on a fresh
        release build and that no console appears on launch.
-2. [ ] Shortcut purge across every label/aria/tooltip source; keep keys working; add or
+       — `c88b111`, `69caa13`; proven both ways (old build spawned a `conhost.exe` child,
+       new build spawns none).
+2. [x] Shortcut purge across every label/aria/tooltip source; keep keys working; add or
        reuse a single Shortcuts reference surface. Update the tests that pin `(F5)` strings.
-3. [ ] Row height fix: single-line, fixed-height, non-wrapping row grid; header/cell share
+       — `fe47083`; the reference now lists all 20 bindings, pinned against the live keymap.
+3. [x] Row height fix: single-line, fixed-height, non-wrapping row grid; header/cell share
        one column spec; verify ~20 rows visible at 1032px.
-4. [ ] Settings page restructure (per surface report).
-5. [ ] Detail pane rebuild per chosen prototype; copy-proxy affordance one click per row.
-6. [ ] Production hardening: panic hook + crash file, persistent not-writable banner, version
+       — `0aef52e` + `a57c44b`; row pitch measured at 30.0px.
+4. [x] Settings page restructure (per surface report).
+       — `b6a6e29`; six sections in a rail, 820px surface so the feed URL stops clipping.
+5. [x] Detail pane rebuild per chosen prototype; copy-proxy affordance one click per row.
+       — `0aef52e`, `658758b`; Variant A, right-hand inspector, row-scoped `Copy proxy`.
+       Bulk workflow closed the antidetect case: `7e28f53`, `aba13c5`, `ce17239`, `4d94bed`.
+6. [~] Production hardening: panic hook + crash file, persistent not-writable banner, version
        stamping, VERSIONINFO, LICENSE/README in the bundle.
+       — done: panic hook, version stamping, VERSIONINFO, licenses, README (`e656868`,
+       `69caa13`). NOT done: the not-writable banner — no banner concept exists in the
+       code. Written up as `.planning/tickets/T-08-writable-banner.md`.
 7. [ ] Verifier pass on the whole diff; then `cargo fmt --check`, `clippy -D warnings`,
        `cargo test --locked`; commit in logical slices.
+       — every ticket verified independently as it landed; the whole-diff pass is pending
+       the phase-2 split and the merge to `master`.
 
 ## Acceptance checks
 
