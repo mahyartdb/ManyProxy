@@ -24309,7 +24309,11 @@ const OVERLAY_CALLS: [&str; 3] = [
 fn boot_scan_survives_crlf_line_endings() {
     // A checkout with CRLF (Windows `core.autocrlf`) must not make the
     // multi-line markers miss their function.
-    let source = include_str!("main.rs");
+    let source = format!(
+        "{}\n{}",
+        include_str!("main.rs"),
+        include_str!("app/bootstrap.rs"),
+    );
     let crlf = source.replace("\r\n", "\n").replace("\n", "\r\n");
     assert!(
         crlf.contains("\r\n"),
@@ -24324,7 +24328,12 @@ fn boot_scan_survives_crlf_line_endings() {
 
 #[test]
 fn boot_paths_never_push_overlays_before_root() {
-    let found = direct_overlay_calls(include_str!("main.rs"), &BOOT_FUNCTIONS);
+    let source = format!(
+        "{}\n{}",
+        include_str!("main.rs"),
+        include_str!("app/bootstrap.rs"),
+    );
+    let found = direct_overlay_calls(&source, &BOOT_FUNCTIONS);
     assert!(
         found.is_empty(),
         "these boot functions reach an overlay before the Root exists; \
