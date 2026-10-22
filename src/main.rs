@@ -18,7 +18,7 @@ mod tray;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -10531,6 +10531,16 @@ struct AppView {
     /// Set after a probe, cleared only by a probe that succeeds.
     write_blocked: Option<String>,
 
+    /// T-08: the folder the banner names when no store can supply one. Only a
+    /// session that fell back to memory after a failed open sets it; a
+    /// deliberate in-memory store leaves it `None`.
+    write_blocked_folder: Option<PathBuf>,
+
+    /// T-08: the banner is pinned by a failed open. A probe may prove the
+    /// folder writable again, but this session still cannot save, so the
+    /// banner must not be cleared into a lie.
+    write_blocked_pinned: bool,
+
     engine: EngineController,
 
     health_store: HealthStore,
@@ -10702,24 +10712,57 @@ struct AppView {
     started_at: std::time::Instant,
 }
 
+/// T-08: why this session is running in memory instead of on disk. The banner
+/// names `folder` and carries `reason` in its tooltip; the pair comes from the
+/// open failure itself, because an in-memory store has no folder to probe.
+struct WriteFallback {
+    folder: Option<PathBuf>,
+    reason: String,
+}
+
+/// T-08: the folder a failed open was trying to use, when the path has one.
+fn store_folder(path: &Path) -> Option<PathBuf> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
 impl AppView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         match Store::open_file(&Store::default_path()) {
             Ok(store) => Self::with_store(window, cx, store),
-            Err(error) => {
-                let mut view = Self::with_store(
-                    window,
-                    cx,
-                    Store::open_in_memory().expect("in-memory store opens"),
-                );
-                view.notify_after_root(
-                    Notification::warning(format!("Running without persistence: {error}")),
-                    window,
-                    cx,
-                );
-                view
-            }
+            Err(error) => Self::fell_back_to_memory(window, cx, error, &Store::default_path()),
         }
+    }
+
+    /// T-08: the primary case, not an edge: a read-only data folder usually
+    /// kills the file store at OPEN, because SQLite must create `-wal`/`-shm`.
+    /// The session then runs in memory and the probe can never see the folder,
+    /// so the open failure itself is the banner's cause. The one-time warning
+    /// still names the reason; the banner stands for as long as the session
+    /// cannot save.
+    fn fell_back_to_memory(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        error: StoreError,
+        path: &Path,
+    ) -> Self {
+        let fallback = WriteFallback {
+            folder: store_folder(path),
+            reason: format!("cannot open {}: {error}", path.display()),
+        };
+        let mut view = Self::with_store_inner(
+            window,
+            cx,
+            Store::open_in_memory().expect("in-memory store opens"),
+            Some(fallback),
+        );
+        view.notify_after_root(
+            Notification::warning(format!("Running without persistence: {error}")),
+            window,
+            cx,
+        );
+        view
     }
 
     /// Defect: boot runs inside `cx.open_window`'s closure, and the window only
@@ -10788,7 +10831,19 @@ impl AppView {
         }
     }
 
+    /// T-08: a deliberate in-memory store (tests, any explicit no-persist
+    /// path) passes no fallback and stays silent: only an open failure can
+    /// claim the folder refused this session.
     fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
+        Self::with_store_inner(window, cx, store, None)
+    }
+
+    fn with_store_inner(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        store: Store,
+        fallback: Option<WriteFallback>,
+    ) -> Self {
         let mut store = store;
         // T-34: read the previous session's verdict first, then assume this
         // session is dirty. The write lands before any restore logic, so a
@@ -10868,8 +10923,12 @@ impl AppView {
         // T-08: the first honest question after the store opens is whether its
         // folder accepts a write — a read-only folder reads fine and lets a
         // save evaporate. Probe once here; the tick and every failed save
-        // re-probe the same state.
-        let write_blocked = store.write_probe().err();
+        // re-probe the same state. A session that fell back to memory has no
+        // folder to probe, so its open failure is the standing cause instead.
+        let (write_blocked, write_blocked_folder, write_blocked_pinned) = match fallback {
+            Some(fallback) => (Some(fallback.reason), fallback.folder, true),
+            None => (store.write_probe().err(), None, false),
+        };
         let split_state = cx.new(|_| ResizableState::default());
         let view = Self {
             focus: cx.focus_handle(),
@@ -10879,6 +10938,8 @@ impl AppView {
             inspector_drawer_open: true,
             store,
             write_blocked,
+            write_blocked_folder,
+            write_blocked_pinned,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
             logs: LogStore::with_capacity(log_cap),
@@ -11175,6 +11236,13 @@ impl AppView {
     /// condition changed, so the tick only asks for a repaint when there is
     /// something new to paint.
     fn refresh_write_blocked(&mut self, cx: &mut Context<Self>) -> bool {
+        // T-08: a failed open pins the banner. A probe can prove the folder
+        // writable again, but this session is still in memory: clearing the
+        // banner would promise saves that still cannot happen. Only a restart
+        // that opens the file store clears it.
+        if self.write_blocked_pinned {
+            return false;
+        }
         let blocked = self.store.write_probe().err();
         if blocked == self.write_blocked {
             return false;

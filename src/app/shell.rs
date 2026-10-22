@@ -168,11 +168,13 @@ impl AppView {
     }
 
     /// T-08: the folder the standing banner names. A file-backed store knows
-    /// its own folder; an in-memory store has none, so the app's data folder is
-    /// the only one left to name (the in-memory case never raises the banner).
+    /// its own folder; a session that fell back to memory carries the folder
+    /// the failed open was using; a deliberate in-memory store has none, and
+    /// never raises the banner anyway.
     pub(crate) fn writable_folder(&self) -> String {
-        self.store
-            .data_dir()
+        self.write_blocked_folder
+            .clone()
+            .or_else(|| self.store.data_dir())
             .unwrap_or_else(crate::store::app_data_dir)
             .display()
             .to_string()

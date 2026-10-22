@@ -7006,6 +7006,26 @@ fn mount_view(store: Store, cx: &mut TestAppContext) -> (Entity<AppView>, &mut V
     (view, cx)
 }
 
+/// T-08: mount through the production memory fallback, carrying the error from
+/// a real failed `Store::open_file`. This is the same constructor `AppView::new`
+/// calls when the file store will not open.
+#[cfg(windows)]
+fn mount_fallback_view(
+    error: StoreError,
+    path: std::path::PathBuf,
+    cx: &mut TestAppContext,
+) -> (Entity<AppView>, &mut VisualTestContext) {
+    let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+    let stash_for_window = stash.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| AppView::fell_back_to_memory(window, cx, error, &path));
+        *stash_for_window.borrow_mut() = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let view = stash.borrow().clone().expect("AppView stashed");
+    (view, cx)
+}
+
 /// T-08: a real folder inside TEMP, writable unless `deny_write` says
 /// otherwise. The denial is a deny-write ACE for the current user — the
 /// cheapest faithful simulation on Windows: reads keep working,
@@ -24260,8 +24280,9 @@ fn launch_intake_opens_the_frame_after_root(cx: &mut TestAppContext) {
 /// `close_sheet`, which panic through `Root::read` rather than
 /// `Root::update`) are guarded by the same `root_installed` check, so they
 /// cannot fire before the Root exists either.
-const BOOT_FUNCTIONS: [&str; 8] = [
+const BOOT_FUNCTIONS: [&str; 9] = [
     "fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {\n        match Store::open_file",
+    "fn fell_back_to_memory(",
     "fn with_store(window: &mut Window",
     "fn create_tray(&mut self",
     "fn restore_on_launch(&mut self",
@@ -31347,6 +31368,15 @@ fn t08_in_memory_store_never_raises_the_banner(cx: &mut TestAppContext) {
             .is_none(),
         "and names no folder"
     );
+    assert!(
+        view.read_with(cx, |view, _| !view.write_blocked_pinned),
+        "a deliberate in-memory store is not a failed open"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.write_blocked_folder.clone()),
+        None,
+        "it claims no folder to blame"
+    );
     assert_absent(cx, "write-banner".to_string());
 
     cx.update(|_, cx| {
@@ -31411,4 +31441,100 @@ fn t08_failed_save_raises_the_banner_instead_of_a_toast(cx: &mut TestAppContext)
     assert_painted(cx, "write-banner");
 
     folder.allow_write();
+}
+
+/// T-08: a folder that refuses the file store's OPEN is the primary case, not
+/// an edge: SQLite must create `-wal`/`-shm`, the app falls back to memory,
+/// and the banner — not just a toast — has to say that nothing will be saved.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_open_failure_raises_the_banner_naming_the_folder(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut folder = T08TempFolder::new("open-failure");
+    let db = folder.path().join("library.db");
+    folder.deny_write();
+    let error = Store::open_file(&db)
+        .err()
+        .expect("a denied folder refuses the file store's open");
+    let (view, cx) = mount_fallback_view(error, db, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert!(
+        view.read_with(cx, |view, _| view.store.data_dir().is_none()),
+        "the session runs in memory"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.write_blocked_pinned),
+        "the failed open pins the banner"
+    );
+    let path = folder.path().display().to_string();
+    let pinned = format!("Cannot write to the data folder ({path}) — changes will not be saved.");
+    let text = view.read_with(cx, |view, _| view.write_banner_text());
+    assert_eq!(
+        text.as_deref(),
+        Some(pinned.as_str()),
+        "the banner names the folder the open failed on"
+    );
+    let reason = view
+        .read_with(cx, |view, _| view.write_blocked.clone())
+        .expect("the open failure is the recorded cause");
+    assert!(
+        reason.contains(&path) && reason.contains("cannot open"),
+        "the reason names the folder and the open failure: {reason}"
+    );
+    assert_painted(cx, "write-banner");
+    assert_painted(cx, "write-banner-open-folder");
+
+    folder.allow_write();
+}
+
+/// T-08: a failed-open session keeps its banner even when the folder writes
+/// again. The store is in memory, so its probe cannot see the folder at all;
+/// and even a successful probe could not make this session persist, so
+/// clearing the banner would be a lie. Only a restart that opens the store
+/// clears it.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_failed_open_banner_survives_a_succeeding_probe(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut folder = T08TempFolder::new("pinned");
+    let db = folder.path().join("library.db");
+    folder.deny_write();
+    let error = Store::open_file(&db)
+        .err()
+        .expect("a denied folder refuses the file store's open");
+    let (view, cx) = mount_fallback_view(error, db, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "write-banner");
+    let before = view.read_with(cx, |view, _| view.write_blocked.clone());
+
+    folder.allow_write();
+    let proof = folder.path().join("proof.tmp");
+    std::fs::write(&proof, b"writable again").expect("the folder writes again");
+    std::fs::remove_file(&proof).expect("the proof file is removed");
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tick_engine_poll(cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, _| view.write_blocked.clone()),
+        before,
+        "a successful write is not proof that this in-memory session saves"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.store.data_dir().is_none()),
+        "the session still has no folder of its own"
+    );
+    assert_painted(cx, "write-banner");
 }
