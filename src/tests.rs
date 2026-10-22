@@ -1041,6 +1041,26 @@ fn t02_vless_panels_paint(cx: &mut TestAppContext) {
         cx.update(|window, _| window.try_find("vless-section-caption").is_some()),
         "the main dialog stays open under the advanced dialog"
     );
+
+    // T-06: Escape pops exactly one layer. The second press is the same bound
+    // "escape" keystroke (the harness has no physical keyboard): the kit's
+    // Cancel binding sits in the deeper "Dialog" context, so the shell's own
+    // escape/ClearChecked binding never fires while a layer is open.
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(esc, cx);
+    });
+    cx.run_until_parked();
+    paint_tall_dialog(cx);
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "the second escape closes the add dialog"
+    );
+    let shell_focus = view.read_with(cx, |view, _| view.focus.clone());
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(shell_focus),
+        "one layer per escape, and the shell holds focus again"
+    );
     cx.update(|window, cx| window.close_all_dialogs(cx));
 }
 
