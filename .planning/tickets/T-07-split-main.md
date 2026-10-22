@@ -53,6 +53,22 @@ Stop after slice 6. T-02..T-06 run here, inside these files.
 Forms, fetch/update, subs, presets, import, health, logs, io, ticks, models, dialog kit,
 `win32_process`. The UI work does not touch these, so they split afterwards without conflict.
 
+### Phase 2 slices (measured against the 20,899-line `main.rs`)
+
+| # | Cluster moved | New file(s) | Anchors in `main.rs` |
+|---|---|---|---|
+| 2a | forms + the dialog/QR kit | `forms/{config,import,sub,preset,rules}.rs` `dialog/{kit,qr}.rs` | `ConfigForm` 741, `ImportForm` 6562, `SubForm` 8054, `PresetForm` 8471, `SimpleRuleBoxes` 8613, `dialog_field`/`dialog_footer`/`sheet_footer`/`footer_commit_label`, `advanced_settings_button`/`password_row`/`advanced_toggle_button`/`panel_toggle_button`, `secret_state_caption`/`field_error_target`, `QrGrid`/`QrPlate`/`qr_grid`/`share_qr_*`/`paint_share_qr` |
+| 2b | import resolution + fetch/update/semver | `import_flow/{resolve,preview}.rs` `update/{fetch,release,semver}.rs` | `resolve_import_inputs` 6754, `parse_import_inputs` 6779, `ImportFileRead`/`read_import_file` 6919, `first_import_failure_reason` 7189, `merge_browse_results` 7209, `FetchedSubscription` 7339, `FetchedHttp` 7360, `resolve_subscription_host` 7471, the redirect helpers 7494–7529, `parse_release_tag` 7587, `compare_parsed_tags` 7638, `parse_release_feed` 7731, `update_check_outcome` 7771, `effective_update_feed_url` 7830, `open_release_in_browser` 7951, `open_url_shell_execute` 7963 AND 7994 (the cfg-split pair — see trap 9) |
+| 2c | groups, subscriptions, presets, rule sets | `preset/{mod,groups,rules,sets}.rs` (turn the existing `src/preset.rs` into `src/preset/mod.rs`) | `redact_subscription_url` 6699, `subscription_label_from_url` 6724, `subscription_row` 8151, `GroupRowView`/`group_row_views` 8335, `group_quota_line` 8400, `update_target_subs` 8441, `update_all_targets` 8451, `preset_row` 8665, `PresetRulesOp` 8765, `rule_set_row` 8771, `preset_rule_attribute_folds` 8832, `preset_advanced_section` 8856 |
+| 2d | models — rows, traffic, inspector tab, palette ops, sampler, chains | `models/{row,traffic,connections,tab,palette,chain,sampler}.rs` | `ConnRow`/`ConnCopyTarget`/`build_conn_rows` 9817, `ExitTraffic` 9884, `TrafficExitSplit` 9914, `traffic_top9_split` 9930, `aggregate_exit_traffic` 9971, `InspectorTab` 10003, `ProcessSample`/`SampleRead`/`cpu_percent_of_one_core` 10070, `ShardRing` 10112, `ChainLibraryEntry` 9620, `WgPeerRefs` 9707, `generate_uuid_v4` 9727, `generate_wireguard_key` 9786, `PaletteOp` 9786 |
+| 2e | pickers — facet, protocol, panel and every `*_choices` list | `pickers/{facet,protocol,panel,choices}.rs` | `FacetMenu`/`FacetChoice`/`FacetChoiceList` 9028, `FacetPicker` 9222, `ProtocolChoice`/`ProtocolChoiceList` 9260, `PanelChoice`/`PanelChoiceList` 9339, the `*_choices` functions 9424–9610, `chain_pick_choices` 9626, `chain_slot_kind` 9642, `chain_existing_kinds` 9656, `chain_hop_label` 9680 |
+| 2f | logs, health tone, row helpers, the bind-host picker | `library/{tone,rows,host}.rs` (existing `library/` dir) | `log_level_text_color` 322, `log_line_level` 336, `parse_log_cap` 345, `log_level_matches` 7228, `ServingTone`/`health_tone_color` 6810, `EndpointUrl` 6832, `RowPhase` 6846, `library_row_lines`/`library_row_cells`/`library_row_full_route`/`library_row_matches` 6976, `MatchContext` 7043, `BindHostChoice`/`BindHostChoiceList` 215, `RowEndpointInputs` 289, `SortMenuAction` 311, `upstream_host_port` 6942 |
+| 2g | bootstrap — the eight boot functions, the window, the tray, `main` | `app/bootstrap.rs` `app/window.rs` | `app_window_options` 177, `stored_window_geometry` 206, `new`, `with_store`, `create_tray`, `restore_on_launch`, `commit_restore_subset`, `open_restore_lan_confirm`, `handle_launch_intake`, `reload`, `spawn_hidden` 135, `main`, the crash hook |
+
+After 2g, `main.rs` holds only: the inner attributes (`#![recursion_limit]`,
+`#![cfg_attr(windows, windows_subsystem = "windows")]`), the `mod` declarations, the crate-root
+`use …::*;` seams, `fn main`, and the crash hook — target ≈150 lines.
+
 ## Traps (verified — do not skip)
 
 1. **Boot-path source scan.** `include_str!("main.rs")` ×2 (`52547`, `52562`);
@@ -63,7 +79,9 @@ Forms, fetch/update, subs, presets, import, health, logs, io, ticks, models, dia
    `create_tray`, `restore_on_launch`, `commit_restore_subset`, `open_restore_lan_confirm`,
    `handle_launch_intake`, `reload`.
    **Slices 3–6 move none of those eight**, so the scan stays untouched there — leave it
-   exactly as it is. The bootstrap cluster moves in phase 2, and the scan is re-pointed then.
+   exactly as it is. **Slice 2g moves them**: re-point the scan at the new file(s) in that
+   slice and keep the exactly-once assertion across the scanned set. The assertion stays
+   exactly as strict — a scanner that reads several files still asserts each marker once.
 2. **`std::fs::read_to_string(file!())`** (`29247`) asserts the source contains
    `const APP_VERSION` + `env!("CARGO_PKG_VERSION")`. Moving tests breaks it: retarget to
    `consts.rs` and keep that const on one line.
@@ -79,6 +97,11 @@ Forms, fetch/update, subs, presets, import, health, logs, io, ticks, models, dia
    keep that test and its function in the same file.
 8. **`mod win32_process`** uses `super::{ProcessSample, …}`; after extraction,
    `crate::models::`.
+9. **Two cfg-split twins.** `open_url_shell_execute` exists TWICE in `main.rs` (7963 and
+   7994) and `win32_process_sample` has the same shape — one per `cfg` arm. Moving BOTH
+   into one module is fine only while they stay cfg-gated; if a crate-root glob seam would
+   import both names at once, add the explicit import the ticket's visibility section
+   names, and check the module does not define a second item with the same name.
 
 ## Per-slice protocol (with the line ratchet)
 
