@@ -1044,6 +1044,16 @@ impl SettingsState {
     }
 }
 
+/// T-04: what the close button does, given the stored choice and whether a
+/// tray exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CloseRoute {
+    /// Hide the window to the tray; the proxies keep running.
+    HideToTray,
+    /// Take the quit path: stop every profile and exit.
+    Quit,
+}
+
 /// T-04: the destructive Maintenance actions, named so the row builder can
 /// pick one without a closure per row.
 #[derive(Clone, Copy)]
@@ -1471,6 +1481,16 @@ impl AppView {
             cx,
         );
         cx.notify();
+    }
+
+    /// T-04: the close button's route. `Tray` hides the window only when a
+    /// tray is there to hide to; without one there is nothing to hide to, so
+    /// the close takes the quit path. `Quit` always takes it.
+    pub(crate) fn close_route(&self, has_tray: bool) -> CloseRoute {
+        match self.store.close_action() {
+            CloseAction::Tray if has_tray => CloseRoute::HideToTray,
+            _ => CloseRoute::Quit,
+        }
     }
 
     /// T-04: the one-time "still running in the tray" hint. It shows exactly

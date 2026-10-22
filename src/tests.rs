@@ -29772,6 +29772,47 @@ fn t04_close_action_round_trips_and_defaults_to_tray() {
     );
 }
 
+/// T-04: the close button's route follows the stored choice. `Tray` hides
+/// the window only when a tray exists to hide to; `Quit` always takes the
+/// stop-and-exit path.
+#[gpui_kit::test]
+fn t04_close_route_follows_the_stored_choice(cx: &mut TestAppContext) {
+    use crate::app::settings::CloseRoute;
+    use crate::store::CloseAction;
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(true)),
+        CloseRoute::HideToTray,
+        "the default choice hides to the tray"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(false)),
+        CloseRoute::Quit,
+        "without a tray there is nothing to hide to"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.store
+                .set_close_action(CloseAction::Quit)
+                .expect("the choice stores")
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(true)),
+        CloseRoute::Quit,
+        "the quit choice quits even with a tray"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(false)),
+        CloseRoute::Quit,
+        "the quit choice quits without a tray too"
+    );
+}
+
 /// T-04: the tray hint shows exactly once. The flag is written before the
 /// toast goes out, so a second hide never repeats it.
 #[gpui_kit::test]

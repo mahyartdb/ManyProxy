@@ -20845,9 +20845,9 @@ fn main() {
                     // Settings → General → Window behaviour. `Tray` hides the
                     // window and leaves the proxies running; `Quit` stops
                     // every profile and exits.
-                    let close_action = view.read_with(cx, |view, _| view.store.close_action());
                     let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
-                    if close_action == CloseAction::Tray && has_tray {
+                    let route = view.read_with(cx, |view, _| view.close_route(has_tray));
+                    if route == app::settings::CloseRoute::HideToTray {
                         view.update(cx, |view, cx| view.hide_to_tray(window, cx));
                         // T-04: the one-time hint that the app is still running.
                         view.update(cx, |view, cx| view.show_tray_hint_once(window, cx));
