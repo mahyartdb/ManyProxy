@@ -189,3 +189,18 @@ Shape of the block, measured by first token of the method name:
 - After phase 3, `main.rs` holds the inner attributes, the `mod` declarations, the
   `use …::*;` seams, `fn main`, and the crash hook — ≈150 lines. That is the acceptance test:
   count it, do not assume it.
+
+### Phase 3, as shipped
+
+`main.rs` landed at **543 lines**, not ≈150, and the difference is deliberate: what remains
+is the inner attributes, 19 `mod` lines, the import block, four `INSPECTOR_*` consts, the
+`actions!` block, the `struct AppView` field block (193 lines), `WriteFallback`,
+`store_folder`, `install_crash_hook`, `append_crash_report`, `fn main`, and `mod tests`.
+The 58,685-line monolith is a 99% reduction.
+
+**Do not move `struct AppView` out of the crate root.** Field privacy is scoped to the module
+that declares the struct and its descendants; declared at the root, every module in the crate
+can touch its private fields, which is what lets 20+ `impl AppView` blocks live in `app/*.rs`
+without widening a single field. Moving the struct into `app/` would force every field to
+`pub(crate)` and buy nothing. Same reason `actions!` and the consts stay: they are the root's
+vocabulary, not a module's.
