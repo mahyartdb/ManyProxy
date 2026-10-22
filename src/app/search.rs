@@ -213,15 +213,6 @@ impl AppView {
                             .accessibility_label("Filter by status"),
                     ),
             )
-            .child(
-                Button::new("groups-dialog")
-                    .small()
-                    .label("Groups")
-                    .tooltip("Rename or merge groups")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_groups_dialog(window, cx);
-                    })),
-            )
             .child(match facet_group_now {
                 Some(group) => {
                     let slug = slugify_group_id(&group);

@@ -74,6 +74,7 @@ impl AppView {
                             view.commit_bulk_stop(window, cx);
                         })),
                 )
+                .child(Separator::vertical())
                 .child(
                     Button::new("bulk-enable")
                         .small()

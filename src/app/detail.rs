@@ -98,12 +98,13 @@ impl AppView {
             .into_any_element()
     }
 
+    /// T-03: rows but no selection. The Add and Import calls to action belong
+    /// to an EMPTY library only — here the inspector just asks for a row.
     pub(crate) fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("config-detail")
             .test_support()
-
-            .border_t_1()
+            .border_l_1()
             .border_color(cx.theme().border)
             .p_2()
             .flex()
@@ -111,53 +112,15 @@ impl AppView {
             .items_center()
             .justify_center()
             .child(
-                Empty::new()
-                    .header(
-                        EmptyHeader::new()
-                            .title(EmptyTitle::new().child(
-                                "Select a configuration to inspect its endpoint, health, and usage",
-                            ))
-
-                            .description(EmptyDescription::new().child(
-                                "Pick a row in the library — its endpoints and controls appear here.",
-                            )),
-                    )
-                    .content(
-                        EmptyContent::new().child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("detail-add")
-
-                                        .small()
-                                        .label("Add configuration")
-                                        .tooltip("Add a proxy configuration")
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            view.open_add_dialog(window, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("detail-import")
-
-                                        .small()
-                                        .label("Import configurations")
-                                        .tooltip("Import share links or files")
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            view.open_import_dialog(
-                                                "",
-                                                DEFAULT_GROUP,
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                ),
-                        ),
-                    ),
+                Empty::new().header(
+                    EmptyHeader::new()
+                        .title(EmptyTitle::new().child(
+                            "Select a configuration to inspect its endpoint, health, and usage",
+                        ))
+                        .description(EmptyDescription::new().child(
+                            "Pick a row in the library — its endpoints and controls appear here.",
+                        )),
+                ),
             )
             .into_any_element()
     }
@@ -171,7 +134,7 @@ impl AppView {
         div()
             .id("config-detail")
             .test_support()
-            .border_t_1()
+            .border_l_1()
             .border_color(cx.theme().border)
             .p_2()
             .flex()

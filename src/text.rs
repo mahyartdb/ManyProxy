@@ -659,15 +659,17 @@ pub(crate) fn serving_ports_text(ports: &[u16]) -> Option<String> {
     }
     let mut sorted = ports.to_vec();
     sorted.sort_unstable();
-    let shown: Vec<String> = sorted
-        .iter()
-        .take(3)
-        .map(|port| format!(":{port}"))
-        .collect();
+    // T-03: one grammar for the whole strip — the segment names itself and
+    // separates its parts with `·`. A bare ":10801 :10802" reads like noise.
+    let shown: Vec<String> = sorted.iter().take(3).map(|port| port.to_string()).collect();
     if sorted.len() > 3 {
-        Some(format!("{} +{}", shown.join(" "), sorted.len() - 3))
+        Some(format!(
+            "ports {} · +{}",
+            shown.join(" · "),
+            sorted.len() - 3
+        ))
     } else {
-        Some(shown.join(" "))
+        Some(format!("ports {}", shown.join(" · ")))
     }
 }
 pub(crate) fn no_matches_text() -> String {

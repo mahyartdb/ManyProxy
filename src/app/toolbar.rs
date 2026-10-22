@@ -198,8 +198,8 @@ impl AppView {
             .child(
                 Button::new("groups-menu")
                     .small()
-                    .label("Groups")
-                    .accessibility_label("Groups")
+                    .label("Manage groups…")
+                    .accessibility_label("Manage groups…")
                     .tooltip("Subscriptions and groups")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
@@ -808,6 +808,30 @@ impl AppView {
             )
 
             .child(div().flex_1())
+
+            // T-03: the two intake actions ride the top right: Add is the
+            // primary commitment, Import sits beside it.
+            .child(
+                Button::new("toolbar-import")
+                    .small()
+                    .label("Import")
+                    .accessibility_label("Import")
+                    .tooltip("Import share links or files (Ctrl-O)")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("toolbar-add-config")
+                    .small()
+                    .primary()
+                    .label("+ Add configuration")
+                    .accessibility_label("Add configuration")
+                    .tooltip("Add a proxy configuration (Ctrl-N)")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_add_dialog(window, cx);
+                    })),
+            )
 
             .child(
                 Button::new("global-start-stop")

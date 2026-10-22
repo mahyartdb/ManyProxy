@@ -9706,7 +9706,7 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
     for (id, pinned) in [
         ("program-menu", "Program"),
         ("settings-menu", "Settings"),
-        ("groups-menu", "Groups"),
+        ("groups-menu", "Manage groups…"),
         ("routing-menu", "Routing"),
         ("tools-menu", "Tools"),
         ("global-start-stop", "Start all"),
@@ -11924,7 +11924,10 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     assert_painted(cx, "facet-group-tip");
     assert_painted(cx, "facet-protocol-tip");
     assert_painted(cx, "facet-status-tip");
-    assert_painted(cx, "groups-dialog");
+    // T-03: the facet row no longer repeats the Groups action — the menu
+    // bar owns it.
+    assert_absent(cx, "groups-dialog".to_string());
+    assert_painted(cx, "groups-menu");
     assert_painted(cx, &format!("check-{}", first.id));
     assert_painted(cx, &format!("check-{}", second.id));
 
@@ -15235,7 +15238,14 @@ fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     cx.update(|window, cx| {
-        window.click("groups-dialog", cx);
+        window.click("groups-menu", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| {
+        window.click("menu-groups-dialog", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
@@ -15263,7 +15273,7 @@ fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
         !cx.update(|window, cx| window.has_active_sheet(cx)),
         "Escape closes the sheet"
     );
-    assert_painted(cx, "groups-dialog");
+    assert_painted(cx, "groups-menu");
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
@@ -21112,14 +21122,18 @@ fn t04_density_anchors_paint(cx: &mut TestAppContext) {
         "search-count",
         "clear-search",
         "clear-facets",
-        "detail-add",
-        "detail-import",
+        "toolbar-add-config",
+        "toolbar-import",
         "status-count",
         "engine-status",
         "health-status",
     ] {
         assert_painted(cx, id);
     }
+    // T-03: the Add and Import calls to action belong to an EMPTY library.
+    // A library with rows but no selection asks for a row instead.
+    assert_absent(cx, "detail-add".to_string());
+    assert_absent(cx, "detail-import".to_string());
 }
 
 #[gpui_kit::test]
@@ -25871,11 +25885,11 @@ fn laneb_status_live_segments(cx: &mut TestAppContext) {
     assert_eq!(serving_ports_text(&[]), None);
     assert_eq!(
         serving_ports_text(&[10802, 10801]),
-        Some(":10801 :10802".to_string())
+        Some("ports 10801 · 10802".to_string())
     );
     assert_eq!(
         serving_ports_text(&[1, 2, 3, 4]),
-        Some(":1 :2 :3 +1".to_string())
+        Some("ports 1 · 2 · 3 · +1".to_string())
     );
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -25994,7 +26008,7 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     assert_eq!(engine_text, "engine running · 3 endpoint(s)");
     assert_eq!(
         crate::serving_ports_text(&[10931, 10932, 10933]),
-        Some(":10931 :10932 :10933".to_string())
+        Some("ports 10931 · 10932 · 10933".to_string())
     );
     let totals = totals.expect("traffic totals render once bytes flow");
     assert!(
