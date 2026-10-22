@@ -1,6 +1,14 @@
 use base64::Engine as _;
 use serde_json::Value;
 
+mod groups;
+mod rules;
+mod sets;
+
+pub(crate) use groups::*;
+pub(crate) use rules::*;
+pub(crate) use sets::*;
+
 pub const MAX_PRESET_NAME_CHARS: usize = 256;
 
 /// Per-rule `name` labels are authoring artifacts like preset names: capped
@@ -1578,7 +1586,13 @@ mod tests {
         for known in VALID_PRESET_ACTIONS {
             assert!(error.message.contains(known), "{error}");
         }
-        for source in [include_str!("preset.rs"), include_str!("engine.rs")] {
+        for source in [
+            include_str!("mod.rs"),
+            include_str!("groups.rs"),
+            include_str!("rules.rs"),
+            include_str!("sets.rs"),
+            include_str!("../engine.rs"),
+        ] {
             assert!(
                 !source.contains(&banned_action),
                 "no new code path names the banned DNS action"
