@@ -132,3 +132,129 @@ pub(crate) fn fold_shard_samples(
     }
     denied
 }
+
+/// Read one child's counters. Windows-only, same posture as `dpapi`: raw
+/// `extern "system"` declarations, no crate, and the handle is closed on every
+/// path.
+#[cfg(all(windows, not(test)))]
+mod win32_process {
+    use std::ffi::c_void;
+
+    use super::{
+        ProcessSample, SampleRead, ERROR_ACCESS_DENIED, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    impl FileTime {
+        /// `FILETIME` counts 100 ns ticks in two halves.
+        fn ticks(&self) -> u64 {
+            (u64::from(self.high) << 32) | u64::from(self.low)
+        }
+    }
+
+    /// `PROCESS_MEMORY_COUNTERS` — only `WorkingSetSize` is read; the rest
+    /// keeps the layout the callee fills.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        _page_fault_count: u32,
+        _peak_working_set_size: usize,
+        working_set_size: usize,
+        _quota_peak_paged_pool_usage: usize,
+        _quota_paged_pool_usage: usize,
+        _quota_peak_non_paged_pool_usage: usize,
+        _quota_non_paged_pool_usage: usize,
+        _pagefile_usage: usize,
+        _peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    /// Owns the query handle; dropping it is the only side effect in here.
+    struct OwnedHandle(*mut c_void);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub(super) fn sample(pid: u32) -> SampleRead {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return if GetLastError() == ERROR_ACCESS_DENIED {
+                    SampleRead::Denied
+                } else {
+                    SampleRead::Gone
+                };
+            }
+            let handle = OwnedHandle(handle);
+
+            let mut creation = FileTime::default();
+            let mut exit = FileTime::default();
+            let mut kernel = FileTime::default();
+            let mut user = FileTime::default();
+            if GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                return SampleRead::Gone;
+            }
+
+            let cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            let mut counters = ProcessMemoryCounters {
+                cb,
+                ..Default::default()
+            };
+            if GetProcessMemoryInfo(handle.0, &mut counters, cb) == 0 {
+                return SampleRead::Gone;
+            }
+
+            SampleRead::Sampled(ProcessSample {
+                cpu_100ns: kernel.ticks().saturating_add(user.ticks()),
+                ram_bytes: counters.working_set_size as u64,
+            })
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+pub(crate) fn win32_process_sample(pid: u32) -> SampleRead {
+    win32_process::sample(pid)
+}
+
+/// Tests inject their own readings (no handle ever opens under `cargo test`),
+/// and non-Windows builds have no Win32 to ask — both degrade to the caption
+/// instead of pretending a number exists.
+#[cfg(any(test, not(windows)))]
+pub(crate) fn win32_process_sample(_pid: u32) -> SampleRead {
+    SampleRead::Denied
+}

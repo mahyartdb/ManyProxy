@@ -8,6 +8,7 @@ mod host;
 mod matching;
 mod metrics;
 mod rows;
+mod shard;
 mod tone;
 
 pub(crate) use columns::*;
@@ -15,6 +16,7 @@ pub(crate) use host::*;
 pub(crate) use matching::*;
 pub(crate) use metrics::*;
 pub(crate) use rows::*;
+pub(crate) use shard::*;
 pub(crate) use tone::*;
 
 pub(crate) struct LibraryDelegate {

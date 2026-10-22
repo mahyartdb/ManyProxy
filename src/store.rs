@@ -799,6 +799,7 @@ pub enum TrafficPeriod {
 }
 
 impl TrafficPeriod {
+    #[cfg(test)]
     pub const ALL: [TrafficPeriod; 4] = [
         TrafficPeriod::Day,
         TrafficPeriod::Week,
@@ -6193,6 +6194,7 @@ impl Store {
         self.refresh_with_body(sub_id, text, now)
     }
 
+    #[cfg(test)]
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
@@ -8289,6 +8291,7 @@ impl Store {
     /// meta keys. Absent or corrupt reads as `None` — the pre-feature default.
     pub const META_GEOMETRY: &str = "geometry";
 
+    #[cfg(test)]
     pub fn window_geometry(&self) -> Option<WindowGeometry> {
         match self.get_meta(Self::META_GEOMETRY) {
             Ok(Some(raw)) => WindowGeometry::from_json(&raw),
