@@ -166,4 +166,78 @@ impl AppView {
                 });
             })
     }
+
+    /// T-08: the folder the standing banner names. A file-backed store knows
+    /// its own folder; an in-memory store has none, so the app's data folder is
+    /// the only one left to name (the in-memory case never raises the banner).
+    pub(crate) fn writable_folder(&self) -> String {
+        self.store
+            .data_dir()
+            .unwrap_or_else(crate::store::app_data_dir)
+            .display()
+            .to_string()
+    }
+
+    /// T-08: the pinned banner sentence, or `None` when the last probe passed.
+    pub(crate) fn write_banner_text(&self) -> Option<String> {
+        self.write_blocked
+            .as_ref()
+            .map(|_| write_banner_sentence(&self.writable_folder()))
+    }
+
+    /// T-08: the standing not-writable strip. It is a child of the shell's
+    /// column — under the toolbar, above the table — so it takes its own height
+    /// and the table shrinks. It carries no focus handle and no click-absorbing
+    /// layer: the app keeps working, only saving is affected.
+    pub(crate) fn render_writable_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let reason = self.write_blocked.as_ref()?;
+        let text = self.write_banner_text()?;
+        let tip = reason.clone();
+        let view = cx.entity();
+        Some(
+            div()
+                .id("write-banner")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .px_2()
+                .py_1()
+                .bg(cx.theme().group_box)
+                .border_b_1()
+                .border_color(cx.theme().danger)
+                .child(
+                    div()
+                        .id("write-banner-text")
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(cx.theme().danger)
+                        .aria_label(text.clone())
+                        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                        .child(text),
+                )
+                .child(
+                    Button::new("write-banner-open-folder")
+                        .small()
+                        .label("Open data folder")
+                        .tooltip("Open the folder that holds the library")
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.open_data_folder(window, cx);
+                            });
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// T-08: one sentence, pinned by tests. The folder is named because the app can
+/// run from any folder; the outcome is named because a silent save is the bug.
+fn write_banner_sentence(folder: &str) -> String {
+    format!("Cannot write to the data folder ({folder}) — changes will not be saved.")
 }

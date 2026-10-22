@@ -7006,6 +7006,91 @@ fn mount_view(store: Store, cx: &mut TestAppContext) -> (Entity<AppView>, &mut V
     (view, cx)
 }
 
+/// T-08: a real read-only folder inside TEMP. A deny-write ACE for the current
+/// user is the cheapest faithful simulation on Windows: reads keep working,
+/// `create_dir_all` keeps working (the folder exists), and creating a file —
+/// which is exactly what the write probe does — is refused. The ACE is removed
+/// on drop, before the folder is removed.
+#[cfg(windows)]
+struct T08DeniedFolder {
+    dir: std::path::PathBuf,
+    denied: bool,
+}
+
+#[cfg(windows)]
+impl T08DeniedFolder {
+    fn new(tag: &str) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t08-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("T-08 temp folder created");
+        Self { dir, denied: false }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    fn deny_write(&mut self) {
+        if self.denied {
+            return;
+        }
+        let principal = format!(
+            "{}:(W)",
+            std::env::var("USERNAME").expect("USERNAME is set")
+        );
+        Self::icacls(&self.dir, "/deny", &principal);
+        self.denied = true;
+    }
+
+    fn allow_write(&mut self) {
+        if !self.denied {
+            return;
+        }
+        let principal = std::env::var("USERNAME").expect("USERNAME is set");
+        Self::icacls(&self.dir, "/remove:d", &principal);
+        self.denied = false;
+    }
+
+    fn icacls(dir: &std::path::Path, flag: &str, principal: &str) {
+        let output = std::process::Command::new("icacls")
+            .arg(dir)
+            .arg(flag)
+            .arg(principal)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("icacls {flag} {principal} on {}: {error}", dir.display())
+            });
+        assert!(
+            output.status.success(),
+            "icacls {flag} {principal} on {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[cfg(windows)]
+impl Drop for T08DeniedFolder {
+    fn drop(&mut self) {
+        if self.denied {
+            if let Ok(principal) = std::env::var("USERNAME") {
+                let _ = std::process::Command::new("icacls")
+                    .arg(&self.dir)
+                    .arg("/remove:d")
+                    .arg(principal)
+                    .status();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn notification_count(cx: &mut VisualTestContext) -> usize {
     cx.update(|window, cx| window.notifications(cx).len())
 }
@@ -31016,4 +31101,148 @@ fn t06_removing_the_selected_row_clears_the_lists_selection(cx: &mut TestAppCont
     );
     assert_eq!(delegate_index, None, "the delegate agrees");
     assert_absent(cx, format!("row-card-{}", doomed.id));
+}
+
+/// T-08: a data folder that refuses a write raises the standing banner, names
+/// the folder it cannot write to, and leaves the keyboard alone. The store is
+/// opened first and the denial comes second, so reads keep working — the shape
+/// of the real bug: everything looks fine until a save evaporates.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_refused_write_raises_the_banner_naming_the_folder(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut folder = T08DeniedFolder::new("banner");
+    let store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
+    folder.deny_write();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let path = folder.path().display().to_string();
+    let pinned = format!("Cannot write to the data folder ({path}) — changes will not be saved.");
+    let (reason, text) = view.read_with(cx, |view, _| {
+        (view.write_blocked.clone(), view.write_banner_text())
+    });
+    let reason = reason.expect("a refused probe is recorded as the banner's cause");
+    assert!(
+        reason.contains(&path),
+        "the recorded reason says which folder refused: {reason}"
+    );
+    assert_eq!(
+        text.as_deref(),
+        Some(pinned.as_str()),
+        "the banner sentence is pinned, with the folder named"
+    );
+
+    assert_painted(cx, "write-banner");
+    assert_painted(cx, "write-banner-text");
+    assert_painted(cx, "write-banner-open-folder");
+    let label = cx.update(|window, _| {
+        window
+            .try_find("write-banner-text".to_string())
+            .expect("the banner text renders")
+            .label()
+            .map(str::to_string)
+    });
+    assert_eq!(
+        label.as_deref(),
+        Some(pinned.as_str()),
+        "the banner announces the sentence it paints"
+    );
+
+    let toggle = cx
+        .update(|window, _| window.try_find("global-start-stop".to_string()))
+        .expect("the toolbar toggle renders")
+        .bounds();
+    let banner = cx
+        .update(|window, _| window.try_find("write-banner".to_string()))
+        .expect("the banner renders")
+        .bounds();
+    let content = cx
+        .update(|window, _| window.try_find("main-content".to_string()))
+        .expect("the content area renders")
+        .bounds();
+    assert!(
+        banner.origin.y >= toggle.origin.y + toggle.size.height - px(1.),
+        "the banner sits under the toolbar: banner {banner:?}, toolbar control {toggle:?}"
+    );
+    assert!(
+        content.origin.y >= banner.origin.y + banner.size.height - px(1.),
+        "the table starts under the banner: banner {banner:?}, content {content:?}"
+    );
+    assert_eq!(
+        cx.update(|window, _| window
+            .try_find("write-banner".to_string())
+            .expect("the banner renders")
+            .focused()),
+        None,
+        "the banner never takes the keyboard"
+    );
+
+    folder.allow_write();
+}
+
+/// T-08: the banner earns its height instead of covering the table. At the
+/// app's minimum frame it stays fully inside, and the list starts below it with
+/// a real row still painted.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_banner_fits_the_minimum_frame_and_the_table_stays_below(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut folder = T08DeniedFolder::new("min-frame");
+    let mut store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
+    let seeded = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    folder.deny_write();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_min(cx);
+    cx.run_until_parked();
+    paint_frame_min(cx);
+
+    assert!(
+        view.read_with(cx, |view, _| view.write_blocked.is_some()),
+        "the banner is up at the minimum frame"
+    );
+    for id in [
+        "write-banner",
+        "write-banner-text",
+        "write-banner-open-folder",
+    ] {
+        assert_painted(cx, id);
+        assert_within_frame_min(cx, id);
+    }
+    assert_painted(cx, "config-list");
+    assert_within_frame_min(cx, "config-list");
+    let row = format!("library-row-{}", seeded.id);
+    assert_painted(cx, &row);
+    assert_within_frame_min(cx, &row);
+
+    let banner = cx
+        .update(|window, _| window.try_find("write-banner".to_string()))
+        .expect("the banner renders")
+        .bounds();
+    let list = cx
+        .update(|window, _| window.try_find("config-list".to_string()))
+        .expect("the list renders")
+        .bounds();
+    let row_bounds = cx
+        .update(|window, _| window.try_find(row.clone()))
+        .expect("the seeded row renders")
+        .bounds();
+    assert!(
+        list.origin.y >= banner.origin.y + banner.size.height - px(1.),
+        "the list starts under the banner: banner {banner:?}, list {list:?}"
+    );
+    assert!(
+        row_bounds.origin.y >= banner.origin.y + banner.size.height - px(1.),
+        "the seeded row is not covered by the banner: banner {banner:?}, row {row_bounds:?}"
+    );
+
+    folder.allow_write();
 }

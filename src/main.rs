@@ -10525,6 +10525,12 @@ struct AppView {
     detail_scroll: ScrollHandle,
     store: Store,
 
+    /// T-08: the last failed write probe, as the standing banner's trigger.
+    /// `Some(reason)` means the data folder refused a real write; `None` means
+    /// the folder is writable (or the store is in-memory, which has no folder).
+    /// Set after a probe, cleared only by a probe that succeeds.
+    write_blocked: Option<String>,
+
     engine: EngineController,
 
     health_store: HealthStore,
@@ -10859,6 +10865,11 @@ impl AppView {
         .map(|(file, found)| sidecar_presence_line(&file, found))
         .collect::<Vec<_>>();
         let log_cap = store.log_max_lines();
+        // T-08: the first honest question after the store opens is whether its
+        // folder accepts a write — a read-only folder reads fine and lets a
+        // save evaporate. Probe once here; the tick and every failed save
+        // re-probe the same state.
+        let write_blocked = store.write_probe().err();
         let split_state = cx.new(|_| ResizableState::default());
         let view = Self {
             focus: cx.focus_handle(),
@@ -10867,6 +10878,7 @@ impl AppView {
             split_state,
             inspector_drawer_open: true,
             store,
+            write_blocked,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
             logs: LogStore::with_capacity(log_cap),
