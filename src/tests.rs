@@ -18820,7 +18820,11 @@ fn keyboard_shortcuts_open_and_guard_dialogs(cx: &mut TestAppContext) {
         cx.update(|window, cx| window.has_active_dialog(cx)),
         "dialog stays exactly one"
     );
-    assert_eq!(notification_count(cx), 0, "guarded shortcut is silent");
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "T-06: the guarded shortcut toasts the refusal instead of doing nothing"
+    );
 }
 
 #[gpui_kit::test]
@@ -18954,7 +18958,11 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
     let guarded = notification_count(cx);
     cx.update(|window, cx| window.focus(&focus, cx));
     press(cx, "delete");
-    assert_eq!(notification_count(cx), guarded, "guarded Delete is silent");
+    assert_eq!(
+        notification_count(cx),
+        guarded + 1,
+        "T-06: the guarded Delete toasts the refusal instead of doing nothing"
+    );
     assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
     cx.update(|window, cx| window.close_all_dialogs(cx));
 
@@ -30705,10 +30713,7 @@ fn t06_esc_dismiss_reclaims_shell_focus_for_the_next_shortcut(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert!(
-        cx.update(overlay_open),
-        "the add dialog is an overlay"
-    );
+    assert!(cx.update(overlay_open), "the add dialog is an overlay");
     assert!(
         cx.update(|window, cx| window.focused(cx)).is_some(),
         "the dialog holds focus while it is open"
@@ -30718,10 +30723,7 @@ fn t06_esc_dismiss_reclaims_shell_focus_for_the_next_shortcut(cx: &mut TestAppCo
     cx.update(|window, cx| window.dispatch_keystroke(esc, cx));
     cx.run_until_parked();
     paint_frame(cx);
-    assert!(
-        !cx.update(overlay_open),
-        "escape dismisses the add dialog"
-    );
+    assert!(!cx.update(overlay_open), "escape dismisses the add dialog");
     let shell_focus = view.read_with(cx, |view, _| view.focus.clone());
     assert_eq!(
         cx.update(|window, cx| window.focused(cx)),
@@ -30757,10 +30759,7 @@ fn t06_palette_second_overlay_keeps_focus(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert!(
-        cx.update(overlay_open),
-        "the palette is an overlay"
-    );
+    assert!(cx.update(overlay_open), "the palette is an overlay");
 
     let settings_op = IndexPath {
         section: 1,
@@ -30772,10 +30771,7 @@ fn t06_palette_second_overlay_keeps_focus(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert!(
-        cx.update(overlay_open),
-        "the second overlay opens"
-    );
+    assert!(cx.update(overlay_open), "the second overlay opens");
     assert_painted(cx, "settings-dialog-done");
     let shell_focus = view.read_with(cx, |view, _| view.focus.clone());
     let focused = cx.update(|window, cx| window.focused(cx));
@@ -30786,4 +30782,53 @@ fn t06_palette_second_overlay_keeps_focus(cx: &mut TestAppContext) {
         "the reclaim leaves the new overlay's focus alone"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
+}
+
+/// T-06: a shortcut pressed while an overlay owns the keyboard is refused with
+/// a toast, not swallowed.
+#[gpui_kit::test]
+fn t06_refused_shortcut_toasts_instead_of_silence(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(notification_count(cx), 0, "opening a dialog is silent");
+
+    let ctrl_o = gpui_kit::Keystroke::parse("ctrl-o").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(ctrl_o, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "the refused shortcut toasts instead of doing nothing"
+    );
+    assert_eq!(
+        crate::OVERLAY_REFUSAL_NOTE,
+        "Close the open dialog first",
+        "the refusal names the way out"
+    );
+    assert!(
+        cx.update(overlay_open),
+        "the add dialog stays the only layer"
+    );
+
+    // One Esc still closes everything: no second overlay was stacked.
+    let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(esc, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !cx.update(overlay_open),
+        "the refused shortcut opened no second overlay"
+    );
 }
