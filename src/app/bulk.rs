@@ -262,11 +262,10 @@ impl AppView {
             window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
             return;
         }
-        let mut started = 0usize;
-        let mut failed: Vec<String> = Vec::new();
         let mut skipped_dirty: Vec<String> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
-        let mut flag_failed: Vec<String> = Vec::new();
+        let mut configs: Vec<ProxyConfig> = Vec::new();
+        let mut names: HashMap<String, String> = HashMap::new();
         for id in ids {
             if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
                 if let Ok(Some(config)) = self.store.get(id) {
@@ -285,19 +284,21 @@ impl AppView {
             if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
                 window.push_notification(Notification::warning(warning), cx);
             }
-            match self.engine.start_one_confirmed(&config) {
-                Ok(()) => {
-                    started += 1;
-                    if self.store.set_enabled(id, true).is_err() {
-                        flag_failed.push(config.name.clone());
-                    }
-                }
-                Err(error) => {
-                    failed.push(format!(
-                        "{}: {}",
-                        config.name,
-                        redact_secrets(&error.to_string())
-                    ));
+            names.insert(config.id.clone(), config.name.clone());
+            configs.push(config);
+        }
+
+        // T-05: ONE additive start for the whole batch. The engine unions
+        // the checked rows with what already serves and applies once, so a
+        // twenty-row batch neither flaps the engine twenty times nor drops
+        // the rows that were already serving.
+        let requested = configs.len();
+        let outcome = self.engine.start_many_additive(&configs, true);
+        let mut flag_failed: Vec<String> = Vec::new();
+        for id in &outcome.applied {
+            if self.store.set_enabled(id, true).is_err() {
+                if let Some(name) = names.get(id) {
+                    flag_failed.push(name.clone());
                 }
             }
         }
@@ -321,20 +322,42 @@ impl AppView {
                 cx,
             );
         }
-        if failed.is_empty() {
-            window.push_notification(
-                Notification::success(format!("Started {started} configuration(s)")),
-                cx,
-            );
-        } else {
-            window.push_notification(
-                Notification::error(format!(
-                    "Started {started}, {} failed: {}",
-                    failed.len(),
-                    failed.join("; ")
-                )),
-                cx,
-            );
+        let started = outcome.applied.len();
+        let failed: Vec<String> = outcome
+            .failed
+            .iter()
+            .map(|(name, reason)| format!("{name}: {}", redact_secrets(reason)))
+            .collect();
+        match outcome.error.as_deref() {
+            // The one apply refused the batch: nothing new started, and the
+            // refusal names the row (or the shared port) that caused it.
+            Some(reason) => {
+                let mut detail = vec![redact_secrets(reason).to_string()];
+                detail.extend(failed.iter().cloned());
+                window.push_notification(
+                    Notification::error(format!(
+                        "Could not start {requested} configuration(s): {}",
+                        detail.join("; ")
+                    )),
+                    cx,
+                );
+            }
+            None if failed.is_empty() => {
+                window.push_notification(
+                    Notification::success(format!("Started {started} configuration(s)")),
+                    cx,
+                );
+            }
+            None => {
+                window.push_notification(
+                    Notification::error(format!(
+                        "Started {started}, {} failed: {}",
+                        failed.len(),
+                        failed.join("; ")
+                    )),
+                    cx,
+                );
+            }
         }
     }
 

@@ -12252,6 +12252,136 @@ fn r05_dirty_start_gates_and_clean_launches(cx: &mut TestAppContext) {
     );
 }
 
+/// T-05: `Start checked` is ADDITIVE. The rows that already serve keep
+/// serving, and the whole batch runs ONE apply — the fake engine's check
+/// counter is the proof (one `check_config` per apply, never per row).
+#[gpui_kit::test]
+fn start_checked_is_additive(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10941"))
+        .expect("seed works");
+    let beta = store
+        .add(t30_engine_seed("Beta", "10942"))
+        .expect("seed works");
+    let gamma = store
+        .add(t30_engine_seed("Gamma", "10943"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let (engine, stock) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.engine = engine;
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&alpha.id, window, cx));
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&beta.id, window, cx));
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        2,
+        "A and B serve before the batch"
+    );
+    let checks_before = stock.check_calls();
+
+    // Only C is checked.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().toggle_checked(&gamma.id);
+                list_cx.notify();
+            });
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+    });
+
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        3,
+        "the batch ADDS C, it does not replace the serving set"
+    );
+    assert_eq!(
+        stock.check_calls(),
+        checks_before + 1,
+        "one apply for the whole batch"
+    );
+    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    for id in [&alpha.id, &beta.id, &gamma.id] {
+        assert!(serving.contains(id), "{id} still serves: {serving:?}");
+    }
+    // The ONE applied config carries all three listeners — A and B were not
+    // torn down on the way.
+    let served = stock.last_config().expect("the batch served a config");
+    let value: serde_json::Value =
+        serde_json::from_str(&served).expect("the served config is JSON");
+    let ports: Vec<u64> = value["inbounds"]
+        .as_array()
+        .expect("inbounds array")
+        .iter()
+        .filter_map(|inbound| inbound["listen_port"].as_u64())
+        .collect();
+    for port in [10941u64, 10942, 10943] {
+        assert!(ports.contains(&port), "port {port} still served: {ports:?}");
+    }
+}
+
+/// T-05: twenty checked rows are ONE apply. The fake's check counter is
+/// the proof — it counts applies, never per-row starts.
+#[gpui_kit::test]
+fn bulk_start_twenty_rows_applies_once(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let mut ids: Vec<String> = Vec::new();
+    for index in 0..20 {
+        let created = store
+            .add(t30_engine_seed(
+                &format!("Row{index}"),
+                &format!("{}", 10951 + index),
+            ))
+            .expect("seed works");
+        ids.push(created.id);
+    }
+    let (view, cx) = mount_view(store, cx);
+    let (engine, stock) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.engine = engine;
+        });
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                for id in &ids {
+                    delegate.toggle_checked(id);
+                }
+                list_cx.notify();
+            });
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        20,
+        "every checked row serves"
+    );
+    assert_eq!(
+        stock.check_calls(),
+        1,
+        "twenty rows, ONE apply — no per-row flap"
+    );
+}
+
 #[test]
 fn r01_row_columns_defaults_parse_and_display() {
     use crate::RowColumns;

@@ -5308,6 +5308,20 @@ pub struct StartAllOutcome {
     pub error: Option<String>,
 }
 
+/// T-05: the outcome of the ADDITIVE batch start (`Start checked`).
+///
+/// `applied` carries the requested ids that are serving after the call,
+/// `failed` the rows that were refused on their own, and `error` the
+/// engine-level refusal (the union or the single apply failed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartManyOutcome {
+    pub applied: Vec<String>,
+
+    pub failed: Vec<(String, String)>,
+
+    pub error: Option<String>,
+}
+
 static CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_config_path(stem: &str) -> PathBuf {
@@ -6597,6 +6611,110 @@ impl EngineController {
                 for row in &candidate {
                     outcome.failed.push((row.name.clone(), error.to_string()));
                 }
+            }
+        }
+        outcome
+    }
+
+    /// T-05: the batch path for `Start checked`.
+    ///
+    /// ADDITIVE: the union of what already serves and what the caller asked
+    /// for is validated once and applied once. A twenty-row batch does not
+    /// flap the engine twenty times, and the rows that were already serving
+    /// keep serving — the union replaces an active row BY ID, it never
+    /// substitutes the serving set for the requested one.
+    ///
+    /// A row that cannot start on its own (bad params, a reserved port, a
+    /// port another row already serves) is named in `failed` and left out of
+    /// the union, so one bad row does not sink the batch. The union itself
+    /// is validated once; if the union or the single apply fails, the
+    /// previous `active`/`status` are restored and the batch is refused.
+    pub fn start_many_additive(
+        &mut self,
+        configs: &[ProxyConfig],
+        confirmed: bool,
+    ) -> StartManyOutcome {
+        let mut outcome = StartManyOutcome::default();
+        if configs.is_empty() {
+            return outcome;
+        }
+
+        // Per-row validation first. The rows that stay in `self.active` and
+        // are NOT being re-checked keep their port, so only the rows the
+        // caller replaces can be taken.
+        let requested: HashSet<&str> = configs.iter().map(|row| row.id.as_str()).collect();
+        let mut taken: HashMap<(String, u16), String> = HashMap::new();
+        for row in &self.active {
+            if requested.contains(row.id.as_str()) {
+                continue;
+            }
+            taken.insert(
+                (normalize_bind_key(&row.bind_ip), row.port),
+                row.name.clone(),
+            );
+        }
+
+        let mut candidates: Vec<ProxyConfig> = Vec::with_capacity(configs.len());
+        for row in configs {
+            if let Err(error) = validate_activation(std::slice::from_ref(row)) {
+                outcome.failed.push((row.name.clone(), error.to_string()));
+                continue;
+            }
+            let key = (normalize_bind_key(&row.bind_ip), row.port);
+            if let Some(first) = taken.get(&key) {
+                let error = EngineError::PortConflict {
+                    bind: row.bind_ip.clone(),
+                    port: row.port,
+                    first: first.clone(),
+                    second: row.name.clone(),
+                };
+                outcome.failed.push((row.name.clone(), error.to_string()));
+                continue;
+            }
+            taken.insert(key, row.name.clone());
+            candidates.push(row.clone());
+        }
+        if candidates.is_empty() {
+            return outcome;
+        }
+
+        // The union: what serves now, plus the checked rows (by id).
+        let mut union = self.active.clone();
+        for row in &candidates {
+            if let Some(slot) = union.iter_mut().find(|active| active.id == row.id) {
+                *slot = row.clone();
+            } else {
+                union.push(row.clone());
+            }
+        }
+
+        // The union is validated once, and the LAN confirm is asked once.
+        if let Err(error) = validate_activation(&union) {
+            self.last_error = Some(error.to_string());
+            outcome.error = Some(error.to_string());
+            return outcome;
+        }
+        if let Err(error) = self.enforce_lan_confirm(&union, confirmed) {
+            outcome.error = Some(error.to_string());
+            return outcome;
+        }
+
+        // One apply for the whole batch.
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
+        self.generation = self.generation.wrapping_add(1);
+        self.active = union;
+        match self.apply() {
+            Ok(()) => {
+                self.prune_lan_confirmed();
+                outcome.applied = candidates.iter().map(|row| row.id.clone()).collect();
+            }
+            Err(error) => {
+                self.active = prev;
+                self.status = prev_status;
+                self.prune_lan_confirmed();
+                self.last_error = Some(error.to_string());
+                outcome.error = Some(error.to_string());
             }
         }
         outcome
