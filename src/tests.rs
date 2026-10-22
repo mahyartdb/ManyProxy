@@ -30852,3 +30852,57 @@ fn t06_refused_shortcut_toasts_instead_of_silence(cx: &mut TestAppContext) {
         "the refused shortcut opened no second overlay"
     );
 }
+
+/// T-06: the selected row card is the app's custom control while the keyboard
+/// lands on the list. The frame hands the list's live focus handle to the
+/// delegate, and the card paints the kit focus ring while that handle is
+/// focused. The harness cannot read a painted ring's colour, so this pins the
+/// handle handoff - the ring's only input - and the row's paint.
+#[gpui_kit::test]
+fn t06_selected_row_wears_the_kit_focus_ring(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let seeded = store
+        .add(facet_seed("Ring", "vless", "team", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    select_library_row(&view, cx, &seeded.id);
+    assert_painted(cx, &format!("row-card-{}", seeded.id));
+
+    let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&list_handle, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(list_handle.clone()),
+        "the library list holds the keyboard"
+    );
+    let handed = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().list_focus.clone()
+    });
+    assert_eq!(
+        handed,
+        Some(list_handle),
+        "the frame hands the live list handle to the delegate"
+    );
+    assert_painted(cx, &format!("row-card-{}", seeded.id));
+
+    // Focus elsewhere: the row stays selected, the ring decision turns off.
+    let shell = view.read_with(cx, |view, _| view.focus.clone());
+    cx.update(|window, cx| window.focus(&shell, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(shell),
+        "the shell can take the keyboard back"
+    );
+    assert_painted(cx, &format!("row-card-{}", seeded.id));
+}

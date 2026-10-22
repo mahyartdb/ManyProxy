@@ -1,5 +1,7 @@
 use crate::*;
 
+use gpui_kit::component::ThemeStyled as _;
+
 mod columns;
 #[path = "match.rs"]
 mod matching;
@@ -16,6 +18,12 @@ pub(crate) struct LibraryDelegate {
     pub(crate) visible: Vec<usize>,
     pub(crate) query: String,
     pub(crate) selected: Option<IndexPath>,
+
+    /// T-06: the list's own focus handle, handed in by the frame that owns the
+    /// `ListState`. The selected row wears the kit focus ring while this handle
+    /// is focused - the row card is the app's custom control, but the keyboard
+    /// lands on the list.
+    pub(crate) list_focus: Option<FocusHandle>,
 
     pub(crate) health: HashMap<String, String>,
 
@@ -182,6 +190,7 @@ impl LibraryDelegate {
             visible: Vec::new(),
             query: String::new(),
             selected: None,
+            list_focus: None,
             health: HashMap::new(),
             health_tone: HashMap::new(),
             running: HashSet::new(),
@@ -979,6 +988,17 @@ impl ListDelegate for LibraryDelegate {
         }
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
+        }
+        // T-06: focus is the kit's ring, not a hand-rolled accent rim. The
+        // keyboard lands on the list, so the selected row wears the ring while
+        // that handle is focused.
+        if selected
+            && self
+                .list_focus
+                .as_ref()
+                .is_some_and(|handle| handle.is_focused(window))
+        {
+            card = card.focus_ring_style(window, cx);
         }
         let tone = serving_tone(
             is_running,

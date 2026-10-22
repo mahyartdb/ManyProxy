@@ -44,6 +44,7 @@ impl Render for AppView {
         // the header strip and the row.
         let table_width = self.library_table_width(window, cx);
         self.libraries.update(cx, |state, cx| {
+            let list_focus = state.focus_handle(cx);
             let delegate = state.delegate_mut();
             if delegate.app_view.is_none() {
                 delegate.app_view = Some(app_entity);
@@ -51,6 +52,10 @@ impl Render for AppView {
             }
             let metrics = RowMetrics::for_table_width(table_width, delegate.row_columns);
             delegate.set_row_metrics(metrics);
+            // T-06: the row cards paint the kit focus ring while the list holds
+            // the keyboard; the handle lives on the ListState, the app owns the
+            // cards, so the frame hands it across once.
+            delegate.list_focus = Some(list_focus);
         });
 
         let show_detail = self.config_count(cx) != 0;
