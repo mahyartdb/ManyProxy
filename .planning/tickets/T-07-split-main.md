@@ -146,3 +146,46 @@ same `format!` — never split the assertion, never scope it per file.
 - Phase 1 stops after slice 6; T-02..T-06 then run in files under ~1,500 lines (inspector and
   toolbar may be larger).
 - `cargo fmt --check`, clippy, and `cargo test --locked` are green at every slice.
+
+## Phase 3 — the `impl AppView` block (what phase 2 could not slice)
+
+Phase 2 landed all seven of its slices and took `main.rs` from 21,160 to **11,193** lines.
+What remains there is one undifferentiated `impl AppView` block: **294 methods, ~10.2k lines**,
+plus a handful of free items that were never on a slice table (`EchoSelect`, `shortcut_kbd`,
+`overlay_open`, `open_app_*`, `focus_shell*`, `ShellFocus`, the `SHARD_*` stat-row renderers,
+`poll_tray_once`/`handle_tray_action`). Phase 2's table never named that block, so this is
+remaining work rather than a shortcut.
+
+Shape of the block, measured by first token of the method name:
+
+| first token | count | | first token | count |
+|---|---|---|---|---|
+| `commit_` | 52 | | `toggle_` / `tick_` / `health_` | 6 / 6 / 5 |
+| `open_` | 49 | | `test_` / `speedtest_` / `resolve_` | 4 / 4 / 5 |
+| `finish_` | 14 | | `record_` / `notify_` / `spawn_` / `sync_` / `log_` | 3 each |
+| `start_` / `refresh_` / `copy_` | 8 each | | `reopen_` / `push_` / `try_` / `due_` / `update_` / `motion_` / `usage_` / `ping_` / `group_` / `save_` / `import_` / `preset_` / `begin_` / `take_` / `running_` / `close_` / `chain_` / `poll_` | 2 each |
+| `stop_` / `reload_` | 5 each | | 52 singleton prefixes | 1 each |
+
+### Slices
+
+| # | Cluster | New file(s) |
+|---|---|---|
+| 3a | every `open_*` dialog opener + `resolve_*` + `reopen_*` + `begin_*` + the `open_app_*` wrappers | `src/app/open.rs` |
+| 3b | `commit_*` + `finish_*` — split by topic when a file passes ~700 lines (`commit_forms.rs` for config/sub/preset/import/move/export, `commit_engine.rs` for start/stop/test/speedtest/traffic) | `src/app/commit*.rs` |
+| 3c | engine lifecycle — `start_*`, `stop_*`, `reload_*`, `apply_*`, `toggle_*`, `tick_*`, `health_*`, `test_*`, `speedtest_*`, `probe`, `restart`, `drain`, `poll_*`, `ensure`, `cycle` | `src/app/engine_ops.rs` |
+| 3d | clipboard and library I/O — `copy_*`, `save_*`, `import_*`, `take_*`, `paste`, `export`, `snapshot`, `wipe`, `flush`, `write`, `stage`, `restore` flows | `src/app/io_ops.rs` |
+| 3e | the remainder — `set_*`, `record_*`, `notify_*`, `spawn_*`, `sync_*`, `log_*`, the singleton-prefix methods, plus the free items above (`ShellFocus`/`focus_shell*` → `src/app/focus.rs`, tray → `src/app/tray.rs`, `SHARD_*` → `src/library/shard.rs`, `EchoSelect`/`shortcut_kbd` → `src/app/kit_bits.rs`) | `src/app/{state,bits,focus,tray}.rs`, `src/library/shard.rs` |
+
+### Constraints specific to phase 3
+
+- **Multiple inherent `impl AppView` blocks across modules are legal** — that is the whole
+  move. A new file writes `use crate::*;` (and `use gpui_kit::*;` where the code did) and
+  then `impl AppView { … }`.
+- **Field privacy is not the obstacle it looks like.** `AppView` is declared in the crate
+  root, so its private fields are visible from the root's descendants — every module in the
+  crate. Do not widen a field unless the compiler actually refuses, and when it does, widen
+  that one field to `pub(crate)` and say so in the commit body.
+- **`fn main` and `install_crash_hook` stay in `main.rs`** (phase 2 already respected this).
+- After phase 3, `main.rs` holds the inner attributes, the `mod` declarations, the
+  `use …::*;` seams, `fn main`, and the crash hook — ≈150 lines. That is the acceptance test:
+  count it, do not assume it.
