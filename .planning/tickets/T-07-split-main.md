@@ -103,6 +103,8 @@ same `format!` — never split the assertion, never scope it per file.
    exactly as it is. **Slice 2g moves them**: re-point the scan at the new file(s) in that
    slice and keep the exactly-once assertion across the scanned set. The assertion stays
    exactly as strict — a scanner that reads several files still asserts each marker once.
+   T-08 added a NINTH marker, `fell_back_to_memory` (the store-open failure path that raises
+   the not-writable banner); slice 2g moves that one with the other eight.
 2. **`std::fs::read_to_string(file!())`** (`29247`) asserts the source contains
    `const APP_VERSION` + `env!("CARGO_PKG_VERSION")`. Moving tests breaks it: retarget to
    `consts.rs` and keep that const on one line.
