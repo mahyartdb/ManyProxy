@@ -1,6 +1,7 @@
 pub(crate) mod bootstrap;
 pub(crate) mod bulk;
 pub(crate) mod detail;
+pub(crate) mod open;
 pub(crate) mod render;
 pub(crate) mod search;
 pub(crate) mod settings;
