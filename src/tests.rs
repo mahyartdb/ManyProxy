@@ -19314,6 +19314,143 @@ fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
     }
 }
 
+/// Paint the frame at an explicit size. The repo's `paint_frame` pins the
+/// 1000x700 frame; the geometry pins need the wide frame and the minimum.
+fn paint_frame_at(cx: &mut VisualTestContext, width: f32, height: f32) {
+    cx.simulate_resize(size(px(width), px(height)));
+    // The resize lands before the first draw, so the frame is laid out at
+    // the size it asks for.
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+}
+
+#[gpui_kit::test]
+fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 800.);
+
+    // Docked: the inspector takes its place on the right, the table keeps
+    // at least its 640px floor.
+    assert_absent(cx, "inspector-drawer".to_string());
+    let (list_width, inspector_width) = cx.update(|window, _| {
+        let list = window
+            .try_find("config-list".to_string())
+            .expect("the table paints")
+            .bounds();
+        let inspector = window
+            .try_find("config-detail".to_string())
+            .expect("the inspector paints")
+            .bounds();
+        (list.size.width.as_f32(), inspector.size.width.as_f32())
+    });
+    assert!(
+        list_width >= 640.,
+        "the table keeps its 640px floor at 1400px, got {list_width}"
+    );
+    assert!(
+        (240. ..=280.).contains(&inspector_width),
+        "the inspector opens at 260px by default (240-360 range), got {inspector_width}"
+    );
+
+    // Narrow: the inspector slides OVER the table as a drawer, so the table
+    // keeps the whole window and never drops under its floor.
+    paint_frame_at(cx, 1000., 700.);
+    assert_painted(cx, "inspector-drawer");
+    let narrow_list = cx.update(|window, _| {
+        window
+            .try_find("config-list".to_string())
+            .expect("the table paints")
+            .bounds()
+            .size
+            .width
+            .as_f32()
+    });
+    assert!(
+        narrow_list >= 640.,
+        "the table keeps the whole window in the drawer, got {narrow_list}"
+    );
+
+    // Esc closes the drawer and hands focus back to the list.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.clear_checked_unless_dialog(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let (open, checked) = view.read_with(cx, |view, cx| {
+        (
+            view.inspector_drawer_open,
+            view.libraries.read(cx).delegate().checked.len(),
+        )
+    });
+    assert!(!open, "Esc closed the drawer");
+    assert_eq!(
+        checked, 0,
+        "Esc closed one layer - the checked set survived"
+    );
+}
+
+#[gpui_kit::test]
+fn t03_row_pitch_holds_at_the_minimum_window(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let mut ids = Vec::new();
+    for index in 0..24 {
+        let row = store
+            .add(seed_input(&format!("row-{index:02}")))
+            .expect("seed works");
+        ids.push(row.id);
+    }
+    let (_view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    // The 880x620 minimum: the narrowest frame the window allows.
+    paint_frame_at(cx, 880., 620.);
+
+    let measured = cx.update(|window, _| {
+        let mut rows: Vec<(f32, f32)> = Vec::new();
+        for id in &ids {
+            let card = window.try_find(format!("row-card-{id}"));
+            if let Some(card) = card {
+                let card = card.bounds();
+                rows.push((card.origin.y.as_f32(), card.size.height.as_f32()));
+            }
+        }
+        rows
+    });
+    assert!(
+        measured.len() >= 8,
+        "the minimum frame paints a screenful of rows, got {}",
+        measured.len()
+    );
+    for (_, height) in &measured {
+        assert!(
+            *height <= 32.,
+            "no row is taller than 32px at the minimum, got {height}"
+        );
+    }
+    for pair in measured.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(
+            gap > 0. && gap <= 32.,
+            "the row pitch stays inside the 32px budget at the minimum, got {gap}"
+        );
+    }
+}
+
 #[gpui_kit::test]
 fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
