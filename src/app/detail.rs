@@ -1318,6 +1318,14 @@ impl AppView {
             AppView::resolve_domain_row,
         ))
         .item(Self::row_menu_item(
+            "copy-proxy",
+            row_id,
+            "Copy proxy",
+            "Copy this row's proxy URL",
+            view,
+            AppView::copy_row_socks,
+        ))
+        .item(Self::row_menu_item(
             "copy",
             row_id,
             "Copy URLs",

@@ -102,6 +102,15 @@ impl AppView {
                             view.open_bulk_move_dialog(window, cx);
                         })),
                 )
+                .child(
+                    Button::new("bulk-copy")
+                        .small()
+                        .label("Copy proxies")
+                        .tooltip("Copy the running endpoints as name + URL")
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.commit_bulk_copy_proxies(window, cx);
+                        })),
+                )
 
                 .child(Separator::vertical())
                 .child(
@@ -196,6 +205,51 @@ impl AppView {
                 cx,
             );
         }
+    }
+
+    /// T-05: the bulk copy — one TAB-separated line per checked-and-running
+    /// row (`name<TAB>socks5://host:port`), so twenty profiles paste into a
+    /// spreadsheet as two columns. Running rows only; the toast says how
+    /// many checked rows were stopped and skipped. Nothing checked means
+    /// every running row.
+    pub(crate) fn commit_bulk_copy_proxies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let checked: Vec<String> = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .checked_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        let ids: Vec<String> = if checked.is_empty() {
+            self.engine.running_ids()
+        } else {
+            checked
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut skipped = 0usize;
+        for id in &ids {
+            let Some(config) = self.row_config(id) else {
+                continue;
+            };
+            if !self.engine.is_running(id) {
+                skipped += 1;
+                continue;
+            }
+            // The STORED bind host travels with the URL — never a hardcoded
+            // 127.0.0.1, never a hand-rolled format.
+            let (socks, _) = proxy_urls(&config.bind_ip, config.port);
+            lines.push(format!("{}\t{}", config.name, socks));
+        }
+        if lines.is_empty() {
+            window.push_notification(Notification::info(bulk_copy_nothing_message(skipped)), cx);
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        window.push_notification(
+            Notification::success(bulk_copy_proxies_message(lines.len(), skipped)),
+            cx,
+        );
     }
 
     pub(crate) fn commit_bulk_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {

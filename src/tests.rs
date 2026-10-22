@@ -9876,7 +9876,7 @@ fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn cua07_card_context_menu_exposes_fifteen_items(cx: &mut TestAppContext) {
+fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9903,7 +9903,7 @@ fn cua07_card_context_menu_exposes_fifteen_items(cx: &mut TestAppContext) {
         serde_json::from_str(include_str!("../tests/fixtures/uia-card-context-menu.json"))
             .expect("card menu fixture parses");
     let items = fixture["items"].as_array().expect("fixture lists items");
-    assert_eq!(items.len(), 15, "card menu pins exactly 15 items");
+    assert_eq!(items.len(), 16, "card menu pins exactly 16 items");
     for item in items {
         let verb = item["verb"].as_str().expect("fixture verb");
         let id = format!("rowctx-{verb}-{}", row.id);
@@ -9955,13 +9955,13 @@ fn cua07_card_context_menu_exposes_fifteen_items(cx: &mut TestAppContext) {
     });
     assert_eq!(
         observed.len(),
-        15,
-        "card menu walks exactly 15 items, no sixteenth: {observed:?}"
+        16,
+        "card menu walks exactly 16 items, no seventeenth: {observed:?}"
     );
     for id in &observed {
         assert!(
             wanted.iter().any(|want| id.contains(want)),
-            "walked node {id} is one of the 15 pinned items"
+            "walked node {id} is one of the 16 pinned items"
         );
     }
     cx.update(|window, cx| {
@@ -11965,6 +11965,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     assert_painted(cx, "bulk-enable");
     assert_painted(cx, "bulk-disable");
     assert_painted(cx, "bulk-move");
+    assert_painted(cx, "bulk-copy");
     assert_painted(cx, "bulk-delete");
     assert_painted(cx, "bulk-clear");
     assert_painted(cx, "bulk-select-visible");
@@ -12038,6 +12039,7 @@ fn laneb_bulk_bar_wraps_within_min_frame(cx: &mut TestAppContext) {
         "bulk-enable",
         "bulk-disable",
         "bulk-move",
+        "bulk-copy",
         "bulk-delete",
         "bulk-clear",
         "bulk-select-visible",
@@ -12439,6 +12441,93 @@ fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext
         "one toast — the refusal names the row, not every row"
     );
     drop(held);
+}
+
+/// T-05: `Copy proxies` yields one TAB-separated line per running checked
+/// row — two spreadsheet columns, the name and the URL.
+#[gpui_kit::test]
+fn bulk_copy_proxies_yields_one_tab_separated_line_per_running_row(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10991"))
+        .expect("seed works");
+    let beta = store
+        .add(t30_engine_seed("Beta", "10992"))
+        .expect("seed works");
+    let gamma = store
+        .add(t30_engine_seed("Gamma", "10993"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let (engine, _stock) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.engine = engine;
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&alpha.id, window, cx));
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&beta.id, window, cx));
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                for id in [&alpha.id, &beta.id, &gamma.id] {
+                    delegate.toggle_checked(id);
+                }
+                list_cx.notify();
+            });
+        });
+    });
+    let read_clip = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        })
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_bulk_copy_proxies(window, cx));
+    });
+    let clip = read_clip(cx);
+    let lines: Vec<&str> = clip.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per running checked row: {clip}");
+    for line in &lines {
+        let columns: Vec<&str> = line.split('\t').collect();
+        assert_eq!(columns.len(), 2, "two spreadsheet columns: {line}");
+    }
+    assert!(clip.contains("Alpha\t"), "the name leads the line: {clip}");
+    assert!(clip.contains("Beta\t"), "the name leads the line: {clip}");
+    assert!(
+        !clip.contains("Gamma"),
+        "the stopped row is skipped: {clip}"
+    );
+    let (socks, _) = crate::store::proxy_urls("127.0.0.1", 10991);
+    assert!(
+        clip.contains(&socks),
+        "the URL carries the stored bind: {clip}"
+    );
+}
+
+/// T-05: the copy toast is honest about what it skipped.
+#[test]
+fn t05_bulk_copy_messages_name_the_skipped_rows() {
+    use crate::{bulk_copy_nothing_message, bulk_copy_proxies_message};
+    assert_eq!(bulk_copy_proxies_message(12, 0), "Copied 12 proxies");
+    assert_eq!(
+        bulk_copy_proxies_message(12, 3),
+        "Copied 12 proxies (3 checked rows are stopped and were skipped)"
+    );
+    assert_eq!(bulk_copy_nothing_message(0), "No running endpoint to copy");
+    assert!(
+        bulk_copy_nothing_message(3).contains("3 checked rows are stopped"),
+        "the empty copy still names the skips"
+    );
 }
 
 #[test]
@@ -16367,6 +16456,7 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
         "bulk-enable",
         "bulk-disable",
         "bulk-move",
+        "bulk-copy",
         "bulk-delete",
     ];
     for id in verbs {

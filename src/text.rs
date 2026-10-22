@@ -643,6 +643,26 @@ pub(crate) fn bulk_start_refused_message(
         detail.join("; ")
     )
 }
+/// T-05: the bulk copy is honest about what it skipped — a stopped row is
+/// never copied, and the toast says so instead of quietly counting less.
+pub(crate) fn bulk_copy_proxies_message(copied: usize, skipped: usize) -> String {
+    if skipped == 0 {
+        format!("Copied {copied} proxies")
+    } else {
+        format!("Copied {copied} proxies ({skipped} checked rows are stopped and were skipped)")
+    }
+}
+
+/// T-05: nothing was running, so nothing was copied — the toast says that
+/// instead of claiming a copy of zero.
+pub(crate) fn bulk_copy_nothing_message(skipped: usize) -> String {
+    if skipped == 0 {
+        "No running endpoint to copy".to_string()
+    } else {
+        format!("No running endpoint to copy ({skipped} checked rows are stopped and were skipped)")
+    }
+}
+
 pub(crate) fn no_selection_message() -> String {
     "Select a configuration first".to_string()
 }
