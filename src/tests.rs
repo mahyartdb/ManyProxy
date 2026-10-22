@@ -7006,19 +7006,20 @@ fn mount_view(store: Store, cx: &mut TestAppContext) -> (Entity<AppView>, &mut V
     (view, cx)
 }
 
-/// T-08: a real read-only folder inside TEMP. A deny-write ACE for the current
-/// user is the cheapest faithful simulation on Windows: reads keep working,
+/// T-08: a real folder inside TEMP, writable unless `deny_write` says
+/// otherwise. The denial is a deny-write ACE for the current user — the
+/// cheapest faithful simulation on Windows: reads keep working,
 /// `create_dir_all` keeps working (the folder exists), and creating a file —
 /// which is exactly what the write probe does — is refused. The ACE is removed
 /// on drop, before the folder is removed.
 #[cfg(windows)]
-struct T08DeniedFolder {
+struct T08TempFolder {
     dir: std::path::PathBuf,
     denied: bool,
 }
 
 #[cfg(windows)]
-impl T08DeniedFolder {
+impl T08TempFolder {
     fn new(tag: &str) -> Self {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7076,7 +7077,7 @@ impl T08DeniedFolder {
 }
 
 #[cfg(windows)]
-impl Drop for T08DeniedFolder {
+impl Drop for T08TempFolder {
     fn drop(&mut self) {
         if self.denied {
             if let Ok(principal) = std::env::var("USERNAME") {
@@ -31113,7 +31114,7 @@ fn t08_refused_write_raises_the_banner_naming_the_folder(cx: &mut TestAppContext
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
 
-    let mut folder = T08DeniedFolder::new("banner");
+    let mut folder = T08TempFolder::new("banner");
     let store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
     folder.deny_write();
     let (view, cx) = mount_view(store, cx);
@@ -31193,7 +31194,7 @@ fn t08_banner_fits_the_minimum_frame_and_the_table_stays_below(cx: &mut TestAppC
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
 
-    let mut folder = T08DeniedFolder::new("min-frame");
+    let mut folder = T08TempFolder::new("min-frame");
     let mut store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
     let seeded = store
         .add(row19_seed("Alpha", "a.example.com", "10801"))
@@ -31243,6 +31244,171 @@ fn t08_banner_fits_the_minimum_frame_and_the_table_stays_below(cx: &mut TestAppC
         row_bounds.origin.y >= banner.origin.y + banner.size.height - px(1.),
         "the seeded row is not covered by the banner: banner {banner:?}, row {row_bounds:?}"
     );
+
+    folder.allow_write();
+}
+
+/// T-08: restoring write permission clears the banner on the next existing
+/// tick — no restart and no new timer thread.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_tick_clears_the_banner_when_the_folder_writes_again(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut folder = T08TempFolder::new("recover");
+    let store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
+    folder.deny_write();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "write-banner");
+    assert!(
+        view.read_with(cx, |view, _| view.write_blocked.is_some()),
+        "the refused startup probe raised the banner"
+    );
+
+    folder.allow_write();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tick_engine_poll(cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, _| view.write_blocked.clone()),
+        None,
+        "the next probe clears the standing condition"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.write_banner_text())
+            .is_none(),
+        "and the sentence goes with it"
+    );
+    assert_absent(cx, "write-banner".to_string());
+}
+
+/// T-08: a writable data folder is silent — no banner at startup, and none
+/// after a tick re-probes it (no false alarm).
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_writable_folder_shows_no_banner(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let folder = T08TempFolder::new("writable");
+    let mut store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
+    store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert!(
+        view.read_with(cx, |view, _| view.write_blocked.is_none()),
+        "a writable folder has nothing to stand up"
+    );
+    assert_absent(cx, "write-banner".to_string());
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tick_engine_poll(cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_absent(cx, "write-banner".to_string());
+}
+
+/// T-08: an in-memory store has no folder to lose, so its probe is clean and
+/// the banner can never fire — a false alarm there would be a defect.
+#[gpui_kit::test]
+fn t08_in_memory_store_never_raises_the_banner(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert!(
+        view.read_with(cx, |view, _| view.write_blocked.is_none()),
+        "an in-memory store probes clean"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.write_banner_text())
+            .is_none(),
+        "and names no folder"
+    );
+    assert_absent(cx, "write-banner".to_string());
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tick_engine_poll(cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_absent(cx, "write-banner".to_string());
+}
+
+/// T-08: a save that fails because the folder refuses writes raises the
+/// standing banner and suppresses the transient toast. The store is forced
+/// read-only as well: an open SQLite handle can still push a commit through
+/// WAL inside an otherwise denied folder, so the denial alone does not make
+/// the save fail.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn t08_failed_save_raises_the_banner_instead_of_a_toast(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    let mut folder = T08TempFolder::new("save");
+    let store = Store::open_file(&folder.path().join("library.db")).expect("file store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_absent(cx, "write-banner".to_string());
+    let notifications_before = notification_count(cx);
+
+    folder.deny_write();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.store
+                .set_query_only_for_test()
+                .expect("read-only sets");
+        });
+    });
+    let added = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_add(seed_input("Lost"), window, cx)
+        })
+    });
+    assert!(!added, "the save fails");
+    assert_eq!(
+        notification_count(cx),
+        notifications_before,
+        "no toast: the standing condition gets the standing surface"
+    );
+
+    let path = folder.path().display().to_string();
+    let pinned = format!("Cannot write to the data folder ({path}) — changes will not be saved.");
+    let text = view.read_with(cx, |view, _| view.write_banner_text());
+    assert_eq!(
+        text.as_deref(),
+        Some(pinned.as_str()),
+        "the failed save names the folder it could not write to"
+    );
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "write-banner");
 
     folder.allow_write();
 }

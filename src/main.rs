@@ -11171,7 +11171,33 @@ impl AppView {
         Ok(())
     }
 
-    fn report_save_error(&self, error: StoreError, window: &mut Window, cx: &mut App) {
+    /// T-08: one probe, one state write. Returns true when the standing
+    /// condition changed, so the tick only asks for a repaint when there is
+    /// something new to paint.
+    fn refresh_write_blocked(&mut self, cx: &mut Context<Self>) -> bool {
+        let blocked = self.store.write_probe().err();
+        if blocked == self.write_blocked {
+            return false;
+        }
+        self.write_blocked = blocked;
+        cx.notify();
+        true
+    }
+
+    /// T-08: a failed save may be the folder, not the row. The probe is the
+    /// honest arbiter: a folder that refuses a write gets the standing banner
+    /// (a toast would vanish); any other failure keeps its own honest toast.
+    fn report_save_error(
+        &mut self,
+        error: StoreError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(reason) = self.store.write_probe() {
+            self.write_blocked = Some(reason);
+            cx.notify();
+            return;
+        }
         window.push_notification(Notification::error(format!("Cannot save: {error}")), cx);
     }
 
@@ -20391,6 +20417,9 @@ impl AppView {
             return None;
         }
 
+        // T-08: the tick is the seam that lets a fixed folder clear the banner
+        // without a restart.
+        self.refresh_write_blocked(cx);
         let cause = self.poll_engine();
         self.tick_shard_samples();
         self.reload_quiet_no_poll(cx);
@@ -20409,6 +20438,7 @@ impl AppView {
         if !self.ticks_enabled {
             return None;
         }
+        self.refresh_write_blocked(cx);
         let detail = self.poll_engine();
         self.tick_shard_samples();
         self.reload_quiet_no_poll(cx);
