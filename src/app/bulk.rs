@@ -271,7 +271,7 @@ impl AppView {
             let view = cx.entity();
             let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
             let description = lan_confirm_description(&lan);
-            window.open_alert_dialog(cx, move |alert, _, _| {
+            open_app_alert_dialog(window, cx, move |alert, _, _| {
                 let view = view.clone();
                 let ids = ids.clone();
                 let description = description.clone();
@@ -555,7 +555,7 @@ impl AppView {
         let names: Vec<String> = targets.iter().map(|(_, name)| name.clone()).collect();
         let count = targets.len();
         let description = bulk_delete_confirm_description(count, &names);
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let targets = targets.clone();
             let description = description.clone();
@@ -642,7 +642,7 @@ impl AppView {
         });
         let commit_key = commit.clone();
         let count = ids.len();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -691,7 +691,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -770,7 +770,7 @@ impl AppView {
         );
         let commit: DialogCommit = Rc::new(|_, _| true);
 
-        window.open_sheet(cx, move |sheet: Sheet, _, _| {
+        open_app_sheet(window, cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
 
             let mut form = v_form().small();
@@ -831,7 +831,6 @@ impl AppView {
                 let delete_group = row.name.clone();
                 let slug = slugify_group_id(&row.name);
                 let mut buttons = div().flex().flex_row().items_center().gap_2().child(
-
                     Button::new(format!("group-rename-{slug}"))
                         .label("Rename")
                         .on_click(move |_, window, cx| {
@@ -948,7 +947,6 @@ impl AppView {
                 .footer(sheet_footer(
                     "groups-dialog-ok",
                     "groups-dialog-cancel",
-
                     footer_commit_label("groups"),
                     commit_click,
                 ))
@@ -977,7 +975,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -1028,7 +1026,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -1121,6 +1119,7 @@ impl AppView {
             cx,
         );
         window.close_all_dialogs(cx);
+        reclaim_shell_focus(window, cx);
         self.open_groups_dialog(window, cx);
         true
     }
@@ -1167,6 +1166,7 @@ impl AppView {
                     cx,
                 );
                 window.close_all_dialogs(cx);
+                reclaim_shell_focus(window, cx);
                 true
             }
             Err(error) => {
@@ -1234,7 +1234,7 @@ impl AppView {
             .filter(|sub| sub.group == name)
             .count();
         let description = group_delete_confirm_description(name, count, subscriptions);
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let group = group.clone();
             let description = description.clone();
@@ -1255,6 +1255,7 @@ impl AppView {
                         window.close_dialog(cx);
                         window.close_dialog(cx);
                         view.open_groups_dialog(window, cx);
+                        reclaim_shell_focus(window, cx);
                     });
                     false
                 })

@@ -1428,7 +1428,7 @@ impl AppView {
             return;
         }
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             alert
                 .confirm()
@@ -1662,7 +1662,7 @@ impl AppView {
             log_cap_input: cap_state.clone(),
         };
 
-        window.open_dialog(cx, move |dialog: Dialog, window, cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, window, cx| {
             let current = *section.borrow();
             let rail = state.render_rail(cx);
             let body = state.render_body(current, window, cx);
@@ -1700,7 +1700,10 @@ impl AppView {
                             .small()
                             .primary()
                             .label(footer_commit_label("settings"))
-                            .on_click(|_, window, cx| window.close_all_dialogs(cx)),
+                            .on_click(|_, window, cx| {
+                                window.close_all_dialogs(cx);
+                                reclaim_shell_focus(window, cx);
+                            }),
                     ),
                 )
         });

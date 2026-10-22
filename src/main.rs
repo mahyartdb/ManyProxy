@@ -383,6 +383,7 @@ fn dialog_footer(
                 if commit(window, cx) {
                     window.close_all_dialogs(cx);
                 }
+                reclaim_shell_focus(window, cx);
             },
         ));
     }
@@ -392,7 +393,10 @@ fn dialog_footer(
             Button::new(cancel_id)
                 .small()
                 .label("Cancel")
-                .on_click(|_, window, cx| window.close_all_dialogs(cx)),
+                .on_click(|_, window, cx| {
+                    window.close_all_dialogs(cx);
+                    reclaim_shell_focus(window, cx);
+                }),
         )
         .child(
             Button::new(ok_id)
@@ -402,12 +406,96 @@ fn dialog_footer(
                     if commit_click(window, cx) {
                         window.close_all_dialogs(cx);
                     }
+                    reclaim_shell_focus(window, cx);
                 }),
         )
 }
 
 fn overlay_open(window: &mut Window, cx: &mut App) -> bool {
     window.has_active_dialog(cx) || window.has_active_sheet(cx)
+}
+
+/// T-06: the shell's focus handle, published once per window, so every
+/// overlay-dismiss path can hand keyboard focus back without threading a
+/// `FocusHandle` through each dialog builder and footer closure.
+struct ShellFocus {
+    window: WindowId,
+    handle: FocusHandle,
+}
+
+impl Global for ShellFocus {}
+
+/// T-06: the end of every overlay-dismiss path. The shell reclaims keyboard
+/// focus only when no overlay is open and no element holds focus - a reclaim
+/// that fires while the user has already clicked elsewhere, or while a second
+/// overlay has just opened, steals the keystroke they were aiming.
+pub(crate) fn reclaim_shell_focus(window: &mut Window, cx: &mut App) {
+    if overlay_open(window, cx) {
+        return;
+    }
+    if window.focused(cx).is_some() {
+        return;
+    }
+    focus_shell(window, cx);
+}
+
+/// T-06: before an overlay opens, the shell takes focus when nothing else
+/// holds it. `Root::open_dialog` remembers `window.focused(cx)` and hands that
+/// handle back when the layer closes, so this is what makes Esc, a backdrop
+/// press, the close button and a footer commit return keyboard control to the
+/// shell instead of leaving the window with a dead focus id.
+pub(crate) fn focus_shell_before_overlay(window: &mut Window, cx: &mut App) {
+    if window.focused(cx).is_none() {
+        focus_shell(window, cx);
+    }
+}
+
+fn focus_shell(window: &mut Window, cx: &mut App) {
+    let Some(shell) = cx.try_global::<ShellFocus>() else {
+        return;
+    };
+    if shell.window != window.window_handle().window_id() {
+        return;
+    }
+    let handle = shell.handle.clone();
+    window.focus(&handle, cx);
+}
+
+/// T-06: every app dialog opens through here, so Esc, a backdrop press and the
+/// close button all end in `reclaim_shell_focus`. The kit fires `on_close`
+/// after `Root::close_dialog` has already popped the layer, which is what makes
+/// the end-of-path predicate correct.
+pub(crate) fn open_app_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    build: impl Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+) {
+    focus_shell_before_overlay(window, cx);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        build(dialog, window, cx).on_close(|_, window, cx| reclaim_shell_focus(window, cx))
+    });
+}
+
+pub(crate) fn open_app_alert_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    build: impl Fn(AlertDialog, &mut Window, &mut App) -> AlertDialog + 'static,
+) {
+    focus_shell_before_overlay(window, cx);
+    window.open_alert_dialog(cx, move |alert, window, cx| {
+        build(alert, window, cx).on_close(|_, window, cx| reclaim_shell_focus(window, cx))
+    });
+}
+
+pub(crate) fn open_app_sheet(
+    window: &mut Window,
+    cx: &mut App,
+    build: impl Fn(Sheet, &mut Window, &mut App) -> Sheet + 'static,
+) {
+    focus_shell_before_overlay(window, cx);
+    window.open_sheet(cx, move |sheet, window, cx| {
+        build(sheet, window, cx).on_close(|_, window, cx| reclaim_shell_focus(window, cx))
+    });
 }
 
 fn sheet_footer(
@@ -426,7 +514,10 @@ fn sheet_footer(
             Button::new(cancel_id)
                 .small()
                 .label("Cancel")
-                .on_click(|_, window, cx| window.close_sheet(cx)),
+                .on_click(|_, window, cx| {
+                    window.close_sheet(cx);
+                    reclaim_shell_focus(window, cx);
+                }),
         )
         .child(
             Button::new(ok_id)
@@ -436,6 +527,7 @@ fn sheet_footer(
                     if commit_click(window, cx) {
                         window.close_sheet(cx);
                     }
+                    reclaim_shell_focus(window, cx);
                 }),
         )
 }
@@ -10651,7 +10743,7 @@ impl AppView {
         F: Fn(AlertDialog, &mut Window, &mut App) -> AlertDialog + 'static,
     {
         self.after_root(window, cx, move |_view, window, cx| {
-            window.open_alert_dialog(cx, build);
+            open_app_alert_dialog(window, cx, build);
         });
     }
 
@@ -10874,6 +10966,13 @@ impl AppView {
             started_at: std::time::Instant::now(),
         };
         let mut view = view;
+        // T-06: publish the shell's focus handle once per window so every
+        // overlay-dismiss path can reclaim keyboard focus without threading
+        // the handle through each dialog builder and footer closure.
+        cx.set_global(ShellFocus {
+            window: window.window_handle().window_id(),
+            handle: view.focus.clone(),
+        });
         if let Some(notice) = unclean_notice {
             // The notification layer needs the Root view, which the window only
             // adopts after this constructor returns: the decision was taken
@@ -10965,6 +11064,7 @@ impl AppView {
         {
             self.log_reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
+            reclaim_shell_focus(window, cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
             return;
@@ -11596,7 +11696,7 @@ impl AppView {
             format_bytes(totals.0),
             format_bytes(totals.1)
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
             let description = description.clone();
@@ -11822,7 +11922,7 @@ impl AppView {
         let view = cx.entity();
         let description =
             settings_clear_traffic_text(self.libraries.read(cx).delegate().counts().0);
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let description = description.clone();
             alert
@@ -11845,7 +11945,7 @@ impl AppView {
     fn open_clear_health_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_health_text();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let description = description.clone();
             alert
@@ -11868,7 +11968,7 @@ impl AppView {
     fn open_clear_snapshot_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_snapshot_text();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let description = description.clone();
             alert
@@ -12069,7 +12169,7 @@ impl AppView {
         let dialog_link =
             crate::import::share_link_for_config(&config.protocol, &config.name, &config.params);
         let payloads = share_qr_payloads(&config);
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -12234,7 +12334,7 @@ impl AppView {
         let view = cx.entity();
         let id = config.id.clone();
         let description = lan_confirm_text(&config.name, &config.bind_ip);
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
             let description = description.clone();
@@ -12392,7 +12492,7 @@ impl AppView {
         if !lan.is_empty() {
             let view = cx.entity();
             let description = lan_confirm_description(&lan);
-            window.open_alert_dialog(cx, move |alert, _, _| {
+            open_app_alert_dialog(window, cx, move |alert, _, _| {
                 let view = view.clone();
                 let description = description.clone();
                 alert
@@ -12563,7 +12663,7 @@ impl AppView {
         let names = self.running_names_for_close();
         let view = cx.entity();
         let description = stop_all_confirm_description(&names);
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let description = description.clone();
             alert
@@ -13048,7 +13148,7 @@ impl AppView {
             format!("Selected: {selected_line}"),
         ];
         lines.push(format!("Processes: {}", shard_stats_summary(&shard_rows)));
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let mut body = div().flex().flex_col().gap_1();
             for (ix, line) in lines.iter().enumerate() {
                 body = body.child(
@@ -13099,7 +13199,7 @@ impl AppView {
         let split = traffic_top9_split(&exits);
         let max = traffic_bar_max(&exits);
         let cycle_view = view.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let cycle_view = cycle_view.clone();
             let mut body = div().flex().flex_col().gap_1();
             body = body.child(
@@ -13124,6 +13224,7 @@ impl AppView {
                             };
                             view.traffic_period = next;
                             window.close_all_dialogs(cx);
+                            reclaim_shell_focus(window, cx);
                             view.open_traffic_stats_dialog(window, cx);
                         });
                     }),
@@ -13185,7 +13286,7 @@ impl AppView {
             &Store::default_path().display().to_string(),
             &Store::default_export_path().display().to_string(),
         );
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let check_view = about_view.clone();
             dialog
                 .title(format!("About {APP_TITLE}"))
@@ -13208,6 +13309,7 @@ impl AppView {
                                 .tooltip("Fetch the release feed once (JSON only — nothing downloads or runs)")
                                 .on_click(move |_, window, cx| {
                                     window.close_all_dialogs(cx);
+                                    reclaim_shell_focus(window, cx);
                                     check_view.update(cx, |view, cx| {
                                         view.check_for_updates(window, cx);
                                     });
@@ -13313,7 +13415,7 @@ impl AppView {
     ) {
         let (id, message, release_name, release_url) =
             update_check_presentation(&outcome, APP_VERSION);
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let mut body = div().flex().flex_col().gap_1();
             body = body.child(
                 div()
@@ -13401,7 +13503,7 @@ impl AppView {
         let state = cx.new(|cx| CommandState::new(window, cx));
         self.palette = Some(state.clone());
         let view = cx.entity();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let view = view.clone();
             dialog.title("Command palette").child(
                 Command::new(&state)
@@ -13538,6 +13640,9 @@ impl AppView {
             PaletteOp::ImportClipboard => self.open_import_from_clipboard(window, cx),
             PaletteOp::ExportLibrary => self.open_export_dialog(window, cx),
         }
+        // T-06: the palette's second overlay opens first; the reclaim runs last,
+        // and its predicate leaves the new overlay's focus alone.
+        reclaim_shell_focus(window, cx);
     }
 
     fn health_map(&self) -> HashMap<String, String> {
@@ -14258,7 +14363,7 @@ impl AppView {
         let names: Vec<String> = candidates.iter().map(|(_, name, _)| name.clone()).collect();
         let description = resolve_domain_confirm_text(&group, &names);
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let candidates = candidates.clone();
             let description = description.clone();
@@ -14466,7 +14571,7 @@ impl AppView {
             }
         };
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let title = title.clone();
             let description = description.clone();
@@ -14750,6 +14855,7 @@ impl AppView {
         let group = group.to_string();
         let title = format!("Enable auto-clear in group \"{group}\"?");
         let description = auto_clear_opt_in_note(&group);
+        focus_shell_before_overlay(window, cx);
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let group = group.clone();
@@ -14771,6 +14877,7 @@ impl AppView {
                             view.commit_auto_clear_opt_in(&group, window, cx);
                             if from_groups_sheet {
                                 window.close_all_dialogs(cx);
+                                reclaim_shell_focus(window, cx);
                                 view.open_groups_dialog(window, cx);
                             }
                         });
@@ -14785,6 +14892,7 @@ impl AppView {
                         }
                         view.update(cx, |exposed, cx| {
                             window.close_all_dialogs(cx);
+                            reclaim_shell_focus(window, cx);
                             exposed.open_groups_dialog(window, cx);
                         });
                         false
@@ -14800,6 +14908,7 @@ impl AppView {
                             window.close_all_dialogs(cx);
                             exposed.open_groups_dialog(window, cx);
                         });
+                        reclaim_shell_focus(window, cx);
                     }
                 })
         });
@@ -15092,7 +15201,7 @@ impl AppView {
         if path.exists() {
             let view = cx.entity();
             let description = logs_overwrite_text(&path);
-            window.open_alert_dialog(cx, move |alert, _, _| {
+            open_app_alert_dialog(window, cx, move |alert, _, _| {
                 let view = view.clone();
                 let description = description.clone();
                 alert
@@ -15149,6 +15258,7 @@ impl AppView {
         if self.logs_open && window.has_active_sheet(cx) {
             self.log_reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
+            reclaim_shell_focus(window, cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
         } else {
@@ -15169,6 +15279,7 @@ impl AppView {
         if self.logs_open && window.has_active_sheet(cx) {
             self.log_reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
+            reclaim_shell_focus(window, cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
         } else {
@@ -15188,6 +15299,7 @@ impl AppView {
         self.log_inputs = None;
         if self.logs_open && window.has_active_sheet(cx) {
             window.close_sheet(cx);
+            reclaim_shell_focus(window, cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
         } else {
@@ -15338,7 +15450,7 @@ impl AppView {
         let chrome_tail = self.log_tail;
 
         let chrome_filter_active = !self.log_filter.trim().is_empty();
-
+        focus_shell_before_overlay(window, cx);
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
 
@@ -15517,10 +15629,11 @@ impl AppView {
                 .title(title.clone())
                 .child(body)
                 .size(px(520.))
-                .on_close(move |_, _, cx| {
+                .on_close(move |_, window, cx| {
                     close_view.update(cx, |view, _| {
                         view.logs_open = false;
                     });
+                    reclaim_shell_focus(window, cx);
                 })
                 .footer(sheet_footer(
                     "logs-dialog-ok",
@@ -15559,7 +15672,7 @@ impl AppView {
             commit_view.update(cx, |view, cx| view.commit_export_dialog(path, window, cx))
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -15619,7 +15732,7 @@ impl AppView {
             let view = cx.entity();
             let description = export_overwrite_confirm_description(trimmed);
             let target = trimmed.to_string();
-            window.open_alert_dialog(cx, move |alert, _, _| {
+            open_app_alert_dialog(window, cx, move |alert, _, _| {
                 let view = view.clone();
                 let target = target.clone();
                 let description = description.clone();
@@ -15682,7 +15795,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let payload = payload.clone();
             alert
@@ -15814,7 +15927,7 @@ impl AppView {
         let adv_view = view.clone();
         let repaint_view = view.clone();
         let adv_form = form.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
             let repaint: DialogRepaint = Rc::new({
                 let repaint_view = repaint_view.clone();
                 move |_window, cx| {
@@ -15838,6 +15951,7 @@ impl AppView {
 
             let back = Rc::new(|window: &mut Window, cx: &mut App| {
                 window.close_dialog(cx);
+                reclaim_shell_focus(window, cx);
             });
             let back_key = back.clone();
             dialog
@@ -15865,7 +15979,7 @@ impl AppView {
     fn open_row_columns_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let live: Rc<RefCell<RowColumns>> = Rc::new(RefCell::new(self.row_columns));
         let view = cx.entity();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let view = view.clone();
             let current = *live.borrow();
             let mut body = div().flex().flex_col().gap_2();
@@ -15997,7 +16111,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, window, cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, window, cx| {
             form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
@@ -16091,6 +16205,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
+        focus_shell_before_overlay(window, cx);
         window.open_dialog(cx, move |dialog: Dialog, window, cx| {
             form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
@@ -16105,8 +16220,9 @@ impl AppView {
                 .overlay_closable(false)
                 .on_close({
                     let track_view = track_source.clone();
-                    move |_, _, cx| {
+                    move |_, window, cx| {
                         track_view.update(cx, |view, _| view.edit_form_open = None);
+                        reclaim_shell_focus(window, cx);
                     }
                 })
                 .child(form.clone().element(
@@ -16138,6 +16254,7 @@ impl AppView {
                                             view.edit_form_open = None;
                                         });
                                         window.close_all_dialogs(cx);
+                                        reclaim_shell_focus(window, cx);
                                     }
                                 }),
                         )
@@ -16148,6 +16265,7 @@ impl AppView {
                                 .on_click(move |_, window, cx| {
                                     if commit_click(window, cx) {
                                         window.close_all_dialogs(cx);
+                                        reclaim_shell_focus(window, cx);
                                     }
                                 }),
                         ),
@@ -16174,7 +16292,7 @@ impl AppView {
         } else {
             delete_confirm_text(&name)
         };
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
             let description = description.clone();
@@ -16204,7 +16322,7 @@ impl AppView {
         let view = cx.entity();
         let id = config.id.clone();
         let name = config.name.clone();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
             alert
@@ -16295,6 +16413,7 @@ impl AppView {
         let commit_key = commit.clone();
         let cancel_view = view.clone();
         let close_view = view.clone();
+        focus_shell_before_overlay(window, cx);
         // Snapshot before the builder runs: reading `AppView` inside the
         // dialog-builder closure re-enters the entity mid-update and panics.
         let in_flight = self.import_parse_in_flight;
@@ -16311,6 +16430,7 @@ impl AppView {
                         .on_click(move |_, window, cx| {
                             cancel_view.update(cx, |view, cx| view.cancel_import_parse(cx));
                             window.close_all_dialogs(cx);
+                            reclaim_shell_focus(window, cx);
                         }),
                 )
                 .child(
@@ -16325,6 +16445,7 @@ impl AppView {
                         .on_click(move |_, window, cx| {
                             if commit_click(window, cx) {
                                 window.close_all_dialogs(cx);
+                                reclaim_shell_focus(window, cx);
                             }
                         }),
                 );
@@ -16336,8 +16457,9 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
-                .on_close(move |_, _, cx| {
+                .on_close(move |_, window, cx| {
                     close_view.update(cx, |view, cx| view.cancel_import_parse(cx));
+                    reclaim_shell_focus(window, cx);
                 })
                 .footer(footer)
         });
@@ -16406,7 +16528,7 @@ impl AppView {
         let proxy_url = url.clone();
         let sub_view = view.clone();
         let sub_url = url.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let proxy_view = proxy_view.clone();
             let proxy_url = proxy_url.clone();
             let sub_view = sub_view.clone();
@@ -16428,6 +16550,7 @@ impl AppView {
                                     .label("Import as proxy here")
                                     .on_click(move |_, window, cx| {
                                         window.close_all_dialogs(cx);
+                                        reclaim_shell_focus(window, cx);
                                         view.update(cx, |view, cx| {
                                             view.open_import_dialog(
                                                 &url,
@@ -16476,6 +16599,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         window.close_all_dialogs(cx);
+        reclaim_shell_focus(window, cx);
         let label = subscription_label_from_url(&url);
         self.commit_subscription_add(
             label,
@@ -16827,6 +16951,7 @@ impl AppView {
         let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
         let (merged, hint, multi) = merge_browse_results(&current_text, &files);
         window.close_all_dialogs(cx);
+        reclaim_shell_focus(window, cx);
         self.open_import_dialog_with_files(&merged, &current_group, hint, multi, window, cx);
         window.push_notification(Notification::success(browse_read_message(&names)), cx);
     }
@@ -16963,6 +17088,7 @@ impl AppView {
         }
         if self.finish_import_batch(batch, &group, window, cx) {
             window.close_all_dialogs(cx);
+            reclaim_shell_focus(window, cx);
         }
     }
 
@@ -17817,6 +17943,7 @@ impl AppView {
         window.close_all_dialogs(cx);
         window.close_sheet(cx);
         self.open_subscriptions_dialog_restored(&label, &url, &group, auto, interval, window, cx);
+        reclaim_shell_focus(window, cx);
     }
 
     fn sync_presets_to_engine(&mut self) -> Result<(), String> {
@@ -18076,7 +18203,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let cell = action_cell.clone();
@@ -18205,7 +18332,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -18442,7 +18569,7 @@ impl AppView {
             let name = preset.name.clone();
             let json_text = rules_text;
             let advanced_view = cx.entity();
-            window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
                 dialog
                     .title(title.clone())
                     .child(
@@ -18512,7 +18639,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -18643,7 +18770,7 @@ impl AppView {
         let view = cx.entity();
         let preset_id = id.to_string();
         let description = preset_delete_confirm_description(name, attached);
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let preset_id = preset_id.clone();
             let description = description.clone();
@@ -18717,6 +18844,7 @@ impl AppView {
                 };
                 window.push_notification(Notification::success(message), cx);
                 window.close_all_dialogs(cx);
+                reclaim_shell_focus(window, cx);
             }
             Err(error) => {
                 self.report_save_error(error, window, cx);
@@ -18916,7 +19044,7 @@ impl AppView {
         });
         let commit_key = commit.clone();
         let commit_click = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit_click.clone();
             dialog
@@ -19058,7 +19186,7 @@ impl AppView {
             grant.dir.display(),
             grant.file_name,
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let grant = grant.clone();
             let view = view.clone();
             let description = description.clone();
@@ -19345,6 +19473,7 @@ impl AppView {
         });
         let commit_key = commit.clone();
         let close_view = view.clone();
+        focus_shell_before_overlay(window, cx);
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
@@ -19453,10 +19582,11 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
-                .on_close(move |_, _, cx| {
+                .on_close(move |_, window, cx| {
                     close_view.update(cx, |view, _| {
                         view.preset_form = None;
                     });
+                    reclaim_shell_focus(window, cx);
                 })
                 .footer(dialog_footer(
                     "presets-dialog-ok",
@@ -19480,6 +19610,7 @@ impl AppView {
         let rules = form.rules.read(cx).value().to_string();
         let boxes = SimpleRuleBoxes::from_form(form, cx);
         window.close_all_dialogs(cx);
+        reclaim_shell_focus(window, cx);
         self.open_presets_dialog_restored(&name, &rules, &boxes, window, cx);
     }
 
@@ -19519,7 +19650,7 @@ impl AppView {
         };
         let commit: DialogCommit = Rc::new(|_, _| true);
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let mut body = div().flex().flex_col().gap_2();
@@ -19598,29 +19729,24 @@ impl AppView {
             if current.is_some() {
                 let detach_view = view.clone();
                 let detach_config = config_id.clone();
-                body = body.child(
-                    Button::new("preset-detach")
-                        .label("Detach")
-                        .on_click(move |_, window, cx| {
-                            let config = detach_config.clone();
-                            detach_view.update(cx, |view, cx| {
-                                view.commit_preset_attach(&config, None, window, cx);
-                            });
-                        }),
-                );
+                body = body.child(Button::new("preset-detach").label("Detach").on_click(
+                    move |_, window, cx| {
+                        let config = detach_config.clone();
+                        detach_view.update(cx, |view, cx| {
+                            view.commit_preset_attach(&config, None, window, cx);
+                        });
+                    },
+                ));
             }
             dialog
                 .title(format!("Routing preset for \"{config_name}\""))
                 .child(body)
                 .button_props(
-
-                    DialogButtonProps::default()
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                    DialogButtonProps::default().on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
                 .footer(dialog_footer(
                     "preset-attach-ok",
                     "preset-attach-cancel",
-
                     footer_commit_label("preset-attach"),
                     commit_click,
                 ))
@@ -19639,7 +19765,7 @@ impl AppView {
             "The full URL for \"{label}\" carries its token in plaintext — anyone holding it can \
              use the subscription. Prefer the redacted copy. Copy the full URL anyway?"
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let full = full.clone();
             let description = description.clone();
             alert
@@ -19745,6 +19871,7 @@ impl AppView {
 
         let batch_progress = self.refresh_batch_progress();
         let refreshing_rows = self.inflight_refreshes.clone();
+        focus_shell_before_overlay(window, cx);
         let kill_view = view.clone();
         let due_view = view.clone();
 
@@ -19837,10 +19964,11 @@ impl AppView {
                 .title("Subscriptions")
                 .child(body)
                 .size(px(520.))
-                .on_close(move |_, _, cx| {
+                .on_close(move |_, window, cx| {
                     close_subs.update(cx, |view, _| {
                         view.subs_form = None;
                     });
+                    reclaim_shell_focus(window, cx);
                 })
                 .footer(sheet_footer(
                     "subscriptions-dialog-ok",
@@ -19919,7 +20047,7 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
 
@@ -19988,7 +20116,7 @@ impl AppView {
         let view = cx.entity();
         let id = sub.id.clone();
         let label = sub.label.clone();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
             alert
@@ -20180,7 +20308,7 @@ impl AppView {
         let view = cx.entity();
         let ids: Vec<String> = included.iter().map(|sub| sub.id.clone()).collect();
         let description = update_all_confirm_text(included.len(), skipped.len());
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let ids = ids.clone();
             alert
@@ -20862,7 +20990,7 @@ fn main() {
                         }
                         Some(description) => {
                             let confirm_view = view.clone();
-                            window.open_alert_dialog(cx, move |alert, _, _| {
+                            open_app_alert_dialog(window, cx, move |alert, _, _| {
                                 let confirm_view = confirm_view.clone();
                                 let description = description.clone();
                                 alert

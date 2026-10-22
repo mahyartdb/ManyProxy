@@ -3,13 +3,14 @@ use std::rc::Rc;
 
 use crate::engine::AutoRestartConfig;
 use crate::import::OpenWithKind;
+use crate::overlay_open;
 use crate::store::{
     AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError, WindowGeometry,
 };
 use crate::AppView;
 use crate::ExitTraffic;
 use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{Root, WindowExt};
+use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{point, px, size, AppContext, Entity, Hsla, TestAppContext};
 
@@ -30686,4 +30687,103 @@ fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
         "127.0.0.1",
         "the custom row keeps its own bind draft"
     );
+}
+
+/// T-06: Esc on the last overlay hands keyboard focus back to the shell, so the
+/// next shortcut works without a click first.
+#[gpui_kit::test]
+fn t06_esc_dismiss_reclaims_shell_focus_for_the_next_shortcut(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        cx.update(overlay_open),
+        "the add dialog is an overlay"
+    );
+    assert!(
+        cx.update(|window, cx| window.focused(cx)).is_some(),
+        "the dialog holds focus while it is open"
+    );
+
+    let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(esc, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !cx.update(overlay_open),
+        "escape dismisses the add dialog"
+    );
+    let shell_focus = view.read_with(cx, |view, _| view.focus.clone());
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(shell_focus),
+        "the shell reclaims keyboard focus once no overlay is open"
+    );
+
+    // The defect: the next shortcut silently no-op'd until the user clicked.
+    let ctrl_n = gpui_kit::Keystroke::parse("ctrl-n").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(ctrl_n, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        cx.update(overlay_open),
+        "ctrl-n opens the add dialog with no click between"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+}
+
+/// T-06: choosing a palette op closes the palette and opens a second overlay in
+/// the same handler; focus lands in the new overlay, not on the shell.
+#[gpui_kit::test]
+fn t06_palette_second_overlay_keeps_focus(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_palette(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        cx.update(overlay_open),
+        "the palette is an overlay"
+    );
+
+    let settings_op = IndexPath {
+        section: 1,
+        row: 4,
+        column: 0,
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.run_palette_op(settings_op, window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        cx.update(overlay_open),
+        "the second overlay opens"
+    );
+    assert_painted(cx, "settings-dialog-done");
+    let shell_focus = view.read_with(cx, |view, _| view.focus.clone());
+    let focused = cx.update(|window, cx| window.focused(cx));
+    assert!(focused.is_some(), "focus lands in the new overlay");
+    assert_ne!(
+        focused,
+        Some(shell_focus),
+        "the reclaim leaves the new overlay's focus alone"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
 }
