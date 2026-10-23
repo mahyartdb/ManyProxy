@@ -181,10 +181,15 @@ impl AppView {
     }
 
     /// T-08: the pinned banner sentence, or `None` when the last probe passed.
+    /// A failed OPEN names its own cause; the probe path keeps the write
+    /// refusal. Both name the folder and both promise the same outcome: this
+    /// session does not save.
     pub(crate) fn write_banner_text(&self) -> Option<String> {
-        self.write_blocked
-            .as_ref()
-            .map(|_| write_banner_sentence(&self.writable_folder()))
+        let reason = self.write_blocked.as_ref()?;
+        Some(write_banner_sentence(
+            &self.writable_folder(),
+            self.write_blocked_pinned.then_some(reason.as_str()),
+        ))
     }
 
     /// T-08: the standing not-writable strip. It is a child of the shell's
@@ -240,6 +245,14 @@ impl AppView {
 
 /// T-08: one sentence, pinned by tests. The folder is named because the app can
 /// run from any folder; the outcome is named because a silent save is the bug.
-fn write_banner_sentence(folder: &str) -> String {
-    format!("Cannot write to the data folder ({folder}) — changes will not be saved.")
+/// `open_failure` carries the real reason a store could not open — a corrupt or
+/// locked database is not a write refusal — while the probe path keeps the
+/// write sentence.
+fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
+    match open_failure {
+        Some(reason) => {
+            format!("Cannot use the data folder ({folder}): {reason} — changes will not be saved.")
+        }
+        None => format!("Cannot write to the data folder ({folder}) — changes will not be saved."),
+    }
 }

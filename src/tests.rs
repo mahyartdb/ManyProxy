@@ -31454,7 +31454,8 @@ fn t08_failed_save_raises_the_banner_instead_of_a_toast(cx: &mut TestAppContext)
 
 /// T-08: a folder that refuses the file store's OPEN is the primary case, not
 /// an edge: SQLite must create `-wal`/`-shm`, the app falls back to memory,
-/// and the banner — not just a toast — has to say that nothing will be saved.
+/// and the banner — not just a toast — has to name the real reason and say
+/// that nothing will be saved.
 #[cfg(windows)]
 #[gpui_kit::test]
 fn t08_open_failure_raises_the_banner_naming_the_folder(cx: &mut TestAppContext) {
@@ -31467,6 +31468,7 @@ fn t08_open_failure_raises_the_banner_naming_the_folder(cx: &mut TestAppContext)
     let error = Store::open_file(&db)
         .err()
         .expect("a denied folder refuses the file store's open");
+    let reason = error.to_string();
     let (view, cx) = mount_fallback_view(error, db, cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -31480,19 +31482,24 @@ fn t08_open_failure_raises_the_banner_naming_the_folder(cx: &mut TestAppContext)
         "the failed open pins the banner"
     );
     let path = folder.path().display().to_string();
-    let pinned = format!("Cannot write to the data folder ({path}) — changes will not be saved.");
+    let pinned =
+        format!("Cannot use the data folder ({path}): {reason} — changes will not be saved.");
     let text = view.read_with(cx, |view, _| view.write_banner_text());
     assert_eq!(
         text.as_deref(),
         Some(pinned.as_str()),
-        "the banner names the folder the open failed on"
+        "the banner names the folder and the real open failure"
     );
-    let reason = view
+    assert!(
+        !pinned.contains("Cannot write to the data folder"),
+        "an open failure is not reported as a write refusal: {pinned}"
+    );
+    let recorded = view
         .read_with(cx, |view, _| view.write_blocked.clone())
         .expect("the open failure is the recorded cause");
-    assert!(
-        reason.contains(&path) && reason.contains("cannot open"),
-        "the reason names the folder and the open failure: {reason}"
+    assert_eq!(
+        recorded, reason,
+        "the tooltip keeps the OS reason, not a generic refusal"
     );
     assert_painted(cx, "write-banner");
     assert_painted(cx, "write-banner-open-folder");

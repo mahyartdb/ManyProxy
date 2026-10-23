@@ -22,7 +22,7 @@ impl AppView {
     ) -> Self {
         let fallback = WriteFallback {
             folder: store_folder(path),
-            reason: format!("cannot open {}: {error}", path.display()),
+            reason: error.to_string(),
         };
         let mut view = Self::with_store_inner(
             window,
