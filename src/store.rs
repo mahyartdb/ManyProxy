@@ -45,12 +45,140 @@ pub const AUTO_PORT_END: u16 = 10999;
 pub const AUTO_PORT_SPILL_START: u16 = 18081;
 pub const AUTO_PORT_SPILL_END: u16 = 18380;
 
+/// T-04: the probe timeout's default, in seconds. It mirrors
+/// `health::URL_TEST_TIMEOUT`, and a test pins the two together.
+pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 3;
+/// T-04: the shortest probe timeout a user may pick. One second is the floor
+/// below which a slow endpoint could never answer at all.
+pub const MIN_PROBE_TIMEOUT_SECS: u64 = 1;
+/// T-04: the longest probe timeout a user may pick.
+pub const MAX_PROBE_TIMEOUT_SECS: u64 = 60;
+
+/// T-04: what the window's close button does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CloseAction {
+    /// Hide the window to the tray; the proxies keep running.
+    #[default]
+    Tray,
+    /// Stop every running profile and exit the app.
+    Quit,
+}
+
+impl CloseAction {
+    /// The value written to the store's meta table.
+    pub fn stored(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "tray",
+            CloseAction::Quit => "quit",
+        }
+    }
+
+    /// Reads a stored value back. Anything unknown is `None`, so the caller
+    /// falls back to the default instead of guessing.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "tray" => Some(CloseAction::Tray),
+            "quit" => Some(CloseAction::Quit),
+            _ => None,
+        }
+    }
+
+    /// The label the Settings radio shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "Close to tray",
+            CloseAction::Quit => "Quit the app",
+        }
+    }
+
+    /// The one-line explanation under the selected radio.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "The window closes and the proxies keep running in the tray.",
+            CloseAction::Quit => "Quitting stops every running profile and exits ManyProxy.",
+        }
+    }
+}
+
+/// T-04: which rows a "Test all" run covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TestAllScope {
+    /// Every running endpoint — the behaviour the app shipped with.
+    #[default]
+    Running,
+    /// Only the endpoints whose rows are checked.
+    Checked,
+}
+
+impl TestAllScope {
+    pub fn stored(self) -> &'static str {
+        match self {
+            TestAllScope::Running => "running",
+            TestAllScope::Checked => "checked",
+        }
+    }
+
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "running" => Some(TestAllScope::Running),
+            "checked" => Some(TestAllScope::Checked),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TestAllScope::Running => "Every running endpoint",
+            TestAllScope::Checked => "Checked endpoints only",
+        }
+    }
+}
+
 #[cfg(test)]
 pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
     + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize;
 
 pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
     (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
+}
+
+/// T-05: how many bind attempts the auto-assignment's probe makes. The
+/// engine's own bind probe retries TEN times with a sleep between them; the
+/// store cannot afford that — a slow add is its own defect — so it tries
+/// ONCE and moves to the next candidate.
+pub const AUTO_PORT_PROBE_ATTEMPTS: u32 = 1;
+
+/// T-05: the auto-assignment asks the SOCKET, not only the DB. The DB knows
+/// which ports are ASSIGNED; the socket knows which are HELD. A port
+/// another process holds is skipped, so a new row never lands on a port
+/// that is already busy.
+///
+/// `taken` carries the ports the DB already assigns (the picked port joins
+/// it). The walk is bounded by the auto range itself, and every candidate
+/// costs one bind attempt.
+fn take_free_auto_port(
+    candidates: impl Iterator<Item = u16>,
+    taken: &mut HashSet<i64>,
+) -> Result<u16, &'static str> {
+    let mut held = false;
+    for port in candidates {
+        if taken.contains(&(port as i64)) {
+            continue;
+        }
+        if crate::engine::probe_bind_available_with(DEFAULT_BIND, port, AUTO_PORT_PROBE_ATTEMPTS)
+            .is_err()
+        {
+            held = true;
+            continue;
+        }
+        taken.insert(port as i64);
+        return Ok(port);
+    }
+    Err(if held {
+        "no automatic port left in the auto range (every free port is held by another process)"
+    } else {
+        "no automatic port left in the auto range"
+    })
 }
 
 pub fn is_auto_port(port: u16) -> bool {
@@ -671,6 +799,7 @@ pub enum TrafficPeriod {
 }
 
 impl TrafficPeriod {
+    #[cfg(test)]
     pub const ALL: [TrafficPeriod; 4] = [
         TrafficPeriod::Day,
         TrafficPeriod::Week,
@@ -3764,6 +3893,37 @@ pub(crate) fn app_data_dir() -> PathBuf {
     app_data_dir_in(crate::engine::current_app_dir().as_deref())
 }
 
+/// T-08: one probe, against one folder. Split out from `Store::write_probe`
+/// so the store's in-memory case stays outside the filesystem path entirely.
+fn write_probe_in(dir: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let seq = WRITE_PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = format!(".mp-write-probe-{}-{stamp}-{seq}", std::process::id());
+    let temp = dir.join(format!("{stem}.tmp"));
+    let renamed = dir.join(format!("{stem}.ok"));
+
+    let outcome = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(b"manyproxy write probe\n")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &renamed)?;
+        std::fs::remove_file(&renamed)?;
+        Ok(())
+    })();
+
+    // Never leave a probe file behind, whichever step failed.
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_file(&renamed);
+
+    outcome.map_err(|error| format!("cannot write in {}: {error}", dir.display()))
+}
+
 pub(crate) const RULE_SETS_DIR_NAME: &str = "rule-sets";
 
 /// T-12: staged `.srs` rule sets live beside the app under `data\rule-sets\`
@@ -3912,6 +4072,11 @@ pub struct Store {
     db_path: Option<PathBuf>,
 }
 
+/// T-08: probe file names carry a process-wide sequence as well as a clock
+/// stamp, so two probes in the same nanosecond (tick plus save) never share a
+/// path.
+static WRITE_PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn swap_tmp_over_live(tmp: &Path, db_path: &Path) -> std::io::Result<()> {
     if std::fs::rename(tmp, db_path).is_ok() {
         return Ok(());
@@ -4056,6 +4221,29 @@ impl Store {
             }
         }
         app_data_dir().join("library.db")
+    }
+
+    /// T-08: the folder the library writes into. `None` for an in-memory
+    /// store — it has no folder, so it has nothing to lose.
+    pub(crate) fn data_dir(&self) -> Option<PathBuf> {
+        self.db_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+    }
+
+    /// T-08: the only honest test of writability is a write. The probe creates
+    /// a temp file inside the data folder, writes bytes, flushes them to the
+    /// OS, renames the file, then removes it. Metadata and a successful read
+    /// are not evidence: a read-only folder still reads. An in-memory store has
+    /// no folder to probe and answers `Ok(())` — the test suite and the
+    /// no-persistence fallback run on it, and a false banner there would be a
+    /// defect.
+    pub fn write_probe(&self) -> Result<(), String> {
+        match self.data_dir() {
+            Some(dir) => write_probe_in(&dir),
+            None => Ok(()),
+        }
     }
 
     fn open_with_path(conn: Connection, db_path: Option<PathBuf>) -> Result<Self, StoreError> {
@@ -4613,24 +4801,12 @@ impl Store {
         for item in fields {
             let port = match item.port {
                 Some(port) => port,
-                None => {
-                    let mut free = None;
-                    for candidate in auto_port_candidates() {
-                        if !taken.contains(&(candidate as i64)) {
-                            free = Some(candidate);
-                            break;
-                        }
+                None => match take_free_auto_port(auto_port_candidates(), &mut taken) {
+                    Ok(port) => port,
+                    Err(reason) => {
+                        return Err(StoreError::Invalid(vec![FieldError::new("port", reason)]));
                     }
-                    match free {
-                        Some(port) => port,
-                        None => {
-                            return Err(StoreError::Invalid(vec![FieldError::new(
-                                "port",
-                                "no automatic port left in the auto range",
-                            )]));
-                        }
-                    }
-                }
+                },
             };
             taken.insert(port as i64);
             assigned.push(ValidatedConfig {
@@ -6018,6 +6194,7 @@ impl Store {
         self.refresh_with_body(sub_id, text, now)
     }
 
+    #[cfg(test)]
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
@@ -6388,21 +6565,15 @@ impl Store {
             .filter(|row| !deleted_set.contains(row.id.as_str()))
             .map(|row| row.port as i64)
             .collect();
-        let mut next_free_port = || -> Option<u16> {
-            for port in auto_port_candidates() {
-                if !taken.contains(&(port as i64)) {
-                    taken.insert(port as i64);
-                    return Some(port);
-                }
-            }
-            None
+        let mut next_free_port = || -> Result<u16, &'static str> {
+            take_free_auto_port(auto_port_candidates(), &mut taken)
         };
         for (key, index, config) in &candidates {
             if consumed.contains(key) {
                 continue;
             }
             match next_free_port() {
-                Some(port) => {
+                Ok(port) => {
                     ops.push(Op::Insert {
                         key: key.clone(),
                         config: config.clone(),
@@ -6411,12 +6582,11 @@ impl Store {
                     outcome.added += 1;
                     outcome.added_names.push(config.name.clone());
                 }
-                None => {
+                Err(reason) => {
                     outcome.failures.push(crate::import::ImportFailure {
                         index: *index,
                         label: crate::import::redact_link(&config.name),
-                        reason: "port-exhausted: no automatic port left in the auto range"
-                            .to_string(),
+                        reason: format!("port-exhausted: {reason}"),
                         code: crate::import::ImportErrorKind::BadPort,
                     });
                 }
@@ -7946,6 +8116,93 @@ impl Store {
         self.set_meta(Self::META_SKIP_DELETE_CONFIRM, if skip { "1" } else { "0" })
     }
 
+    pub const META_CLOSE_ACTION: &str = "close_action";
+
+    /// T-04: what the window's close button does. `Tray` hides the window and
+    /// leaves the proxies running; `Quit` stops every profile and exits. A
+    /// missing or corrupt value reads as `Tray` — the long-standing behaviour.
+    pub fn close_action(&self) -> CloseAction {
+        match self.get_meta(Self::META_CLOSE_ACTION) {
+            Ok(Some(raw)) => CloseAction::from_stored(&raw).unwrap_or_default(),
+            _ => CloseAction::default(),
+        }
+    }
+
+    pub fn set_close_action(&mut self, action: CloseAction) -> Result<(), StoreError> {
+        self.set_meta(Self::META_CLOSE_ACTION, action.stored())
+    }
+
+    pub const META_SEEN_TRAY_HINT: &str = "seen_tray_hint";
+
+    /// T-04: the one-time "still running in the tray" hint. Absent or corrupt
+    /// reads as not-seen, so the hint shows exactly once per library.
+    pub fn seen_tray_hint(&self) -> bool {
+        self.get_meta(Self::META_SEEN_TRAY_HINT)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_seen_tray_hint(&mut self, seen: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_SEEN_TRAY_HINT, if seen { "1" } else { "0" })
+    }
+
+    pub const META_PROBE_TIMEOUT_SECS: &str = "probe_timeout_secs";
+
+    /// T-04: how long one URL probe may take. A missing or out-of-range value
+    /// reads as the default, so a corrupt meta row never stalls a probe.
+    pub fn probe_timeout_secs(&self) -> u64 {
+        match self.get_meta(Self::META_PROBE_TIMEOUT_SECS) {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|secs| (MIN_PROBE_TIMEOUT_SECS..=MAX_PROBE_TIMEOUT_SECS).contains(secs))
+                .unwrap_or(DEFAULT_PROBE_TIMEOUT_SECS),
+            _ => DEFAULT_PROBE_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn set_probe_timeout_secs(&mut self, secs: u64) -> Result<(), StoreError> {
+        if !(MIN_PROBE_TIMEOUT_SECS..=MAX_PROBE_TIMEOUT_SECS).contains(&secs) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "probe_timeout_secs",
+                format!(
+                    "probe timeout must be {MIN_PROBE_TIMEOUT_SECS}-{MAX_PROBE_TIMEOUT_SECS} seconds"
+                ),
+            )]));
+        }
+        self.set_meta(Self::META_PROBE_TIMEOUT_SECS, &secs.to_string())
+    }
+
+    pub const META_TEST_ALL_SCOPE: &str = "test_all_scope";
+
+    /// T-04: which rows a "Test all" run covers. A missing or corrupt value
+    /// reads as `Running` — the behaviour the app shipped with.
+    pub fn test_all_scope(&self) -> TestAllScope {
+        match self.get_meta(Self::META_TEST_ALL_SCOPE) {
+            Ok(Some(raw)) => TestAllScope::from_stored(&raw).unwrap_or_default(),
+            _ => TestAllScope::default(),
+        }
+    }
+
+    pub fn set_test_all_scope(&mut self, scope: TestAllScope) -> Result<(), StoreError> {
+        self.set_meta(Self::META_TEST_ALL_SCOPE, scope.stored())
+    }
+
+    pub const META_LAST_UPDATE_CHECK: &str = "last_update_check";
+
+    /// T-04: when the update feed was last checked, as a Unix timestamp.
+    pub fn last_update_check(&self) -> Option<i64> {
+        match self.get_meta(Self::META_LAST_UPDATE_CHECK) {
+            Ok(Some(raw)) => raw.trim().parse::<i64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn set_last_update_check(&mut self, at: i64) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LAST_UPDATE_CHECK, &at.to_string())
+    }
+
     pub const META_LIBRARY_COLUMNS: &str = "library_columns";
 
     pub fn library_columns_raw(&self) -> Option<String> {
@@ -8034,6 +8291,7 @@ impl Store {
     /// meta keys. Absent or corrupt reads as `None` — the pre-feature default.
     pub const META_GEOMETRY: &str = "geometry";
 
+    #[cfg(test)]
     pub fn window_geometry(&self) -> Option<WindowGeometry> {
         match self.get_meta(Self::META_GEOMETRY) {
             Ok(Some(raw)) => WindowGeometry::from_json(&raw),
@@ -8306,15 +8564,8 @@ impl Store {
         if let Some(own) = exclude {
             taken.remove(&(own as i64));
         }
-        for port in auto_port_candidates() {
-            if !taken.contains(&(port as i64)) {
-                return Ok(port);
-            }
-        }
-        Err(StoreError::Invalid(vec![FieldError::new(
-            "port",
-            "no automatic port left in the auto range",
-        )]))
+        take_free_auto_port(auto_port_candidates(), &mut taken)
+            .map_err(|reason| StoreError::Invalid(vec![FieldError::new("port", reason)]))
     }
 
     fn validate_patch(
@@ -9108,6 +9359,50 @@ mod tests {
                 .expect("add works");
             assert!(ports.insert(created.port), "port reused: {}", created.port);
         }
+    }
+
+    /// T-05: the auto-assignment asks the SOCKET. A port held by a
+    /// listening temp socket is skipped, never handed out.
+    #[test]
+    fn t05_auto_assignment_skips_a_port_held_by_a_listening_socket() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let held_port = held.local_addr().expect("addr").port();
+        let spare = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let free_port = spare.local_addr().expect("addr").port();
+        drop(spare);
+        let mut taken: HashSet<i64> = HashSet::new();
+        let picked = take_free_auto_port(
+            std::iter::once(held_port).chain(std::iter::once(free_port)),
+            &mut taken,
+        )
+        .expect("a free port is still picked");
+        assert_eq!(picked, free_port, "the held port is skipped");
+        assert!(
+            taken.contains(&(free_port as i64)),
+            "the pick joins the taken set"
+        );
+        assert!(
+            !taken.contains(&(held_port as i64)),
+            "the held port is never handed out"
+        );
+    }
+
+    /// T-05: the add path skips a held port too — the row lands on the
+    /// next free auto port, never on the one the socket holds.
+    #[test]
+    fn t05_add_auto_port_skips_the_held_first_candidate() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let held = std::net::TcpListener::bind(format!("127.0.0.1:{AUTO_PORT_START}")).ok();
+        let created = store
+            .add(valid_input("Auto"))
+            .expect("the auto port still assigns");
+        assert_ne!(created.port, AUTO_PORT_START, "the held port is skipped");
+        assert!(
+            is_auto_port(created.port),
+            "still an auto port: {}",
+            created.port
+        );
+        drop(held);
     }
 
     #[test]
@@ -17390,5 +17685,77 @@ mod tests {
             ],
             "only the unused extra leaves"
         );
+    }
+
+    fn probe_temp(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "manyproxy-t08-{tag}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    /// T-08: the probe is a write, not a metadata guess. A writable folder
+    /// answers clean and the probe file never survives the round trip.
+    #[test]
+    fn t08_write_probe_writes_and_cleans_up() {
+        let in_memory = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            in_memory.data_dir(),
+            None,
+            "an in-memory store has no data folder"
+        );
+        assert!(
+            in_memory.write_probe().is_ok(),
+            "an in-memory store probes clean — a false banner would be a defect"
+        );
+
+        let dir = probe_temp("probe");
+        std::fs::create_dir_all(&dir).expect("temp dir created");
+        let store = Store::open_file(&dir.join("library.db")).expect("file store opens");
+        assert_eq!(
+            store.data_dir().as_deref(),
+            Some(dir.as_path()),
+            "the probe folder is the database's own folder"
+        );
+        store
+            .write_probe()
+            .expect("a writable data folder probes clean");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("temp dir reads")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".mp-write-probe"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the probe removes its temp and renamed files: {leftovers:?}"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-08: a folder that refuses a write must say so, with the path, and must
+    /// not be inferred writable from anything else. A regular file is the
+    /// cheapest reliable refusal on every platform.
+    #[test]
+    fn t08_write_probe_reports_a_refused_write_with_the_path() {
+        let file = probe_temp("probe-file").with_extension("bin");
+        std::fs::write(&file, b"not a folder").expect("temp file writes");
+        let error = write_probe_in(&file).expect_err("a file path refuses the probe");
+        assert!(
+            error.contains(&file.display().to_string()),
+            "the reason names the folder path: {error}"
+        );
+        assert!(
+            file.is_file(),
+            "a failed probe never deletes anything it did not create"
+        );
+        let _ = std::fs::remove_file(&file);
     }
 }
