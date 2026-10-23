@@ -7747,7 +7747,9 @@ impl EngineController {
         match &self.status {
             EngineStatus::Stopped => "engine stopped".to_string(),
             EngineStatus::Running => {
-                format!("engine running · {} endpoint(s)", self.active.len())
+                let count = self.active.len();
+                let noun = if count == 1 { "endpoint" } else { "endpoints" };
+                format!("engine running · {count} {noun}")
             }
             EngineStatus::Crashed { cause } => format!("engine crashed ({cause})"),
         }

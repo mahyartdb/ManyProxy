@@ -135,7 +135,7 @@ pub(crate) fn sort_header_cell(
         .truncate()
         .text_sm()
         .text_color(if active {
-            cx.theme().accent
+            cx.theme().foreground
         } else {
             cx.theme().muted_foreground
         })

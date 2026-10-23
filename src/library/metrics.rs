@@ -46,7 +46,10 @@ impl RowMetrics {
     pub(crate) const CARD_GAP: f32 = 1.;
 
     pub(crate) const LAMP_CHECK: f32 = 28.;
-    pub(crate) const CHECK_SLOT: f32 = 20.;
+    /// The chip shows the checked position; three digits need ~31px with
+    /// `px_1` + a 1px border, so the slot is 32. It stays reserved whether or
+    /// not a row is checked.
+    pub(crate) const CHECK_SLOT: f32 = 32.;
     pub(crate) const NAME_MIN: f32 = 160.;
     pub(crate) const GROUP: f32 = 100.;
     pub(crate) const PROTOCOL: f32 = 90.;

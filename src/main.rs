@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::badge::Badge;
-use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;

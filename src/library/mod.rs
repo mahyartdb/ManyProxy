@@ -986,7 +986,9 @@ impl ListDelegate for LibraryDelegate {
             });
 
         if is_checked {
-            card = card.border_2().border_color(cx.theme().accent);
+            // The checked set is a second selection: a real signal-blue rim,
+            // not `accent` (neutral-800 in the dark kit, invisible on the card).
+            card = card.border_2().border_color(cx.theme().list_active_border);
         } else {
             card = card.border_1().border_color(cx.theme().border);
         }
@@ -1046,8 +1048,8 @@ impl ListDelegate for LibraryDelegate {
                         .px_1()
                         .rounded_full()
                         .border_1()
-                        .border_color(cx.theme().accent)
-                        .text_color(cx.theme().accent)
+                        .border_color(cx.theme().list_active_border)
+                        .text_color(cx.theme().accent_foreground)
                         .tooltip({
                             let tip = chip_tip.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
@@ -1201,6 +1203,10 @@ impl ListDelegate for LibraryDelegate {
                     .child(
                         Button::new(format!("row-copy-{row_id}"))
                             .small()
+                            // Pinned row test: 72px cell. The default small
+                            // padding clipped "Copy proxy"; compact keeps the
+                            // full label inside the cell.
+                            .compact()
                             .label("Copy proxy")
                             .accessibility_label(format!("Copy proxy URL for {copy_name}"))
                             .tooltip(format!(
@@ -1315,7 +1321,13 @@ impl ListDelegate for LibraryDelegate {
             let all_view = list_view.clone();
             let hint_sync = self.app_view.clone();
             let all_sync = self.app_view.clone();
-            return div().id("library-empty").test_support().size_full().child(
+            return div()
+                .id("library-empty")
+                .test_support()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(
                 Empty::new()
                     .header(
                         EmptyHeader::new()
@@ -1386,6 +1398,7 @@ impl ListDelegate for LibraryDelegate {
             ctas = ctas.child(
                 Button::new("empty-add")
                     .small()
+                    .primary()
                     .label("Add configuration")
                     .tooltip("Add a proxy configuration")
                     .on_click(move |_, window, cx| {
@@ -1408,18 +1421,20 @@ impl ListDelegate for LibraryDelegate {
                     }),
             );
         }
-        div().id("library-empty").test_support().size_full().child(
-            Empty::new()
-                .header(
-                    EmptyHeader::new()
-                        .title(EmptyTitle::new().child(empty_library_text()))
-                        .description(
-                            EmptyDescription::new().child(
-                                "Add one proxy, or import many at once — new rows land here.",
-                            ),
-                        ),
-                )
-                .content(EmptyContent::new().child(ctas)),
-        )
+        div()
+            .id("library-empty")
+            .test_support()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(
+                Empty::new()
+                    .header(
+                        EmptyHeader::new()
+                            .title(EmptyTitle::new().child(empty_library_title()))
+                            .description(EmptyDescription::new().child(empty_library_text())),
+                    )
+                    .content(EmptyContent::new().child(ctas)),
+            )
     }
 }

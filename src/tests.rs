@@ -6060,7 +6060,7 @@ fn t75_status_bar_renders_counter_line(cx: &mut TestAppContext) {
 
     assert_eq!(
         view.read_with(cx, |view, _| view.conn_counter_text()),
-        Some("4 active · 2 TCP · 1 UDP".to_string()),
+        Some("4 connections · 2 TCP · 1 UDP".to_string()),
         "counts merge both core snapshots; blank network stays active-only"
     );
     cx.run_until_parked();
@@ -6098,7 +6098,7 @@ fn t75_status_bar_renders_counter_line(cx: &mut TestAppContext) {
     });
     assert_eq!(
         view.read_with(cx, |view, _| view.conn_counter_text()),
-        Some("0 active · 0 TCP · 0 UDP".to_string()),
+        Some("0 connections · 0 TCP · 0 UDP".to_string()),
         "running but idle still reports zeros"
     );
 }
@@ -19526,9 +19526,12 @@ fn serving_badge_copy() {
     );
     assert_eq!(
         serving_badge(false, "127.0.0.1", 10801, Some("87ms")),
-        "○ Stopped"
+        "○ Stopped · 127.0.0.1:10801"
     );
-    assert_eq!(serving_badge(false, "127.0.0.1", 10801, None), "○ Stopped");
+    assert_eq!(
+        serving_badge(false, "127.0.0.1", 10801, None),
+        "○ Stopped · 127.0.0.1:10801"
+    );
     for canary in ["hunter2", "SECRET-UUID", "token=abc"] {
         assert!(!serving_badge(true, "127.0.0.1", 10801, Some("87ms")).contains(canary));
     }
@@ -26682,7 +26685,7 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     });
     assert_eq!(total, 3, "three rows counted");
     assert_eq!(health_text, "health: 2 live · 1 dead");
-    assert_eq!(engine_text, "engine running · 3 endpoint(s)");
+    assert_eq!(engine_text, "engine running · 3 endpoints");
     assert_eq!(
         crate::serving_ports_text(&[10931, 10932, 10933]),
         Some("ports 10931 · 10932 · 10933".to_string())

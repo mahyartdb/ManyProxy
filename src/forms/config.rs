@@ -8,7 +8,8 @@ pub(crate) fn advanced_settings_button(
     let adv_form = form.clone();
     Button::new("advanced-settings")
         .small()
-        .label("Advanced Settings")
+        .ghost()
+        .label("Advanced settings")
         .tooltip("Dial fields and TLS extras — edits apply directly, no extra checks")
         .accessibility_label("Open Advanced Settings: dial fields and TLS extras")
         .on_click(move |_, window, cx| {
@@ -456,10 +457,10 @@ impl ConfigForm {
             ),
             group: Self::field(window, cx, "Group", Some(DEFAULT_GROUP)),
             bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
-            port: Self::field(window, cx, "Port (blank or auto = auto-assign)", None),
+            port: Self::field(window, cx, "auto", None),
             test_url: Self::field(window, cx, "Test URL (blank = global)", None),
-            guided_server: Self::field(window, cx, "Server (e.g. example.com)", None),
-            guided_port: Self::field(window, cx, "Port (e.g. 443)", None),
+            guided_server: Self::field(window, cx, "example.com", None),
+            guided_port: Self::field(window, cx, "443", None),
             guided_identity: Self::secret_field(window, cx, "Identity secret", None),
 
             vless_uuid: Self::secret_field(window, cx, "UUID", None),
@@ -694,17 +695,12 @@ impl ConfigForm {
             ),
             group: Self::field(window, cx, "Group", Some(config.group.as_str())),
             bind: Self::field(window, cx, "Bind address", Some(config.bind_ip.as_str())),
-            port: Self::field(
-                window,
-                cx,
-                "Port (blank or auto = auto-assign)",
-                Some(&config.port.to_string()),
-            ),
+            port: Self::field(window, cx, "auto", Some(&config.port.to_string())),
             test_url: Self::field(window, cx, "Test URL (blank = global)", test_url),
             guided_server: Self::field(
                 window,
                 cx,
-                "Server (e.g. example.com)",
+                "example.com",
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server", "address"],
@@ -713,7 +709,7 @@ impl ConfigForm {
             guided_port: Self::field(
                 window,
                 cx,
-                "Port (e.g. 443)",
+                "443",
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server_port", "port"],
@@ -4165,7 +4161,11 @@ impl ConfigForm {
                 .test_support()
                 .child(Label::new("Common")),
         );
-        if has_advanced_dialog(&protocol_text) {
+        // F-33: in the raw-JSON layout the dial/TLS dialog still needs a
+        // door, and there is no guided hint row to hold it. In the guided
+        // layout it moves down beside "Advanced (raw JSON)" so the first
+        // line reads as two column heads, not three tabs.
+        if expanded && has_advanced_dialog(&protocol_text) {
             common_head = common_head.child(advanced_settings_button(&view, &toggle_form));
         }
         let mut common = div().flex().flex_col().gap_1().child(common_head).child(
@@ -4332,14 +4332,36 @@ impl ConfigForm {
                         ),
                 );
             }
-            let mut hint_row = div().flex().flex_row().items_center().gap_2();
+            // The hint must be allowed to shrink. Without `min_w_0` its
+            // min-content width pushed the adjacent Advanced settings and
+            // Advanced (raw JSON) buttons outside the 448px edit dialog, where
+            // clicks landed on the overlay instead of the buttons.
+            let mut hint_row = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .min_w_0();
             if let Some(hint) = guided_hint_line(&protocol_text) {
-                hint_row =
-                    hint_row.child(div().flex_1().id("guided-hint").test_support().child(hint));
+                hint_row = hint_row.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .id("guided-hint")
+                        .test_support()
+                        .child(hint),
+                );
             } else {
-                hint_row = hint_row.child(div().flex_1());
+                hint_row = hint_row.child(div().flex_1().min_w_0());
             }
-            common = common.child(hint_row.child(advanced_toggle_button(
+            let mut actions = hint_row;
+            if has_advanced_dialog(&protocol_text) {
+                actions = actions.child(advanced_settings_button(&view, &toggle_form));
+            }
+            common = common.child(actions.child(advanced_toggle_button(
                 "Advanced (raw JSON)",
                 &view,
                 &toggle_form,

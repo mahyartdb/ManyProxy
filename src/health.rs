@@ -1228,8 +1228,8 @@ pub enum ConnProto {
     Other,
 }
 
-/// T-25: `N active · M TCP · K UDP` derived from clash snapshot rows. Counts
-/// only — no row content reaches the status bar.
+/// T-25: `N connections · M TCP · K UDP` derived from clash snapshot rows.
+/// Counts only — no row content reaches the status bar.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConnCounts {
     pub active: usize,
@@ -1262,8 +1262,13 @@ impl ConnCounts {
     }
 
     pub fn status_text(&self) -> String {
+        let noun = if self.active == 1 {
+            "connection"
+        } else {
+            "connections"
+        };
         format!(
-            "{} active · {} TCP · {} UDP",
+            "{} {noun} · {} TCP · {} UDP",
             self.active, self.tcp, self.udp
         )
     }
@@ -4243,7 +4248,7 @@ mod tests {
                 udp: 1
             }
         );
-        assert_eq!(counts.status_text(), "4 active · 1 TCP · 1 UDP");
+        assert_eq!(counts.status_text(), "4 connections · 1 TCP · 1 UDP");
     }
 
     #[test]
@@ -4282,7 +4287,16 @@ mod tests {
         );
         assert_eq!(
             ConnCounts::from_conns(std::iter::empty()).status_text(),
-            "0 active · 0 TCP · 0 UDP"
+            "0 connections · 0 TCP · 0 UDP"
+        );
+        assert_eq!(
+            ConnCounts {
+                active: 1,
+                tcp: 1,
+                udp: 0
+            }
+            .status_text(),
+            "1 connection · 1 TCP · 0 UDP"
         );
     }
 

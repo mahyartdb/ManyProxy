@@ -1756,6 +1756,11 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title("Add proxy configuration")
+                // The guided two-column form needs more than the kit's 448px
+                // default: at 448 the Server sub-field clipped even the short
+                // `example.com` placeholder. 560 keeps both columns whole at
+                // the 880px window minimum.
+                .w(px(560.))
                 .overlay_closable(false)
                 .child(form.clone().element(
                     element_view.clone(),
@@ -1850,6 +1855,10 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title(title.clone())
+                // Match Add: the guided form plus its hint/advanced row needs
+                // more than the kit's 448px default, or the hint truncates to
+                // an ellipsis and the two dialog buttons crowd its edge.
+                .w(px(560.))
                 .overlay_closable(false)
                 .on_close({
                     let track_view = track_source.clone();

@@ -1,4 +1,5 @@
 use crate::*;
+use gpui_kit::component::scroll::ScrollableElement as _;
 
 /// T-02: a key never rides inside a label or an accessible name. The operate
 /// row announces the action alone and keeps the key in its tooltip, so the
@@ -111,6 +112,9 @@ impl AppView {
             .flex_col()
             .items_center()
             .justify_center()
+            .w_full()
+            .h_full()
+            .min_w_0()
             .child(
                 Empty::new().header(
                     EmptyHeader::new()
@@ -141,7 +145,10 @@ impl AppView {
             .flex_col()
             .gap_1()
             .h_full()
+            .w_full()
             .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
             .child(self.render_inspector_tabs(cx))
             .child(
                 div()
@@ -150,11 +157,22 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .flex_1()
+                    // The body hugs its modules when the pane is tall, then a
+                    // spacer below the row editors pushes the operate row to
+                    // the bottom. When the pane is short the body shrinks
+                    // (min_h_0) and scrolls; it never strands the row editors
+                    // a screenful below the Usage title.
+                    .flex_initial()
+                    .flex_grow_0()
                     .min_h_0()
+                    .min_w_0()
                     .overflow_y_scroll()
                     .overflow_x_hidden()
                     .track_scroll(&self.detail_scroll)
+                    // Appears on hover/wheel: at 620px the pane content sits
+                    // below the overview, and a clipped line alone is a poor
+                    // scroll cue.
+                    .vertical_scrollbar(&self.detail_scroll)
                     .child(self.render_inspector_overview(cx, config))
                     .child(Self::motion_enter(
                         match self.inspector_tab {
@@ -183,6 +201,9 @@ impl AppView {
             // above the operate row — the operate row keeps its two-line
             // budget, and the editors keep their room.
             .child(self.render_row_editors(window, cx, config))
+            // Keeps the operate row pinned to the bottom while the editors
+            // stay attached to the body modules above them.
+            .child(div().flex_1())
             .child(self.render_detail_actions(cx, config))
             .into_any_element()
     }
@@ -347,6 +368,7 @@ impl AppView {
                         div()
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(
@@ -613,7 +635,6 @@ impl AppView {
             )
             .child(Tag::new().child(config.protocol.clone()))
             .child(Tag::new().child(config.group.clone()))
-            .child(format!("{}:{}", config.bind_ip, config.port))
             .child({
                 // T-03: the dirty marker rides the inspector's row header —
                 // the row is one line and has no room for it.
@@ -634,7 +655,7 @@ impl AppView {
                         .test_support()
                         .size(px(6.))
                         .rounded_full()
-                        .bg(cx.theme().accent)
+                        .bg(cx.theme().list_active_border)
                         .tooltip({
                             let tip = dirty_tip.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
@@ -663,15 +684,28 @@ impl AppView {
         config: &ProxyConfig,
     ) -> impl IntoElement {
         let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
+        // The row label already says SOCKS / HTTP, so the scheme is redundant
+        // noise in a 260px pane. Show host:port — it fits whole — while every
+        // Copy action still puts the full URL on the clipboard.
+        let socks_display = socks_url
+            .strip_prefix("socks5://")
+            .unwrap_or(&socks_url)
+            .to_string();
+        let http_display = http_url
+            .strip_prefix("http://")
+            .unwrap_or(&http_url)
+            .to_string();
 
         let upstream = self.cached_upstream(cx, config);
 
         div().id("config-endpoints").test_support().child(
-            GroupBox::new().title("Endpoints").gap_1().child(
+            GroupBox::new().title("Endpoints").gap_0().child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_0()
+                    .w_full()
+                    .min_w_0()
                     .max_w(px(620.))
                     .child(Self::endpoint_row(
                         cx,
@@ -685,7 +719,7 @@ impl AppView {
                         cx,
                         &config.id,
                         "SOCKS",
-                        socks_url,
+                        socks_display,
                         "endpoint-value-socks",
                         Some(EndpointUrl::Socks),
                     ))
@@ -693,7 +727,7 @@ impl AppView {
                         cx,
                         &config.id,
                         "HTTP",
-                        http_url,
+                        http_display,
                         "endpoint-value-http",
                         Some(EndpointUrl::Http),
                     )),
@@ -710,6 +744,11 @@ impl AppView {
         which: Option<EndpointUrl>,
     ) -> impl IntoElement {
         let tip = value.clone();
+        // T-03: one row per endpoint. The value takes the leftover width and
+        // truncates at the 260px default; the full text stays in its tooltip
+        // and the Copy button never clips. Wrapping Copy under the value made
+        // the endpoint block tall enough to push HTTP out of the 620px pane,
+        // so the compact single-line row is deliberate.
         let mut value_row = div()
             .flex()
             .flex_row()
@@ -722,7 +761,7 @@ impl AppView {
                     .id(value_id)
                     .test_support()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(72.))
                     .truncate()
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(value),
@@ -731,19 +770,19 @@ impl AppView {
             let (id, button_label, tip, a11y) = match which {
                 EndpointUrl::Socks => (
                     "copy-socks",
-                    "Copy SOCKS",
+                    "Copy",
                     "Copy the SOCKS endpoint (no secrets)",
                     "Copy SOCKS URL",
                 ),
                 EndpointUrl::Http => (
                     "copy-http",
-                    "Copy HTTP",
+                    "Copy",
                     "Copy the HTTP endpoint (no secrets)",
                     "Copy HTTP URL",
                 ),
                 EndpointUrl::Upstream => (
                     "copy-upstream",
-                    "Copy upstream",
+                    "Copy",
                     "Copy the upstream host:port (no secrets)",
                     "Copy upstream endpoint",
                 ),
@@ -776,7 +815,7 @@ impl AppView {
             .w_full()
             .child(
                 div()
-                    .w(px(72.))
+                    .w(px(64.))
                     .flex_shrink_0()
                     .text_sm()
                     .text_color(cx.theme().description_list_label_foreground)
@@ -1093,132 +1132,141 @@ impl AppView {
         let failed = self.detail_failed(config);
         let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
 
+        // T-03: these three are direct children of the wrapping operate row.
+        // A ButtonGroup is a single flex item and cannot break, so inside the
+        // 260px drawer it clipped its own last button. Kept as siblings, each
+        // button wraps on its own line and the pinned shortcut chips survive.
+        let mut start = Button::new("engine-start")
+            .small()
+            .label(start_label)
+            .accessibility_label("Start the selected endpoint")
+            .child(shortcut_kbd("f5", "(F5)"))
+            .tooltip(OPERATE_START_TOOLTIP)
+            .loading(self.start_in_flight)
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.start_selected_engine(window, cx);
+            }));
+        if self.start_in_flight {
+            start = start.child(
+                div()
+                    .id("engine-start-spinner")
+                    .test_support()
+                    .child(Spinner::new().small()),
+            );
+        }
+
+        let mut stop = Button::new("engine-stop")
+            .small()
+            .label("Stop")
+            .accessibility_label("Stop")
+            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
+            .tooltip(OPERATE_STOP_TOOLTIP)
+            .loading(self.start_in_flight)
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.stop_selected_engine(window, cx);
+            }));
+        if self.start_in_flight {
+            stop = stop.child(
+                div()
+                    .id("engine-stop-spinner")
+                    .test_support()
+                    .child(Spinner::new().small()),
+            );
+        }
+
+        let mut test = Button::new("health-test")
+            .small()
+            .label("Test")
+            .accessibility_label("Test")
+            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
+            .tooltip(OPERATE_TEST_TOOLTIP)
+            .loading(self.probe_kind_in_flight(false))
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.test_selected_health(window, cx);
+            }));
+        if self.probe_kind_in_flight(false) {
+            test = test.child(
+                div()
+                    .id("health-test-spinner")
+                    .test_support()
+                    .child(Spinner::new().small()),
+            );
+        }
+
+        // The hairline is a sibling wrapper, not part of the row: the pinned
+        // minimum-width test budgets four 24px lines plus gaps inside
+        // `detail-operate`, and a 1px top border would push the row to 121px.
         div()
-            .id("detail-operate")
-            .test_support()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
             .w_full()
             .border_t_1()
             .border_color(cx.theme().border)
             .child(
-                Switch::new(switch_id)
-                    .checked(config.enabled)
-                    .label("Auto-start")
-                    .accessibility_label("Auto-start")
-                    .tooltip("Auto-start with Start-all — Start/Stop control serving now")
-                    .on_change(move |enabled: &bool, window, cx| {
-                        let enabled = *enabled;
-                        let id = switch_id_for_handler.clone();
-                        switch_view.update(cx, |view, cx| {
-                            view.commit_enabled_flag(&id, enabled, window, cx);
-                        });
-                    }),
-            )
-            .child({
-                let mut start = Button::new("engine-start")
-                    .small()
-                    .label(start_label)
-                    .accessibility_label("Start the selected endpoint")
-                    .child(shortcut_kbd("f5", "(F5)"))
-                    .tooltip(OPERATE_START_TOOLTIP)
-                    .loading(self.start_in_flight)
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.start_selected_engine(window, cx);
-                    }));
-                if self.start_in_flight {
-                    start = start.child(
-                        div()
-                            .id("engine-start-spinner")
-                            .test_support()
-                            .child(Spinner::new().small()),
-                    );
-                }
-
-                let mut stop = Button::new("engine-stop")
-                    .small()
-                    .label("Stop")
-                    .accessibility_label("Stop")
-                    .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                    .tooltip(OPERATE_STOP_TOOLTIP)
-                    .loading(self.start_in_flight)
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.stop_selected_engine(window, cx);
-                    }));
-                if self.start_in_flight {
-                    stop = stop.child(
-                        div()
-                            .id("engine-stop-spinner")
-                            .test_support()
-                            .child(Spinner::new().small()),
-                    );
-                }
-
-                let mut test = Button::new("health-test")
-                    .small()
-                    .label("Test")
-                    .accessibility_label("Test")
-                    .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                    .tooltip(OPERATE_TEST_TOOLTIP)
-                    .loading(self.probe_kind_in_flight(false))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.test_selected_health(window, cx);
-                    }));
-                if self.probe_kind_in_flight(false) {
-                    test = test.child(
-                        div()
-                            .id("health-test-spinner")
-                            .test_support()
-                            .child(Spinner::new().small()),
-                    );
-                }
-                ButtonGroup::new("detail-operate-primaries")
+                div()
+                    .id("detail-operate")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .child(
+                        Switch::new(switch_id)
+                            .checked(config.enabled)
+                            .label("Auto-start")
+                            .accessibility_label("Auto-start")
+                            .tooltip("Auto-start with Start-all — Start/Stop control serving now")
+                            .on_change(move |enabled: &bool, window, cx| {
+                                let enabled = *enabled;
+                                let id = switch_id_for_handler.clone();
+                                switch_view.update(cx, |view, cx| {
+                                    view.commit_enabled_flag(&id, enabled, window, cx);
+                                });
+                            }),
+                    )
                     .child(start)
                     .child(stop)
                     .child(test)
-            })
-            .child({
-                let mut ping = Button::new("health-ping")
-                    .small()
-                    .label("Ping")
-                    .tooltip("TCP-ping the selected endpoint")
-                    .loading(self.probe_kind_in_flight(true))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.ping_selected(window, cx);
-                    }));
-                if self.probe_kind_in_flight(true) {
-                    ping = ping.child(
-                        div()
-                            .id("health-ping-spinner")
-                            .test_support()
-                            .child(Spinner::new().small()),
-                    );
-                }
-                ping
-            })
-            .child(
-                Button::new("logs-open")
-                    .small()
-                    .label("Logs")
-                    .tooltip("Open logs for the selection")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_logs_dialog(window, cx);
-                    })),
+                    .child({
+                        let mut ping = Button::new("health-ping")
+                            .small()
+                            .label("Ping")
+                            .tooltip("TCP-ping the selected endpoint")
+                            .loading(self.probe_kind_in_flight(true))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.ping_selected(window, cx);
+                            }));
+                        if self.probe_kind_in_flight(true) {
+                            ping = ping.child(
+                                div()
+                                    .id("health-ping-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        ping
+                    })
+                    .child(
+                        Button::new("logs-open")
+                            .small()
+                            .label("Logs")
+                            .tooltip("Open logs for the selection")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_logs_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("copy-urls")
+                            .small()
+                            .label("Copy URLs")
+                            .tooltip("Copy bind endpoints (no secrets)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.copy_selected_urls(window, cx);
+                            })),
+                    )
+                    .child(self.render_row_menu(cx))
+                    .children(self.render_row_endpoint_warning(cx, config)),
             )
-            .child(
-                Button::new("copy-urls")
-                    .small()
-                    .label("Copy URLs")
-                    .tooltip("Copy bind endpoints (no secrets)")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.copy_selected_urls(window, cx);
-                    })),
-            )
-            .child(self.render_row_menu(cx))
-            .children(self.render_row_endpoint_warning(cx, config))
     }
 
     pub(crate) fn row_menu_item(
@@ -1568,62 +1616,94 @@ impl AppView {
 }
 
 impl AppView {
+    /// T-03: six panes at 244–344px do not fit one segmented row. Two rows of
+    /// three keep every pane visible without a hidden horizontal scroll; the
+    /// Ctrl-1…6 keys live in the tooltips of the commands/Settings → Shortcuts
+    /// and no longer ride the tab labels.
     pub(crate) fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
+        let top_view = cx.entity();
+        let bottom_view = cx.entity();
+        let selected = self.inspector_tab.index();
+        let top_selected = (selected < 3).then_some(selected);
+        let bottom_selected = selected.checked_sub(3);
 
-        div().id("inspector-tabs").test_support().child(
-            TabBar::new("inspector-tabs")
-                .segmented()
-                .small()
-                .selected_index(self.inspector_tab.index())
-                .on_click(move |index, _, cx| {
-                    view.update(cx, |view, _| {
-                        view.set_inspector_tab(InspectorTab::from_index(*index));
-                    });
-                })
-                .child(
-                    Tab::new()
-                        .label("Details")
-                        .aria_label(InspectorTab::Details.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-1", "(Ctrl-1)"))
-                        .child(div().id("inspector-tab-details").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Health")
-                        .aria_label(InspectorTab::Health.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-2", "(Ctrl-2)"))
-                        .child(div().id("inspector-tab-health").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Presets")
-                        .aria_label(InspectorTab::Presets.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-3", "(Ctrl-3)"))
-                        .child(div().id("inspector-tab-presets").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Logs")
-                        .aria_label(InspectorTab::Logs.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-4", "(Ctrl-4)"))
-                        .child(div().id("inspector-tab-logs").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Connections")
-                        .aria_label(InspectorTab::Connections.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-5", "(Ctrl-5)"))
-                        .child(div().id("inspector-tab-connections").test_support()),
-                )
-                .child(
-                    Tab::new()
-                        .label("Traffic")
-                        .aria_label(InspectorTab::Traffic.a11y_label())
-                        .suffix(shortcut_kbd("ctrl-6", "(Ctrl-6)"))
-                        .child(div().id("inspector-tab-traffic").test_support()),
-                ),
-        )
+        let mut top_bar = TabBar::new("inspector-tabs-top")
+            .segmented()
+            .small()
+            .w_full()
+            .on_click(move |index, _, cx| {
+                top_view.update(cx, |view, _| {
+                    view.set_inspector_tab(InspectorTab::from_index(*index));
+                });
+            })
+            .child(
+                Tab::new()
+                    .label("Details")
+                    .aria_label(InspectorTab::Details.a11y_label())
+                    .flex_1()
+                    .child(div().id("inspector-tab-details").test_support()),
+            )
+            .child(
+                Tab::new()
+                    .label("Health")
+                    .aria_label(InspectorTab::Health.a11y_label())
+                    .flex_1()
+                    .child(div().id("inspector-tab-health").test_support()),
+            )
+            .child(
+                Tab::new()
+                    .label("Presets")
+                    .aria_label(InspectorTab::Presets.a11y_label())
+                    .flex_1()
+                    .child(div().id("inspector-tab-presets").test_support()),
+            );
+        if let Some(index) = top_selected {
+            top_bar = top_bar.selected_index(index);
+        }
+
+        let mut bottom_bar = TabBar::new("inspector-tabs-bottom")
+            .segmented()
+            .small()
+            .w_full()
+            .on_click(move |index, _, cx| {
+                bottom_view.update(cx, |view, _| {
+                    view.set_inspector_tab(InspectorTab::from_index(*index + 3));
+                });
+            })
+            .child(
+                Tab::new()
+                    .label("Logs")
+                    .aria_label(InspectorTab::Logs.a11y_label())
+                    .flex_1()
+                    .child(div().id("inspector-tab-logs").test_support()),
+            )
+            .child(
+                Tab::new()
+                    .label("Connections")
+                    .aria_label(InspectorTab::Connections.a11y_label())
+                    .flex_1()
+                    .child(div().id("inspector-tab-connections").test_support()),
+            )
+            .child(
+                Tab::new()
+                    .label("Traffic")
+                    .aria_label(InspectorTab::Traffic.a11y_label())
+                    .flex_1()
+                    .child(div().id("inspector-tab-traffic").test_support()),
+            );
+        if let Some(index) = bottom_selected {
+            bottom_bar = bottom_bar.selected_index(index);
+        }
+
+        div()
+            .id("inspector-tabs")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .child(top_bar)
+            .child(bottom_bar)
     }
 
     pub(crate) fn render_inspector_overview(
@@ -1636,7 +1716,7 @@ impl AppView {
             .test_support()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_0()
             .child(self.render_detail_header(cx, config));
         if self.detail_failed(config) {
             overview = overview.child(

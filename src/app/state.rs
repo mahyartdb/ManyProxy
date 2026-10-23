@@ -2148,6 +2148,8 @@ impl AppView {
             return div()
                 .id("config-history-empty")
                 .test_support()
+                .w_full()
+                .min_w_0()
                 .text_color(health_tone_color(caption_tone, cx))
                 .child(match latencies.len() {
                     1 => format!("1 probe recorded — no trend yet ({})", latencies[0]),
@@ -2160,8 +2162,11 @@ impl AppView {
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap_2()
+            .w_full()
+            .min_w_0()
             .child(
                 div()
                     .text_color(health_tone_color(caption_tone, cx))

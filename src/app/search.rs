@@ -116,6 +116,17 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.sync_facet_pickers(window, cx);
+        // The drawer is an overlay below 1080px, so the table's full width is
+        // still painted underneath it. Reserve the drawer's share in the
+        // facet bar while it is open: otherwise the count's Clear search
+        // button lands under the overlay and cannot be clicked. This makes the
+        // bar wrap to a second line instead of hiding controls.
+        let drawer_reserve = if !self.inspector_docked(window) && self.inspector_drawer_open {
+            self.inspector_width(cx) + 12.
+        } else {
+            0.
+        };
+        let right_pad = 8. + drawer_reserve;
         let has_facets = self.libraries.read(cx).delegate().facets_active();
         // T-19: the facet area carries the same per-group opt-in switch for
         // the focused group; has no group to protect by design.
@@ -159,24 +170,16 @@ impl AppView {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .px_2()
+            .pl_2()
+            .pr(px(right_pad))
             .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(
-                div()
-                    .id("library-search")
-                    .test_support()
-                    .flex_1()
-                    .min_w(px(140.))
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(SEARCH_HINT)).into())
-                    .child(
-                        Input::new(&self.search_input)
-                            .small()
-                            .aria_label("Search configurations"),
-                    ),
-            )
-            .child(self.render_search_count(cx))
+            // T-23 / F-32: filters lead the row. A `flex_1` search used to
+            // claim the whole width and shove Protocol/Status under the
+            // inspector drawer at 880–1000px. The search keeps the remaining
+            // stretch but stops at 320px, so the drawer can only ever cover
+            // its right edge — never the filter values.
             .child(
                 div()
                     .id("facet-group-tip")
@@ -205,7 +208,9 @@ impl AppView {
                 div()
                     .id("facet-status-tip")
                     .test_support()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(status_tip.clone())).into())
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new(status_tip.clone())).into()
+                    })
                     .child(
                         Select::new(&self.facet_status.state)
                             .id("facet-status")
@@ -213,6 +218,21 @@ impl AppView {
                             .accessibility_label("Filter by status"),
                     ),
             )
+            .child(
+                div()
+                    .id("library-search")
+                    .test_support()
+                    .flex_1()
+                    .min_w(px(140.))
+                    .max_w(px(320.))
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(SEARCH_HINT)).into())
+                    .child(
+                        Input::new(&self.search_input)
+                            .small()
+                            .aria_label("Search configurations"),
+                    ),
+            )
+            .child(self.render_search_count(cx))
             .child(match facet_group_now {
                 Some(group) => {
                     let slug = slugify_group_id(&group);

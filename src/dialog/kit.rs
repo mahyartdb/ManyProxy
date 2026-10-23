@@ -44,6 +44,7 @@ pub(crate) fn dialog_footer(
         .child(
             Button::new(ok_id)
                 .small()
+                .primary()
                 .label(ok_label)
                 .on_click(move |_, window, cx| {
                     if commit_click(window, cx) {
@@ -78,6 +79,7 @@ pub(crate) fn sheet_footer(
         .child(
             Button::new(ok_id)
                 .small()
+                .primary()
                 .label(ok_label)
                 .on_click(move |_, window, cx| {
                     if commit_click(window, cx) {

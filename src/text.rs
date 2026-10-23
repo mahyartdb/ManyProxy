@@ -547,22 +547,23 @@ pub(crate) fn resolve_domain_group_notification(
 }
 /// T-03: the badge carries the endpoint, not an orphaned colon — `Running ·
 /// 127.0.0.1:10801 · 87ms`. The bind belongs to the endpoint, so the string
-/// carries it; the latency segment appears only once a probe has run.
+/// carries it; the latency segment appears only once a probe has run. A stopped
+/// endpoint still names its bind so the header never has to repeat it.
 pub(crate) fn serving_badge(
     is_running: bool,
     bind: &str,
     port: u16,
     health: Option<&str>,
 ) -> String {
-    if !is_running {
-        return "○ Stopped".to_string();
-    }
     let bind = bind.trim();
     let endpoint = if bind.is_empty() {
         format!(":{port}")
     } else {
         format!("{bind}:{port}")
     };
+    if !is_running {
+        return format!("○ Stopped · {endpoint}");
+    }
     match health.map(str::trim).filter(|summary| !summary.is_empty()) {
         Some(summary) => format!("● Running · {endpoint} · {summary}"),
         None => format!("● Running · {endpoint}"),
@@ -721,8 +722,11 @@ pub(crate) fn serving_ports_text(ports: &[u16]) -> Option<String> {
 pub(crate) fn no_matches_text() -> String {
     "No matches — Clear search".to_string()
 }
+pub(crate) fn empty_library_title() -> String {
+    "No proxy configurations yet".to_string()
+}
 pub(crate) fn empty_library_text() -> String {
-    "No proxy configurations yet — Add or Import to start".to_string()
+    "Add one proxy, or use Import for many at once.".to_string()
 }
 pub(crate) fn crash_notification_text(detail: &str) -> String {
     format!("Engine crashed ({detail}) — View logs")
