@@ -6707,6 +6707,16 @@ impl EngineController {
         }
 
         let mut candidates: Vec<ProxyConfig> = Vec::with_capacity(configs.len());
+        // Requested rows that are in `active` but no longer serve: their shard
+        // is dead, so they hold nothing and must not stay in the union — that
+        // would make `apply` refuse the batch for a port they no longer serve.
+        // A dead row that passes the preflight is re-added from `candidates`.
+        let dropped_dead: HashSet<String> = self
+            .active
+            .iter()
+            .filter(|active| requested.contains(active.id.as_str()) && !self.is_running(&active.id))
+            .map(|active| active.id.clone())
+            .collect();
         for row in configs {
             // 1. the row on its own.
             if let Err(error) = validate_activation(std::slice::from_ref(row)) {
@@ -6717,7 +6727,9 @@ impl EngineController {
             // socket knows which are HELD. A row whose port another process
             // holds is named and left out of the union, so the batch
             // survives one occupied port and the ONE apply only carries
-            // the free rows.
+            // the free rows. A row that is in `active` but whose shard is
+            // dead holds nothing, so it is probed like any other row and,
+            // when the probe fails, named and left out of the union.
             if !is_custom_config_protocol(&row.protocol)
                 && !self.serves_this_endpoint(row)
                 && probe_bind_available(&row.bind_ip, row.port).is_err()
@@ -6761,8 +6773,10 @@ impl EngineController {
             return outcome;
         }
 
-        // The union: what serves now, plus the checked rows (by id).
+        // The union: what serves now, plus the checked rows (by id). A dead
+        // row is not serving, so it is not part of the union.
         let mut union = self.active.clone();
+        union.retain(|row| !dropped_dead.contains(&row.id));
         for row in &candidates {
             if let Some(slot) = union.iter_mut().find(|active| active.id == row.id) {
                 *slot = row.clone();
@@ -6803,8 +6817,14 @@ impl EngineController {
 
     /// T-05: is this row already serving on exactly this endpoint? Our own
     /// listener holds that port, so there is nothing to probe — and probing
-    /// would report our own row as "another process holds it".
+    /// would report our own row as "another process holds it". An active row
+    /// whose shard is dead is NOT serving: it does not hold its port, so a
+    /// stranger there must be caught by the preflight (and named) instead of
+    /// by `apply`, which would refuse the whole batch.
     fn serves_this_endpoint(&self, row: &ProxyConfig) -> bool {
+        if !self.is_running(&row.id) {
+            return false;
+        }
         let key = normalize_bind_key(&row.bind_ip);
         self.active.iter().any(|active| {
             active.id == row.id
@@ -6813,14 +6833,14 @@ impl EngineController {
         })
     }
 
-    /// T-05: the name of an active row that already serves `port` (under
-    /// any bind). It tells "our own sidecar holds it" from "a stranger
-    /// holds it" — the first is a conflict, the second is a row-local
-    /// refusal.
+    /// T-05: the name of an active row that is actually alive and serves
+    /// `port` (under any bind). It tells "our own sidecar holds it" from "a
+    /// stranger holds it" — the first is a conflict, the second is a
+    /// row-local refusal. A dead shard holds nothing.
     fn own_port_holder(&self, port: u16) -> Option<&str> {
         self.active
             .iter()
-            .find(|active| active.port == port)
+            .find(|active| active.port == port && self.is_running(&active.id))
             .map(|active| active.name.as_str())
     }
 
@@ -12346,6 +12366,59 @@ Active Connections\r
             &EngineStatus::Stopped,
             "no Running claim when nothing is serving"
         );
+    }
+
+    /// FIX: a row can be `active` with a dead shard. It holds no port, so a
+    /// stranger on that port must be caught by the preflight and the row
+    /// NAMED — not left to `apply`, which refuses the whole batch.
+    #[test]
+    fn t05_crashed_row_whose_port_is_taken_is_named_and_skipped() {
+        let ephemeral = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = ephemeral.local_addr().expect("addr").port();
+        drop(ephemeral);
+
+        let (mut controller, stock) = EngineController::fake();
+        let squatter = fixture(
+            "2",
+            "Squatter",
+            "shadowsocks",
+            ss_params("pass2"),
+            "127.0.0.1",
+            port,
+        );
+        let first = controller.start_many_additive(std::slice::from_ref(&squatter), true);
+        assert_eq!(first.applied, vec!["2".to_string()], "{first:?}");
+
+        // The shard dies; the port it used to hold is free again, and a
+        // stranger takes it.
+        stock.inject_crash("engine exited (1)");
+        controller.poll_shards();
+        assert!(!controller.is_running("2"), "the shard is dead");
+        let held =
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+
+        let gamma = fixture("3", "Gamma", "vless", vless_params(), "127.0.0.1", 10843);
+        let rows = vec![squatter.clone(), gamma];
+        let outcome = controller.start_many_additive(&rows, true);
+        assert!(outcome.error.is_none(), "the batch survives: {outcome:?}");
+        assert_eq!(
+            outcome.failed.len(),
+            1,
+            "only the dead row is named: {outcome:?}"
+        );
+        assert_eq!(outcome.failed[0].0, "Squatter");
+        assert!(
+            outcome.failed[0].1.contains("port unavailable"),
+            "a stranger holds it, not a serving row: {}",
+            outcome.failed[0].1
+        );
+        assert_eq!(outcome.applied, vec!["3".to_string()], "{outcome:?}");
+        assert_eq!(
+            controller.running_ids(),
+            vec!["3".to_string()],
+            "the dead row is not claimed as serving"
+        );
+        drop(held);
     }
 
     /// T-05: the shared ports (clash controller, xray bridge) are not
