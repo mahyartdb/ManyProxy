@@ -5914,6 +5914,10 @@ struct FakeState {
     fail_check: Option<String>,
 
     fail_start: Option<String>,
+
+    /// Every `start` fails, including the rollback restart a failed apply
+    /// attempts — the shard ends up dead with no way back.
+    fail_start_always: Option<String>,
     exited: Option<String>,
     pending_logs: Vec<String>,
 
@@ -5949,10 +5953,17 @@ impl FakeHandle {
         self.state.borrow_mut().fail_start = Some(detail.to_string());
     }
 
+    /// Every `start` fails from now on — the batch start and the rollback
+    /// restart both, so the shard cannot recover.
+    pub fn fail_start_always(&self, detail: &str) {
+        self.state.borrow_mut().fail_start_always = Some(detail.to_string());
+    }
+
     pub fn clear_failures(&self) {
         let mut state = self.state.borrow_mut();
         state.fail_check = None;
         state.fail_start = None;
+        state.fail_start_always = None;
     }
 
     pub fn inject_crash(&self, cause: &str) {
@@ -6007,7 +6018,11 @@ impl EngineBackend for FakeEngineBackend {
 
     fn start(&mut self, config_json: &str) -> Result<(), String> {
         let mut state = self.state.borrow_mut();
-        if let Some(detail) = state.fail_start.take() {
+        let refusal = state
+            .fail_start
+            .take()
+            .or_else(|| state.fail_start_always.clone());
+        if let Some(detail) = refusal {
             state.running = false;
             return Err(detail);
         }
@@ -6662,7 +6677,10 @@ impl EngineController {
     /// port another row already serves) is named in `failed` and left out of
     /// the union, so one bad row does not sink the batch. The union itself
     /// is validated once; if the union or the single apply fails, the
-    /// previous `active`/`status` are restored and the batch is refused.
+    /// previous `active` is restored and the batch is refused. The status is
+    /// NOT restored: `apply` has already rolled back and set the honest
+    /// value, and a stale `Running` would claim a serving engine while the
+    /// failed rollback left no shard alive.
     pub fn start_many_additive(
         &mut self,
         configs: &[ProxyConfig],
@@ -6766,7 +6784,6 @@ impl EngineController {
 
         // One apply for the whole batch.
         let prev = self.active.clone();
-        let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
         self.active = union;
         match self.apply() {
@@ -6776,7 +6793,6 @@ impl EngineController {
             }
             Err(error) => {
                 self.active = prev;
-                self.status = prev_status;
                 self.prune_lan_confirmed();
                 self.last_error = Some(error.to_string());
                 outcome.error = Some(error.to_string());
@@ -12287,6 +12303,49 @@ Active Connections\r
         assert_eq!(controller.running_count(), 2, "the free rows serve");
         assert_eq!(stock.check_calls(), 1, "one apply for the batch");
         drop(held);
+    }
+
+    /// FIX: a failed batch must not restore the status it found. `apply` has
+    /// already rolled back and computed the honest status; restoring the old
+    /// `Running` would claim a serving engine while the failed rollback left
+    /// no shard alive.
+    #[test]
+    fn t05_failed_batch_leaves_the_status_honest() {
+        let (mut controller, stock) = EngineController::fake();
+        let alpha = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            10841,
+        );
+        let first = controller.start_many_additive(std::slice::from_ref(&alpha), true);
+        assert_eq!(first.applied, vec!["1".to_string()], "{first:?}");
+        assert_eq!(controller.status(), &EngineStatus::Running);
+
+        // The shard cannot start again — neither for the batch row nor for
+        // the rollback restart.
+        stock.fail_start_always("sidecar refused to start");
+        let beta = fixture(
+            "2",
+            "Beta",
+            "shadowsocks",
+            ss_params("pass2"),
+            "127.0.0.1",
+            10842,
+        );
+        let outcome = controller.start_many_additive(std::slice::from_ref(&beta), true);
+        assert!(outcome.error.is_some(), "the apply failed: {outcome:?}");
+        assert!(
+            !stock.is_running(),
+            "nothing serves after the failed rollback"
+        );
+        assert_eq!(
+            controller.status(),
+            &EngineStatus::Stopped,
+            "no Running claim when nothing is serving"
+        );
     }
 
     /// T-05: the shared ports (clash controller, xray bridge) are not
