@@ -31152,7 +31152,7 @@ fn t08_refused_write_raises_the_banner_naming_the_folder(cx: &mut TestAppContext
     paint_frame(cx);
 
     let path = folder.path().display().to_string();
-    let pinned = format!("Cannot write to the data folder ({path}) — changes will not be saved.");
+    let pinned = format!("Changes will not be saved — cannot write to the data folder ({path}).");
     let (reason, text) = view.read_with(cx, |view, _| {
         (view.write_blocked.clone(), view.write_banner_text())
     });
@@ -31438,7 +31438,7 @@ fn t08_failed_save_raises_the_banner_instead_of_a_toast(cx: &mut TestAppContext)
     );
 
     let path = folder.path().display().to_string();
-    let pinned = format!("Cannot write to the data folder ({path}) — changes will not be saved.");
+    let pinned = format!("Changes will not be saved — cannot write to the data folder ({path}).");
     let text = view.read_with(cx, |view, _| view.write_banner_text());
     assert_eq!(
         text.as_deref(),
@@ -31482,16 +31482,15 @@ fn t08_open_failure_raises_the_banner_naming_the_folder(cx: &mut TestAppContext)
         "the failed open pins the banner"
     );
     let path = folder.path().display().to_string();
-    let pinned =
-        format!("Cannot use the data folder ({path}): {reason} — changes will not be saved.");
+    let pinned = format!("Changes will not be saved — cannot use the data folder ({path}).");
     let text = view.read_with(cx, |view, _| view.write_banner_text());
     assert_eq!(
         text.as_deref(),
         Some(pinned.as_str()),
-        "the banner names the folder and the real open failure"
+        "the banner names the folder; the OS reason rides the tooltip"
     );
     assert!(
-        !pinned.contains("Cannot write to the data folder"),
+        !pinned.contains("cannot write to the data folder"),
         "an open failure is not reported as a write refusal: {pinned}"
     );
     let recorded = view

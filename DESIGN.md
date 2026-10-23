@@ -257,6 +257,7 @@ Concrete guardrails grounded in the implementation. Every `Button::new` id, pinn
 - **Do** keep endpoints above the operate row and failure evidence inside the inspector's minimum height.
 - **Do** keep the row endpoint editors on stable per-row ids (`row-bind-<id>`, `row-port-input-<id>`, `row-serve-<id>`, `row-edit-<id>`) — now in the inspector for the selected row — with Enter-commit, Esc-revert, live draft warnings, and flush-before-act on serve/edit; the draft is never silently dropped, blurred away, or committed without the save gate. The row itself shows the port as the quiet `row-port-<id>` pill.
 - **Do** decide writability with a probe that actually writes a temp file into the folder and removes it — metadata and a successful read are not evidence — and never clear the not-writable banner on a probe while the session is in memory: a writable folder does not make an in-memory session persist, so clearing it there would be the banner lying.
+- **Do** lead the standing banner with the consequence (`Changes will not be saved — …`), not the cause. The strip is one truncated line and a folder path can outrun any window: with the promise last, a long path silently cut off the only part that matters. The path follows, and the OS reason rides the tooltip.
 
 ### Don't:
 

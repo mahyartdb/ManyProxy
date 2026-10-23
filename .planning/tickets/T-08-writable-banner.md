@@ -25,6 +25,11 @@ toast is gone in seconds. This is a standing condition, so it gets a standing su
 2. **A persistent banner in the shell.** A full-width strip UNDER the toolbar and above the
    table — not a toast, not a dialog. It names the folder and the reason:
    `Cannot write to the data folder (<path>) — changes will not be saved.`
+   Shipped copy leads with the consequence instead —
+   `Changes will not be saved — cannot write to the data folder (<path>).` — because the
+   strip truncates on a long path and the promise must never be the part that is cut; the
+   OS reason rides the tooltip. An open failure (corrupt/locked database) says
+   `cannot use` rather than `cannot write`, so it is not blamed on permissions.
    It carries one action: `Open data folder`.
    The banner is PERSISTENT: it stays while the probe fails and disappears when a probe
    succeeds. It never blocks the UI — the app starts, the library reads, and everything

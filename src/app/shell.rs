@@ -249,10 +249,12 @@ impl AppView {
 /// locked database is not a write refusal — while the probe path keeps the
 /// write sentence.
 fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
+    // The consequence leads. The strip is one truncated line, and a folder
+    // path can be longer than the window: with the promise last, a long path
+    // silently cut off the only part that matters. The OS reason rides the
+    // tooltip (`write_blocked`), so it is never lost either.
     match open_failure {
-        Some(reason) => {
-            format!("Cannot use the data folder ({folder}): {reason} — changes will not be saved.")
-        }
-        None => format!("Cannot write to the data folder ({folder}) — changes will not be saved."),
+        Some(_) => format!("Changes will not be saved — cannot use the data folder ({folder})."),
+        None => format!("Changes will not be saved — cannot write to the data folder ({folder})."),
     }
 }
