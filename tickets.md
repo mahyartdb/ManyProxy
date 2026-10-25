@@ -111,6 +111,12 @@ Bughunt A5-2, A6-6, A7-10, A4 leftovers.
 
 ## Final (orchestrator)
 
+### K19 · Hot-5 real-eyes walkthrough — owner: verification agent (cua-driver)
+> **Status — DONE (2026-10-25).** All five hot states verified with screenshot evidence (Temp\opencode\hot5\): empty library (native — the real library opened empty), 9-checked bulk bar (accent bar + filled chips, `9 checked (of 9)` never wraps), inspector Details+Health (badge grammar, one copy action, lamp-click filter live = K11 closed end-to-end), Settings look-only (one footer, 2×2 maintenance untouched), delete→undo→expiry (row menu = K8 grammar live). Stretch: chip unclipped at 882px and 1400px, sort headers read as words, **second-display rendering verified — closes K12's placement UNVERIFIED**; DPI>100% stays UNVERIFIED (no such hardware here). Library delta: none. Findings → K20: D1 P2 (inspector tab row clips at default 1002px drawer width: Connections truncated, Traffic invisible), D2 P3 (DESIGN.md still prescribes in-canvas Add/Import buttons — stale vs K11 + tests), D3 P3 (dialog-kit modal ships an invisible interactive Close hit-target, Settings top-right).
+
+### K20 · Walkthrough findings fix — owner: fixes agent
+> **Status — VERIFIED (2026-10-25, commit `cccf6e5`).** D1: segmented tab bar sizes to content — drawer and docked panel share one call site, so both layouts are covered — with a paint test at the default width (suite now **1302 passed / 0 failed**; aria reads and `inspector-tab*` ids unchanged, dispatch through `set_inspector_tab` intact). D2: DESIGN.md empty-library section rewritten to the landed toolbar-only grammar. D3: upstream `Dialog::close_button(false)` applied at the three direct dialog builders (Add/Edit, Import, presets) and the `open_app_dialog` choke point — the ghost Close was an unrealized gpui-component icon Button; no close route lost anywhere (each dialog keeps a named commit footer + Esc). Upstream note: Sheet's header close is hardcoded upstream with no toggle and was not part of D3's scope. Gate on the final tree: fmt 0, clippy 0, full suite 1302/0.
+
 ### K18 · Regression sweep — owner: orchestrator
 - `cargo fmt --check` · `cargo clippy --all-targets --locked -- -D warnings` · `cargo test --locked`
 - Run the app briefly if possible (`cargo run`) and eyeball the five hot states from the video: empty, 9 checked, inspector Details/Health, Settings modal, delete-undo toast.
