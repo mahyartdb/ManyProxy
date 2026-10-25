@@ -8,6 +8,64 @@ pub(crate) const OPERATE_START_TOOLTIP: &str = "Start the selected endpoint (F5)
 pub(crate) const OPERATE_STOP_TOOLTIP: &str = "Stop the selected endpoint (Shift-F5)";
 pub(crate) const OPERATE_TEST_TOOLTIP: &str = "Test the selected endpoint (Ctrl-T)";
 
+/// K20/D1 metrics for the inspector tab strip: labels at the kit's xsmall text
+/// step with segmented chrome measured in fixed pixels, so the fit below and
+/// the layout above can never drift apart.
+const TAB_LABEL_REM: f32 = 0.75;
+const TAB_LABEL_PAD_X: f32 = 3.;
+const TAB_LABEL_GAP: f32 = 2.;
+/// Everything the row adds around the labels themselves: 5 × (2 × padding)
+/// + 4 gaps + the bar's own 2×2 inset.
+const TAB_LABEL_CHROME: f32 = 2. * 5. * TAB_LABEL_PAD_X + 4. * TAB_LABEL_GAP + 4.;
+
+/// The measured fit of the inspector tab strip across frames.
+///
+/// Labels report their painted width and the strip its capacity through
+/// prepaint (the channel the kit's own tab indicator uses); the *next* render
+/// normalizes those widths by the scale that painted them and re-solves the
+/// scale that keeps all five labels inside the drawer. `settle` reports false
+/// once the solved scale matches the applied one — the row is at rest.
+#[derive(Clone, Copy)]
+struct InspectorTabFit {
+    scale: f32,
+}
+
+impl InspectorTabFit {
+    const ONE: Self = Self { scale: 1.0 };
+
+    fn settle(&mut self, measured: (f32, f32)) -> bool {
+        let (labels, capacity) = measured;
+        if labels <= 0. || capacity <= TAB_LABEL_CHROME {
+            return false;
+        }
+        // 2% of capacity is air for the sub-pixel rounding between measure
+        // and paint; without it the solver would tick 0.5px round-trips.
+        let want = (capacity - TAB_LABEL_CHROME) / (labels / self.scale) * 0.98;
+        // One 1/128 step at a time, so the settled scale stops moving once
+        // the sub-pixel rounding can no longer meaningfully change it.
+        let want = (want.clamp(0.5, 1.0) * 128.).round() / 128.;
+        if (want - self.scale).abs() < 0.008 {
+            return false;
+        }
+        self.scale = want;
+        true
+    }
+}
+
+#[derive(Default)]
+struct InspectorTabFitMeasure {
+    /// Per-tab label widths in px from the last completed frame.
+    labels: [f32; 5],
+    /// Strip capacity in px from the last completed frame.
+    container: f32,
+}
+
+impl InspectorTabFitMeasure {
+    fn report(&self) -> (f32, f32) {
+        (self.labels.iter().sum(), self.container)
+    }
+}
+
 impl AppView {
     /// T-03: below the breakpoint the inspector slides OVER the table as a
     /// drawer. It is an overlay: the table keeps its full width underneath,
@@ -149,7 +207,7 @@ impl AppView {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .child(self.render_inspector_tabs(cx))
+            .child(self.render_inspector_tabs(window, cx))
             // K1/A4-2: ONE scroll for the whole pane — header, endpoints (with
             // their editors), the pane module, then the operate row. Nothing
             // is pinned to the panel bottom: actions follow content, so the
@@ -1639,63 +1697,146 @@ impl AppView {
     /// Connections · Traffic, one row. Presets has no tab of its home here
     /// (Routing is its home); the legacy Ctrl-3 target lands on Details. The
     /// Ctrl-1…5 keys live in Settings → Shortcuts, not on the tab labels.
-    pub(crate) fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
+    pub(crate) fn render_inspector_tabs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
-        let bar = TabBar::new("inspector-tabs-segment")
-            .segmented()
-            .small()
-            .w_full()
-            .selected_index(self.inspector_tab.index())
-            .on_click(move |index, _, cx| {
-                view.update(cx, |view, _| {
-                    view.set_inspector_tab(InspectorTab::from_index(*index));
-                });
+        use gpui_kit::base::ElementExt as _;
+        use gpui_kit::prelude::FluentBuilder as _;
+
+        let view = cx.entity();
+        let (tab_fg_active, tab_fg_muted, tab_bar_bg, pill_bg, radius) = {
+            let theme = cx.theme();
+            (
+                theme.tab_active_foreground,
+                theme.muted_foreground,
+                theme.tokens.tab_bar_segmented,
+                theme.tokens.background,
+                theme.radius,
+            )
+        };
+        let pill_radius = (radius - px(2.)).max(px(0.));
+
+        // K20/D1: the five labels size the row instead of splitting 242px into
+        // five equal `flex_1` slots — under the drawer the upstream bar clipped
+        // Connections and hid Traffic whole. Labels are content-fit; when the
+        // measured content still overruns the capacity, ONE uniform scale-down
+        // keeps every label painted: the row never wraps, never shortens.
+        let fit = window.use_keyed_state("inspector-tab-fit", cx, |_, _| InspectorTabFit::ONE);
+        let measure = window
+            .use_keyed_state("inspector-tab-fit-measure", cx, |_, _| {
+                Rc::new(RefCell::new(InspectorTabFitMeasure::default()))
             })
-            .child(
-                Tab::new()
-                    .label("Details")
-                    .aria_label(InspectorTab::Details.a11y_label())
-                    .flex_1()
-                    .child(div().id("inspector-tab-details").test_support()),
-            )
-            .child(
-                Tab::new()
-                    .label("Health")
-                    .aria_label(InspectorTab::Health.a11y_label())
-                    .flex_1()
-                    .child(div().id("inspector-tab-health").test_support()),
-            )
-            .child(
-                Tab::new()
-                    .label("Logs")
-                    .aria_label(InspectorTab::Logs.a11y_label())
-                    .flex_1()
-                    .child(div().id("inspector-tab-logs").test_support()),
-            )
-            .child(
-                Tab::new()
-                    .label("Connections")
-                    .aria_label(InspectorTab::Connections.a11y_label())
-                    .flex_1()
-                    .child(div().id("inspector-tab-connections").test_support()),
-            )
-            .child(
-                Tab::new()
-                    .label("Traffic")
-                    .aria_label(InspectorTab::Traffic.a11y_label())
-                    .flex_1()
-                    .child(div().id("inspector-tab-traffic").test_support()),
+            .read(cx)
+            .clone();
+        let mut current_fit = *fit.read(cx);
+        if current_fit.settle(measure.borrow().report()) {
+            fit.update(cx, |state, _| *state = current_fit);
+            // Paint the settled scale on the next frame; this frame is already
+            // committed to its own (possibly just-measured) size.
+            window.refresh();
+        }
+        let scale = current_fit.scale;
+
+        let tabs = [
+            InspectorTab::Details,
+            InspectorTab::Health,
+            InspectorTab::Logs,
+            InspectorTab::Connections,
+            InspectorTab::Traffic,
+        ];
+
+        let mut buttons = Vec::with_capacity(tabs.len());
+        for (index, tab) in tabs.into_iter().enumerate() {
+            let label = tab.a11y_label();
+            let slug = label.to_lowercase();
+            let selected = self.inspector_tab == tab;
+            buttons.push(
+                div()
+                    .id(format!("inspector-tab-button-{slug}"))
+                    .test_support()
+                    .role(Role::Tab)
+                    .aria_label(label)
+                    .aria_selected(selected)
+                    // The drawer overlays the table, so a press must not leak
+                    // through to the rows underneath it. Mirrors the kit Tab.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |view, _| {
+                                view.set_inspector_tab(InspectorTab::from_index(index));
+                            });
+                        }
+                    })
+                    .flex()
+                    .h_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .px(px(TAB_LABEL_PAD_X))
+                    .rounded(pill_radius)
+                    .text_color(if selected {
+                        tab_fg_active
+                    } else {
+                        tab_fg_muted
+                    })
+                    .when(selected, |this| this.bg(pill_bg))
+                    .when(!selected, |this| {
+                        this.hover(|style| style.text_color(tab_fg_active))
+                    })
+                    .child(
+                        div()
+                            .id(format!("inspector-tab-{slug}"))
+                            .test_support()
+                            .text_size(rems(TAB_LABEL_REM * scale))
+                            .line_height(relative(1.0))
+                            .whitespace_nowrap()
+                            .on_prepaint({
+                                let measure = measure.clone();
+                                move |bounds, _, _| {
+                                    measure.borrow_mut().labels[index] = bounds.size.width.into();
+                                }
+                            })
+                            .child(label),
+                    ),
             );
+        }
 
         div()
             .id("inspector-tabs")
             .test_support()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_1()
-            .w_full()
-            .child(bar)
+            .on_prepaint({
+                let measure = measure.clone();
+                move |bounds, _, _| {
+                    measure.borrow_mut().container = bounds.size.width.into();
+                }
+            })
+            .child(
+                div()
+                    .id("inspector-tab-bar")
+                    .role(Role::TabList)
+                    .w_full()
+                    .min_w_0()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .gap(px(TAB_LABEL_GAP))
+                    .overflow_hidden()
+                    .p(px(2.))
+                    .rounded(radius)
+                    .bg(tab_bar_bg)
+                    .children(buttons),
+            )
     }
 
     /// K1/A4-4: the single-scroll head — header, failed alert (only when the

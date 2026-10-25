@@ -21549,6 +21549,90 @@ fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
     );
 }
 
+// K20/D1: the inspector switcher sizes to its five labels instead of five
+// fixed slots. At the 1000x700 default frame the drawer leaves 242px for the
+// strip and the flex `TabBar` truncated Connections and hid Traffic whole;
+// content-fit with one uniform scale-down paints every label at the default
+// width, on the wide side panel, and at the 240px panel floor.
+#[gpui_kit::test]
+fn t20_inspector_tab_row_fits_the_default_drawer(cx: &mut TestAppContext) {
+    use gpui_kit::component::IndexPath;
+
+    const SLUGS: [&str; 5] = ["details", "health", "logs", "connections", "traffic"];
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().selected = Some(IndexPath::new(0));
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    for (width, height) in [(1000., 700.), (1400., 800.)] {
+        // The first paint measures the painted strip, the next paints the
+        // settled scale; two passes keep the assertion frame-order-proof.
+        for _ in 0..2 {
+            paint_frame_at(cx, width, height);
+        }
+        assert_painted(cx, "inspector-tabs");
+        for slug in SLUGS {
+            assert_painted(cx, &format!("inspector-tab-button-{slug}"));
+            assert_painted(cx, &format!("inspector-tab-{slug}"));
+        }
+
+        let (strip, labels) = cx.update(|window, _| {
+            let strip = window
+                .try_find("inspector-tabs".to_string())
+                .expect("strip paints")
+                .bounds();
+            let labels = SLUGS
+                .iter()
+                .map(|slug| {
+                    window
+                        .try_find(format!("inspector-tab-{slug}"))
+                        .expect("label paints")
+                        .bounds()
+                })
+                .collect::<Vec<_>>();
+            (strip, labels)
+        });
+
+        let left = strip.origin.x;
+        let right = strip.origin.x + strip.size.width;
+        for (index, label) in labels.iter().enumerate() {
+            let name = SLUGS[index];
+            assert_eq!(
+                label.origin.y, labels[0].origin.y,
+                "{name} shares the one tab row"
+            );
+            let end = label.origin.x + label.size.width;
+            assert!(
+                end <= right,
+                "{name} label ends at {end}, past the strip's right edge {right}"
+            );
+            assert!(
+                label.origin.x >= left,
+                "{name} label starts at {}, before the strip's left edge {left}",
+                label.origin.x
+            );
+            if index > 0 {
+                assert!(
+                    label.origin.x > labels[index - 1].origin.x,
+                    "{name} follows the row order"
+                );
+            }
+        }
+    }
+}
+
 #[gpui_kit::test]
 fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;

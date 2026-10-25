@@ -1505,6 +1505,7 @@ impl AppView {
                 // an ellipsis and the two dialog buttons crowd its edge.
                 .w(px(560.))
                 .overlay_closable(false)
+                .close_button(false)
                 .on_close({
                     let track_view = track_source.clone();
                     move |_, window, cx| {
@@ -1696,6 +1697,7 @@ impl AppView {
                 );
             dialog
                 .title("Import proxy configurations")
+                .close_button(false)
                 .child(form.clone().element(element_view.clone(), cx))
                 .button_props(
                     DialogButtonProps::default()
@@ -2325,6 +2327,7 @@ impl AppView {
             body = body.child(form.clone().element(cx));
             dialog
                 .title("Routing presets")
+                .close_button(false)
                 .child(body)
                 .button_props(
                     DialogButtonProps::default()
@@ -2935,8 +2938,14 @@ pub(crate) fn open_app_dialog(
     build: impl Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
 ) {
     focus_shell_before_overlay(window, cx);
+    // K19/D3: the kit's header Close renders as a blank 24x24 icon (no asset
+    // source registers kit glyphs here), so it was an invisible interactive
+    // target. Every app dialog carries a named commit footer and Esc, so the
+    // redundant header X is disabled at both open routes.
     window.open_dialog(cx, move |dialog, window, cx| {
-        build(dialog, window, cx).on_close(|_, window, cx| reclaim_shell_focus(window, cx))
+        build(dialog, window, cx)
+            .close_button(false)
+            .on_close(|_, window, cx| reclaim_shell_focus(window, cx))
     });
 }
 

@@ -232,7 +232,7 @@ Compact one-line rows (fixed small muted label in the description-label token, w
 
 - **Health:** detail line reads `health: never tested - press Test to check` until the first probe; dead rows render the same pinned copy inside an error Alert titled `Endpoint failed`, with the same operate row inline beside it. The status bar keeps the short `health never tested` describer.
 - **Serving badge string:** the badge reads `<state> · <bind>:<port> · <latency>` — a bare `Running :10801` with an orphaned colon and no host is a defect, not a style choice. The bind belongs to the endpoint, so the string carries it; the latency segment appears only once a probe has run.
-- **Empty library:** title `No proxy configurations yet` with description `Add one proxy, or use Import for many at once.` and working Add (`empty-add`) and Import (`empty-import`) buttons beside it; counts read (0,0); usage is absent-or-zero, never nonzero. The no-selection inspector centers its `Empty` block in the pane instead of anchoring left.
+- **Empty library:** the panel describes the state — title `No proxy configurations yet`, description `Add one proxy, or use Import for many at once.` — and holds no entry of its own (`empty-add` / `empty-import` stayed retired): toolbar Add/Import is the only door; counts read (0,0), the status bar keeps its segments honest (`health never tested`, usage absent-or-zero), and the bar's right end names the palette with its `Ctrl+K` chip. The no-selection inspector centers its `Empty` block in the pane instead of anchoring left.
 - **File drops:** no persistent hint band — drops land anywhere on the shell, and a blocked drop (dialog open) toasts `Close the open dialog first — dropped files were not imported` instead of stacking.
 
 ### Dialogs
