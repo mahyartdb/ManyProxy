@@ -10,24 +10,25 @@ pub(crate) enum InspectorTab {
 }
 
 impl InspectorTab {
+    /// K1: the switcher holds five panes in one row (Details · Health · Logs ·
+    /// Connections · Traffic). `Presets` is a legacy Ctrl-3 target kept for
+    /// the bound action; it has no tab of its own and renders as Details.
     pub(crate) fn index(self) -> usize {
         match self {
-            InspectorTab::Details => 0,
+            InspectorTab::Details | InspectorTab::Presets => 0,
             InspectorTab::Health => 1,
-            InspectorTab::Presets => 2,
-            InspectorTab::Logs => 3,
-            InspectorTab::Connections => 4,
-            InspectorTab::Traffic => 5,
+            InspectorTab::Logs => 2,
+            InspectorTab::Connections => 3,
+            InspectorTab::Traffic => 4,
         }
     }
 
     pub(crate) fn from_index(index: usize) -> Self {
         match index {
             1 => InspectorTab::Health,
-            2 => InspectorTab::Presets,
-            3 => InspectorTab::Logs,
-            4 => InspectorTab::Connections,
-            5 => InspectorTab::Traffic,
+            2 => InspectorTab::Logs,
+            3 => InspectorTab::Connections,
+            4 => InspectorTab::Traffic,
             _ => InspectorTab::Details,
         }
     }

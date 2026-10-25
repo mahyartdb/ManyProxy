@@ -16,8 +16,15 @@ pub(crate) fn dialog_footer(
     ok_label: &'static str,
     commit: DialogCommit,
 ) -> DialogFooter {
+    // K2/K3: the Throne-grammar dialogs (add / edit / routing presets) carry a
+    // literal `OK` by ticket decision — they are the only exempt footers.
+    let throne_grammar = matches!(
+        ok_id,
+        "add-dialog-ok" | "edit-dialog-ok" | "presets-dialog-ok"
+    );
     debug_assert!(
-        !ok_label.eq_ignore_ascii_case("ok") && !ok_label.eq_ignore_ascii_case("okay"),
+        throne_grammar
+            || (!ok_label.eq_ignore_ascii_case("ok") && !ok_label.eq_ignore_ascii_case("okay")),
         "Ticket 05: honest footers never use a bare OK label"
     );
     if ok_label.eq_ignore_ascii_case("close") {
@@ -92,11 +99,14 @@ pub(crate) fn sheet_footer(
 
 pub(crate) fn footer_commit_label(dialog: &str) -> &'static str {
     match dialog {
-        "settings" => "Done",
+        // K9 handed the dead Settings mapping over to K5: the settings modal
+        // owns its own Cancel/Save footer, so "settings" falls through.
         "groups" | "preset-attach" => "Close",
         "logs" => "Apply filter",
-        "presets" | "subscriptions" | "add" => "Add",
-        "edit" | "preset-edit" | "subscription-edit" => "Save",
+        "presets" | "add" => "OK",
+        "edit" => "OK",
+        "subscriptions" => "Add",
+        "preset-edit" | "subscription-edit" => "Save",
         "import" => "Import",
         "export" => "Export",
         "bulk-move" => "Move",

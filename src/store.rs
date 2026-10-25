@@ -779,17 +779,6 @@ pub fn proxy_urls(bind_ip: &str, port: u16) -> (String, String) {
     )
 }
 
-pub fn delete_confirm_text(name: &str) -> String {
-    format!("Remove \"{name}\"? The stored configuration is deleted. Nothing else changes.")
-}
-
-pub fn delete_running_confirm_text(name: &str) -> String {
-    format!(
-        "Remove \"{name}\"? Its endpoint is running and will be stopped first, \
-         then the stored configuration is deleted."
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficPeriod {
     Day,
@@ -3388,37 +3377,6 @@ fn validate_protocol_params(
         }
     }
     Some((canonical, params_text))
-}
-
-pub fn row_server_hostname(params_raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(params_raw.trim()).ok()?;
-    let obj = value.as_object()?;
-    for (key, item) in obj {
-        if key.eq_ignore_ascii_case("server") || key.eq_ignore_ascii_case("address") {
-            if let serde_json::Value::String(text) = item {
-                let trimmed = text.trim().to_string();
-                if trimmed.is_empty() || trimmed.parse::<std::net::IpAddr>().is_ok() {
-                    return None;
-                }
-                return Some(trimmed);
-            }
-            return None;
-        }
-    }
-    None
-}
-
-pub fn rewrite_server_to_ip(params_raw: &str, ip: &str) -> Option<String> {
-    row_server_hostname(params_raw)?;
-    let mut value: serde_json::Value = serde_json::from_str(params_raw.trim()).ok()?;
-    let obj = value.as_object_mut()?;
-    for (key, item) in obj.iter_mut() {
-        if key.eq_ignore_ascii_case("server") || key.eq_ignore_ascii_case("address") {
-            *item = serde_json::Value::String(ip.trim().to_string());
-            return serde_json::to_string(&value).ok();
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8104,17 +8062,11 @@ impl Store {
         self.set_meta(Self::META_APPEARANCE, value)
     }
 
-    pub const META_SKIP_DELETE_CONFIRM: &str = "skip_delete_confirm";
-
-    pub fn skip_delete_confirm(&self) -> bool {
-        self.get_meta(Self::META_SKIP_DELETE_CONFIRM)
-            .map(|value| value.as_deref() == Some("1"))
-            .unwrap_or(false)
-    }
-
-    pub fn set_skip_delete_confirm(&mut self, skip: bool) -> Result<(), StoreError> {
-        self.set_meta(Self::META_SKIP_DELETE_CONFIRM, if skip { "1" } else { "0" })
-    }
+    // K17: the old META_SKIP_DELETE_CONFIRM meta and its accessors are gone.
+    // The confirm gate they armed no longer exists (spec line 91: delete is
+    // immediate, the undo toast is the net), so keeping them would leave a
+    // stored value that controls nothing; a legacy library's skip_delete_confirm
+    // meta row is simply ignored.
 
     pub const META_CLOSE_ACTION: &str = "close_action";
 
@@ -9494,15 +9446,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirm_names_config() {
-        let text = delete_confirm_text("Work VPN");
-        assert!(
-            text.contains("Work VPN"),
-            "confirm names the config, got {text}"
-        );
-    }
-
-    #[test]
     fn export_warning_names_secret_classes() {
         let text = export_warning_text();
         for class in ["private keys", "tokens", "passwords", "plaintext"] {
@@ -10823,31 +10766,6 @@ mod tests {
             0,
             "missing group clears nothing"
         );
-    }
-
-    #[test]
-    fn t09_resolve_domain_rewrite_helpers() {
-        assert_eq!(
-            row_server_hostname(r#"{"server":"example.com","server_port":443}"#),
-            Some("example.com".to_string())
-        );
-        assert_eq!(row_server_hostname(r#"{"server":"93.184.216.34"}"#), None);
-        assert_eq!(row_server_hostname(r#"{"server":"::1"}"#), None);
-        assert_eq!(row_server_hostname("{}"), None);
-        assert_eq!(row_server_hostname("not json"), None);
-        assert_eq!(
-            rewrite_server_to_ip(
-                r#"{"server":"example.com","server_port":443}"#,
-                "93.184.216.34"
-            ),
-            Some(r#"{"server":"93.184.216.34","server_port":443}"#.to_string())
-        );
-        assert_eq!(
-            rewrite_server_to_ip(r#"{"server":"93.184.216.34"}"#, "1.2.3.4"),
-            None,
-            "already an IP"
-        );
-        assert_eq!(rewrite_server_to_ip("{}", "1.2.3.4"), None);
     }
 
     #[test]
@@ -15345,20 +15263,6 @@ mod tests {
     }
 
     #[test]
-    fn t10_skip_delete_confirm_defaults_off_and_round_trips() {
-        let mut store = Store::open_in_memory().expect("in-memory store opens");
-        assert!(!store.skip_delete_confirm(), "default asks");
-        store.set_skip_delete_confirm(true).expect("opt-out writes");
-        assert!(store.skip_delete_confirm(), "skip reads back");
-        store.set_skip_delete_confirm(false).expect("opt-in writes");
-        assert!(!store.skip_delete_confirm(), "ask reads back");
-        store
-            .set_meta(Store::META_SKIP_DELETE_CONFIRM, "maybe")
-            .expect("raw write");
-        assert!(!store.skip_delete_confirm(), "corrupt reads ask");
-    }
-
-    #[test]
     fn t10_conn_column_widths_persist_clamp_and_reset() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         assert_eq!(
@@ -16709,21 +16613,6 @@ mod tests {
                 .count(),
             crate::preset::MAX_RULE_NAME_CHARS,
             "set_preset_rules caps too"
-        );
-    }
-
-    #[test]
-    fn delete_running_confirm_promises_stop_first() {
-        let stopped = super::delete_confirm_text("Work");
-        assert!(
-            !stopped.contains("stopped"),
-            "idle text claims nothing: {stopped}"
-        );
-        let running = super::delete_running_confirm_text("Work");
-        assert!(running.contains("Work"), "names row: {running}");
-        assert!(
-            running.contains("stopped first"),
-            "promises stop-first: {running}"
         );
     }
 

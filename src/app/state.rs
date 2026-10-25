@@ -97,27 +97,12 @@ impl AppView {
         });
 
         let empty_delegate = LibraryDelegate::new();
-        let (group_choices, group_current) = FacetMenu::Group.choices(&empty_delegate);
-        let facet_group =
-            FacetPicker::new(FacetMenu::Group, group_choices, group_current, window, cx);
-        let (protocol_choices, protocol_current) = FacetMenu::Protocol.choices(&empty_delegate);
-        let facet_protocol = FacetPicker::new(
-            FacetMenu::Protocol,
-            protocol_choices,
-            protocol_current,
-            window,
-            cx,
-        );
-        let (status_choices, status_current) = FacetMenu::Status.choices(&empty_delegate);
-        let facet_status = FacetPicker::new(
-            FacetMenu::Status,
-            status_choices,
-            status_current,
-            window,
-            cx,
-        );
+        let (choices, current) = FacetMenu::Group.choices(&empty_delegate);
+        let facet_group = FacetPicker::new(FacetMenu::Group, choices, current, window, cx);
 
         apply_appearance(&store.appearance(), Some(window), cx);
+        // K5: the toast park rides `apply_appearance` (bottom-right above the
+        // status bar, max 2) so it survives every theme change for free.
 
         {
             let our_ports: Vec<u16> = store
@@ -204,7 +189,6 @@ impl AppView {
             update_check_in_flight: false,
             probe_stop: Arc::new(AtomicBool::new(false)),
             group_test_in_flight: false,
-            speedtest_mode: SpeedtestMode::Download,
             subs_form: None,
             preset_form: None,
             edit_form_open: None,
@@ -243,8 +227,6 @@ impl AppView {
                 },
             ),
             facet_group,
-            facet_protocol,
-            facet_status,
             row_columns,
             inspector_tab: InspectorTab::Details,
             conn_snapshot: Vec::new(),
@@ -795,6 +777,9 @@ impl AppView {
     /// T-25: `N active · M TCP · K UDP` from the last merged clash snapshot.
     /// Hidden while no core runs — there is no collection to report, and zeros
     /// would read as a measured idle instead of "nothing is being polled".
+    /// K12/A5-1: the strip no longer renders this count; the Connections
+    /// inspector tab carries it. Retained for the counter merge tests only.
+    #[cfg(test)]
     pub(crate) fn conn_counter_text(&self) -> Option<String> {
         if self.engine.running_count() == 0 {
             return None;
@@ -851,6 +836,11 @@ impl AppView {
         let url = self.effective_test_url(&rows);
         self.group_test_in_flight = true;
         self.probe_stop.store(false, Ordering::SeqCst);
+        if let Some(handle) = window {
+            let _ = handle.update(cx, |_, window, cx| {
+                push_probe_start_toast(probe_start_toast(count), window, cx);
+            });
+        }
         let stop = self.probe_stop.clone();
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
@@ -895,6 +885,9 @@ impl AppView {
                         .update(cx, |_, window, cx| {
                             view.update(cx, |view, cx| {
                                 view.reload(window, cx);
+                                // K5: the start toast leaves exactly when the
+                                // sweep's own summary arrives.
+                                close_probe_start_toast(window, cx);
                                 window.push_notification(Notification::success(message), cx);
                                 // T-19: exactly ONE auto-clear summary per
                                 // sweep — success when rows went, info when
@@ -918,25 +911,6 @@ impl AppView {
             });
         })
         .detach();
-    }
-
-    pub(crate) fn record_and_persist_speed(&mut self, outcomes: &[SpeedtestOutcome]) {
-        let mut snapshots = Vec::with_capacity(outcomes.len());
-        for outcome in outcomes {
-            self.health_store.record_speed_sample(outcome, now_unix());
-            snapshots.push(HealthSnapshot {
-                config_id: outcome.config_id.clone(),
-                at: now_unix(),
-                kind: HealthKind::SpeedTest.as_str().to_string(),
-                latency_ms: outcome.latency_ms,
-                error: outcome.error.clone(),
-            });
-        }
-        if !snapshots.is_empty() {
-            if let Err(error) = self.store.save_health_snapshots(&snapshots) {
-                eprintln!("speed snapshot persist failed: {error}");
-            }
-        }
     }
 
     pub(crate) fn group_test_sample_count(&self, group: &str) -> usize {
@@ -1090,6 +1064,16 @@ impl AppView {
         } else {
             self.probe_url_in_flight = true;
         }
+        // K5: batched runs say once that they started. Single-row runs keep
+        // the established one-shot result toast, so the editor's own Health
+        // tab stays the per-row detail surface.
+        if toast && count > 1 {
+            if let Some(handle) = window {
+                let _ = handle.update(cx, |_, window, cx| {
+                    push_probe_start_toast(probe_start_toast(count), window, cx);
+                });
+            }
+        }
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
 
@@ -1136,17 +1120,25 @@ impl AppView {
                                     .unwrap_or_else(|| outcome.sample.config_id.clone());
                                 probe_result_toast(&name, outcome, toast_ping)
                             }
-                            None => probe_summary_toast(count, live, dead),
+                            None => probe_batched_toast(count, live, dead),
                         }
                     } else {
-                        probe_summary_toast(count, live, dead)
+                        probe_batched_toast(count, live, dead)
                     };
                     if let Some(handle) = window {
                         if handle
                             .update(cx, |_, window, cx| {
                                 view.update(cx, |view, cx| {
                                     view.reload(window, cx);
-                                    window.push_notification(Notification::success(message), cx);
+                                    // K5: the start toast leaves exactly when
+                                    // the result arrives.
+                                    close_probe_start_toast(window, cx);
+                                    if count == 1 {
+                                        window
+                                            .push_notification(Notification::success(message), cx);
+                                    } else {
+                                        view.toast_success(message, window, cx);
+                                    }
                                 });
                             })
                             .is_ok()
@@ -1875,13 +1867,6 @@ impl AppView {
             .ok()
             .flatten()
             .map(|preset| preset.name)
-    }
-
-    pub(crate) fn preset_summary_for(&self, preset_id: Option<&str>) -> Option<(String, usize)> {
-        let id = preset_id?;
-        let preset = self.store.get_preset(id).ok().flatten()?;
-        let count = preset.rules().ok().map(|rules| rules.len())?;
-        Some((preset.name, count))
     }
 
     pub(crate) fn refresh_preset_by_id(

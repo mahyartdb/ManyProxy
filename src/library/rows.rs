@@ -8,13 +8,6 @@ pub(crate) enum SortMenuAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndpointUrl {
-    Socks,
-    Http,
-    Upstream,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowPhase {
     Stopped,
     Starting,

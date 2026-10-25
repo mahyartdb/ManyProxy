@@ -150,6 +150,10 @@ impl AppView {
             .min_w_0()
             .overflow_hidden()
             .child(self.render_inspector_tabs(cx))
+            // K1/A4-2: ONE scroll for the whole pane — header, endpoints (with
+            // their editors), the pane module, then the operate row. Nothing
+            // is pinned to the panel bottom: actions follow content, so the
+            // dead gap and the stranded editor strip cannot come back.
             .child(
                 div()
                     .id("config-detail-body")
@@ -157,54 +161,41 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    // The body hugs its modules when the pane is tall, then a
-                    // spacer below the row editors pushes the operate row to
-                    // the bottom. When the pane is short the body shrinks
-                    // (min_h_0) and scrolls; it never strands the row editors
-                    // a screenful below the Usage title.
-                    .flex_initial()
-                    .flex_grow_0()
+                    // A scroll container must own a BOUNDED height: `flex_1`
+                    // takes the space left by the tabs so the body scrolls
+                    // instead of growing past the panel (which clipped the
+                    // operate row and reported a 0px scroll range).
+                    .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .overflow_y_scroll()
                     .overflow_x_hidden()
                     .track_scroll(&self.detail_scroll)
-                    // Appears on hover/wheel: at 620px the pane content sits
-                    // below the overview, and a clipped line alone is a poor
-                    // scroll cue.
+                    // Appears on hover/wheel: a clipped line alone is a poor
+                    // scroll cue once the body carries the whole pane.
                     .vertical_scrollbar(&self.detail_scroll)
-                    .child(self.render_inspector_overview(cx, config))
+                    .child(self.render_inspector_overview(window, cx, config))
                     .child(Self::motion_enter(
                         match self.inspector_tab {
-                            InspectorTab::Details => {
-                                self.render_inspector_details(cx, config).into_any_element()
-                            }
-                            InspectorTab::Health => {
-                                self.render_inspector_health(cx, config).into_any_element()
-                            }
-                            InspectorTab::Presets => {
-                                self.render_inspector_presets(cx, config).into_any_element()
-                            }
-                            InspectorTab::Logs => self.render_inspector_logs(cx).into_any_element(),
                             InspectorTab::Connections => {
                                 self.render_inspector_connections(cx).into_any_element()
                             }
                             InspectorTab::Traffic => {
                                 self.render_inspector_traffic(cx).into_any_element()
                             }
+                            InspectorTab::Health => {
+                                self.render_inspector_health(cx, config).into_any_element()
+                            }
+                            InspectorTab::Logs => self.render_inspector_logs(cx).into_any_element(),
+                            // Details and the legacy Ctrl-3 Presets target share
+                            // the Details pane — presets live in Routing now.
+                            _ => self.render_inspector_details(cx, config).into_any_element(),
                         },
                         format!("inspector-pane-enter-{}", self.inspector_tab.index()),
                         cx,
-                    )),
+                    ))
+                    .child(self.render_detail_actions(cx, config)),
             )
-            // T-03: the selected row's endpoint editors ride their own line
-            // above the operate row — the operate row keeps its two-line
-            // budget, and the editors keep their room.
-            .child(self.render_row_editors(window, cx, config))
-            // Keeps the operate row pinned to the bottom while the editors
-            // stay attached to the body modules above them.
-            .child(div().flex_1())
-            .child(self.render_detail_actions(cx, config))
             .into_any_element()
     }
 
@@ -598,32 +589,60 @@ impl AppView {
         pane
     }
 
+    /// K1/A4-3: ONE non-wrapping header line — acting echo, protocol tag, and
+    /// the dirty dot on the left; group tag and the single serving badge flush
+    /// right (a spacer, not a wrap). The badge is a lamp div plus
+    /// `<state> · <bind:port> · <latency>` text: no `●`/`○` glyph, no kit
+    /// overlay dot, and `dead` is never co-signed with `Running`.
     pub(crate) fn render_detail_header(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
         let is_running = self.engine.is_running(&config.id);
-        let summary_text = self.health_store.row_summary(&config.id);
-        let summary_trimmed = summary_text.trim().to_string();
-        let summary_opt = if summary_trimmed.is_empty() {
-            None
-        } else {
-            Some(summary_trimmed.as_str())
-        };
         let crashed = self.engine.ids_on_crashed_shards().contains(&config.id);
-        let badge = if is_running {
-            serving_badge(true, &config.bind_ip, config.port, summary_opt)
+        let health = self.health_store.status(&config.id);
+        // The state word follows the row's endpoint truth: a stopped row is
+        // never `dead` (nothing is serving that could fail); a serving row
+        // with a dead verdict or a crashed shard is `Failed`.
+        let dead_evidence = matches!(health.state, crate::health::RowState::Dead) || crashed;
+        let state = if !is_running {
+            BadgeState::Stopped
+        } else if dead_evidence {
+            BadgeState::Failed
         } else {
-            serving_badge(false, &config.bind_ip, config.port, None)
+            BadgeState::Running
+        };
+        // The latency segment exists only while the endpoint is serving and a
+        // probe has run — a stale latency must never dress a failed state.
+        let latency_ms = if state == BadgeState::Running {
+            health.latency_ms
+        } else {
+            None
+        };
+        let badge = inspector_badge_text(state, &config.bind_ip, config.port, latency_ms);
+        let badge_color = match state {
+            BadgeState::Running => cx.theme().success,
+            BadgeState::Failed => cx.theme().danger,
+            BadgeState::Stopped => cx.theme().secondary,
         };
         div()
+            .id("detail-header-line")
+            .test_support()
             .flex()
             .flex_row()
+            // K1/A4-3 keeps the group chip and badge on the same line via a
+            // spacer, but a narrow pane (240px default) cannot fit the name +
+            // tag + a ~220px badge side by side. Wrapping is the fallback that
+            // keeps the badge INSIDE the panel instead of overflowing past the
+            // window edge (invisible). With room to spare the spacer still
+            // pushes the badge flush right on one line.
             .flex_wrap()
             .items_center()
             .gap_2()
             .w_full()
+            .min_w_0()
+            .flex_shrink_0()
             .child(
                 div()
                     .id("detail-acting-on")
@@ -634,7 +653,6 @@ impl AppView {
                     .child(acting_on_label(config)),
             )
             .child(Tag::new().child(config.protocol.clone()))
-            .child(Tag::new().child(config.group.clone()))
             .child({
                 // T-03: the dirty marker rides the inspector's row header —
                 // the row is one line and has no room for it.
@@ -664,29 +682,38 @@ impl AppView {
                         .into_any_element()
                 }
             })
+            // K1/A4-3: the group chip and the badge stay on the SAME line —
+            // the spacer pushes them flush right instead of letting a long
+            // name wrap them onto a second line.
+            .child(div().flex_1().min_w_0())
+            .child(Tag::new().child(config.group.clone()))
             .child(
-                div().id("detail-serving").test_support().child(
-                    Badge::new()
-                        .dot()
-                        .color(match serving_tone(is_running, summary_opt, crashed) {
-                            ServingTone::Failed => cx.theme().danger,
-                            ServingTone::Serving => cx.theme().success,
-                            ServingTone::Stopped => cx.theme().secondary,
-                        })
-                        .child(badge),
-                ),
+                div()
+                    .id("detail-serving")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(div().size(px(6.)).rounded_full().bg(badge_color))
+                    .child(div().text_sm().text_color(badge_color).child(badge)),
             )
     }
 
+    /// K1/A4-4: ONE endpoints block — the read-only contact rows and the
+    /// selected row's editable bind/port strip share one frame, one draft
+    /// warning, and ONE copy action (was three per-row copies plus a strip
+    /// pinned below the pane body).
     pub(crate) fn render_detail_endpoints(
         &self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
         let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
         // The row label already says SOCKS / HTTP, so the scheme is redundant
-        // noise in a 260px pane. Show host:port — it fits whole — while every
-        // Copy action still puts the full URL on the clipboard.
+        // noise in a 260px pane. Show host:port — it fits whole — while the
+        // block's single Copy action still puts the full URLs on the clipboard.
         let socks_display = socks_url
             .strip_prefix("socks5://")
             .unwrap_or(&socks_url)
@@ -697,65 +724,91 @@ impl AppView {
             .to_string();
 
         let upstream = self.cached_upstream(cx, config);
+        let strip = self.render_row_editors(window, cx, config);
 
         div().id("config-endpoints").test_support().child(
-            GroupBox::new().title("Endpoints").gap_0().child(
+            GroupBox::new().title("Endpoints").gap_1().child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_0()
+                    .gap_1()
                     .w_full()
                     .min_w_0()
                     .max_w(px(620.))
                     .child(Self::endpoint_row(
                         cx,
-                        &config.id,
-                        "upstream",
+                        "Upstream",
                         upstream,
                         "endpoint-value-upstream",
-                        Some(EndpointUrl::Upstream),
                     ))
                     .child(Self::endpoint_row(
                         cx,
-                        &config.id,
                         "SOCKS",
                         socks_display,
                         "endpoint-value-socks",
-                        Some(EndpointUrl::Socks),
                     ))
                     .child(Self::endpoint_row(
                         cx,
-                        &config.id,
                         "HTTP",
                         http_display,
                         "endpoint-value-http",
-                        Some(EndpointUrl::Http),
-                    )),
+                    ))
+                    // K1/A4-4: one copy action for the whole block — the
+                    // per-row `[Copy]` buttons are gone.
+                    .child({
+                        let copy_id = config.id.clone();
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .flex_shrink_0()
+                            .child(div().flex_1().min_w_0())
+                            .child(
+                                Button::new("copy-endpoints")
+                                    .small()
+                                    .label("Copy URLs")
+                                    .accessibility_label("Copy this endpoint's URLs")
+                                    .tooltip("Copy bind endpoints (no secrets)")
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.copy_row_urls(&copy_id, window, cx);
+                                    })),
+                            )
+                    })
+                    // K1/A4-7: the editor strip lives INSIDE the block it edits.
+                    .child(strip)
+                    // The draft's live warning rides the strip that caused it.
+                    .children(self.render_row_endpoint_warning(cx, config)),
             ),
         )
     }
 
+    /// One read-only contact row. T-03: the value takes the leftover width and
+    /// truncates at the 260px default; the full text stays in its tooltip.
+    /// K1/A4-4: the per-row Copy left — the block carries the single action.
     pub(crate) fn endpoint_row(
         cx: &mut Context<Self>,
-        row_id: &str,
         label: &'static str,
         value: String,
         value_id: &'static str,
-        which: Option<EndpointUrl>,
     ) -> impl IntoElement {
         let tip = value.clone();
-        // T-03: one row per endpoint. The value takes the leftover width and
-        // truncates at the 260px default; the full text stays in its tooltip
-        // and the Copy button never clips. Wrapping Copy under the value made
-        // the endpoint block tall enough to push HTTP out of the 620px pane,
-        // so the compact single-line row is deliberate.
-        let mut value_row = div()
+        div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .flex_1()
+            .w_full()
             .min_w_0()
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(cx.theme().description_list_label_foreground)
+                    .child(label),
+            )
             .child(
                 div()
                     .id(value_id)
@@ -765,73 +818,100 @@ impl AppView {
                     .truncate()
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(value),
-            );
-        if let Some(which) = which {
-            let (id, button_label, tip, a11y) = match which {
-                EndpointUrl::Socks => (
-                    "copy-socks",
-                    "Copy",
-                    "Copy the SOCKS endpoint (no secrets)",
-                    "Copy SOCKS URL",
-                ),
-                EndpointUrl::Http => (
-                    "copy-http",
-                    "Copy",
-                    "Copy the HTTP endpoint (no secrets)",
-                    "Copy HTTP URL",
-                ),
-                EndpointUrl::Upstream => (
-                    "copy-upstream",
-                    "Copy",
-                    "Copy the upstream host:port (no secrets)",
-                    "Copy upstream endpoint",
-                ),
-            };
-            // T-03: SOCKS has one path — the row-scoped copy, which reads the
-            // row by id and never the selection.
-            let row_id = row_id.to_string();
-            value_row = value_row.child(
-                div().flex_shrink_0().child(
-                    Button::new(id)
-                        .small()
-                        .label(button_label)
-                        .accessibility_label(a11y)
-                        .tooltip(tip)
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            if matches!(which, EndpointUrl::Socks) {
-                                view.copy_row_socks(&row_id, window, cx);
-                            } else {
-                                view.copy_single_endpoint_url(which, window, cx);
-                            }
-                        })),
-                ),
-            );
-        }
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .child(
-                div()
-                    .w(px(64.))
-                    .flex_shrink_0()
-                    .text_sm()
-                    .text_color(cx.theme().description_list_label_foreground)
-                    .child(label),
             )
-            .child(value_row)
     }
 
+    /// K1/A4-5: red ONLY for a failing state — live numbers ride dim mono and
+    /// the probe wording drops `(s)` plus the `probe:`/byte jargon. The full
+    /// detail line keeps its job inside the failed ALERT, where red is earned.
     pub(crate) fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
-        let tone = self.health_store.health_tone(&config.id);
+        let status = self.health_store.status(&config.id);
+        let mono_number = |text: String| {
+            div()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_color(cx.theme().muted_foreground)
+                .child(text)
+        };
+        let state_line = match status.state {
+            crate::health::RowState::Unknown => div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Never tested — press Test to check")
+                .into_any_element(),
+            crate::health::RowState::Dead => div()
+                .text_sm()
+                .text_color(cx.theme().danger)
+                .child(format!(
+                    "Failed — {}",
+                    status.cause.as_deref().unwrap_or("endpoint dead")
+                ))
+                .into_any_element(),
+            crate::health::RowState::Live => {
+                let mut samples: Vec<(&str, String)> = Vec::new();
+                if let Some(ms) = self
+                    .health_store
+                    .latest_of(&config.id, HealthKind::UrlTest)
+                    .and_then(|sample| sample.latency_ms)
+                {
+                    samples.push(("URL test", format!("{ms}ms")));
+                }
+                if let Some(ms) = self
+                    .health_store
+                    .latest_of(&config.id, HealthKind::TcpPing)
+                    .and_then(|sample| sample.latency_ms)
+                {
+                    samples.push(("TCP ping", format!("{ms}ms")));
+                }
+                if samples.is_empty() {
+                    samples.push(("State", "live".to_string()));
+                }
+                let mut line = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .text_sm();
+                for (index, (label, value)) in samples.iter().enumerate() {
+                    if index > 0 {
+                        line = line.child(mono_number("·".to_string()));
+                    }
+                    line = line.child(*label).child(mono_number(value.clone()));
+                }
+                line.into_any_element()
+            }
+        };
+        // Probe accounting, plainly worded: bytes with their direction and a
+        // correctly pluralized probe count (never `1 probe(s)`).
+        let traffic = self.health_store.traffic(&config.id);
+        let probe_line = (traffic.probes > 0).then(|| {
+            let probes = if traffic.probes == 1 {
+                "1 probe".to_string()
+            } else {
+                format!("{} probes", traffic.probes)
+            };
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Probe traffic")
+                .child(mono_number(format!("{} ↓", format_bytes(traffic.rx_bytes))))
+                .child(mono_number("·".to_string()))
+                .child(mono_number(format!("{} ↑", format_bytes(traffic.tx_bytes))))
+                .child(mono_number("·".to_string()))
+                .child(mono_number(probes))
+                .into_any_element()
+        });
         div().id("config-health").test_support().child(
-            GroupBox::new().title("Health").gap_1().child(
-                div()
-                    .text_color(health_tone_color(tone, cx))
-                    .child(self.health_store.detail_line(&config.id).into_any_element()),
-            ),
+            GroupBox::new()
+                .title("Health")
+                .gap_1()
+                .child(state_line)
+                .children(probe_line),
         )
     }
 
@@ -862,19 +942,45 @@ impl AppView {
         )
     }
 
+    /// K1/A4-6: the sparkline earns its 160x32 only with 3+ samples — a
+    /// one-or-two-point "trend" is noise, so the block says how many probes
+    /// it has instead. The real trend (caption + chart) still comes from
+    /// `history_line` once the row has enough history to draw honestly.
     pub(crate) fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
-        div().id("config-history").test_support().child(
-            GroupBox::new()
-                .title("History")
-                .gap_1()
-                .child(self.history_line(&config.id, cx)),
-        )
+        // Same 90-day window the sparkline reads, so the count matches the
+        // samples `history_line` would chart.
+        let since = now_unix().saturating_sub(90 * 86_400);
+        let samples = self
+            .store
+            .load_health_history(&config.id, Some(since))
+            .map(|entries| url_test_sparkline(&entries, 120).len())
+            .unwrap_or(0);
+        let body = if samples >= 3 {
+            self.history_line(&config.id, cx)
+        } else {
+            div()
+                .id("config-history-few")
+                .test_support()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(if samples == 0 {
+                    "No health history yet — press Test to record a probe".to_string()
+                } else {
+                    format!("History needs 3 samples — {samples} recorded")
+                })
+                .into_any_element()
+        };
+        div()
+            .id("config-history")
+            .test_support()
+            .child(GroupBox::new().title("History").gap_1().child(body))
     }
 
-    /// T-03: the row's endpoint editors live in the inspector now — a 30px
-    /// row cannot hold five framed controls. The per-row ids stay stable
-    /// (`row-bind-<id>`, `row-port-input-<id>`, `row-serve-<id>`,
-    /// `row-edit-<id>`), so the row and the inspector speak the same names.
+    /// The row's endpoint editors — K1/A4-4 now mounts this strip INSIDE the
+    /// endpoints block, with the ids kept stable (`row-bind-<id>`,
+    /// `row-port-input-<id>`) so the row and the inspector speak the same
+    /// names. Start/Stop live in the operate row; Edit lives in the row's
+    /// context menu — neither rides the strip anymore (K1/A4-8).
     pub(crate) fn render_row_editors(
         &self,
         window: &mut Window,
@@ -908,7 +1014,6 @@ impl AppView {
         // from the document, so they keep the free-text bind field.
         let custom_config_row = is_custom_config_protocol(&config.protocol);
         let name = config.name.clone();
-        let is_running = self.engine.is_running(&config.id);
         let bind_cell = if custom_config_row {
             div()
                 .id(format!("row-bind-{}", config.id))
@@ -922,10 +1027,16 @@ impl AppView {
                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                 })
                 .child(
-                    Input::new(&bind_state)
-                        .id(format!("row-bind-input-{}", config.id))
-                        .small()
-                        .aria_label(format!("Serve bind address for {name}")),
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(
+                            Input::new(&bind_state)
+                                .id(format!("row-bind-input-{}", config.id))
+                                .small()
+                                // K1/A4-7: every strip input is bordered + mono.
+                                .bordered(true)
+                                .aria_label(format!("Serve bind address for {name}")),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -941,11 +1052,16 @@ impl AppView {
                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                 })
                 .child(
-                    Select::new(&bind_picker)
-                        .id(format!("row-bind-picker-{}", config.id))
-                        .small()
-                        .placeholder("pick address")
-                        .accessibility_label(format!("Serve bind address for {name}")),
+                    // K1/A4-7: the picker matches the port field's mono frame.
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(
+                            Select::new(&bind_picker)
+                                .id(format!("row-bind-picker-{}", config.id))
+                                .small()
+                                .placeholder("pick address")
+                                .accessibility_label(format!("Serve bind address for {name}")),
+                        ),
                 )
                 .into_any_element()
         };
@@ -975,10 +1091,9 @@ impl AppView {
             .items_center()
             .gap_2()
             .w_full()
-            .px_2()
-            .py_1()
-            .border_t_1()
-            .border_color(cx.theme().border)
+            .min_w_0()
+            // K1/A4-4: inside the Endpoints frame the strip needs no hairline
+            // or own padding — the GroupBox already separates it.
             .key_context("row-endpoint")
             .on_key_down(cx.listener({
                 let revert_id = row_id.clone();
@@ -1028,56 +1143,18 @@ impl AppView {
                         move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                     })
                     .child(
-                        Input::new(&port_state)
-                            .id(format!("row-port-input-{}", config.id))
-                            .small()
-                            .aria_label(format!("Local port for {name}")),
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .child(
+                                Input::new(&port_state)
+                                    .id(format!("row-port-input-{}", config.id))
+                                    .small()
+                                    // K1/A4-7: the port field stopped being the
+                                    // borderless one wedged between Add… and value.
+                                    .bordered(true)
+                                    .aria_label(format!("Local port for {name}")),
+                            ),
                     ),
-            )
-            .child(
-                Button::new(format!("row-serve-{}", config.id))
-                    .small()
-                    .label(if is_running { "■ Stop" } else { "Start" })
-                    .accessibility_label(if is_running {
-                        format!("Stop \"{name}\"")
-                    } else {
-                        format!("Start \"{name}\"")
-                    })
-                    .tooltip(if is_running {
-                        format!("Stop \"{name}\"")
-                    } else {
-                        format!("Start \"{name}\" (F5)")
-                    })
-                    .on_click({
-                        let serve_view = cx.entity();
-                        let serve_id = config.id.clone();
-                        move |_, window, cx| {
-                            serve_view.update(cx, |view, cx| {
-                                if is_running {
-                                    view.stop_row(&serve_id, window, cx);
-                                } else {
-                                    view.start_row(&serve_id, window, cx);
-                                }
-                            });
-                        }
-                    }),
-            )
-            .child(
-                Button::new(format!("row-edit-{}", config.id))
-                    .small()
-                    .label("Edit")
-                    .accessibility_label(format!("Edit \"{name}\""))
-                    .tooltip(format!("Edit \"{name}\""))
-                    .on_click({
-                        let edit_view = cx.entity();
-                        let edit_id = config.id.clone();
-                        move |_, window, cx| {
-                            edit_view.update(cx, |view, cx| {
-                                view.commit_row_endpoint(&edit_id, window, cx);
-                                view.open_edit_for_row(&edit_id, window, cx);
-                            });
-                        }
-                    }),
             )
             .into_any_element()
     }
@@ -1124,10 +1201,6 @@ impl AppView {
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        let switch_id = format!("enabled-{}", config.id);
-        let switch_view = cx.entity();
-        let switch_id_for_handler = config.id.clone();
-
         let is_running = self.engine.is_running(&config.id);
         let failed = self.detail_failed(config);
         let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
@@ -1196,6 +1269,9 @@ impl AppView {
         // The hairline is a sibling wrapper, not part of the row: the pinned
         // minimum-width test budgets four 24px lines plus gaps inside
         // `detail-operate`, and a 1px top border would push the row to 121px.
+        // K1/A4-8: ONE tier now — Start · Stop · Test plus the `…` kebab
+        // holding Auto-start, Ping, Logs, Copy URLs, Copy proxy. The draft
+        // warning travels with the editors into the endpoints block (A4-4).
         div()
             .w_full()
             .border_t_1()
@@ -1210,62 +1286,10 @@ impl AppView {
                     .items_center()
                     .gap_2()
                     .w_full()
-                    .child(
-                        Switch::new(switch_id)
-                            .checked(config.enabled)
-                            .label("Auto-start")
-                            .accessibility_label("Auto-start")
-                            .tooltip("Auto-start with Start-all — Start/Stop control serving now")
-                            .on_change(move |enabled: &bool, window, cx| {
-                                let enabled = *enabled;
-                                let id = switch_id_for_handler.clone();
-                                switch_view.update(cx, |view, cx| {
-                                    view.commit_enabled_flag(&id, enabled, window, cx);
-                                });
-                            }),
-                    )
                     .child(start)
                     .child(stop)
                     .child(test)
-                    .child({
-                        let mut ping = Button::new("health-ping")
-                            .small()
-                            .label("Ping")
-                            .tooltip("TCP-ping the selected endpoint")
-                            .loading(self.probe_kind_in_flight(true))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.ping_selected(window, cx);
-                            }));
-                        if self.probe_kind_in_flight(true) {
-                            ping = ping.child(
-                                div()
-                                    .id("health-ping-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        ping
-                    })
-                    .child(
-                        Button::new("logs-open")
-                            .small()
-                            .label("Logs")
-                            .tooltip("Open logs for the selection")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_logs_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("copy-urls")
-                            .small()
-                            .label("Copy URLs")
-                            .tooltip("Copy bind endpoints (no secrets)")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.copy_selected_urls(window, cx);
-                            })),
-                    )
-                    .child(self.render_row_menu(cx))
-                    .children(self.render_row_endpoint_warning(cx, config)),
+                    .child(self.render_row_menu(cx, config)),
             )
     }
 
@@ -1308,7 +1332,16 @@ impl AppView {
         menu: PopupMenu,
         row_id: &str,
         view: &Entity<AppView>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        // K8/A6-2: 7 core verbs at top level (Reset… is its own submenu) and
+        // the demoted row chores behind `More ▾`. Speedtest / Resolve Out-IP /
+        // Resolve domain are retired (K8): they appear in no menu at all.
+        let reset_id = row_id.to_string();
+        let reset_view = view.clone();
+        let more_id = row_id.to_string();
+        let more_view = view.clone();
         menu.item(Self::row_menu_item(
             "start",
             row_id,
@@ -1334,60 +1367,12 @@ impl AppView {
             AppView::test_row,
         ))
         .item(Self::row_menu_item(
-            "ping",
-            row_id,
-            "Ping",
-            "TCP-ping this row's endpoint",
-            view,
-            AppView::ping_row,
-        ))
-        .item(Self::row_menu_item(
-            "speedtest",
-            row_id,
-            "Speedtest",
-            "Measure this row's transfer rate (mode + timeout)",
-            view,
-            AppView::speedtest_row,
-        ))
-        .item(Self::row_menu_item(
-            "out-ip",
-            row_id,
-            "Resolve Out-IP",
-            "Show this row's egress IP address",
-            view,
-            AppView::resolve_out_ip_row,
-        ))
-        .item(Self::row_menu_item(
-            "resolve-domain",
-            row_id,
-            "Resolve domain",
-            "Resolve this row's server domain to an IP and save it",
-            view,
-            AppView::resolve_domain_row,
-        ))
-        .item(Self::row_menu_item(
             "copy-proxy",
             row_id,
             "Copy proxy",
             "Copy this row's proxy URL",
             view,
             AppView::copy_row_socks,
-        ))
-        .item(Self::row_menu_item(
-            "copy",
-            row_id,
-            "Copy URLs",
-            "Copy bind endpoints (no secrets)",
-            view,
-            AppView::copy_row_urls,
-        ))
-        .item(Self::row_menu_item(
-            "share",
-            row_id,
-            "Share",
-            "Copy this row's share link (carries credentials)",
-            view,
-            AppView::open_share_for_row,
         ))
         .item(Self::row_menu_item(
             "edit",
@@ -1397,14 +1382,24 @@ impl AppView {
             view,
             AppView::open_edit_for_row,
         ))
-        .item(Self::row_menu_item(
-            "duplicate",
-            row_id,
-            "Duplicate",
-            "Duplicate this row (disabled copy)",
-            view,
-            AppView::commit_duplicate,
-        ))
+        .submenu("Reset…", window, cx, move |menu, _, _| {
+            menu.item(Self::row_menu_item(
+                "reset-traffic",
+                &reset_id,
+                "Reset traffic",
+                "Reset this row's traffic counters",
+                &reset_view,
+                AppView::open_traffic_reset_for_row,
+            ))
+            .item(Self::row_menu_item(
+                "reset-usage",
+                &reset_id,
+                "Reset usage",
+                "Reset this row's usage counters",
+                &reset_view,
+                AppView::open_usage_reset_for_row,
+            ))
+        })
         .item(Self::row_menu_item(
             "delete",
             row_id,
@@ -1413,121 +1408,125 @@ impl AppView {
             view,
             AppView::open_remove_for_row,
         ))
-        .item(Self::row_menu_item(
-            "reset-traffic",
-            row_id,
-            "Reset traffic",
-            "Reset this row's traffic counters",
-            view,
-            AppView::open_traffic_reset_for_row,
-        ))
-        .item(Self::row_menu_item(
-            "reset-usage",
-            row_id,
-            "Reset usage",
-            "Reset this row's usage counters",
-            view,
-            AppView::open_usage_reset_for_row,
-        ))
-        .item(Self::row_menu_item(
-            "move",
-            row_id,
-            "Move to group",
-            "Move this row to a group",
-            view,
-            AppView::open_row_move_dialog,
-        ))
+        .submenu("More ▾", window, cx, move |menu, _, _| {
+            menu.item(Self::row_menu_item(
+                "move",
+                &more_id,
+                "Move to group",
+                "Move this row to a group",
+                &more_view,
+                AppView::open_row_move_dialog,
+            ))
+            .item(Self::row_menu_item(
+                "copy",
+                &more_id,
+                "Copy URLs",
+                "Copy bind endpoints (no secrets)",
+                &more_view,
+                AppView::copy_row_urls,
+            ))
+            .item(Self::row_menu_item(
+                "share",
+                &more_id,
+                "Share…",
+                "Copy this row's share link (carries credentials)",
+                &more_view,
+                AppView::open_share_for_row,
+            ))
+            .item(Self::row_menu_item(
+                "duplicate",
+                &more_id,
+                "Duplicate",
+                "Duplicate this row (disabled copy)",
+                &more_view,
+                AppView::commit_duplicate,
+            ))
+            .item(Self::row_menu_item(
+                "ping",
+                &more_id,
+                "Ping",
+                "TCP-ping this row's endpoint",
+                &more_view,
+                AppView::ping_row,
+            ))
+        })
     }
 
-    pub(crate) fn render_row_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// K1/A4-8: the operate row's overflow — ONE `…` trigger holding the five
+    /// actions that no longer earn a button: Auto-start (writes the stored
+    /// flag only), Ping, Logs, Copy URLs, Copy proxy. Row management (Edit /
+    /// Delete / Duplicate / Reset) lives in the row's context menu — this
+    /// button used to duplicate half of it above itself.
+    pub(crate) fn render_row_menu(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
         let row_view = cx.entity();
+        let row_id = config.id.clone();
+        let auto_start = config.enabled;
 
         Button::new("row-menu")
             .small()
-            .label("Row actions…")
-            .tooltip("Edit, delete, duplicate, or reset this row")
+            .label("…")
+            .accessibility_label("More actions")
+            .tooltip("More actions for the selected endpoint")
             .dropdown_menu(move |menu, _, _| {
+                let view = row_view.clone();
+                let toggle_id = row_id.clone();
+                let copy_id = row_id.clone();
                 menu.item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("edit-config")
-                            .test_support()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Edit the selected configuration"))
-                                    .into()
-                            })
-                            .child("Edit")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_edit_dialog(config, window, cx);
-                                }
-                            });
-                        }
-                    }),
-                )
-                .item(
                     PopupMenuItem::element(move |_, _| {
                         div()
-                            .id("delete-config")
+                            .id("kebab-auto-start")
                             .test_support()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Delete the selected configuration"))
-                                    .into()
-                            })
-                            .child("Delete")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_remove_confirm(config, window, cx);
-                                }
-                            });
-                        }
-                    }),
-                )
-                .item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("duplicate-config")
-                            .test_support()
+                            .role(Role::MenuItem)
+                            .aria_label("Auto-start")
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
                             .tooltip(|_, cx| {
                                 cx.new(|_| {
-                                    Tooltip::new("Duplicate the selected row (disabled copy)")
+                                    Tooltip::new(
+                                        "Auto-start with Start-all — Start/Stop control serving now",
+                                    )
                                 })
                                 .into()
                             })
-                            .child("Duplicate")
+                            .child(format!(
+                                "Auto-start · {}",
+                                if auto_start { "On" } else { "Off" }
+                            ))
+                    })
+                    .on_click(move |_, window, cx| {
+                        let enabled = !auto_start;
+                        view.update(cx, |view, cx| {
+                            view.commit_enabled_flag(&toggle_id, enabled, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("kebab-ping")
+                            .test_support()
+                            .role(Role::MenuItem)
+                            .aria_label("Ping")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("TCP-ping the selected endpoint")).into()
+                            })
+                            .child("Ping")
                     })
                     .on_click({
                         let view = row_view.clone();
                         move |_, window, cx| {
                             view.update(cx, |view, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.commit_duplicate(&config.id, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
+                                view.ping_selected(window, cx);
                             });
                         }
                     }),
@@ -1535,30 +1534,24 @@ impl AppView {
                 .item(
                     PopupMenuItem::element(|_, _| {
                         div()
-                            .id("reset-traffic")
+                            .id("kebab-logs")
                             .test_support()
+                            .role(Role::MenuItem)
+                            .aria_label("Logs")
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
                             .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Reset this row's traffic counters"))
-                                    .into()
+                                cx.new(|_| Tooltip::new("Open logs for the selection")).into()
                             })
-                            .child("Reset traffic")
+                            .child("Logs")
                     })
                     .on_click({
                         let view = row_view.clone();
                         move |_, window, cx| {
                             view.update(cx, |view, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_traffic_reset_confirm(config, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
+                                view.open_logs_dialog(window, cx);
                             });
                         }
                     }),
@@ -1566,25 +1559,51 @@ impl AppView {
                 .item(
                     PopupMenuItem::element(|_, _| {
                         div()
-                            .id("usage-reset")
+                            .id("kebab-copy-urls")
                             .test_support()
+                            .role(Role::MenuItem)
+                            .aria_label("Copy URLs")
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
                             .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Reset this row's usage counters"))
-                                    .into()
+                                cx.new(|_| Tooltip::new("Copy bind endpoints (no secrets)")).into()
                             })
-                            .child("Reset usage")
+                            .child("Copy URLs")
                     })
                     .on_click({
                         let view = row_view.clone();
                         move |_, window, cx| {
                             view.update(cx, |view, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_usage_reset_confirm(config, window, cx);
-                                }
+                                view.copy_selected_urls(window, cx);
+                            });
+                        }
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("kebab-copy-proxy")
+                            .test_support()
+                            .role(Role::MenuItem)
+                            .aria_label("Copy proxy")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Copy this row's proxy URL")).into()
+                            })
+                            .child("Copy proxy")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                // SOCKS bind:port only, no secrets — the row
+                                // id captured above keeps it row-scoped.
+                                view.copy_row_socks(&copy_id, window, cx);
                             });
                         }
                     }),
@@ -1616,23 +1635,20 @@ impl AppView {
 }
 
 impl AppView {
-    /// T-03: six panes at 244–344px do not fit one segmented row. Two rows of
-    /// three keep every pane visible without a hidden horizontal scroll; the
-    /// Ctrl-1…6 keys live in the tooltips of the commands/Settings → Shortcuts
-    /// and no longer ride the tab labels.
+    /// K1/A4-1: ONE segmented switcher — Details · Health · Logs ·
+    /// Connections · Traffic, one row. Presets has no tab of its home here
+    /// (Routing is its home); the legacy Ctrl-3 target lands on Details. The
+    /// Ctrl-1…5 keys live in Settings → Shortcuts, not on the tab labels.
     pub(crate) fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let top_view = cx.entity();
-        let bottom_view = cx.entity();
-        let selected = self.inspector_tab.index();
-        let top_selected = (selected < 3).then_some(selected);
-        let bottom_selected = selected.checked_sub(3);
+        let view = cx.entity();
 
-        let mut top_bar = TabBar::new("inspector-tabs-top")
+        let bar = TabBar::new("inspector-tabs-segment")
             .segmented()
             .small()
             .w_full()
+            .selected_index(self.inspector_tab.index())
             .on_click(move |index, _, cx| {
-                top_view.update(cx, |view, _| {
+                view.update(cx, |view, _| {
                     view.set_inspector_tab(InspectorTab::from_index(*index));
                 });
             })
@@ -1650,26 +1666,6 @@ impl AppView {
                     .flex_1()
                     .child(div().id("inspector-tab-health").test_support()),
             )
-            .child(
-                Tab::new()
-                    .label("Presets")
-                    .aria_label(InspectorTab::Presets.a11y_label())
-                    .flex_1()
-                    .child(div().id("inspector-tab-presets").test_support()),
-            );
-        if let Some(index) = top_selected {
-            top_bar = top_bar.selected_index(index);
-        }
-
-        let mut bottom_bar = TabBar::new("inspector-tabs-bottom")
-            .segmented()
-            .small()
-            .w_full()
-            .on_click(move |index, _, cx| {
-                bottom_view.update(cx, |view, _| {
-                    view.set_inspector_tab(InspectorTab::from_index(*index + 3));
-                });
-            })
             .child(
                 Tab::new()
                     .label("Logs")
@@ -1691,9 +1687,6 @@ impl AppView {
                     .flex_1()
                     .child(div().id("inspector-tab-traffic").test_support()),
             );
-        if let Some(index) = bottom_selected {
-            bottom_bar = bottom_bar.selected_index(index);
-        }
 
         div()
             .id("inspector-tabs")
@@ -1702,12 +1695,16 @@ impl AppView {
             .flex_col()
             .gap_1()
             .w_full()
-            .child(top_bar)
-            .child(bottom_bar)
+            .child(bar)
     }
 
+    /// K1/A4-4: the single-scroll head — header, failed alert (only when the
+    /// endpoint is the failure source), then the merged endpoints+editors
+    /// block. It needs `window` because the folded editor strip materializes
+    /// the row's draft inputs.
     pub(crate) fn render_inspector_overview(
         &self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
@@ -1729,7 +1726,7 @@ impl AppView {
                 ),
             );
         }
-        overview.child(self.render_detail_endpoints(cx, config))
+        overview.child(self.render_detail_endpoints(window, cx, config))
     }
 
     pub(crate) fn render_inspector_details(
@@ -1755,104 +1752,5 @@ impl AppView {
             .gap_1()
             .child(self.render_detail_health(cx, config))
             .child(self.render_detail_history(cx, config))
-    }
-
-    pub(crate) fn render_inspector_presets(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        div().flex().flex_col().gap_1().child({
-            let preset_line = match self.preset_summary_for(config.preset_id.as_deref()) {
-                Some((name, count)) => {
-                    format!("{name} ({count} rule(s))")
-                }
-                None => match self.preset_name_for(config.preset_id.as_deref()) {
-                    Some(name) => name,
-                    None => "no routing preset".to_string(),
-                },
-            };
-            div().id("config-preset").test_support().child(
-                GroupBox::new().title("Routing preset").gap_1().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child({
-                            let tip = preset_line.clone();
-                            div()
-                                .id("preset-line-tip")
-                                .test_support()
-                                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                                .child(
-                                    DescriptionList::new()
-                                        .bordered(false)
-                                        .small()
-                                        .columns(1)
-                                        .label_width(px(72.))
-                                        .item("Preset", preset_line, 1),
-                                )
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("preset-open")
-                                        .small()
-                                        .label("Preset")
-                                        .tooltip("Attach a routing preset")
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            if let Some(config) = view.selected_config(cx) {
-                                                view.open_preset_attach_dialog(config, window, cx);
-                                            }
-                                        })),
-                                )
-                                .child(if config.preset_id.is_some() {
-                                    let detach_id = config.id.clone();
-                                    Button::new("preset-detach-inline")
-                                        .small()
-                                        .label("Detach")
-                                        .tooltip("Detach the routing preset from this row")
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.commit_preset_attach(&detach_id, None, window, cx);
-                                        }))
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .id("preset-detach-idle")
-                                        .test_support()
-                                        .into_any_element()
-                                }),
-                        )
-                        // T-04: the routing inventory left Settings — the pane
-                        // that talks about presets now carries it, next to the
-                        // link into the manager that edits the rules.
-                        .child({
-                            let presets = self.store.list_presets().ok().map(|list| list.len());
-                            let attached = self.store.list().ok().map(|rows| {
-                                rows.iter().filter(|row| row.preset_id.is_some()).count()
-                            });
-                            div()
-                                .id("preset-inventory")
-                                .test_support()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(routing_summary_text(presets, attached))
-                        })
-                        .child(
-                            Button::new("preset-open-manager")
-                                .small()
-                                .label("Manage presets")
-                                .tooltip("Open the routing presets manager")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.open_presets_dialog(window, cx);
-                                })),
-                        ),
-                ),
-            )
-        })
     }
 }

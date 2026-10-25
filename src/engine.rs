@@ -7744,13 +7744,12 @@ impl EngineController {
     }
 
     pub fn status_text(&self) -> String {
+        // K12/A5-1: the status strip owns the endpoint count in its first
+        // segment; this text names the engine state only, so the center
+        // segment reads `engine running · health X live · Y dead`.
         match &self.status {
             EngineStatus::Stopped => "engine stopped".to_string(),
-            EngineStatus::Running => {
-                let count = self.active.len();
-                let noun = if count == 1 { "endpoint" } else { "endpoints" };
-                format!("engine running · {count} {noun}")
-            }
+            EngineStatus::Running => "engine running".to_string(),
             EngineStatus::Crashed { cause } => format!("engine crashed ({cause})"),
         }
     }

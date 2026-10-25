@@ -7,6 +7,9 @@ pub(crate) fn topbar_menu_row(
     tip: &'static str,
     shortcut: Option<(&'static str, &'static str, &'static str)>,
 ) -> AnyElement {
+    // A6-5/K8: the label flexes and the chip is parked on the row's right
+    // edge, so every chipped item in a menu reads as one aligned column and
+    // the chip keeps its full width (never "Ctrl+…").
     match shortcut {
         Some((parse, chip, aria)) => div()
             .id(id)
@@ -19,7 +22,7 @@ pub(crate) fn topbar_menu_row(
             .items_center()
             .gap_2()
             .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
-            .child(label)
+            .child(div().flex_1().min_w_0().child(label))
             .child(shortcut_kbd(parse, chip))
             .into_any_element(),
         None => div()
@@ -180,7 +183,14 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
         rx = rx.saturating_add(*row_rx);
         tx = tx.saturating_add(*row_tx);
     }
-    Some(format!("↓ {} · ↑ {}", format_bytes(rx), format_bytes(tx)))
+    // K12/A5-1: words instead of the tiny `↓`/`↑` pair, which the UI video
+    // showed degrading to a serif "T". `out` is what the endpoints sent
+    // (tx), `in` is what came back (rx).
+    Some(format!(
+        "out {} · in {}",
+        format_bytes(tx),
+        format_bytes(rx)
+    ))
 }
 
 pub(crate) fn interval_picker_row(

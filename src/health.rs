@@ -17,7 +17,6 @@ pub const GROUP_TEST_BATCH_SIZE: usize = 100;
 pub const GROUP_TEST_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub const GROUP_TEST_CONCURRENCY: usize = 10;
 pub const URL_TEST_TIMEOUT: Duration = Duration::from_secs(3);
-pub const SPEED_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Host of a test `url`, path/query trimmed. Empty when the URL has no host.
 pub fn probe_host_for(url: &str) -> String {
@@ -155,36 +154,6 @@ pub trait HealthProber {
 
     fn tcp_ping(&self, config: &ProxyConfig, bind: &str, port: u16)
         -> Result<ProbeSuccess, String>;
-
-    fn speed_test(
-        &self,
-        config: &ProxyConfig,
-        bind: &str,
-        port: u16,
-        url: &str,
-        mode: SpeedtestMode,
-        timeout: Duration,
-    ) -> Result<SpeedtestOutcome, String> {
-        let _ = (bind, port, url, mode, timeout);
-        Err(format!(
-            "speed test not supported for \"{}\" by this driver",
-            redact_secrets(&config.name)
-        ))
-    }
-
-    fn out_ip(
-        &self,
-        config: &ProxyConfig,
-        bind: &str,
-        port: u16,
-        url: &str,
-    ) -> Result<String, String> {
-        let _ = (bind, port, url);
-        Err(format!(
-            "out-ip resolve not supported for \"{}\" by this driver",
-            redact_secrets(&config.name)
-        ))
-    }
 }
 
 pub fn is_probeable_protocol(protocol: &str) -> bool {
@@ -401,224 +370,6 @@ impl HealthProber for RealHealthProber {
             bytes_tx: 0,
         })
     }
-
-    fn speed_test(
-        &self,
-        config: &ProxyConfig,
-        bind: &str,
-        port: u16,
-        url: &str,
-        mode: SpeedtestMode,
-        timeout: Duration,
-    ) -> Result<SpeedtestOutcome, String> {
-        let outcome =
-            |latency_ms: Option<u64>, mbps: Option<f64>, error: Option<String>| SpeedtestOutcome {
-                config_id: config.id.clone(),
-                mode,
-                latency_ms,
-                mbps,
-                error,
-            };
-        let endpoint =
-            endpoint_addr(bind, port, timeout).map_err(|cause| named_speed_error(config, cause))?;
-        let (scheme, host) =
-            split_http_url(url).map_err(|cause| named_speed_error(config, cause))?;
-        if !scheme.eq_ignore_ascii_case("http") {
-            return Err(named_speed_error(
-                config,
-                format!(
-                    "unsupported url scheme \"{scheme}\" for speed test (use an http:// test url)"
-                ),
-            ));
-        }
-        match mode {
-            SpeedtestMode::Download => {
-                let request = format!(
-                    "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\n\r\n"
-                );
-                let started = Instant::now();
-                match exchange(endpoint, &request, timeout, 8 * 1024 * 1024) {
-                    Ok((code, body)) if (200..300).contains(&code) => Ok(outcome(
-                        Some(started.elapsed().as_millis() as u64),
-                        Some(mbps_of(body.len() as u64, started.elapsed())),
-                        None,
-                    )),
-                    Ok((code, _)) => Err(named_speed_error(
-                        config,
-                        format!("speed test via {endpoint}: unexpected status {code}"),
-                    )),
-                    Err(cause) => Err(named_speed_error(config, cause)),
-                }
-            }
-            SpeedtestMode::Upload => {
-                let payload = vec![b'M'; 256 * 1024];
-                let request = format!(
-                    "POST {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\nContent-Length: {}\r\n\r\n",
-                    payload.len()
-                );
-                let started = Instant::now();
-                match post_exchange(endpoint, &request, &payload, timeout) {
-                    Ok(code) if (200..300).contains(&code) => Ok(outcome(
-                        Some(started.elapsed().as_millis() as u64),
-                        Some(mbps_of(payload.len() as u64, started.elapsed())),
-                        None,
-                    )),
-                    Ok(code) => Err(named_speed_error(
-                        config,
-                        format!("speed test via {endpoint}: unexpected status {code}"),
-                    )),
-                    Err(cause) => Err(named_speed_error(config, cause)),
-                }
-            }
-        }
-    }
-
-    fn out_ip(
-        &self,
-        config: &ProxyConfig,
-        bind: &str,
-        port: u16,
-        url: &str,
-    ) -> Result<String, String> {
-        let named = |cause: String| {
-            format!(
-                "out-ip resolve failed for \"{}\": {}",
-                redact_secrets(&config.name),
-                redact_secrets(&cause)
-            )
-        };
-        let endpoint = endpoint_addr(bind, port, self.timeout).map_err(named)?;
-        let (scheme, host) = split_http_url(url).map_err(named)?;
-        if !scheme.eq_ignore_ascii_case("http") {
-            return Err(named(format!(
-                "unsupported url scheme \"{scheme}\" for out-ip resolve (use an http:// url)"
-            )));
-        }
-        let request = format!(
-            "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\n\r\n"
-        );
-        let (_, body) = exchange(endpoint, &request, self.timeout, 4096).map_err(named)?;
-        let text = String::from_utf8_lossy(&body);
-
-        let candidate = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or(text.as_ref())
-            .trim();
-        candidate
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.to_string())
-            .map_err(|_| named("unexpected out-ip response (not an IP address)".to_string()))
-    }
-}
-
-fn named_speed_error(config: &ProxyConfig, cause: impl Into<String>) -> String {
-    format!(
-        "speed test failed for \"{}\": {}",
-        redact_secrets(&config.name),
-        redact_secrets(&cause.into())
-    )
-}
-
-fn exchange(
-    endpoint: SocketAddr,
-    request: &str,
-    timeout: Duration,
-    cap: usize,
-) -> Result<(u16, Vec<u8>), String> {
-    use std::io::{Read as _, Write as _};
-    let started = Instant::now();
-    let mut stream = TcpStream::connect_timeout(&endpoint, timeout)
-        .map_err(|error| format!("speed test via {endpoint}: dial failed ({error})"))?;
-    stream.set_write_timeout(Some(timeout)).ok();
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("speed test via {endpoint}: write failed ({error})"))?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            return Err(format!("speed test via {endpoint}: timed out"));
-        }
-        stream.set_read_timeout(Some(timeout - elapsed)).ok();
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() >= cap {
-                    break;
-                }
-            }
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    return Err(format!("speed test via {endpoint}: timed out"));
-                }
-                return Err(format!("speed test via {endpoint}: read failed ({error})"));
-            }
-        }
-    }
-    let head = String::from_utf8_lossy(&buf);
-    let code = head
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| format!("speed test via {endpoint}: bad proxy response"))?;
-    Ok((code, buf))
-}
-
-fn post_exchange(
-    endpoint: SocketAddr,
-    headers: &str,
-    payload: &[u8],
-    timeout: Duration,
-) -> Result<u16, String> {
-    use std::io::{Read as _, Write as _};
-    let started = Instant::now();
-    let mut stream = TcpStream::connect_timeout(&endpoint, timeout)
-        .map_err(|error| format!("speed test via {endpoint}: dial failed ({error})"))?;
-    stream.set_write_timeout(Some(timeout)).ok();
-    stream
-        .write_all(headers.as_bytes())
-        .map_err(|error| format!("speed test via {endpoint}: write failed ({error})"))?;
-    stream
-        .write_all(payload)
-        .map_err(|error| format!("speed test via {endpoint}: write failed ({error})"))?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            return Err(format!("speed test via {endpoint}: timed out"));
-        }
-        stream.set_read_timeout(Some(timeout - elapsed)).ok();
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if find_headers_end(&buf).is_some() || buf.len() >= 65_536 {
-                    break;
-                }
-            }
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    return Err(format!("speed test via {endpoint}: timed out"));
-                }
-                return Err(format!("speed test via {endpoint}: read failed ({error})"));
-            }
-        }
-    }
-    String::from_utf8_lossy(&buf)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| format!("speed test via {endpoint}: bad proxy response"))
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
@@ -960,140 +711,6 @@ fn run_group(
     out
 }
 
-pub fn speed_group(
-    configs: &[ProxyConfig],
-    url: &str,
-    mode: SpeedtestMode,
-    timeout: Duration,
-    prober: &dyn HealthProber,
-    stop: &std::sync::atomic::AtomicBool,
-    mut on_progress: impl FnMut(usize, usize),
-) -> Vec<SpeedtestOutcome> {
-    use std::sync::atomic::Ordering;
-    let total = configs.len();
-    let mut out = Vec::with_capacity(total);
-    for config in configs {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        if !prober.supports(config) {
-            out.push(SpeedtestOutcome {
-                config_id: config.id.clone(),
-                mode,
-                latency_ms: None,
-                mbps: None,
-                error: Some(format!(
-                    "unsupported protocol \"{}\" for \"{}\" (no speed test for this protocol yet)",
-                    config.protocol,
-                    redact_secrets(&config.name)
-                )),
-            });
-        } else {
-            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prober.speed_test(config, &config.bind_ip, config.port, url, mode, timeout)
-            }));
-            out.push(match probed {
-                Ok(Ok(measured)) => measured,
-                Ok(Err(cause)) => SpeedtestOutcome {
-                    config_id: config.id.clone(),
-                    mode,
-                    latency_ms: None,
-                    mbps: None,
-                    error: Some(cause),
-                },
-                Err(_) => SpeedtestOutcome {
-                    config_id: config.id.clone(),
-                    mode,
-                    latency_ms: None,
-                    mbps: None,
-                    error: Some(format!(
-                        "speed test failed for \"{}\": probe panicked",
-                        redact_secrets(&config.name)
-                    )),
-                },
-            });
-        }
-        on_progress(out.len(), total);
-    }
-    out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SpeedtestMode {
-    #[default]
-    Download,
-    Upload,
-}
-
-impl SpeedtestMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SpeedtestMode::Download => "download",
-            SpeedtestMode::Upload => "upload",
-        }
-    }
-
-    #[cfg(test)]
-    pub fn from_label(label: &str) -> Option<SpeedtestMode> {
-        match label.trim().to_ascii_lowercase().as_str() {
-            "download" => Some(SpeedtestMode::Download),
-            "upload" => Some(SpeedtestMode::Upload),
-            _ => None,
-        }
-    }
-
-    pub fn next(self) -> SpeedtestMode {
-        match self {
-            SpeedtestMode::Download => SpeedtestMode::Upload,
-            SpeedtestMode::Upload => SpeedtestMode::Download,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpeedtestConfig {
-    pub mode: SpeedtestMode,
-    pub timeout: Duration,
-}
-
-impl Default for SpeedtestConfig {
-    fn default() -> Self {
-        Self {
-            mode: SpeedtestMode::Download,
-            timeout: SPEED_TEST_TIMEOUT,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SpeedtestOutcome {
-    pub config_id: String,
-    pub mode: SpeedtestMode,
-    pub latency_ms: Option<u64>,
-    pub mbps: Option<f64>,
-    pub error: Option<String>,
-}
-
-pub fn mbps_of(bytes: u64, elapsed: Duration) -> f64 {
-    (bytes as f64 * 8.0) / elapsed.as_secs_f64().max(1e-9) / 1e6
-}
-
-pub fn format_speed_result(outcome: &SpeedtestOutcome) -> String {
-    match (outcome.mbps, outcome.error.as_deref()) {
-        (Some(mbps), _) => format!("{} {mbps:.1} Mbps", outcome.mode.as_str()),
-        (None, Some(cause)) => cause.to_string(),
-        (None, None) => "untested".to_string(),
-    }
-}
-
-pub const RESOLVE_IP_URL: &str = "http://api.ipify.org";
-
-pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub fn resolve_hostname(host: &str, timeout: Duration) -> Option<std::net::IpAddr> {
-    resolve_endpoint_host(host.trim(), 80, timeout).map(|addr| addr.ip())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowState {
     Unknown,
@@ -1261,6 +878,9 @@ impl ConnCounts {
         counts
     }
 
+    /// K12/A5-1: the strip no longer renders this count; the Connections tab
+    /// owns the number, so the string builder is test-only now.
+    #[cfg(test)]
     pub fn status_text(&self) -> String {
         let noun = if self.active == 1 {
             "connection"
@@ -2088,16 +1708,6 @@ impl HealthStore {
         (live, dead)
     }
 
-    pub fn record_speed_sample(&mut self, outcome: &SpeedtestOutcome, at: i64) {
-        self.push_sample(HealthSample {
-            config_id: outcome.config_id.clone(),
-            at,
-            kind: HealthKind::SpeedTest,
-            latency_ms: outcome.latency_ms,
-            error: outcome.error.clone(),
-        });
-    }
-
     /// Duration of the latest successful speed sample, rendered as a transfer
     /// duration (e.g. `2.7s`) rather than a latency. None without one.
     pub fn speed_summary(&self, config_id: &str) -> Option<String> {
@@ -2731,8 +2341,6 @@ struct FakeProbeState {
     latency: HashMap<String, u64>,
     failures: HashMap<String, String>,
     denied: HashSet<String>,
-    speed_mbps: HashMap<String, f64>,
-    out_ips: HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -2786,22 +2394,6 @@ impl FakeHealthHandle {
             .filter(|call| call.config_id == config_id)
             .cloned()
             .collect()
-    }
-
-    pub fn script_speed(&self, config_id: &str, mbps: f64) {
-        self.state
-            .lock()
-            .unwrap()
-            .speed_mbps
-            .insert(config_id.to_string(), mbps);
-    }
-
-    pub fn script_out_ip(&self, config_id: &str, ip: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .out_ips
-            .insert(config_id.to_string(), ip.to_string());
     }
 }
 
@@ -2884,52 +2476,6 @@ impl HealthProber for FakeHealthProber {
             url: String::new(),
         });
         self.scripted(config)
-    }
-
-    fn speed_test(
-        &self,
-        config: &ProxyConfig,
-        _bind: &str,
-        _port: u16,
-        _url: &str,
-        mode: SpeedtestMode,
-        _timeout: Duration,
-    ) -> Result<SpeedtestOutcome, String> {
-        let state = self.state.lock().unwrap();
-        if let Some(cause) = state.failures.get(&config.id) {
-            return Err(cause.clone());
-        }
-        let latency = state
-            .latency
-            .get(&config.id)
-            .copied()
-            .unwrap_or(self.default_latency);
-        let mbps = state.speed_mbps.get(&config.id).copied().unwrap_or(10.0);
-        Ok(SpeedtestOutcome {
-            config_id: config.id.clone(),
-            mode,
-            latency_ms: Some(latency),
-            mbps: Some(mbps),
-            error: None,
-        })
-    }
-
-    fn out_ip(
-        &self,
-        config: &ProxyConfig,
-        _bind: &str,
-        _port: u16,
-        _url: &str,
-    ) -> Result<String, String> {
-        let state = self.state.lock().unwrap();
-        if let Some(cause) = state.failures.get(&config.id) {
-            return Err(cause.clone());
-        }
-        Ok(state
-            .out_ips
-            .get(&config.id)
-            .cloned()
-            .unwrap_or_else(|| "203.0.113.7".to_string()))
     }
 }
 
@@ -3026,7 +2572,6 @@ mod tests {
         assert_eq!(GROUP_TEST_CONCURRENCY, 10, "concurrency pinned");
         assert_eq!(MAX_PROBE_CONCURRENCY, 10, "runner matches");
         assert_eq!(URL_TEST_TIMEOUT, std::time::Duration::from_secs(3));
-        assert_eq!(SPEED_TEST_TIMEOUT, std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -3533,122 +3078,6 @@ mod tests {
     }
 
     #[test]
-    fn t09_speed_runs_never_credit_probe_bytes() {
-        let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
-        let (prober, handle) = FakeHealthProber::shared();
-        handle.script_speed("1", 24.5);
-        let outcome = prober
-            .speed_test(
-                &config,
-                "127.0.0.1",
-                10801,
-                DEFAULT_TEST_URL,
-                SpeedtestMode::Download,
-                SPEED_TEST_TIMEOUT,
-            )
-            .expect("fake measures");
-        assert_eq!(outcome.mbps, Some(24.5));
-        assert_eq!(format_speed_result(&outcome), "download 24.5 Mbps");
-        let mut store = HealthStore::default();
-        store.record_speed_sample(&outcome, 1_700_000_000);
-        assert_eq!(
-            store.traffic("1"),
-            TrafficStats::default(),
-            "no usage credit"
-        );
-        assert_eq!(
-            store
-                .latest_of("1", HealthKind::SpeedTest)
-                .and_then(|sample| sample.latency_ms),
-            Some(42),
-            "speed duration kept in its own slot"
-        );
-        assert_eq!(
-            store.status("1").state,
-            RowState::Unknown,
-            "a speed sample never sets row health"
-        );
-        assert!(
-            store.latest_of("1", HealthKind::UrlTest).is_none(),
-            "the url-test slot stays empty"
-        );
-
-        assert_eq!(
-            SpeedtestMode::from_label("upload"),
-            Some(SpeedtestMode::Upload)
-        );
-        assert_eq!(SpeedtestMode::from_label("bogus"), None);
-        assert_eq!(SpeedtestMode::Download.next(), SpeedtestMode::Upload);
-        let failed = SpeedtestOutcome {
-            config_id: "1".to_string(),
-            mode: SpeedtestMode::Upload,
-            latency_ms: None,
-            mbps: None,
-            error: Some("dial refused".to_string()),
-        };
-        assert_eq!(format_speed_result(&failed), "dial refused");
-
-        let probe = prober
-            .url_test(&config, "127.0.0.1", 10801, DEFAULT_TEST_URL)
-            .expect("fake probes");
-        store.record_outcome(&TestOutcome {
-            sample: HealthSample {
-                config_id: "1".to_string(),
-                at: 1_700_000_001,
-                kind: HealthKind::UrlTest,
-                latency_ms: Some(probe.latency_ms),
-                error: None,
-            },
-            success: Some(probe),
-        });
-        assert_ne!(
-            store.traffic("1"),
-            TrafficStats::default(),
-            "url probes credit"
-        );
-
-        assert!((mbps_of(1_250_000, std::time::Duration::from_secs(1)) - 10.0).abs() < 1e-9);
-        assert_eq!(mbps_of(100, std::time::Duration::ZERO), 800.0 / 1e6 * 1e9);
-    }
-
-    #[test]
-    fn t09_speed_group_measures_and_stops() {
-        let configs = vec![
-            fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
-            fixture("2", "Beta", "trojan", "127.0.0.1", 10802),
-        ];
-        let (prober, handle) = FakeHealthProber::shared();
-        handle.script_speed("2", 50.0);
-        handle.deny_protocol("vless");
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let mut progress = Vec::new();
-        let outcomes = speed_group(
-            &configs,
-            DEFAULT_TEST_URL,
-            SpeedtestMode::Download,
-            SPEED_TEST_TIMEOUT,
-            &prober,
-            &stop,
-            |done, total| progress.push((done, total)),
-        );
-        assert_eq!(outcomes.len(), 2, "denied rows record named skips");
-        assert!(outcomes[0].error.as_deref().unwrap_or("").contains("vless"));
-        assert_eq!(outcomes[1].mbps, Some(50.0));
-        assert_eq!(progress, vec![(1, 2), (2, 2)], "per-row progress");
-        let stopped = std::sync::atomic::AtomicBool::new(true);
-        let outcomes = speed_group(
-            &configs,
-            DEFAULT_TEST_URL,
-            SpeedtestMode::Download,
-            SPEED_TEST_TIMEOUT,
-            &prober,
-            &stopped,
-            |_, _| {},
-        );
-        assert!(outcomes.is_empty(), "stopped speed run records nothing");
-    }
-
-    #[test]
     fn t09_ping_group_chunks_and_stops() {
         let configs: Vec<ProxyConfig> = (0..105)
             .map(|i| {
@@ -3695,27 +3124,6 @@ mod tests {
             "traffic pruned"
         );
         assert!(store.latest("2").is_some(), "other rows kept");
-    }
-
-    #[test]
-    fn t09_out_ip_scripts_per_row() {
-        let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
-        let (prober, handle) = FakeHealthProber::shared();
-        assert_eq!(
-            prober.out_ip(&config, "127.0.0.1", 10801, RESOLVE_IP_URL),
-            Ok("203.0.113.7".to_string()),
-            "documented default"
-        );
-        handle.script_out_ip("1", "198.51.100.9");
-        assert_eq!(
-            prober.out_ip(&config, "127.0.0.1", 10801, RESOLVE_IP_URL),
-            Ok("198.51.100.9".to_string())
-        );
-        handle.script_failure("1", "egress down");
-        assert_eq!(
-            prober.out_ip(&config, "127.0.0.1", 10801, RESOLVE_IP_URL),
-            Err("egress down".to_string())
-        );
     }
 
     #[test]
@@ -4781,57 +4189,6 @@ mod tests {
             numeric.excludes("93.184.216.34"),
             "numeric resolve is local"
         );
-    }
-
-    #[test]
-    fn bug21_speed_sample_is_a_duration_not_row_latency() {
-        let mut store = HealthStore::default();
-        let slow = SpeedtestOutcome {
-            config_id: "1".to_string(),
-            mode: SpeedtestMode::Download,
-            latency_ms: Some(2700),
-            mbps: Some(24.0),
-            error: None,
-        };
-        store.record_speed_sample(&slow, now_unix());
-        assert_eq!(
-            store.status("1").state,
-            RowState::Unknown,
-            "a slow 8 MiB download is not a dead row"
-        );
-        assert_eq!(
-            store.row_summary("1"),
-            "2.7s",
-            "a transfer duration, not a fake latency"
-        );
-        assert_eq!(store.speed_summary("1").as_deref(), Some("2.7s"));
-
-        let failed = SpeedtestOutcome {
-            config_id: "2".to_string(),
-            mode: SpeedtestMode::Upload,
-            latency_ms: None,
-            mbps: None,
-            error: Some("speed test failed for \"Beta\": dial refused".to_string()),
-        };
-        store.record_speed_sample(&failed, now_unix());
-        assert_eq!(
-            store.status("2").state,
-            RowState::Unknown,
-            "a failed speedtest never marks the row dead"
-        );
-        assert_eq!(
-            store.speed_summary("2"),
-            None,
-            "failed speeds are not shown"
-        );
-        assert_eq!(
-            store.row_summary("2"),
-            "",
-            "a failed speedtest leaves the health column blank, never dead"
-        );
-
-        assert_eq!(format_transfer_duration(2700), "2.7s");
-        assert_eq!(format_transfer_duration(250), "250ms");
     }
 
     #[test]

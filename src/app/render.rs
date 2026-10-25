@@ -115,7 +115,7 @@ impl Render for AppView {
         };
 
         self.render_shell(cx)
-            .child(TitleBar::new().child(Label::new(current_title)))
+            .child(self.render_titlebar(current_title, window, cx))
             .child(self.render_toolbar(cx))
             .children(self.render_writable_banner(cx))
             .child(

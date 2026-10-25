@@ -34,4 +34,7 @@ pub(crate) fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
 }
 pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(resolve_appearance_mode(appearance), window, cx);
+    // K5: `Theme::change` rebuilds the notification settings with the theme,
+    // so the toast park rides along on every re-appearance.
+    crate::configure_notification_toasts(cx);
 }

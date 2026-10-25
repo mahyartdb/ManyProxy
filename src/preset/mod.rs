@@ -794,27 +794,6 @@ pub fn preset_share_link(name: &str, rules: &[Value]) -> String {
     format!("throne://route/{payload}")
 }
 
-pub const BASIC_PRESET_ACTIONS: &[&str] = &["direct", "proxy", "block"];
-
-pub fn structured_preset_rules(action: &str) -> Result<Vec<Value>, PresetError> {
-    if !BASIC_PRESET_ACTIONS.contains(&action) {
-        if action == "warp" || action == "warp-bypass" {
-            return validate_preset_rules(&[serde_json::json!({"action": action})])
-                .map(|()| Vec::new());
-        }
-        return Err(PresetError::new(
-            PresetErrorKind::BadRule,
-            format!(
-                "rule 0: field \"action\" must be one of {}",
-                BASIC_PRESET_ACTIONS.join(", ")
-            ),
-        ));
-    }
-    let rules = vec![serde_json::json!({"action": action})];
-    validate_preset_rules(&rules)?;
-    Ok(rules)
-}
-
 pub fn set_rule_action(rule: &mut Value, action: &str) -> Result<(), PresetError> {
     if !VALID_PRESET_ACTIONS.contains(&action) && action != "proxy" {
         return validate_preset_rules(&[serde_json::json!({"action": action})]);
@@ -1366,20 +1345,6 @@ mod tests {
         let parsed = decode_route_link(&empty).expect("shell link decodes");
         assert_eq!(parsed.name, "shell");
         assert!(parsed.rules.is_empty());
-    }
-
-    #[test]
-    fn t10_structured_preset_rules_cover_basic_actions() {
-        for action in ["direct", "proxy", "block"] {
-            let rules = structured_preset_rules(action).expect("basic action builds");
-            assert_eq!(rules.len(), 1);
-            assert_eq!(rules[0].get("action").and_then(Value::as_str), Some(action));
-        }
-        for action in ["warp", "warp-bypass", "sniff"] {
-            let error = structured_preset_rules(action).expect_err("non-basic fails");
-            assert_eq!(error.kind, PresetErrorKind::BadRule);
-            assert!(error.message.contains("rule 0"), "{error}");
-        }
     }
 
     #[test]

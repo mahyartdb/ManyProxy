@@ -3,9 +3,14 @@ use crate::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FacetMenu {
     Group,
-    Protocol,
-    Status,
 }
+
+/// K11/A2-1: the enabled/disabled axis rides the group dropdown (one `facet`
+/// menu, not a second picker; picking one releases the other). The values are
+/// encoded with a control character no group or protocol name can carry, so a
+/// sentinel choice can never collide with a real group row.
+const STATE_ENABLED_VALUE: &str = "\u{1}state:enabled";
+const STATE_DISABLED_VALUE: &str = "\u{1}state:disabled";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FacetChoice {
@@ -94,80 +99,50 @@ pub(crate) fn slugify_group_id(group: &str) -> String {
 }
 
 impl FacetMenu {
-    pub(crate) const ALL: [FacetMenu; 3] =
-        [FacetMenu::Group, FacetMenu::Protocol, FacetMenu::Status];
-
+    /// K11/A2-1: the filter row is `Search · Group · N of M`. The dropdown's
+    /// per-group count chips live inside the list (including the `All` header
+    /// row), never on the collapsed control — the `N of M` readout beside the
+    /// search box carries the visible count. Enabled/Disabled entries close
+    /// the menu over the state axis so the row never grows a second picker.
     pub(crate) fn choices(&self, delegate: &LibraryDelegate) -> (Vec<FacetChoice>, Option<String>) {
-        match self {
-            FacetMenu::Group => (
-                std::iter::once(FacetChoice {
-                    id: "facet-group-all".to_string(),
-                    title: "All groups".to_string(),
-                    display: "Group: All".to_string(),
-                    value: None,
-                })
-                .chain(
-                    delegate
-                        .group_options()
-                        .into_iter()
-                        .map(|(group, count)| FacetChoice {
-                            id: format!("facet-group-{}", slugify_group_id(&group)),
-                            title: format!("{group} ({count})"),
-                            display: format!("Group: {group} ({count})"),
-                            value: Some(group),
-                        }),
-                )
-                .collect(),
-                delegate.facet_group.clone(),
-            ),
-            FacetMenu::Protocol => (
-                std::iter::once(FacetChoice {
-                    id: "facet-protocol-all".to_string(),
-                    title: "All protocols".to_string(),
-                    display: "Protocol: All".to_string(),
-                    value: None,
-                })
-                .chain(
-                    delegate
-                        .protocol_options()
-                        .into_iter()
-                        .map(|(protocol, count)| FacetChoice {
-                            id: format!("facet-protocol-{protocol}"),
-                            title: format!("{protocol} ({count})"),
-                            display: format!("Protocol: {protocol} ({count})"),
-                            value: Some(protocol),
-                        }),
-                )
-                .collect(),
-                delegate.facet_protocol.clone(),
-            ),
-            FacetMenu::Status => (
-                std::iter::once(FacetChoice {
-                    id: "facet-status-all".to_string(),
-                    title: "All statuses".to_string(),
-                    display: "Status: All".to_string(),
-                    value: None,
-                })
-                .chain(
-                    delegate
-                        .status_options()
-                        .into_iter()
-                        .map(|(status, count)| {
-                            let label = status.label().to_string();
-                            FacetChoice {
-                                id: format!("facet-status-{label}"),
-                                title: format!("{label} ({count})"),
-                                display: format!("Status: {label} ({count})"),
-                                value: Some(label),
-                            }
-                        }),
-                )
-                .collect(),
-                delegate
-                    .facet_status
-                    .map(|status| status.label().to_string()),
-            ),
-        }
+        let total = delegate.rows.len();
+        let mut choices = vec![FacetChoice {
+            id: "facet-group-all".to_string(),
+            title: format!("All groups ({total})"),
+            display: "Group: All".to_string(),
+            value: None,
+        }];
+        choices.extend(
+            delegate
+                .group_options()
+                .into_iter()
+                .map(|(group, count)| FacetChoice {
+                    id: format!("facet-group-{}", slugify_group_id(&group)),
+                    title: format!("{group} ({count})"),
+                    display: format!("Group: {group}"),
+                    value: Some(group),
+                }),
+        );
+        let enabled_count = delegate.rows.iter().filter(|row| row.enabled).count();
+        let disabled_count = delegate.rows.len() - enabled_count;
+        choices.push(FacetChoice {
+            id: "facet-status-enabled".to_string(),
+            title: format!("Enabled ({enabled_count})"),
+            display: "Enabled".to_string(),
+            value: Some(STATE_ENABLED_VALUE.to_string()),
+        });
+        choices.push(FacetChoice {
+            id: "facet-status-disabled".to_string(),
+            title: format!("Disabled ({disabled_count})"),
+            display: "Disabled".to_string(),
+            value: Some(STATE_DISABLED_VALUE.to_string()),
+        });
+        let current = match delegate.facet_status {
+            Some(FacetStatus::Enabled) => Some(STATE_ENABLED_VALUE.to_string()),
+            Some(FacetStatus::Disabled) => Some(STATE_DISABLED_VALUE.to_string()),
+            _ => delegate.facet_group.clone(),
+        };
+        (choices, current)
     }
 
     pub(crate) fn current_display(&self, delegate: &LibraryDelegate) -> String {
@@ -187,14 +162,15 @@ impl FacetMenu {
     ) {
         view.libraries.update(cx, |state, list_cx| {
             let delegate = state.delegate_mut();
-            match self {
-                FacetMenu::Group => delegate.set_facet_group(value),
-                FacetMenu::Protocol => delegate.set_facet_protocol(value),
-                FacetMenu::Status => {
-                    delegate
-                        .set_facet_status(value.and_then(|label| FacetStatus::from_label(&label)));
-                }
-            }
+            // K11/A2-1: the dropdown shows one selected item, so a pick writes
+            // the two slots disjointly — a state sentinel releases the group
+            // choice and any group pick releases the sentinel.
+            let (group, status) = match value.as_deref() {
+                Some(STATE_ENABLED_VALUE) => (None, Some(FacetStatus::Enabled)),
+                Some(STATE_DISABLED_VALUE) => (None, Some(FacetStatus::Disabled)),
+                _ => (value, None),
+            };
+            delegate.set_facet_menu(group, status);
             list_cx.notify();
         });
         cx.notify();

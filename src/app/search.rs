@@ -76,15 +76,9 @@ impl AppView {
     }
 
     pub(crate) fn sync_facet_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for menu in FacetMenu::ALL {
-            let (choices, current) = menu.choices(self.libraries.read(cx).delegate());
-            let picker = match menu {
-                FacetMenu::Group => &mut self.facet_group,
-                FacetMenu::Protocol => &mut self.facet_protocol,
-                FacetMenu::Status => &mut self.facet_status,
-            };
-            Self::sync_facet_picker(picker, choices, current, window, cx);
-        }
+        // K11/A2-1: one facet menu; the enabled/disabled axis rides inside it.
+        let (choices, current) = FacetMenu::Group.choices(self.libraries.read(cx).delegate());
+        Self::sync_facet_picker(&mut self.facet_group, choices, current, window, cx);
     }
 
     pub(crate) fn sync_facet_picker(
@@ -137,29 +131,15 @@ impl AppView {
             .unwrap_or(false);
         let facet_auto_view = cx.entity();
 
-        let (group_tip, protocol_tip, status_tip) = {
+        let group_tip = {
             let libraries = self.libraries.read(cx);
             let delegate = libraries.delegate();
             let (visible, total, _) = delegate.delegate_counts_for_search();
-            (
-                facet_tip_text(
-                    "group",
-                    &FacetMenu::Group.current_display(delegate),
-                    visible,
-                    total,
-                ),
-                facet_tip_text(
-                    "protocol",
-                    &FacetMenu::Protocol.current_display(delegate),
-                    visible,
-                    total,
-                ),
-                facet_tip_text(
-                    "status",
-                    &FacetMenu::Status.current_display(delegate),
-                    visible,
-                    total,
-                ),
+            facet_tip_text(
+                "group",
+                &FacetMenu::Group.current_display(delegate),
+                visible,
+                total,
             )
         };
         div()
@@ -190,32 +170,6 @@ impl AppView {
                             .id("facet-group")
                             .small()
                             .accessibility_label("Filter by group"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("facet-protocol-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(protocol_tip.clone())).into())
-                    .child(
-                        Select::new(&self.facet_protocol.state)
-                            .id("facet-protocol")
-                            .small()
-                            .accessibility_label("Filter by protocol"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("facet-status-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| Tooltip::new(status_tip.clone())).into()
-                    })
-                    .child(
-                        Select::new(&self.facet_status.state)
-                            .id("facet-status")
-                            .small()
-                            .accessibility_label("Filter by status"),
                     ),
             )
             .child(
@@ -281,7 +235,7 @@ impl AppView {
                 Button::new("clear-facets")
                     .small()
                     .label("Clear facet filters")
-                    .tooltip("Clear group, protocol and status filters (keeps search and checked)")
+                    .tooltip("Clear the group and status filters (keeps search and checked)")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.clear_facets(window, cx);
                     }))

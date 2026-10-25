@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::badge::Badge;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
@@ -49,7 +48,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::notification::{Notification, NotificationType};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, ResizableState};
@@ -82,12 +81,10 @@ use engine::{
     xray_binary_file_name, AutoRestartConfig, EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
-    clamp_log_max_lines, format_speed_result, outcome_is_neutral, ping_all, redact_secrets,
-    resolve_hostname, sparkline_caption_tone, speed_group, test_all, test_group, truncate,
-    url_test_sparkline, HealthKind, HealthProber, HealthStore, LatencyTone, LogLevel, LogStore,
-    LogTagIndex, ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode,
-    SpeedtestOutcome, TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL,
-    RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
+    clamp_log_max_lines, outcome_is_neutral, ping_all, redact_secrets, sparkline_caption_tone,
+    test_all, test_group, truncate, url_test_sparkline, HealthKind, HealthProber, HealthStore,
+    LatencyTone, LogLevel, LogStore, LogTagIndex, ProbeExclusions, RealHealthProber, TestOutcome,
+    TrafficSeenMap, DEFAULT_TEST_URL,
 };
 use import::{
     classify_open_with, commit_batch, effective_hint_for_text, format_import_failures,
@@ -97,10 +94,9 @@ use import::{
 };
 use store::{
     chain_hop_rejection, chain_nodes_of, clear_group_tests_confirm_text, compare_type_security,
-    count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, extra_config_prefill, fold_amneziawg_into_params,
-    fold_anytls_into_params, fold_chain_nodes_into_params, fold_dial_into_params,
-    fold_extra_into_params, fold_guided_into_params, fold_http_into_params,
+    count_importable, due_for_refresh_for, export_confirm_description, extra_config_prefill,
+    fold_amneziawg_into_params, fold_anytls_into_params, fold_chain_nodes_into_params,
+    fold_dial_into_params, fold_extra_into_params, fold_guided_into_params, fold_http_into_params,
     fold_hysteria_into_params, fold_mux_into_params, fold_naive_into_params,
     fold_shadowsocks_inner_into_params, fold_shadowtls_into_params, fold_snell_into_params,
     fold_socks_into_params, fold_ssh_into_params, fold_tls_forced_into_params,
@@ -110,14 +106,13 @@ use store::{
     guided_identity_fields, guided_prefill_bool, guided_prefill_list, guided_prefill_value,
     is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
     prune_duplicates_confirm_text, prune_invalid_confirm_text, prune_unavailable_confirm_text,
-    rewrite_server_to_ip, row_security_label, row_server_hostname, validate_extra_params,
-    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, AutoClearGroupConfig,
-    ChainHopSlot, CloseAction, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot,
-    HttpFold, HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig,
-    ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SortDirection, SshFold,
-    Store, StoreError, Subscription as ProxySubscription, TestAllScope, TlsForcedFold,
-    TlsOptionalFold, TransportFold, TuicFold, WindowGeometry, WireguardFold, XrayFold,
-    DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROBE_TIMEOUT_SECS, DEFAULT_PROTOCOL,
+    row_security_label, validate_extra_params, vmess_cipher_value, vmess_tls_enabled, AmneziaFold,
+    AnytlsFold, AutoClearGroupConfig, ChainHopSlot, CloseAction, ConfigPatch, DialFold, ExtraFold,
+    GroupPruneKind, HealthSnapshot, HttpFold, HysteriaFold, LibrarySort, LibrarySortKey, MuxFold,
+    NaiveFold, NewConfig, ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold,
+    SortDirection, SshFold, Store, StoreError, Subscription as ProxySubscription, TestAllScope,
+    TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold, WindowGeometry, WireguardFold,
+    XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROBE_TIMEOUT_SECS, DEFAULT_PROTOCOL,
     MAX_PROBE_TIMEOUT_SECS, MIN_PROBE_TIMEOUT_SECS, VALID_PROTOCOLS,
 };
 
@@ -271,8 +266,6 @@ struct AppView {
 
     group_test_in_flight: bool,
 
-    speedtest_mode: SpeedtestMode,
-
     subs_form: Option<SubForm>,
 
     preset_form: Option<PresetForm>,
@@ -306,8 +299,6 @@ struct AppView {
     _libraries_subscription: Subscription,
 
     facet_group: FacetPicker,
-    facet_protocol: FacetPicker,
-    facet_status: FacetPicker,
 
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
@@ -434,8 +425,12 @@ fn main() {
         gpui_kit::init(cx);
 
         bind_app_keys(cx);
+        let startup_bounds = startup_window_bounds(
+            startup_geometry,
+            cx.primary_display().map(|display| display.visible_bounds()),
+        );
         cx.spawn(async move |cx| {
-            cx.open_window(app_window_options(startup_geometry), |window, cx| {
+            cx.open_window(app_window_options(startup_bounds), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 view.update(cx, |view, cx| {
                     view.refresh_due_on_startup_deferred(cx);
@@ -501,7 +496,13 @@ fn main() {
                         None => {
                             // T-34: a plain close with nothing running is an
                             // orderly exit too — mark it before the window goes.
-                            view.update(cx, |view, _| view.mark_clean_exit());
+                            // The rectangle has to travel with it: without this
+                            // save, a close-to-quit dropped the window's placed
+                            // position and the next launch started centered.
+                            view.update(cx, |view, _| {
+                                view.save_window_geometry(window);
+                                view.mark_clean_exit();
+                            });
                             true
                         }
                         Some(description) => {

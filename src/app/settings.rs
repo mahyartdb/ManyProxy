@@ -6,8 +6,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 // Six named sections in a left rail; the body shows exactly one at a time.
 // Every setting is one row: the label on the left, the control on the right,
 // and at most one muted help line beneath. Toggles and radios save on change;
-// text fields save on Enter or on the section's own Save button — never on
-// blur. The dialog's own footer carries one primary button, `Done`.
+// text fields save on Enter or on the dialog's one footer `Save` — never on
+// blur. K9: the footer is the only commit row: `Cancel` (secondary) beside
+// `Save` (primary), bottom-right, with the Esc note on its left. The body
+// hugs its content (capped, then it scrolls) instead of holding a fixed
+// black frame.
 
 /// T-04: the six named sections, in rail order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -100,17 +103,15 @@ const SETTINGS_CONTROL_WIDTH: f32 = 320.;
 /// top and bottom, the title line, two 16 px gaps and the 24 px footer button.
 const SETTINGS_CHROME_HEIGHT: f32 = 100.;
 
-/// T-04: the shortest body a small window may squeeze before the section
-/// body starts scrolling inside the dialog.
-const SETTINGS_BODY_MIN_HEIGHT: f32 = 220.;
-
-/// T-04: the height the section body gets. The kit clamps a dialog to
-/// `viewport - viewport/10 - 16` px (its own top margin plus the theme's
-/// large spacing), so the body takes what is left after the chrome.
-fn settings_body_height(window: &Window) -> f32 {
+/// T-04/K9: the tallest the section body may grow before it scrolls. The kit
+/// clamps a dialog to `viewport - viewport/10 - 16` px (its own top margin plus
+/// the theme's large spacing), so the body takes what is left after the chrome.
+/// Short sections stay shorter than this — the body hugs its content, so a
+/// three-control section never paints a 500 px black void under itself.
+fn settings_body_max_height(window: &Window) -> f32 {
     let viewport = window.viewport_size().height.as_f32();
     let max_height = viewport - viewport / 10.0 - 16.0;
-    (max_height - SETTINGS_CHROME_HEIGHT).max(SETTINGS_BODY_MIN_HEIGHT)
+    (max_height - SETTINGS_CHROME_HEIGHT).max(0.0)
 }
 
 /// T-04: one setting row — the label on the left, the control on the right,
@@ -193,19 +194,6 @@ fn settings_field_row(
         .test_support()
 }
 
-/// T-04: a section's action row. Buttons size to their content and sit
-/// against the right edge; the commit button is the primary one.
-fn settings_footer(id: &'static str, actions: Vec<AnyElement>) -> impl IntoElement {
-    div()
-        .id(id)
-        .test_support()
-        .flex()
-        .flex_row()
-        .justify_end()
-        .gap_2()
-        .children(actions)
-}
-
 /// T-04: the state the dialog body reads on every frame. The body is rebuilt
 /// each frame and cannot read the view it belongs to, so every value it shows
 /// travels through one of these cells.
@@ -216,7 +204,6 @@ struct SettingsState {
     autostart: Rc<RefCell<bool>>,
     restore: Rc<RefCell<bool>>,
     auto_restart: Rc<RefCell<bool>>,
-    skip_delete: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
     test_all_scope: Rc<RefCell<TestAllScope>>,
     bind_hosts: Rc<RefCell<Vec<String>>>,
@@ -273,7 +260,10 @@ impl SettingsState {
                             .w_full()
                             .ghost()
                             .label(section.title())
-                            .tooltip(format!("{} settings", section.title()))
+                            // K9/A7-6-pending: no tooltip here. `"{title}
+                            // settings"` restated the label and, on hover,
+                            // painted as a stray `Updates settings` chip over
+                            // the rail — the label already names the target.
                             .on_click(move |_, _, cx| {
                                 *cell.borrow_mut() = section;
                                 view.update(cx, |_, cx| cx.notify());
@@ -445,33 +435,9 @@ impl SettingsState {
             group,
         ));
 
-        // Confirm before deleting.
-        let skip_cell = self.skip_delete.clone();
-        let skip_view = self.view.clone();
-        let skip_on = *skip_cell.borrow();
-        body = body.child(settings_row(
-            "settings-row-skip-delete",
-            "Confirm before deleting",
-            Some(
-                "Off deletes a row (or the checked set) at once; preset detach-deletes still ask."
-                    .to_string(),
-            ),
-            muted,
-            Switch::new("settings-skip-delete-switch")
-                .checked(skip_on)
-                .accessibility_label("Confirm before deleting")
-                .on_change(move |next: &bool, window, cx| {
-                    let next = *next;
-                    let cell = skip_cell.clone();
-                    skip_view.update(cx, |view, cx| {
-                        if view.commit_skip_delete_confirm(next, window, cx) {
-                            *cell.borrow_mut() = next;
-                            cx.notify();
-                        }
-                    });
-                }),
-        ));
-
+        // K17 ruling (spec line 91): no blocking delete confirms — the undo
+        // toast is the safety net — so this section lost the "Confirm before
+        // deleting" toggle; nothing read its state any more.
         body.into_any_element()
     }
 
@@ -551,26 +517,6 @@ impl SettingsState {
             group,
         ));
 
-        let view = self.view.clone();
-        let test_url = self.test_url.clone();
-        let timeout = self.timeout_input.clone();
-        body = body.child(settings_footer(
-            "settings-footer-probing",
-            vec![Button::new("settings-save-test-url")
-                .small()
-                .primary()
-                .label("Save")
-                .on_click(move |_, window, cx| {
-                    let url = test_url.read(cx).value().to_string();
-                    let raw = timeout.read(cx).value().to_string();
-                    view.update(cx, |view, cx| {
-                        view.commit_test_url(&url, window, cx);
-                        view.commit_probe_timeout(&raw, window, cx);
-                    });
-                })
-                .into_any_element()],
-        ));
-
         body.into_any_element()
     }
 
@@ -603,39 +549,30 @@ impl SettingsState {
             Some(at) => format!("Last checked at {}.", format_check_time(at)),
             None => "Never checked.".to_string(),
         };
+        // K9: `Check now` is a row action, not a commit. It rides beside the
+        // timestamp so the section keeps one commit row: the dialog footer.
+        let check_view = self.view.clone();
         body = body.child(settings_row(
             "settings-row-last-check",
             "Last checked",
             None,
             muted,
-            div().text_sm().text_color(muted).child(last),
-        ));
-
-        let check_view = self.view.clone();
-        let save_view = self.view.clone();
-        let feed_url = self.feed_url.clone();
-        body = body.child(settings_footer(
-            "settings-footer-updates",
-            vec![
-                Button::new("settings-check-updates")
-                    .small()
-                    .ghost()
-                    .label("Check now")
-                    .on_click(move |_, window, cx| {
-                        check_view.update(cx, |view, cx| view.check_for_updates(window, cx));
-                    })
-                    .into_any_element(),
-                Button::new("settings-save-update-feed")
-                    .small()
-                    .primary()
-                    .label("Save")
-                    .on_click(move |_, window, cx| {
-                        let url = feed_url.read(cx).value().to_string();
-                        save_view
-                            .update(cx, |view, cx| view.commit_update_feed_url(&url, window, cx));
-                    })
-                    .into_any_element(),
-            ],
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().text_sm().text_color(muted).child(last))
+                .child(
+                    Button::new("settings-check-updates")
+                        .small()
+                        .ghost()
+                        .label("Check now")
+                        .tooltip("Read the update feed now")
+                        .on_click(move |_, window, cx| {
+                            check_view.update(cx, |view, cx| view.check_for_updates(window, cx));
+                        }),
+                ),
         ));
 
         body.into_any_element()
@@ -665,23 +602,40 @@ impl SettingsState {
             ),
             ("settings-row-engine-xray", "xray", resolve_xray_binary()),
         ] {
-            let (status, path) = match resolved {
-                Ok(path) => ("ready", path.display().to_string()),
-                Err(_) => ("not found", "beside the app".to_string()),
+            // K9/A7-5: the row is the summary (`sing-box · ready`) and the
+            // full path lives behind ONE `Details` tooltip. A path is noise at
+            // rest and truncates mid-directory in the row.
+            let (ready, path) = match resolved {
+                Ok(path) => (true, Some(path)),
+                Err(_) => (false, None),
             };
-            body = body.child(settings_row(
-                id,
-                name,
-                None,
-                muted,
+            let status_color = if ready { muted } else { cx.theme().danger };
+            body = body.child(
                 div()
+                    .id(id)
+                    .test_support()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().text_sm().child(status))
-                    .child(div().text_sm().text_color(muted).child(path)),
-            ));
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id(format!("settings-engine-summary-{name}"))
+                            .test_support()
+                            .text_sm()
+                            .text_color(status_color)
+                            .child(engine_summary(name, ready)),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(format!("settings-engine-details-{name}"))
+                            .small()
+                            .ghost()
+                            .label("Details")
+                            .tooltip(engine_details_tooltip(name, path.as_deref())),
+                    ),
+            );
         }
 
         let auto_restart_cell = self.auto_restart.clone();
@@ -760,15 +714,6 @@ impl SettingsState {
                         .text_color(cx.theme().danger)
                         .child(error_text)
                 }),
-        );
-
-        body = body.child(
-            div()
-                .id("settings-ticks")
-                .test_support()
-                .text_sm()
-                .text_color(muted)
-                .child(format!("Timers: {}", tick_interval_summary())),
         );
 
         body.into_any_element()
@@ -926,76 +871,63 @@ impl SettingsState {
                 .child(Input::new(&self.log_cap_input)),
         ));
 
+        // K9/A7-4: four upkeep ops as one neutral 2×2 grid. The buttons carry
+        // their own labels (no orphan `Library` section label), and nothing is
+        // painted red at rest — each click opens the naming confirm, whose
+        // affirmative carries the danger variant.
+        body = body.child(
+            div()
+                .id("settings-maintenance-note")
+                .test_support()
+                .text_sm()
+                .text_color(muted)
+                .child("Each action asks before it runs; nothing here is undone by Cancel."),
+        );
+        let mut grid = div()
+            .id("settings-maintenance-grid")
+            .test_support()
+            .grid()
+            .grid_cols(2)
+            .gap_2();
         for (id, label, action) in [
             (
-                "settings-row-clear-traffic",
+                "settings-clear-traffic",
                 "Clear traffic counters",
                 MaintenanceAction::Traffic,
             ),
             (
-                "settings-row-clear-health",
+                "settings-clear-health",
                 "Clear health snapshots",
                 MaintenanceAction::Health,
             ),
             (
-                "settings-row-clear-snapshot",
+                "settings-clear-snapshot",
                 "Reset running snapshot",
                 MaintenanceAction::Snapshot,
             ),
         ] {
             let view = self.view.clone();
-            body = body.child(settings_row(
-                id,
-                label,
-                None,
-                muted,
-                Button::new(id.replace("settings-row-", "settings-"))
-                    .small()
-                    .danger()
-                    .label(label)
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |view, cx| match action {
-                            MaintenanceAction::Traffic => {
-                                view.open_clear_traffic_confirm(window, cx)
-                            }
-                            MaintenanceAction::Health => view.open_clear_health_confirm(window, cx),
-                            MaintenanceAction::Snapshot => {
-                                view.open_clear_snapshot_confirm(window, cx)
-                            }
-                        });
-                    }),
+            grid = grid.child(Button::new(id).small().label(label).w_full().on_click(
+                move |_, window, cx| {
+                    view.update(cx, |view, cx| match action {
+                        MaintenanceAction::Traffic => view.open_clear_traffic_confirm(window, cx),
+                        MaintenanceAction::Health => view.open_clear_health_confirm(window, cx),
+                        MaintenanceAction::Snapshot => view.open_clear_snapshot_confirm(window, cx),
+                    });
+                },
             ));
         }
-
         let view = self.view.clone();
-        body = body.child(settings_row(
-            "settings-row-reset-library",
-            "Library",
-            Some("Deletes every configuration. This cannot be undone.".to_string()),
-            muted,
+        grid = grid.child(
             Button::new("settings-reset-library")
                 .small()
-                .danger()
                 .label("Reset library")
+                .w_full()
                 .on_click(move |_, window, cx| {
                     view.update(cx, |view, cx| view.open_reset_library_confirm(window, cx));
                 }),
-        ));
-
-        let view = self.view.clone();
-        let log_cap = self.log_cap_input.clone();
-        body = body.child(settings_footer(
-            "settings-footer-maintenance",
-            vec![Button::new("settings-save-log-cap")
-                .small()
-                .primary()
-                .label("Save")
-                .on_click(move |_, window, cx| {
-                    let raw = log_cap.read(cx).value().to_string();
-                    view.update(cx, |view, cx| view.commit_log_cap(window, &raw, cx));
-                })
-                .into_any_element()],
-        ));
+        );
+        body = body.child(grid);
 
         body.into_any_element()
     }
@@ -1068,6 +1000,33 @@ fn data_folder_text() -> String {
     crate::store::app_data_dir().display().to_string()
 }
 
+/// K9/A7-5: the Engine section's whole resting summary — name and resolved
+/// state, no path. The path rides behind `Details` so a long install path is
+/// never truncated mid-directory in the row.
+pub(crate) fn engine_summary(name: &str, ready: bool) -> String {
+    format!("{name} · {}", if ready { "ready" } else { "not found" })
+}
+
+/// K9/A7-5: the one `Details` tooltip. A resolved engine names its exe; a
+/// missing one states the lookup rule instead of inventing a path.
+pub(crate) fn engine_details_tooltip(name: &str, path: Option<&std::path::Path>) -> String {
+    match path {
+        Some(path) => format!("{name}: {}", path.display()),
+        None => format!(
+            "{name} is not beside ManyProxy.exe — engines are read from the app folder only; PATH is never searched."
+        ),
+    }
+}
+
+/// K9: the text fields the one footer `Save` owns. Toggles and radios keep
+/// their save-on-change contract; these four commit on Enter or on `Save`.
+pub(crate) struct SettingsTextDraft {
+    pub(crate) test_url: String,
+    pub(crate) probe_timeout: String,
+    pub(crate) feed_url: String,
+    pub(crate) log_cap: String,
+}
+
 /// T-04: a check timestamp, rendered as plain local text. The app never
 /// claims a timezone it does not know.
 fn format_check_time(at: i64) -> String {
@@ -1078,6 +1037,50 @@ fn format_check_time(at: i64) -> String {
 }
 
 impl AppView {
+    /// K9: the footer `Save` commits every text field whose value differs from
+    /// the stored one and skips the rest, so one Save never fires a toast per
+    /// untouched field. A refused value keeps the dialog open.
+    pub(crate) fn commit_settings_text_draft(
+        &mut self,
+        draft: &SettingsTextDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut saved = true;
+
+        let test_url = draft.test_url.trim();
+        let stored_test_url = self.store.test_url().unwrap_or_default();
+        if test_url != stored_test_url.trim() && !self.commit_test_url(test_url, window, cx) {
+            saved = false;
+        }
+
+        let timeout = draft.probe_timeout.trim();
+        if timeout != self.store.probe_timeout_secs().to_string()
+            && !self.commit_probe_timeout(timeout, window, cx)
+        {
+            saved = false;
+        }
+
+        let feed_url = draft.feed_url.trim();
+        let stored_feed_url = self.store.update_feed_url().unwrap_or_default();
+        if feed_url != stored_feed_url.trim() && !self.commit_update_feed_url(feed_url, window, cx)
+        {
+            saved = false;
+        }
+
+        let log_cap = draft.log_cap.trim();
+        if log_cap != self.logs.cap().to_string() {
+            // `commit_log_cap` toasts its own refusal and returns nothing; the
+            // parse is the one failure that must keep the dialog open.
+            self.commit_log_cap(window, log_cap, cx);
+            if parse_log_cap(log_cap).is_none() {
+                saved = false;
+            }
+        }
+
+        saved
+    }
+
     pub(crate) fn commit_autostart(
         &mut self,
         enabled: bool,
@@ -1176,34 +1179,6 @@ impl AppView {
             Err(error) => {
                 window.push_notification(
                     Notification::error(format!("Auto-restart setting failed: {error}")),
-                    cx,
-                );
-                cx.notify();
-                false
-            }
-        }
-    }
-
-    pub(crate) fn commit_skip_delete_confirm(
-        &mut self,
-        skip: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        match self.store.set_skip_delete_confirm(skip) {
-            Ok(()) => {
-                let message = if skip {
-                    "Delete confirms off — single and bulk deletes run at once (preset detach-deletes still ask)"
-                } else {
-                    "Delete confirms on"
-                };
-                window.push_notification(Notification::success(message), cx);
-                cx.notify();
-                true
-            }
-            Err(error) => {
-                window.push_notification(
-                    Notification::error(format!("Delete-confirm setting failed: {error}")),
                     cx,
                 );
                 cx.notify();
@@ -1523,7 +1498,6 @@ impl AppView {
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
         let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
-        let skip_delete_state = Rc::new(RefCell::new(self.store.skip_delete_confirm()));
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
@@ -1559,8 +1533,8 @@ impl AppView {
         let bind_host_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20 or fd00::7"));
 
-        // T-04: Enter commits a text field; the section's Save button commits
-        // the same value. A field never commits on blur.
+        // T-04/K9: Enter commits a text field; the dialog's one footer `Save`
+        // commits the same value. A field never commits on blur.
         let weak = cx.entity().downgrade();
         let mut subscriptions = Vec::new();
         {
@@ -1644,6 +1618,13 @@ impl AppView {
         let bind_hosts_cell = Rc::new(RefCell::new(self.store.bind_hosts()));
         let bind_host_error_cell: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
+        // K9: the one footer `Save` reads every text field the dialog owns.
+        let save_view = view.clone();
+        let save_test_url = test_url_state.clone();
+        let save_feed_url = feed_url_state.clone();
+        let save_timeout = timeout_state.clone();
+        let save_log_cap = cap_state.clone();
+
         let state = SettingsState {
             view: view.clone(),
             section: section.clone(),
@@ -1651,7 +1632,6 @@ impl AppView {
             autostart: autostart_state.clone(),
             restore: restore_state.clone(),
             auto_restart: auto_restart_state.clone(),
-            skip_delete: skip_delete_state.clone(),
             close_action: close_action_state.clone(),
             test_all_scope: test_all_scope_state.clone(),
             bind_hosts: bind_hosts_cell.clone(),
@@ -1668,7 +1648,9 @@ impl AppView {
             let current = *section.borrow();
             let rail = state.render_rail(cx);
             let body = state.render_body(current, window, cx);
-            let body_height = settings_body_height(window);
+            // K9: auto-height up to the cap. A short section hugs its rows;
+            // only a long one (Engine/Shortcuts) grows and then scrolls.
+            let body_max_height = settings_body_max_height(window);
             dialog
                 .title("Settings")
                 .w(px(SETTINGS_DIALOG_WIDTH))
@@ -1679,7 +1661,7 @@ impl AppView {
                         .flex()
                         .flex_row()
                         .gap_4()
-                        .h(px(body_height))
+                        .max_h(px(body_max_height))
                         .child(rail)
                         .child(Separator::vertical())
                         .child(
@@ -1696,18 +1678,60 @@ impl AppView {
                                 .child(body),
                         ),
                 )
-                .footer(
-                    DialogFooter::new().child(
-                        Button::new("settings-dialog-done")
-                            .small()
-                            .primary()
-                            .label(footer_commit_label("settings"))
-                            .on_click(|_, window, cx| {
-                                window.close_all_dialogs(cx);
-                                reclaim_shell_focus(window, cx);
-                            }),
-                    ),
-                )
+                // K9/A7-2: ONE footer. `Cancel` is secondary, `Save` primary,
+                // both bottom-right; the Esc note keeps the keyboard route
+                // visible. There is no mid-body Save and no `Done`.
+                .footer({
+                    let save_view = save_view.clone();
+                    let save_test_url = save_test_url.clone();
+                    let save_feed_url = save_feed_url.clone();
+                    let save_timeout = save_timeout.clone();
+                    let save_log_cap = save_log_cap.clone();
+                    DialogFooter::new()
+                        .child(
+                            div()
+                                .id("settings-footer-esc-note")
+                                .test_support()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Esc cancels without saving"),
+                        )
+                        .child(
+                            Button::new("settings-dialog-cancel")
+                                .small()
+                                .label("Cancel")
+                                .tooltip("Close without saving (Esc)")
+                                .on_click(|_, window, cx| {
+                                    window.close_all_dialogs(cx);
+                                    reclaim_shell_focus(window, cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("settings-dialog-save")
+                                .small()
+                                .primary()
+                                .label("Save")
+                                .tooltip("Save the text fields and close")
+                                .on_click(move |_, window, cx| {
+                                    let draft = SettingsTextDraft {
+                                        test_url: save_test_url.read(cx).value().to_string(),
+                                        probe_timeout: save_timeout.read(cx).value().to_string(),
+                                        feed_url: save_feed_url.read(cx).value().to_string(),
+                                        log_cap: save_log_cap.read(cx).value().to_string(),
+                                    };
+                                    let saved = save_view.update(cx, |view, cx| {
+                                        view.commit_settings_text_draft(&draft, window, cx)
+                                    });
+                                    if saved {
+                                        window.close_all_dialogs(cx);
+                                    }
+                                    reclaim_shell_focus(window, cx);
+                                }),
+                        )
+                })
         });
     }
 }

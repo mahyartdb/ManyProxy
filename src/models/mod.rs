@@ -1,3 +1,4 @@
+mod badge;
 mod chain;
 mod connections;
 mod palette;
@@ -6,6 +7,7 @@ mod sampler;
 mod tab;
 mod traffic;
 
+pub(crate) use badge::*;
 pub(crate) use chain::*;
 pub(crate) use connections::*;
 pub(crate) use palette::*;

@@ -49,7 +49,6 @@ pub(crate) struct LibraryDelegate {
     pub(crate) checked: HashSet<String>,
 
     pub(crate) facet_group: Option<String>,
-    pub(crate) facet_protocol: Option<String>,
     pub(crate) facet_status: Option<FacetStatus>,
 
     pub(crate) show_security: bool,
@@ -90,22 +89,24 @@ pub(crate) struct LibraryDelegate {
 pub(crate) enum FacetStatus {
     Enabled,
     Disabled,
+    /// K11/A2-1: the lamp's three tones are the endpoint-state facet. Matches
+    /// reads the same `serving_tone(..)` the lamp paints, so a lamp click
+    /// always shows the rows that carry that lamp.
     Running,
-    Stopped,
-    Live,
     Dead,
-    Untested,
+    Stopped,
 }
 
 impl FacetStatus {
-    pub(crate) const ALL: [FacetStatus; 7] = [
+    // K11: the menus no longer round-trip status labels; these survive for the
+    // tests that pin the label vocabulary.
+    #[cfg(test)]
+    pub(crate) const ALL: [FacetStatus; 5] = [
         FacetStatus::Enabled,
         FacetStatus::Disabled,
         FacetStatus::Running,
-        FacetStatus::Stopped,
-        FacetStatus::Live,
         FacetStatus::Dead,
-        FacetStatus::Untested,
+        FacetStatus::Stopped,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -113,13 +114,12 @@ impl FacetStatus {
             FacetStatus::Enabled => "Enabled",
             FacetStatus::Disabled => "Disabled",
             FacetStatus::Running => "Running",
-            FacetStatus::Stopped => "Stopped",
-            FacetStatus::Live => "Live",
             FacetStatus::Dead => "Dead",
-            FacetStatus::Untested => "Untested",
+            FacetStatus::Stopped => "Stopped",
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_label(label: &str) -> Option<FacetStatus> {
         Self::ALL.into_iter().find(|status| status.label() == label)
     }
@@ -129,24 +129,21 @@ impl FacetStatus {
         row: &ProxyConfig,
         running: &HashSet<String>,
         health: &HashMap<String, String>,
+        crashed: &HashSet<String>,
     ) -> bool {
+        let tone = || {
+            serving_tone(
+                running.contains(&row.id),
+                health.get(&row.id).map(String::as_str),
+                crashed.contains(&row.id),
+            )
+        };
         match self {
             FacetStatus::Enabled => row.enabled,
             FacetStatus::Disabled => !row.enabled,
-            FacetStatus::Running => running.contains(&row.id),
-            FacetStatus::Stopped => !running.contains(&row.id),
-            FacetStatus::Live => health
-                .get(&row.id)
-                .map(|summary| !summary.trim().is_empty() && summary.trim() != "dead")
-                .unwrap_or(false),
-            FacetStatus::Dead => health
-                .get(&row.id)
-                .map(|s| s.trim() == "dead")
-                .unwrap_or(false),
-            FacetStatus::Untested => health
-                .get(&row.id)
-                .map(|summary| summary.trim().is_empty())
-                .unwrap_or(true),
+            FacetStatus::Running => tone() == ServingTone::Serving,
+            FacetStatus::Dead => tone() == ServingTone::Failed,
+            FacetStatus::Stopped => tone() == ServingTone::Stopped,
         }
     }
 }
@@ -208,7 +205,6 @@ impl LibraryDelegate {
             preset_names: HashMap::new(),
             checked: HashSet::new(),
             facet_group: None,
-            facet_protocol: None,
             facet_status: None,
             show_security: false,
             sort: LibrarySort::default(),
@@ -551,13 +547,8 @@ impl LibraryDelegate {
                 return false;
             }
         }
-        if let Some(protocol) = &self.facet_protocol {
-            if row.protocol.to_lowercase() != *protocol {
-                return false;
-            }
-        }
         if let Some(status) = &self.facet_status {
-            if !status.matches(row, &self.running, &self.health) {
+            if !status.matches(row, &self.running, &self.health, &self.crashed) {
                 return false;
             }
         }
@@ -565,16 +556,13 @@ impl LibraryDelegate {
     }
 
     pub(crate) fn facets_active(&self) -> bool {
-        self.facet_group.is_some() || self.facet_protocol.is_some() || self.facet_status.is_some()
+        self.facet_group.is_some() || self.facet_status.is_some()
     }
 
     pub(crate) fn active_filter_text(&self) -> String {
         let mut parts = Vec::new();
         if let Some(group) = &self.facet_group {
             parts.push(format!("group: {group}"));
-        }
-        if let Some(protocol) = &self.facet_protocol {
-            parts.push(format!("protocol: {protocol}"));
         }
         if let Some(status) = &self.facet_status {
             parts.push(format!("status: {}", status.label()));
@@ -597,11 +585,10 @@ impl LibraryDelegate {
         if self.checked.is_empty() {
             return String::new();
         }
-        format!(
-            "{} checked (of {} visible)",
-            self.checked.len(),
-            self.visible.len()
-        )
+        // K4: the count keeps its checked set first and the visible scope in
+        // parentheses. The bar never says "visible" twice, and M stays the
+        // visible row count so the number is honest after a filter.
+        format!("{} checked (of {})", self.checked.len(), self.visible.len())
     }
 
     pub(crate) fn checked_rows(&self) -> Vec<ProxyConfig> {
@@ -625,37 +612,17 @@ impl LibraryDelegate {
         options
     }
 
-    pub(crate) fn protocol_options(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for row in &self.rows {
-            *counts.entry(row.protocol.to_lowercase()).or_default() += 1;
-        }
-        let mut options: Vec<(String, usize)> = counts.into_iter().collect();
-        options.sort();
-        options
-    }
-
-    pub(crate) fn status_options(&self) -> Vec<(FacetStatus, usize)> {
-        FacetStatus::ALL
-            .iter()
-            .map(|status| {
-                let count = self
-                    .rows
-                    .iter()
-                    .filter(|row| status.matches(row, &self.running, &self.health))
-                    .count();
-                (*status, count)
-            })
-            .collect()
-    }
-
     pub(crate) fn set_facet_group(&mut self, group: Option<String>) {
         self.facet_group = group;
         self.apply_filter();
     }
 
-    pub(crate) fn set_facet_protocol(&mut self, protocol: Option<String>) {
-        self.facet_protocol = protocol.map(|p| p.to_lowercase());
+    /// K11/A2-1: the group dropdown owns both slots — one pick writes group
+    /// and status disjointly in a single re-rank, so the menu can never show
+    /// two active choices at once.
+    pub(crate) fn set_facet_menu(&mut self, group: Option<String>, status: Option<FacetStatus>) {
+        self.facet_group = group;
+        self.facet_status = status;
         self.apply_filter();
     }
 
@@ -693,7 +660,6 @@ impl LibraryDelegate {
 
     pub(crate) fn clear_facets(&mut self) {
         self.facet_group = None;
-        self.facet_protocol = None;
         self.facet_status = None;
         self.apply_filter();
     }
@@ -720,6 +686,9 @@ impl LibraryDelegate {
         self.checked.clear();
     }
 
+    /// K4: rows no longer paint numeral chips, but the checked set keeps its
+    /// insertion order and the tests pin it through this helper.
+    #[cfg(test)]
     pub(crate) fn checked_position(&self, id: &str) -> Option<usize> {
         self.rows
             .iter()
@@ -921,6 +890,10 @@ impl ListDelegate for LibraryDelegate {
 
         let row_id = row.id.clone();
         let list_view = cx.entity();
+        // The checkbox's and the lamp's handlers are separate closures; both
+        // update this list state, so both need their own handle.
+        let lamp_view = list_view.clone();
+        let lamp_app = self.app_view.clone();
         let is_checked = self.checked.contains(&row_id);
         let toggle_id = row_id.clone();
         let checkbox = Checkbox::new(format!("check-{row_id}"))
@@ -985,12 +958,23 @@ impl ListDelegate for LibraryDelegate {
                 cx.theme().group_box
             });
 
+        // K4: the checked set no longer borrows selection's rim. The card keeps
+        // its hairline and carries a 3px signal-blue bar on the leading edge;
+        // the kit checkbox fills when checked. Selection alone keeps its 2px
+        // rim, so the two grammars never collide.
+        card = card.relative().border_1().border_color(cx.theme().border);
         if is_checked {
-            // The checked set is a second selection: a real signal-blue rim,
-            // not `accent` (neutral-800 in the dark kit, invisible on the card).
-            card = card.border_2().border_color(cx.theme().list_active_border);
-        } else {
-            card = card.border_1().border_color(cx.theme().border);
+            card = card.child(
+                div()
+                    .id(format!("row-check-bar-{row_id}"))
+                    .test_support()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(cx.theme().list_active_border),
+            );
         }
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
@@ -1022,9 +1006,23 @@ impl ListDelegate for LibraryDelegate {
             ServingTone::Serving => cx.theme().success,
             ServingTone::Stopped => cx.theme().muted_foreground,
         };
-        let check_chip = self.checked_position(&row_id);
-        let checked_total = self.checked.len();
         let lamp_label = lamp_access_label(tone, &row.name);
+        // K11/A2-1: the occupancy lamp doubles as the health filter's toggle —
+        // its tone names the verdict a click filters by.
+        let lamp_status = match tone {
+            ServingTone::Serving => FacetStatus::Running,
+            ServingTone::Failed => FacetStatus::Dead,
+            ServingTone::Stopped => FacetStatus::Stopped,
+        };
+        let lamp_active = self.facet_status == Some(lamp_status);
+        let lamp_hint = if lamp_active {
+            format!("{lamp_label} · click to stop filtering")
+        } else {
+            format!(
+                "{lamp_label} · click to show only {} rows",
+                lamp_status.label().to_lowercase()
+            )
+        };
         let full_route = library_row_full_route(&row, &upstream);
         let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
             &row,
@@ -1037,28 +1035,6 @@ impl ListDelegate for LibraryDelegate {
         {
             let name = row.name.clone();
             let metrics = self.row_metrics;
-            let mut leading: Vec<AnyElement> = Vec::new();
-            if let Some(position) = check_chip {
-                let chip_tip = check_chip_tip(position, checked_total);
-                leading.push(
-                    div()
-                        .id(format!("row-check-chip-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .px_1()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(cx.theme().list_active_border)
-                        .text_color(cx.theme().accent_foreground)
-                        .tooltip({
-                            let tip = chip_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(chip_tip)
-                        .child(format!("{position}"))
-                        .into_any_element(),
-                );
-            }
             let mut cells: Vec<AnyElement> = Vec::new();
             if metrics.show_group {
                 cells.push(
@@ -1246,22 +1222,41 @@ impl ListDelegate for LibraryDelegate {
                                 .size(px(12.))
                                 .rounded_full()
                                 .bg(lamp_color)
+                                .cursor_pointer()
                                 .tooltip({
-                                    let tip = lamp_label.clone();
+                                    let tip = lamp_hint.clone();
                                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                                 })
-                                .aria_label(lamp_label.clone()),
+                                .aria_label(lamp_hint.clone())
+                                .on_click(move |_, window, cx| {
+                                    // The lamp owns its click; the card's
+                                    // double-click-to-edit must not swallow it.
+                                    cx.stop_propagation();
+                                    let status = lamp_status;
+                                    lamp_view.update(cx, |state, cx| {
+                                        let delegate = state.delegate_mut();
+                                        if delegate.facet_status == Some(status) {
+                                            delegate.set_facet_status(None);
+                                        } else {
+                                            delegate.set_facet_status(Some(status));
+                                        }
+                                        cx.notify();
+                                    });
+                                    // Keep the one facet menu honest: the lamp is
+                                    // its second input, so the collapsed display
+                                    // must re-sync in the same click.
+                                    if let Some(app) = lamp_app.as_ref() {
+                                        app.update(cx, |view, cx| {
+                                            view.sync_facet_pickers(window, cx);
+                                        });
+                                    }
+                                }),
                         )
                         .child(checkbox),
                 )
-                // The check chip's slot is always reserved, so checking a row
-                // never shifts its name out of the header's alignment.
-                .child(
-                    div()
-                        .w(px(metrics.check_slot))
-                        .flex_shrink_0()
-                        .children(leading),
-                )
+                // The check chip's slot stays reserved for the column grid;
+                // K4 removed the numeral chip itself, so nothing paints here.
+                .child(div().w(px(metrics.check_slot)).flex_shrink_0())
                 .child(
                     div()
                         .id(format!("row-name-{row_id}"))
@@ -1294,8 +1289,8 @@ impl ListDelegate for LibraryDelegate {
                             });
                         }
                     })
-                    .context_menu(move |menu, _, _| {
-                        AppView::row_context_menu(menu, &menu_id, &menu_view)
+                    .context_menu(move |menu, window, cx| {
+                        AppView::row_context_menu(menu, &menu_id, &menu_view, window, cx)
                     }),
                 )
             }
@@ -1384,43 +1379,8 @@ impl ListDelegate for LibraryDelegate {
             );
         }
 
-        let add_view = self.app_view.clone();
-        let import_view = self.app_view.clone();
-        let mut ctas = div()
-            .id("empty-library-ctas")
-            .test_support()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap_2();
-        if let Some(view) = add_view {
-            ctas = ctas.child(
-                Button::new("empty-add")
-                    .small()
-                    .primary()
-                    .label("Add configuration")
-                    .tooltip("Add a proxy configuration")
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.open_add_dialog(window, cx);
-                        });
-                    }),
-            );
-        }
-        if let Some(view) = import_view {
-            ctas = ctas.child(
-                Button::new("empty-import")
-                    .small()
-                    .label("Import configurations")
-                    .tooltip("Import share links or files")
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                        });
-                    }),
-            );
-        }
+        // A1-3/K11: Add and Import stay single-entry (the toolbar); the empty
+        // canvas keeps only the explanation, so there is one way in.
         div()
             .id("library-empty")
             .test_support()
@@ -1428,13 +1388,11 @@ impl ListDelegate for LibraryDelegate {
             .flex_col()
             .size_full()
             .child(
-                Empty::new()
-                    .header(
-                        EmptyHeader::new()
-                            .title(EmptyTitle::new().child(empty_library_title()))
-                            .description(EmptyDescription::new().child(empty_library_text())),
-                    )
-                    .content(EmptyContent::new().child(ctas)),
+                Empty::new().header(
+                    EmptyHeader::new()
+                        .title(EmptyTitle::new().child(empty_library_title()))
+                        .description(EmptyDescription::new().child(empty_library_text())),
+                ),
             )
     }
 }

@@ -331,10 +331,13 @@ impl AppView {
 
     pub(crate) fn health_status_text(&self) -> String {
         let (live, dead) = self.health_counts();
+        // K12/A5-1: the center segment is `engine <state> · health X live ·
+        // Y dead`; the label carries no colon so the `·` grammar stays the
+        // only separator the strip spends.
         if live == 0 && dead == 0 {
-            "health: no probes this session".to_string()
+            "health never tested".to_string()
         } else {
-            format!("health: {live} live · {dead} dead")
+            format!("health {live} live · {dead} dead")
         }
     }
 
@@ -404,6 +407,10 @@ impl AppView {
         self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
     }
 
+    /// K8 removed the Tools "Test group" row; the group sweep stays wired for
+    /// the T-19 auto-clear path and its tests, so the entry point is retained
+    /// until a group-test entry gets a new UI home.
+    #[allow(dead_code)]
     pub(crate) fn test_group_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -439,154 +446,6 @@ impl AppView {
         window.push_notification(Notification::info("Stopping the group test…"), cx);
     }
 
-    pub(crate) fn speedtest_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
-            return;
-        };
-        if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
-            return;
-        }
-        self.speedtest_rows(vec![config], None, Some(window.window_handle()), cx);
-    }
-
-    pub(crate) fn speedtest_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.selected_config(cx) else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        };
-        self.speedtest_rows(vec![config], None, Some(window.window_handle()), cx);
-    }
-
-    pub(crate) fn speedtest_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
-            return;
-        };
-        let rows = self.group_running_rows(&group);
-        if rows.is_empty() {
-            window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no running endpoints to speedtest"
-                )),
-                cx,
-            );
-            return;
-        }
-        if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
-            return;
-        }
-        self.speedtest_rows(rows, Some(group), Some(window.window_handle()), cx);
-    }
-
-    pub(crate) fn speedtest_rows(
-        &mut self,
-        rows: Vec<ProxyConfig>,
-        group: Option<String>,
-        window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>,
-    ) {
-        use std::sync::atomic::Ordering;
-        if rows.is_empty() || self.group_test_in_flight {
-            return;
-        }
-        let mode = self.speedtest_mode;
-        let config = SpeedtestConfig {
-            mode,
-            timeout: SPEED_TEST_TIMEOUT,
-        };
-        let url = self.effective_test_url(&rows);
-        let scope = group.unwrap_or_else(|| {
-            rows.first()
-                .map(|row| format!("\"{}\"", row.name))
-                .unwrap_or_default()
-        });
-        let single_name: Option<String> = if rows.len() == 1 {
-            rows.first().map(|row| row.name.clone())
-        } else {
-            None
-        };
-        self.group_test_in_flight = true;
-        self.probe_stop.store(false, Ordering::SeqCst);
-        let stop = self.probe_stop.clone();
-        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
-        let weak = cx.entity().downgrade();
-        cx.spawn(async move |_entity, cx| {
-            let (outcomes, prober) = cx
-                .background_executor()
-                .spawn(async move {
-                    let prober = prober;
-                    let outcomes = speed_group(
-                        &rows,
-                        &url,
-                        config.mode,
-                        config.timeout,
-                        &*prober,
-                        &stop,
-                        |_, _| {},
-                    );
-                    (outcomes, prober)
-                })
-                .await;
-            cx.update(|cx| {
-                let summary = weak.update(cx, |view, _| {
-                    view.prober = prober;
-                    view.group_test_in_flight = false;
-                    view.record_and_persist_speed(&outcomes);
-                    let measured = outcomes.iter().filter(|o| o.mbps.is_some()).count();
-                    let failed = outcomes.len() - measured;
-                    let single = single_name.as_deref().and_then(|name| {
-                        outcomes
-                            .first()
-                            .map(|outcome| speed_result_toast(name, outcome))
-                    });
-                    (measured, failed, outcomes.len(), single)
-                });
-                let Ok((measured, failed, count, single)) = summary else {
-                    return;
-                };
-                let Some(view) = weak.upgrade() else {
-                    return;
-                };
-                let message = single.unwrap_or_else(|| {
-                    if count == 1 {
-                        format!("Speedtest {scope}: {measured} measured · {failed} failed")
-                    } else {
-                        speed_test_summary_toast(&scope, mode, measured, failed)
-                    }
-                });
-                if let Some(handle) = window {
-                    if handle
-                        .update(cx, |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.reload(window, cx);
-                                window.push_notification(Notification::success(message), cx);
-                            });
-                        })
-                        .is_ok()
-                    {
-                        return;
-                    }
-                }
-                view.update(cx, |view, cx| view.reload_quiet(cx));
-            });
-        })
-        .detach();
-    }
-
-    pub(crate) fn cycle_speedtest_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.speedtest_mode = self.speedtest_mode.next();
-        window.push_notification(
-            Notification::info(format!("Speedtest mode: {}", self.speedtest_mode.as_str())),
-            cx,
-        );
-    }
-
     pub(crate) fn health_store_prune_group(&mut self, group: &str) {
         let ids: HashSet<String> = self
             .store
@@ -599,20 +458,14 @@ impl AppView {
         self.health_store.prune_configs(&ids);
     }
 
-    pub(crate) fn toggle_show_security(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_show_security(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // A6-4/K8: the toggle renders in place (rows re-render with the
+        // security marks) — no toast while the menu is open.
         let show = !self.libraries.read(cx).delegate().show_security;
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_show_security(show);
             list_cx.notify();
         });
-        window.push_notification(
-            Notification::info(if show {
-                "Show security: on".to_string()
-            } else {
-                "Show security: off".to_string()
-            }),
-            cx,
-        );
     }
 
     pub(crate) fn toggle_library_sort_direction(

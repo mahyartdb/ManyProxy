@@ -270,13 +270,10 @@ impl AppView {
     }
 
     pub(crate) fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self
-            .store
-            .get(id)
-            .ok()
-            .flatten()
-            .map(|row| row.name)
-            .unwrap_or_else(|| id.to_string());
+        // K5: the whole row is captured BEFORE removal — the undo toast keeps
+        // it in memory for its lifetime, so expiry means the row is simply
+        // gone, and Undo re-adds it with its group assignment.
+        let removed = self.store.get(id).ok().flatten();
         let was_running = self.engine.stop_one(id);
         match self.store.remove(id) {
             Ok(true) => {
@@ -292,10 +289,25 @@ impl AppView {
                 self.reload(window, cx);
 
                 window.focus(&self.focus, cx);
-                window.push_notification(
-                    Notification::success(removed_message(&name, was_running)),
-                    cx,
-                );
+                let name = removed
+                    .as_ref()
+                    .map(|row| row.name.clone())
+                    .unwrap_or_else(|| id.to_string());
+                if let Some(row) = removed {
+                    let batch = next_undo_batch_id();
+                    stash_undo_rows(vec![row], batch);
+                    self.push_delete_undo_toast(
+                        batch,
+                        Notification::success(removed_message(&name, was_running)),
+                        window,
+                        cx,
+                    );
+                } else {
+                    window.push_notification(
+                        Notification::success(removed_message(&name, was_running)),
+                        cx,
+                    );
+                }
             }
             Ok(false) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
@@ -589,99 +601,6 @@ impl AppView {
                     .push_notification(Notification::error(format!("Cannot toggle: {error}")), cx);
             }
         }
-    }
-
-    pub(crate) fn commit_resolve_domain_group(
-        &mut self,
-        candidates: &[(String, String, String)],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if candidates.is_empty() || self.group_test_in_flight {
-            return;
-        }
-        self.group_test_in_flight = true;
-        self.probe_stop
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let stop = self.probe_stop.clone();
-        let handle = window.window_handle();
-        let weak = cx.entity().downgrade();
-        let candidates = candidates.to_vec();
-        let store_snapshot: Vec<(String, String)> = self
-            .store
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| (row.id, row.params))
-            .collect();
-        cx.spawn(async move |_entity, cx| {
-            let done = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut rewritten = Vec::new();
-                    let mut failed = Vec::new();
-                    for (id, name, host) in &candidates {
-                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            break;
-                        }
-                        let params = store_snapshot
-                            .iter()
-                            .find(|(row_id, _)| row_id == id)
-                            .map(|(_, params)| params.clone())
-                            .unwrap_or_default();
-                        match resolve_hostname(host, RESOLVE_TIMEOUT) {
-                            Some(ip) => match rewrite_server_to_ip(&params, &ip.to_string()) {
-                                Some(new_params) => rewritten.push((
-                                    id.clone(),
-                                    name.clone(),
-                                    host.clone(),
-                                    new_params,
-                                )),
-                                None => failed.push(format!("\"{name}\": no domain server")),
-                            },
-                            None => failed.push(format!("\"{name}\": could not resolve {host}")),
-                        }
-                    }
-                    (rewritten, failed)
-                })
-                .await;
-            cx.update(|cx| {
-                let _ = handle.update(cx, |_, window, cx| {
-                    let _ = weak.update(cx, |view, cx| {
-                        view.group_test_in_flight = false;
-                        let (rewritten, failed) = done;
-                        let mut saved: Vec<(String, String, String)> = Vec::new();
-                        let mut save_failed = failed;
-                        let mut any_running = false;
-                        for (id, name, host, new_params) in rewritten {
-                            if view.engine.is_running(&id) {
-                                any_running = true;
-                            }
-                            let patch = ConfigPatch {
-                                params: Some(new_params),
-                                ..Default::default()
-                            };
-                            match view.store.update(&id, patch) {
-                                Ok(updated) => {
-                                    let new_host = row_server_hostname(&updated.params)
-                                        .unwrap_or_else(|| updated.params.clone());
-                                    saved.push((name, host, new_host));
-                                }
-                                Err(error) => save_failed.push(format!("\"{name}\": {error}")),
-                            }
-                        }
-                        view.reload(window, cx);
-                        let (severity, message) =
-                            resolve_domain_group_notification(&saved, &save_failed, any_running);
-                        window.push_notification(
-                            Notification::new().message(message).with_type(severity),
-                            cx,
-                        );
-                    });
-                });
-            });
-        })
-        .detach();
     }
 
     pub(crate) fn commit_prune(
@@ -1413,7 +1332,18 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if name.trim().is_empty() && rules_text.trim().is_empty() && boxes.is_empty() {
+        // K3: the form's `Add remote ruleset…` URL is content — a URL-only
+        // form still commits (it stages the download below).
+        let remote_url = self
+            .preset_form
+            .as_ref()
+            .map(|form| form.remote_url.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if name.trim().is_empty()
+            && rules_text.trim().is_empty()
+            && boxes.is_empty()
+            && remote_url.is_empty()
+        {
             return true;
         }
         let mut rules = if rules_text.trim().is_empty() {
@@ -1450,98 +1380,21 @@ impl AppView {
                     Notification::success(preset_imported_message(&preset.name, rules.len())),
                     cx,
                 );
-                true
-            }
-            Err(error) => {
-                self.report_save_error(error, window, cx);
-                false
-            }
-        }
-    }
-
-    pub(crate) fn commit_preset_create_structured(
-        &mut self,
-        name: String,
-        action: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if name.trim().is_empty() {
-            window.push_notification(
-                Notification::error("Invalid routing preset: preset needs a name"),
-                cx,
-            );
-            return false;
-        }
-        let rules = match crate::preset::structured_preset_rules(&action) {
-            Ok(rules) => rules,
-            Err(error) => {
-                window.push_notification(Notification::error(preset_error_message(&error)), cx);
-                return false;
-            }
-        };
-        match self
-            .store
-            .create_preset(name.trim(), "manual", None, &rules)
-        {
-            Ok(preset) => {
-                self.reload(window, cx);
-                window.push_notification(
-                    Notification::success(preset_imported_message(&preset.name, rules.len())),
-                    cx,
-                );
-                self.reopen_presets_if_open(window, cx);
-                true
-            }
-            Err(error) => {
-                self.report_save_error(error, window, cx);
-                false
-            }
-        }
-    }
-
-    pub(crate) fn commit_preset_create_remote(
-        &mut self,
-        name: String,
-        url: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if name.trim().is_empty() {
-            window.push_notification(
-                Notification::error("Invalid routing preset: preset needs a name"),
-                cx,
-            );
-            return false;
-        }
-        match crate::store::subscription_fetch_policy(url.trim()) {
-            crate::store::SubscriptionFetchPolicy::Block { reason } => {
-                window.push_notification(
-                    Notification::error(format!("Invalid preset URL: {reason}")),
-                    cx,
-                );
-                return false;
-            }
-            crate::store::SubscriptionFetchPolicy::Warn { reason } => {
-                window.push_notification(Notification::warning(reason.to_string()), cx);
-            }
-            crate::store::SubscriptionFetchPolicy::Allow => {}
-        }
-        match self
-            .store
-            .import_remote_preset_shell(name.trim(), url.trim())
-        {
-            Ok(preset) => {
-                self.reload(window, cx);
-                window.push_notification(
-                    Notification::success(format!(
-                        "Routing preset \"{}\" added — fetching rules",
-                        preset.name
-                    )),
-                    cx,
-                );
-                self.start_preset_refresh(preset, cx);
-                self.reopen_presets_if_open(window, cx);
+                if !remote_url.is_empty() {
+                    // K3: one creation path — the URL row stages the same
+                    // explicit-confirm-per-download rule-set staging the old
+                    // `Add by URL` dialog did. The staging request is deferred:
+                    // the footer closes every dialog after a successful commit,
+                    // and opening the Download confirm synchronously would be
+                    // swept away by that same close.
+                    let view = cx.entity();
+                    let set_name = rule_set_name_from_url(&remote_url);
+                    window.defer(cx, move |window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.begin_rule_set_download(set_name, remote_url, window, cx);
+                        });
+                    });
+                }
                 true
             }
             Err(error) => {
@@ -1927,5 +1780,33 @@ impl AppView {
             );
         }
         self.reopen_subscriptions_if_open(window, cx);
+    }
+}
+
+/// K3: the `Add remote ruleset…` row only carries a URL, so the staging name
+/// falls back to the URL's last path segment with the extension stripped. The
+/// store still validates the final name and reports why it refused.
+fn rule_set_name_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches(['/', '\\']);
+    let segment = trimmed
+        .split(['/', '?', '#'])
+        .next_back()
+        .unwrap_or_default();
+    let stem = segment.split('.').next().unwrap_or_default();
+    let slug: String = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "rule-set".to_string()
+    } else {
+        slug
     }
 }

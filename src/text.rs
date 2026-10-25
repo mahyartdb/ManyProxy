@@ -30,14 +30,6 @@ pub(crate) fn settings_clear_snapshot_text() -> String {
      engine is untouched. This cannot be undone."
         .to_string()
 }
-pub(crate) fn routing_summary_text(presets: Option<usize>, attached: Option<usize>) -> String {
-    match (presets, attached) {
-        (Some(presets), Some(attached)) => {
-            format!("{presets} routing preset(s) · {attached} row(s) attached")
-        }
-        _ => "Routing inventory unavailable".to_string(),
-    }
-}
 pub(crate) fn preset_summary_text(presets: Option<usize>) -> String {
     match presets {
         Some(presets) => format!("{presets} routing preset(s) stored"),
@@ -297,27 +289,37 @@ pub(crate) fn removed_message(name: &str, was_running: bool) -> String {
         format!("Removed \"{name}\"")
     }
 }
-pub(crate) fn bulk_delete_confirm_description(count: usize, names: &[String]) -> String {
-    const SHOWN: usize = 3;
-    if names.is_empty() {
-        return format!(
-            "Delete {count} checked configuration(s)? Running endpoints stop first. This cannot be undone."
-        );
+/// K5: the undo toast carries the same removed-row wording; the Undo action
+/// button is the offer, the text never promises more than removal itself.
+pub(crate) fn undo_restored_message(names: &[String], restored: usize) -> String {
+    if restored == 1 {
+        if let [single] = names {
+            return format!("Restored \"{single}\" to its group");
+        }
     }
-    let shown = names
-        .iter()
-        .take(SHOWN)
-        .map(|name| format!("\"{name}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let more = if names.len() > SHOWN {
-        format!(" +{} more", names.len() - SHOWN)
+    format!("Restored {restored} configuration(s) in their groups")
+}
+pub(crate) fn undo_failed_message(error: &StoreError) -> String {
+    format!("Restore failed: {error}")
+}
+/// K5: the update feed is the only thing a failed check may name — no URLs,
+/// statuses, or body echoes.
+pub(crate) fn update_feed_failure_message() -> String {
+    "Couldn't reach the update feed".to_string()
+}
+/// K17: the bulk delete outcome toast — one tint per truth (clean = success,
+/// nothing removed = error, partial = warning) — and the sentence the Undo
+/// toast carries. The blocking confirm the old copy described is gone
+/// (spec line 91); naming the rows stays.
+pub(crate) fn bulk_delete_note(removed: &[String], failed: &[String]) -> Notification {
+    let text = bulk_delete_result_message(removed, failed);
+    if failed.is_empty() {
+        Notification::success(text)
+    } else if removed.is_empty() {
+        Notification::error(text)
     } else {
-        String::new()
-    };
-    format!(
-        "Delete {count} checked configuration(s) ({shown}{more})? Running endpoints stop first. This cannot be undone."
-    )
+        Notification::warning(text)
+    }
 }
 pub(crate) fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> String {
     const SHOWN: usize = 3;
@@ -380,8 +382,15 @@ pub(crate) fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) 
         (None, None) => format!("{verb} \"{name}\": dead"),
     }
 }
-pub(crate) fn probe_summary_toast(count: usize, live: usize, dead: usize) -> String {
-    format!("Tested {count} endpoint(s): {live} live · {dead} dead")
+/// K5: the batched start toast (`Testing N…`) — groups and test-all runs say
+/// once what is about to happen, then exactly one summary closes the story.
+pub(crate) fn probe_start_toast(count: usize) -> String {
+    format!("Testing {count}…")
+}
+/// K5: the batched result line; per-row `probe_result_toast` prose is for
+/// single-row tests only.
+pub(crate) fn probe_batched_toast(count: usize, live: usize, dead: usize) -> String {
+    format!("Tested {count}: {live} live · {dead} dead")
 }
 pub(crate) fn apply_show_security(text: &mut String, row: &ProxyConfig) {
     text.push_str(" · ");
@@ -423,127 +432,8 @@ pub(crate) fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[Stri
         )
     }
 }
-pub(crate) fn speed_test_summary_toast(
-    scope: &str,
-    mode: SpeedtestMode,
-    measured: usize,
-    failed: usize,
-) -> String {
-    format!(
-        "Speedtest ({}): {scope}: {measured} measured · {failed} failed",
-        mode.as_str()
-    )
-}
-pub(crate) fn speed_result_toast(name: &str, outcome: &SpeedtestOutcome) -> String {
-    match (outcome.mbps, outcome.error.as_deref()) {
-        (Some(_), _) => format!("Speedtest \"{name}\": {}", format_speed_result(outcome)),
-        (None, Some(cause)) => format!("Speedtest \"{name}\": failed — {cause}"),
-        (None, None) => format!("Speedtest \"{name}\": no result"),
-    }
-}
-pub(crate) fn out_ip_summary_toast(scope: &str, ips: &[String], failed: &[String]) -> String {
-    let mut unique: Vec<&String> = Vec::new();
-    for ip in ips {
-        if !unique.contains(&ip) {
-            unique.push(ip);
-        }
-    }
-    let shown: Vec<&str> = unique.iter().take(3).map(|ip| ip.as_str()).collect();
-    let mut text = if shown.is_empty() {
-        format!("Out-IP {scope}: no address resolved")
-    } else {
-        format!("Out-IP {scope}: {}", shown.join(", "))
-    };
-    if unique.len() > shown.len() {
-        text.push_str(&format!(" (+{} more)", unique.len() - shown.len()));
-    }
-    if !failed.is_empty() {
-        text.push_str(&format!(
-            " · {} failed: {}",
-            failed.len(),
-            failed.join(", ")
-        ));
-    }
-    text
-}
-pub(crate) fn resolve_domain_confirm_text(group: &str, names: &[String]) -> String {
-    let mut text = format!(
-        "Rewrite {} domain server(s) in group \"{group}\" to their resolved IPs? \
-         Rows are saved with the looked-up address. This cannot be undone.",
-        names.len()
-    );
-    if !names.is_empty() {
-        let preview: Vec<&str> = names.iter().take(20).map(String::as_str).collect();
-        text.push_str(&format!(" Rows: {}.", preview.join(", ")));
-        if names.len() > preview.len() {
-            text.push_str(&format!(" (+{} more)", names.len() - preview.len()));
-        }
-    }
-    text
-}
-pub(crate) fn resolve_domain_result_message(
-    rewritten: &[(String, String, String)],
-    failed: &[String],
-) -> String {
-    if rewritten.is_empty() && failed.is_empty() {
-        return "Resolve domain: nothing to rewrite".to_string();
-    }
-    let mut parts: Vec<String> = rewritten
-        .iter()
-        .take(3)
-        .map(|(name, old, new)| format!("\"{name}\": {old} → {new}"))
-        .collect();
-    if rewritten.len() > parts.len() {
-        parts.push(format!("(+{} more)", rewritten.len() - parts.len()));
-    }
-    let mut text = format!("Resolve domain: {} rewritten", rewritten.len());
-    if !parts.is_empty() {
-        text.push_str(&format!(" ({})", parts.join(", ")));
-    }
-    if !failed.is_empty() {
-        text.push_str(&format!(
-            " · {} failed: {}",
-            failed.len(),
-            failed.join(", ")
-        ));
-    }
-    text
-}
 pub(crate) fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
-}
-pub(crate) fn resolve_domain_row_message(
-    name: &str,
-    ip: &str,
-    host: &str,
-    running: bool,
-) -> String {
-    let base = format!("\"{name}\": server now {ip} (was {host})");
-    if running {
-        format!("{base} — restart it to apply (still serving the previous config)")
-    } else {
-        base
-    }
-}
-/// Severity + copy for a group resolve: a fully failed batch is an error, a
-/// partial batch is a warning, and success is honest about a pending restart.
-pub(crate) fn resolve_domain_group_notification(
-    saved: &[(String, String, String)],
-    failed: &[String],
-    any_running: bool,
-) -> (NotificationType, String) {
-    let mut message = resolve_domain_result_message(saved, failed);
-    if any_running && !saved.is_empty() {
-        message.push_str(" · restart the affected endpoint(s) to apply");
-    }
-    let severity = if saved.is_empty() && !failed.is_empty() {
-        NotificationType::Error
-    } else if failed.is_empty() {
-        NotificationType::Success
-    } else {
-        NotificationType::Warning
-    };
-    (severity, message)
 }
 /// T-03: the badge carries the endpoint, not an orphaned colon — `Running ·
 /// 127.0.0.1:10801 · 87ms`. The bind belongs to the endpoint, so the string
@@ -586,6 +476,9 @@ pub(crate) fn lamp_access_label(tone: ServingTone, name: &str) -> String {
         ServingTone::Stopped => format!("Stopped — {name}"),
     }
 }
+/// K4: numeral chips left the rows, so this helper survives only for the
+/// checked-set ordering tests that still pin the 1-based position.
+#[cfg(test)]
 pub(crate) fn check_chip_tip(position: usize, total: usize) -> String {
     format!("Checked {position} of {total} — bulk action target")
 }
@@ -692,6 +585,31 @@ pub(crate) fn start_all_partial_message(started: usize, failed_names: &[String])
 pub(crate) fn search_count_text(visible: usize, total: usize) -> String {
     format!("{visible} of {total}")
 }
+/// K12/A5-1: the status strip's first segment — library totals, singular at 1.
+pub(crate) fn status_count_text(total: usize, enabled: usize) -> String {
+    format!(
+        "{} {} · {} enabled",
+        total,
+        if total == 1 {
+            "configuration"
+        } else {
+            "configurations"
+        },
+        enabled
+    )
+}
+/// K12/A5-1: the sort header names its direction in words. The old `↑`/`↓`
+/// glyphs degrade to `1`/`T` at the small header size, so the marker is a word
+/// suffix that reads at any scale. `None` means "library order" and adds
+/// nothing; the retired toggle keeps its fixed direction label.
+pub(crate) fn sort_header_marker(sort: LibrarySort) -> &'static str {
+    match sort.key {
+        LibrarySortKey::None => "",
+        LibrarySortKey::TypeSecurity => " · fixed",
+        _ if sort.direction == SortDirection::Descending => " · desc",
+        _ => " · asc",
+    }
+}
 pub(crate) fn facet_tip_text(
     dimension: &str,
     active_display: &str,
@@ -699,25 +617,6 @@ pub(crate) fn facet_tip_text(
     total: usize,
 ) -> String {
     format!("Filter by {dimension}: {active_display} · {visible} of {total} shown")
-}
-pub(crate) fn serving_ports_text(ports: &[u16]) -> Option<String> {
-    if ports.is_empty() {
-        return None;
-    }
-    let mut sorted = ports.to_vec();
-    sorted.sort_unstable();
-    // T-03: one grammar for the whole strip — the segment names itself and
-    // separates its parts with `·`. A bare ":10801 :10802" reads like noise.
-    let shown: Vec<String> = sorted.iter().take(3).map(|port| port.to_string()).collect();
-    if sorted.len() > 3 {
-        Some(format!(
-            "ports {} · +{}",
-            shown.join(" · "),
-            sorted.len() - 3
-        ))
-    } else {
-        Some(format!("ports {}", shown.join(" · ")))
-    }
 }
 pub(crate) fn no_matches_text() -> String {
     "No matches — Clear search".to_string()
@@ -881,10 +780,6 @@ pub(crate) fn traffic_summary_text(rx: u64, tx: u64) -> Option<String> {
 pub(crate) fn traffic_status_text(total_rx: u64, total_tx: u64) -> Option<String> {
     traffic_summary_text(total_rx, total_tx).map(|summary| format!("traffic {summary}"))
 }
-pub(crate) fn browse_read_message(names: &[String]) -> String {
-    let short: Vec<String> = names.iter().map(|name| file_basename(name)).collect();
-    format!("Read {} file(s): {}", short.len(), short.join(", "))
-}
 pub(crate) fn export_overwrite_confirm_description(path: &str) -> String {
     format!("\"{path}\" already exists. Overwrite it with the new export?")
 }
@@ -897,6 +792,10 @@ pub(crate) fn log_level_tooltip(label: &str) -> String {
         format!("Show only {label} records")
     }
 }
+/// K9/A7-5: the Settings → Engine body no longer paints the `Timers: …` line
+/// (it was jargon at rest). The formatter stays as the tested summary of the
+/// tick constants, so the numbers still have one source under test.
+#[cfg(test)]
 pub(crate) fn tick_interval_summary() -> String {
     format!(
         "engine poll {ENGINE_POLL_TICK_SECS}s · subscriptions {DUE_SUBSCRIPTION_TICK_SECS}s · \

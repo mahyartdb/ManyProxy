@@ -14,13 +14,10 @@ impl AppView {
         cx.notify();
         match update_check_outcome(fetched) {
             Ok(outcome) => self.open_update_check_dialog(outcome, window, cx),
-            Err(why) => {
-                // every remaining failure is a plain error notification; the
-                // strings carry no URL or body echoes, only the fixed cause
-                window.push_notification(
-                    Notification::error(format!("Update check failed: {why}")),
-                    cx,
-                );
+            Err(_why) => {
+                // every remaining failure is a plain error notification; K5:
+                // the copy says only what failed and never the internals
+                window.push_notification(Notification::error(update_feed_failure_message()), cx);
             }
         }
     }
@@ -98,12 +95,14 @@ impl AppView {
         if files.is_empty() {
             return;
         }
-        let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
         let (merged, hint, multi) = merge_browse_results(&current_text, &files);
         window.close_all_dialogs(cx);
         reclaim_shell_focus(window, cx);
         self.open_import_dialog_with_files(&merged, &current_group, hint, multi, window, cx);
-        window.push_notification(Notification::success(browse_read_message(&names)), cx);
+        // K17/A7-10: the dialog's `Files:` row is the one representation of
+        // the picked files — a success toast repeating the same names was the
+        // second render. Unreadable files keep their warning toast (they
+        // cannot be named by a row that lists only readable ones).
     }
 
     pub(crate) fn finish_import_parse(

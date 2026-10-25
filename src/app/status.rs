@@ -1,32 +1,24 @@
 use crate::*;
 
 impl AppView {
+    /// K12/A5-1: three segments, one grammar.
+    ///
+    /// `configs · enabled` | `engine <state> · health X live · Y dead` |
+    /// `out <bytes> · in <bytes>`
+    ///
+    /// Ports and connection counters left the strip: ports belong to the
+    /// engine's own surface, and the connections count lives in the
+    /// Connections inspector tab (its group title already carries `(N)`).
     pub(crate) fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let libraries = self.libraries.read(cx);
         let delegate = libraries.delegate();
         let (total, enabled) = delegate.counts();
+        let count_text = status_count_text(total, enabled);
+        let filter_text = delegate.active_filter_text();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
+        let usage_text = summed_traffic_text(&self.store);
 
-        let filter_text = delegate.active_filter_text();
-        let ports: Vec<u16> = delegate
-            .rows
-            .iter()
-            .filter(|row| self.engine.is_running(&row.id))
-            .map(|row| row.port)
-            .collect();
-        let ports_text = serving_ports_text(&ports);
-
-        let count_text = format!(
-            "{} {} · {} enabled",
-            total,
-            if total == 1 {
-                "configuration"
-            } else {
-                "configurations"
-            },
-            enabled
-        );
         let mut left = div()
             .id("status-left")
             .test_support()
@@ -40,103 +32,112 @@ impl AppView {
                 div()
                     .id("status-count")
                     .test_support()
-                    .min_w(px(180.))
+                    .min_w_0()
                     .truncate()
+                    .aria_label(count_text.clone())
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(count_text)
             });
 
         if !filter_text.is_empty() {
             let tip = filter_text.clone();
-            left = left.child(Separator::vertical()).child(
-                div()
-                    .id("status-filter")
-                    .test_support()
-                    .min_w_0()
-                    .max_w(px(280.))
-                    .truncate()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(filter_text),
-            );
+            left = left
+                .child(div().text_color(cx.theme().muted_foreground).child("·"))
+                .child(
+                    div()
+                        .id("status-filter")
+                        .test_support()
+                        .min_w_0()
+                        .max_w(px(280.))
+                        .truncate()
+                        .aria_label(filter_text.clone())
+                        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                        .child(filter_text),
+                );
         }
-        let mut center = div()
+
+        // K12/A5-1: the two dividers ride with the unit they introduce, so
+        // neither floats away from its text. The `·` sits between the two
+        // words with the same 8px rhythm the bar uses everywhere else.
+        let center = div()
             .id("status-center")
             .test_support()
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
+            .justify_center()
             .min_w(px(430.))
-            .child({
-                let tip = engine_text.clone();
+            .child(
                 div()
-                    .id("engine-status")
-                    .test_support()
-                    .min_w(px(140.))
-                    .truncate()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(engine_text)
-            })
-            .child(Separator::vertical())
-            .child({
-                let tip = health_text.clone();
-                div()
-                    .id("health-status")
-                    .test_support()
-                    .min_w(px(190.))
-                    .truncate()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(health_text)
-            });
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(Separator::vertical())
+                    .child({
+                        let tip = engine_text.clone();
+                        div()
+                            .id("engine-status")
+                            .test_support()
+                            .truncate()
+                            .aria_label(engine_text.clone())
+                            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                            .child(engine_text)
+                    })
+                    .child(div().child("·"))
+                    .child({
+                        let tip = health_text.clone();
+                        div()
+                            .id("health-status")
+                            .test_support()
+                            .truncate()
+                            .aria_label(health_text.clone())
+                            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                            .child(health_text)
+                    }),
+            );
 
-        if let Some(ports) = ports_text {
-            center = center.child(Separator::vertical()).child({
-                let tip = ports.clone();
-                div()
-                    .id("status-ports")
-                    .test_support()
-                    .min_w_0()
-                    .max_w(px(200.))
-                    .truncate()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(ports)
-            });
-        }
-
-        if let Some(counters) = self.conn_counter_text() {
-            center = center.child(Separator::vertical()).child({
-                let tip = counters.clone();
-                div()
-                    .id("conn-counters")
-                    .test_support()
-                    .min_w_0()
-                    .max_w(px(180.))
-                    .truncate()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(counters)
-            });
-        }
         let mut right = div()
             .id("status-right")
             .test_support()
             .flex()
             .flex_row()
             .items_center()
+            .justify_end()
             .gap_2()
             .min_w(px(150.));
-        if let Some(totals) = summed_traffic_text(&self.store) {
+        if let Some(usage) = usage_text {
+            // K12/A5-2: the separator rides with the segment it splits off, so
+            // an absent usage segment can never leave a lone dash on the bar.
             right = right.child(Separator::vertical()).child({
-                let tip = totals.clone();
+                let tip = usage.clone();
                 div()
                     .id("traffic-status")
                     .test_support()
                     .min_w_0()
                     .max_w(px(200.))
                     .truncate()
+                    .aria_label(usage.clone())
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(totals)
+                    .child(usage)
             });
         }
+        // K17/A6-6: the palette's one at-a-glance hint, parked at the bar's
+        // right end. A Kbd chip (the same element the menu rows use), not
+        // menu text and not a second affordance: the `⌘K` glyph is out —
+        // this is a Ctrl-K binding on Windows, and the small-size glyph
+        // fallback (`↓` → serif "T", f_0014's family) is what the bar never
+        // risks again.
+        right = right.child(
+            div()
+                .id("palette-hint")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .aria_label("Command palette (Ctrl+K)")
+                .child(shortcut_kbd("ctrl-k", "Ctrl+K")),
+        );
 
         StatusBar::new().left(left).child(center).right(right)
     }

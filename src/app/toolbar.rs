@@ -3,7 +3,6 @@ use crate::*;
 impl AppView {
     pub(crate) fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let program_view = cx.entity();
-        let settings_view = cx.entity();
         let groups_view = cx.entity();
         let routing_view = cx.entity();
         let tools_view = cx.entity();
@@ -39,93 +38,6 @@ impl AppView {
                     .tooltip("App and single-config intake")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "menu-add-config",
-                                    "Add configuration",
-                                    "Add configuration",
-                                    "Add a proxy configuration",
-                                    Some(("ctrl-n", "(Ctrl-N)", "Ctrl-N")),
-                                )
-                            })
-                            .on_click({
-                                let view = program_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_add_dialog(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "menu-import-config",
-                                    "Import",
-                                    "Import",
-                                    "Import share links or files",
-                                    Some(("ctrl-o", "(Ctrl-O)", "Ctrl-O")),
-                                )
-                            })
-                            .on_click({
-                                let view = program_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_import_dialog(
-                                            "",
-                                            DEFAULT_GROUP,
-                                            None,
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "import-clipboard",
-                                    "From clipboard",
-                                    "From clipboard",
-                                    "Import from clipboard text",
-                                    Some(("ctrl-v", "(Ctrl-V)", "Ctrl-V")),
-                                )
-                            })
-                            .on_click({
-                                let view = program_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_import_from_clipboard(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "import-files",
-                                    "From file(s)",
-                                    "From file(s)",
-                                    "Pick config files to import (any type, 50MB each)",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = program_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.browse_for_import_files(
-                                            String::new(),
-                                            DEFAULT_GROUP.to_string(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "export-library",
@@ -172,35 +84,17 @@ impl AppView {
                     .label("Settings")
                     .accessibility_label("Settings")
                     .tooltip("Settings")
-                    .dropdown_menu(move |menu, _, _| {
-                        menu.item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "settings-dialog",
-                                    "Settings",
-                                    "Settings",
-                                    "Autostart, restore, test URL",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = settings_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_settings_dialog(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                    }),
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_settings_dialog(window, cx);
+                    })),
             )
 
             .child(
                 Button::new("groups-menu")
                     .small()
-                    .label("Manage groups…")
-                    .accessibility_label("Manage groups…")
-                    .tooltip("Subscriptions and groups")
+                    .label("Library…")
+                    .accessibility_label("Library…")
+                    .tooltip("Subscriptions, groups, and cleanup")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
@@ -413,114 +307,6 @@ impl AppView {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
-                                    "start-selected",
-                                    "Start selected",
-                                    "Start selected",
-                                    "Start the selected endpoint",
-                                    Some(("f5", "(F5)", "F5")),
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.start_selected_engine(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "stop-selected",
-                                    "Stop selected",
-                                    "Stop selected",
-                                    "Stop the selected endpoint",
-                                    Some(("shift-f5", "(Shift-F5)", "Shift-F5")),
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.stop_selected_engine(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "test-selected",
-                                    "Test selected",
-                                    "Test selected",
-                                    "Test the selected endpoint",
-                                    Some(("ctrl-t", "(Ctrl-T)", "Ctrl-T")),
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.test_selected_health(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row("menu-logs", "Logs", "Logs", "Sidecar output", None)
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_logs_dialog(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "runtime-stats",
-                                    "Runtime stats",
-                                    "Runtime stats",
-                                    "Process health on one screen",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_runtime_stats_dialog(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "traffic-stats",
-                                    "Traffic stats",
-                                    "Traffic stats",
-                                    "Per-exit traffic with period and By Profile",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_traffic_stats_dialog(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
                                     "engine-start-all",
                                     "Start all",
                                     "Start all",
@@ -575,140 +361,6 @@ impl AppView {
                                 }
                             }),
                         )
-
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "test-group",
-                                    "Test group",
-                                    "Test group",
-                                    "URL-test the focused group's running endpoints",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.test_group_health(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "speedtest-selected",
-                                    "Speedtest selected",
-                                    "Speedtest selected",
-                                    "Measure the selected endpoint's transfer rate",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.speedtest_selected(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "speedtest-group",
-                                    "Speedtest group",
-                                    "Speedtest group",
-                                    "Measure the focused group's running endpoints",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.speedtest_group(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "speedtest-mode",
-                                    "Speedtest mode",
-                                    "Speedtest mode",
-                                    "Cycle download → upload (timeout stays 5s)",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.cycle_speedtest_mode(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "out-ip-selected",
-                                    "Resolve Out-IP selected",
-                                    "Resolve Out-IP selected",
-                                    "Show the selected row's egress IP address",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.resolve_out_ip_selected(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "out-ip-group",
-                                    "Resolve Out-IP group",
-                                    "Resolve Out-IP group",
-                                    "Show the focused group's egress IP addresses",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.resolve_out_ip_group(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
-                                    "resolve-domain-group",
-                                    "Resolve domain group",
-                                    "Resolve domain group",
-                                    "Rewrite the focused group's domain servers to IPs (asks first)",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_resolve_domain_group_confirm(window, cx);
-                                    });
-                                }
-                            }),
-                        )
                         .item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
@@ -724,6 +376,78 @@ impl AppView {
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.stop_group_tests(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row("menu-logs", "Logs", "Logs", "Sidecar output", None)
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_logs_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "runtime-stats",
+                                    "Runtime stats",
+                                    "Runtime stats",
+                                    "Process health on one screen",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_runtime_stats_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "traffic-stats",
+                                    "Traffic stats",
+                                    "Traffic stats",
+                                    "Per-exit traffic with period and By Profile",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_traffic_stats_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "show-security",
+                                    "Show security",
+                                    "Show security",
+                                    "Toggle the transport-security column",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.toggle_show_security(window, cx);
                                     });
                                 }
                             }),
@@ -750,28 +474,9 @@ impl AppView {
                         .item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
-                                    "show-security",
-                                    "Show security",
-                                    "Show security",
-                                    "Toggle the transport-security column",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.toggle_show_security(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
                                     "menu-row-columns",
                                     "Row columns…",
-                                    "Row columns",
+                                    "Row columns…",
                                     "Choose which columns each library row shows",
                                     None,
                                 )

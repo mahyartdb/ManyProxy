@@ -14,43 +14,6 @@ impl AppView {
         window.push_notification(Notification::success("Copied SOCKS URL"), cx);
     }
 
-    pub(crate) fn copy_single_endpoint_url(
-        &mut self,
-        which: EndpointUrl,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(config) = self.selected_config(cx) {
-            // T-03: SOCKS has one path — the row-scoped copy.
-            if matches!(which, EndpointUrl::Socks) {
-                self.copy_row_socks(&config.id, window, cx);
-                return;
-            }
-            let (_, http) = proxy_urls(&config.bind_ip, config.port);
-            let (url, name) = match which {
-                EndpointUrl::Socks => (None, "SOCKS"),
-                EndpointUrl::Http => (Some(http), "HTTP"),
-
-                EndpointUrl::Upstream => (upstream_host_port(&config), "upstream"),
-            };
-            match url {
-                Some(url) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(url));
-                    window
-                        .push_notification(Notification::success(format!("Copied {name} URL")), cx);
-                }
-                None => {
-                    window.push_notification(
-                        Notification::info(format!("No upstream endpoint for \"{}\"", config.name)),
-                        cx,
-                    );
-                }
-            }
-        } else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-        }
-    }
-
     pub(crate) fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -74,11 +37,15 @@ impl AppView {
     /// last clean-exit save — the snapshot's own tolerance. Maximized
     /// rectangles are not persisted (out of scope): the pre-maximize windowed
     /// rect from the previous clean exit stays current.
+    ///
+    /// The value must come from `window.window_bounds()`, not
+    /// `window.bounds()`: the former is the exact inverse of the
+    /// `WindowBounds::Windowed` transform startup uses, while the live client
+    /// rect skips the frame split and walked the window up 4px per relaunch.
     pub(crate) fn save_window_geometry(&mut self, window: &Window) {
-        if !matches!(window.window_bounds(), WindowBounds::Windowed(_)) {
+        let WindowBounds::Windowed(bounds) = window.window_bounds() else {
             return;
-        }
-        let bounds = window.bounds();
+        };
         let geometry = WindowGeometry {
             x: f32::from(bounds.origin.x),
             y: f32::from(bounds.origin.y),
@@ -194,11 +161,42 @@ impl AppView {
             return None;
         }
         if import_text(text).configs.is_empty() {
-            return Some(
-                "Clipboard text is not importable — nothing imported (paste a share link, JSON, conf, or preset link)",
-            );
+            return Some("Nothing importable in clipboard");
         }
         None
+    }
+
+    /// K5: `Ctrl+V` / `From clipboard` / clipboard paste imports straight
+    /// into the current group — no blocking preview dialog when the content
+    /// parses cleanly. The ambiguous branches of the import grammar keep
+    /// their dialog (library exports keep their explicit-confirm restore —
+    /// hard rule; the bare-HTTP chooser and preset shells keep asking).
+    pub(crate) fn import_text_direct(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = Self::paste_intake_refusal(&text) {
+            window.push_notification(Notification::warning(reason), cx);
+            return;
+        }
+        let group = self
+            .current_group(cx)
+            .unwrap_or_else(|| DEFAULT_GROUP.to_string());
+        self.commit_import_dialog(text, group, None, None, None, window, cx);
+    }
+
+    pub(crate) fn import_from_clipboard_direct(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        self.import_text_direct(text, window, cx);
     }
 
     pub(crate) fn import_dropped_files(

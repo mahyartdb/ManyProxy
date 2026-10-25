@@ -1,15 +1,21 @@
 use crate::*;
 
 #[derive(Clone)]
-/// T-11 simple-rules boxes (write-once authoring sugar over the same stored
-/// rules): the rules JSON view stays the single source of truth — box text
-/// expands into the structured rules on save and round-trips nowhere.
+/// K3/T-11 simple-rules boxes (write-once authoring sugar over the same
+/// stored rules): the boxes are the whole authoring surface now — K3 removed
+/// the `Rules JSON (optional)` textarea and the grammar explainer paragraph,
+/// so the grammar lives in each box's placeholder and tooltip only. The
+/// `rules` state stays in the form because the commit and reopen paths read
+/// whatever a restored preset already carried.
 pub(crate) struct PresetForm {
     pub(crate) name: Entity<InputState>,
     pub(crate) rules: Entity<TextareaState>,
     pub(crate) simple_direct: Entity<TextareaState>,
     pub(crate) simple_block: Entity<TextareaState>,
     pub(crate) simple_proxy: Entity<TextareaState>,
+    /// K3: the single `Add remote ruleset…` URL row — the one creation path
+    /// replaces the old `Add by URL` / `New Remote` doors.
+    pub(crate) remote_url: Entity<InputState>,
 }
 
 impl PresetForm {
@@ -55,47 +61,43 @@ impl PresetForm {
                     .placeholder("ruleset:streaming, domain:netflix.com")
                     .default_value(boxes.proxy.clone())
             }),
+            remote_url: cx
+                .new(|cx| InputState::new(window, cx).placeholder("https://host.example/set.srs")),
         }
     }
 
     pub(crate) fn element(self, cx: &App) -> impl IntoElement {
         use crate::preset::SimpleRulesBox;
+        let example = |r#box: SimpleRulesBox| match r#box {
+            SimpleRulesBox::Direct => "domain:example.com, suffix:cn",
+            SimpleRulesBox::Block => "keyword:ads, processName:updater.exe",
+            SimpleRulesBox::Proxy => "ruleset:streaming, domain:netflix.com",
+        };
         let mut simple = div()
+            .id("preset-simple-rules")
+            .test_support()
             .flex()
             .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .id("preset-simple-rules")
-                    .test_support()
-                    .text_sm()
-                    .child("Simple rules"),
-            )
-            .child(
-                div()
-                    .id("preset-simple-help")
-                    .test_support()
-                    .text_sm()
-                    .child(
-                        "One rule per line: tokens domain:/suffix:/keyword:/regex:/ruleset:/ip:/processName:/processPath: separated by commas or spaces; blank and # lines are skipped. ruleset: names require a staged rule set (Rule sets section) — unstaged sets fail loud when the preset attaches and at config generation.",
-                    ),
-            );
+            .gap_1();
         for (r#box, state) in [
             (SimpleRulesBox::Direct, &self.simple_direct),
             (SimpleRulesBox::Block, &self.simple_block),
             (SimpleRulesBox::Proxy, &self.simple_proxy),
         ] {
+            let tip = format!("One rule per line — e.g. {}", example(r#box));
+            let action = r#box.action();
             simple = simple
                 .child(
                     div()
-                        .id(format!("preset-simple-label-{}", r#box.action()))
+                        .id(format!("preset-simple-label-{action}"))
                         .test_support()
                         .text_sm()
+                        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                         .child(r#box.label()),
                 )
                 .child(
                     div()
-                        .id(format!("field-preset-simple-{}", r#box.action()))
+                        .id(format!("field-preset-simple-{action}"))
                         .test_support()
                         .flex()
                         .flex_col()
@@ -133,17 +135,19 @@ impl PresetForm {
             .flex()
             .flex_col()
             .gap_2()
-            .child(dialog_field("field-preset-name", "Name", self.name))
             .child(
                 div()
-                    .id("field-preset-rules")
+                    .id("preset-new-caption")
                     .test_support()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(Label::new("Rules JSON (optional)"))
-                    .child(Textarea::new(&self.rules).h(px(120.))),
+                    .text_sm()
+                    .child("New preset"),
             )
+            .child(dialog_field("field-preset-name", "Name", self.name))
             .child(simple)
+            .child(dialog_field(
+                "field-preset-remote-url",
+                "Add remote ruleset (URL)",
+                self.remote_url,
+            ))
     }
 }

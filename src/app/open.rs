@@ -723,302 +723,6 @@ impl AppView {
         });
     }
 
-    pub(crate) fn resolve_out_ip_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
-            return;
-        };
-        if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
-            return;
-        }
-        self.resolve_out_ip_rows(vec![config], None, Some(window.window_handle()), cx);
-    }
-
-    pub(crate) fn resolve_out_ip_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.selected_config(cx) else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        };
-        if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
-            return;
-        }
-        self.resolve_out_ip_rows(vec![config], None, Some(window.window_handle()), cx);
-    }
-
-    pub(crate) fn resolve_out_ip_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
-            return;
-        };
-        let rows = self.group_running_rows(&group);
-        if rows.is_empty() {
-            window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no running endpoints to resolve"
-                )),
-                cx,
-            );
-            return;
-        }
-        if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
-            return;
-        }
-        self.resolve_out_ip_rows(
-            rows,
-            Some(format!("in group \"{group}\"")),
-            Some(window.window_handle()),
-            cx,
-        );
-    }
-
-    pub(crate) fn resolve_out_ip_rows(
-        &mut self,
-        rows: Vec<ProxyConfig>,
-        scope: Option<String>,
-        window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>,
-    ) {
-        use std::sync::atomic::Ordering;
-        if rows.is_empty() || self.group_test_in_flight {
-            return;
-        }
-        let scope = scope.unwrap_or_else(|| {
-            rows.first()
-                .map(|row| format!("of \"{}\"", row.name))
-                .unwrap_or_default()
-        });
-        self.group_test_in_flight = true;
-        self.probe_stop.store(false, Ordering::SeqCst);
-        let stop = self.probe_stop.clone();
-        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
-        let weak = cx.entity().downgrade();
-        cx.spawn(async move |_entity, cx| {
-            let (resolved, prober) = cx
-                .background_executor()
-                .spawn(async move {
-                    let prober = prober;
-                    let mut ips = Vec::new();
-                    let mut failed = Vec::new();
-                    for row in &rows {
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if prober.supports(row) {
-                            match prober.out_ip(row, &row.bind_ip, row.port, RESOLVE_IP_URL) {
-                                // T-27: keep the row association so the `out_ip`
-                                // sort key has per-row text to compare.
-                                Ok(ip) => ips.push((row.id.clone(), ip)),
-                                Err(cause) => failed.push(format!("\"{}\": {cause}", row.name)),
-                            }
-                        } else {
-                            failed.push(format!(
-                                "\"{}\": unsupported protocol for out-ip resolve",
-                                row.name
-                            ));
-                        }
-                    }
-                    ((ips, failed), prober)
-                })
-                .await;
-            cx.update(|cx| {
-                let done = weak.update(cx, |view, _| {
-                    view.prober = prober;
-                    view.group_test_in_flight = false;
-                });
-                if done.is_err() {
-                    return;
-                }
-                let Some(view) = weak.upgrade() else {
-                    return;
-                };
-                let (ips, failed) = resolved;
-                let message = out_ip_summary_toast(
-                    &scope,
-                    &ips.iter().map(|(_, ip)| ip.clone()).collect::<Vec<_>>(),
-                    &failed,
-                );
-                view.update(cx, |view, _| {
-                    for (id, ip) in &ips {
-                        view.out_ip_by_row.insert(id.clone(), ip.clone());
-                    }
-                });
-                if let Some(handle) = window {
-                    if handle
-                        .update(cx, |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.reload(window, cx);
-                                window.push_notification(Notification::success(message), cx);
-                            });
-                        })
-                        .is_ok()
-                    {
-                        return;
-                    }
-                }
-                view.update(cx, |view, cx| view.reload_quiet(cx));
-            });
-        })
-        .detach();
-    }
-
-    pub(crate) fn resolve_domain_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
-            return;
-        };
-        let Some(host) = row_server_hostname(&config.params) else {
-            window.push_notification(
-                Notification::info(format!(
-                    "\"{}\" has no domain server to resolve",
-                    config.name
-                )),
-                cx,
-            );
-            return;
-        };
-        if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
-            return;
-        }
-        self.group_test_in_flight = true;
-        let handle = window.window_handle();
-        let weak = cx.entity().downgrade();
-        let id = config.id.clone();
-        let name = config.name.clone();
-        let params = config.params.clone();
-        cx.spawn(async move |_entity, cx| {
-            let lookup = host.clone();
-            let found = cx
-                .background_executor()
-                .spawn(async move { resolve_hostname(&lookup, RESOLVE_TIMEOUT) })
-                .await;
-            cx.update(|cx| {
-                let _ = handle.update(cx, |_, window, cx| {
-                    let _ = weak.update(cx, |view, cx| {
-                        view.group_test_in_flight = false;
-                        let Some(ip) = found else {
-                            window.push_notification(
-                                Notification::warning(format!(
-                                    "Could not resolve \"{name}\" — server unchanged"
-                                )),
-                                cx,
-                            );
-                            return;
-                        };
-                        let Some(rewritten) = rewrite_server_to_ip(&params, &ip.to_string()) else {
-                            window.push_notification(
-                                Notification::warning(format!(
-                                    "\"{name}\" has no domain server to resolve"
-                                )),
-                                cx,
-                            );
-                            return;
-                        };
-                        let patch = ConfigPatch {
-                            params: Some(rewritten),
-                            ..Default::default()
-                        };
-                        match view.store.update(&id, patch) {
-                            Ok(_) => {
-                                let running = view.engine.is_running(&id);
-                                view.reload(window, cx);
-                                window.push_notification(
-                                    Notification::success(resolve_domain_row_message(
-                                        &name,
-                                        &ip.to_string(),
-                                        &host,
-                                        running,
-                                    )),
-                                    cx,
-                                );
-                            }
-                            Err(error) => {
-                                window
-                                    .push_notification(Notification::error(error.to_string()), cx);
-                            }
-                        }
-                    });
-                });
-            });
-        })
-        .detach();
-    }
-
-    pub(crate) fn open_resolve_domain_group_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
-            return;
-        };
-        let candidates: Vec<(String, String, String)> = self
-            .store
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|row| row.group == group)
-            .filter_map(|row| {
-                row_server_hostname(&row.params)
-                    .map(|host| (row.id.clone(), row.name.clone(), host))
-            })
-            .collect();
-        if candidates.is_empty() {
-            window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no domain servers to resolve"
-                )),
-                cx,
-            );
-            return;
-        }
-        let names: Vec<String> = candidates.iter().map(|(_, name, _)| name.clone()).collect();
-        let description = resolve_domain_confirm_text(&group, &names);
-        let view = cx.entity();
-        open_app_alert_dialog(window, cx, move |alert, _, _| {
-            let view = view.clone();
-            let candidates = candidates.clone();
-            let description = description.clone();
-            alert
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .ok_text("Rewrite")
-                        .ok_variant(ButtonVariant::Danger),
-                )
-                .title(format!("Resolve domains in group \"{group}\"?"))
-                .description(description)
-                .on_ok(move |_, window, cx| {
-                    let candidates = candidates.clone();
-                    view.update(cx, |view, cx| {
-                        view.commit_resolve_domain_group(&candidates, window, cx)
-                    });
-                    true
-                })
-        });
-    }
-
     pub(crate) fn open_prune_confirm(
         &mut self,
         kind: GroupPruneKind,
@@ -1578,65 +1282,6 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_advanced_dialog(
-        &mut self,
-        form: &ConfigForm,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let view = cx.entity();
-        let adv_view = view.clone();
-        let repaint_view = view.clone();
-        let adv_form = form.clone();
-        open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
-            let repaint: DialogRepaint = Rc::new({
-                let repaint_view = repaint_view.clone();
-                move |_window, cx| {
-                    repaint_view.update(cx, |_, cx| cx.notify());
-                }
-            });
-            let body_view = adv_view.clone();
-            let protocol = adv_form.protocol_text(cx);
-            let mut body = div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .id("advanced-dialog")
-                .test_support();
-            if has_dial_panel(&protocol) {
-                body = body.child(adv_form.s4_section(&body_view, &repaint, cx));
-            }
-            if tls_panel_plan(&protocol).is_some() {
-                body = body.child(adv_form.s2_extras_section(&repaint));
-            }
-
-            let back = Rc::new(|window: &mut Window, cx: &mut App| {
-                window.close_dialog(cx);
-                reclaim_shell_focus(window, cx);
-            });
-            let back_key = back.clone();
-            dialog
-                .title("Advanced Settings")
-                .child(body)
-                .button_props(DialogButtonProps::default().show_cancel(false).on_ok(
-                    move |_, window, cx| {
-                        back_key(window, cx);
-                        false
-                    },
-                ))
-                .footer(
-                    DialogFooter::new().child(
-                        Button::new("advanced-dialog-back")
-                            .small()
-                            .label("Back")
-                            .tooltip("Back to the main form — edits already apply")
-                            .accessibility_label("Back to the main form")
-                            .on_click(move |_, window, cx| back(window, cx)),
-                    ),
-                )
-        });
-    }
-
     pub(crate) fn open_row_columns_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let live: Rc<RefCell<RowColumns>> = Rc::new(RefCell::new(self.row_columns));
         let view = cx.entity();
@@ -1921,38 +1566,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.store.skip_delete_confirm() {
-            self.commit_remove(&config.id, window, cx);
-            return;
-        }
-        let view = cx.entity();
-        let id = config.id.clone();
-        let name = config.name.clone();
-
-        let description = if self.engine.is_running(&config.id) {
-            delete_running_confirm_text(&name)
-        } else {
-            delete_confirm_text(&name)
-        };
-        open_app_alert_dialog(window, cx, move |alert, _, _| {
-            let view = view.clone();
-            let id = id.clone();
-            let description = description.clone();
-            alert
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .ok_text("Delete")
-                        .ok_variant(ButtonVariant::Danger),
-                )
-                .title("Remove configuration")
-                .description(description)
-                .on_ok(move |_, window, cx| {
-                    view.update(cx, |view, cx| view.commit_remove(&id, window, cx));
-                    true
-                })
-        });
+        // K5: deletion is immediate — no blocking confirm for a single row.
+        // The undo toast (commit_remove) is the safety net; the rows stay in
+        // memory for its lifetime and vanish with it. K17 ruling: the bulk
+        // More ▾ path is immediate too (spec line 91) — same pipeline.
+        self.commit_remove(&config.id, window, cx);
     }
 
     pub(crate) fn open_usage_reset_confirm(
@@ -2060,6 +1678,9 @@ impl AppView {
                 .child(
                     Button::new("import-dialog-ok")
                         .small()
+                        // K17/A7-10: the named commit is a primary action —
+                        // accent-filled like the other dialog footers.
+                        .primary()
                         .label(if in_flight {
                             "Importing…"
                         } else {
@@ -2094,16 +1715,9 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .unwrap_or_default();
-        match Self::paste_intake_refusal(&text) {
-            None => self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx),
-            Some(reason) => {
-                window.push_notification(Notification::warning(reason), cx);
-            }
-        }
+        // K5: the clipboard paste imports directly into the current group;
+        // ambiguous grammar keeps its dialog inside import_text_direct.
+        self.import_from_clipboard_direct(window, cx);
     }
 
     pub(crate) fn open_bare_url_chooser(
@@ -2216,142 +1830,6 @@ impl AppView {
         window.close_sheet(cx);
         self.open_subscriptions_dialog_restored(&label, &url, &group, auto, interval, window, cx);
         reclaim_shell_focus(window, cx);
-    }
-
-    pub(crate) fn open_preset_structured_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Preset name"));
-        let action_cell = Rc::new(RefCell::new("direct".to_string()));
-        let view = cx.entity();
-        let name_reader = name_state.clone();
-        let action_reader = action_cell.clone();
-        let commit_view = view.clone();
-        let commit: DialogCommit = Rc::new(move |window, cx| {
-            let name = name_reader.read(cx).value().to_string();
-            let action = action_reader.borrow().clone();
-            commit_view.update(cx, |view, cx| {
-                view.commit_preset_create_structured(name, action, window, cx)
-            })
-        });
-        let commit_key = commit.clone();
-        open_app_dialog(window, cx, move |dialog: Dialog, _, _cx| {
-            let commit_key = commit_key.clone();
-            let commit_click = commit.clone();
-            let cell = action_cell.clone();
-            let current = cell.borrow().clone();
-            let selected = ["direct", "proxy", "block"]
-                .iter()
-                .position(|value| *value == current);
-            dialog
-                .title("New structured preset")
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(dialog_field(
-                            "field-structured-preset-name",
-                            "Name",
-                            name_state.clone(),
-                        ))
-                        .child(
-                            div()
-                                .id("field-structured-preset-action")
-                                .test_support()
-                                .child({
-                                    let mut group =
-                                        RadioGroup::horizontal("structured-preset-action-options")
-                                            .selected_index(selected)
-                                            .on_change(move |ix, _, _| {
-                                                let actions = ["direct", "proxy", "block"];
-                                                if let Some(action) = actions.get(*ix) {
-                                                    *cell.borrow_mut() = action.to_string();
-                                                }
-                                            });
-                                    for label in ["Direct", "Proxy", "Block"] {
-                                        group = group.child(
-                                            Radio::new(label)
-                                                .label(label.to_string())
-                                                .tooltip(format!("Catch-all rule: {label}")),
-                                        );
-                                    }
-                                    group
-                                }),
-                        ),
-                )
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
-                .footer(dialog_footer(
-                    "structured-preset-ok",
-                    "structured-preset-cancel",
-                    footer_commit_label("presets"),
-                    commit_click,
-                ))
-        });
-    }
-
-    pub(crate) fn open_preset_remote_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Preset name"));
-        let url_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/preset.json"));
-        let view = cx.entity();
-        let name_reader = name_state.clone();
-        let url_reader = url_state.clone();
-        let commit_view = view.clone();
-        let commit: DialogCommit = Rc::new(move |window, cx| {
-            let name = name_reader.read(cx).value().to_string();
-            let url = url_reader.read(cx).value().to_string();
-            if name.trim().is_empty() && url.trim().is_empty() {
-                return true;
-            }
-            commit_view.update(cx, |view, cx| {
-                view.commit_preset_create_remote(name, url, window, cx)
-            })
-        });
-        let commit_key = commit.clone();
-        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
-            let commit_key = commit_key.clone();
-            let commit_click = commit.clone();
-            dialog
-                .title("New remote preset")
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(dialog_field(
-                            "field-remote-preset-name",
-                            "Name",
-                            name_state.clone(),
-                        ))
-                        .child(dialog_field(
-                            "field-remote-preset-url",
-                            "Preset URL",
-                            url_state.clone(),
-                        )),
-                )
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
-                .footer(dialog_footer(
-                    "remote-preset-ok",
-                    "remote-preset-cancel",
-                    footer_commit_label("presets"),
-                    commit_click,
-                ))
-        });
     }
 
     pub(crate) fn open_preset_edit_dialog(
@@ -2761,7 +2239,12 @@ impl AppView {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
             let boxes = SimpleRuleBoxes::from_form(&reader, cx);
-            if name.trim().is_empty() && rules.trim().is_empty() && boxes.is_empty() {
+            let remote_url = reader.remote_url.read(cx).value().trim().to_string();
+            if name.trim().is_empty()
+                && rules.trim().is_empty()
+                && boxes.is_empty()
+                && remote_url.is_empty()
+            {
                 return true;
             }
             commit_view.update(cx, |view, cx| {
@@ -2839,37 +2322,6 @@ impl AppView {
                 );
             }
 
-            {
-                let structured_view = view_for_rows.clone();
-                let remote_view = view_for_rows.clone();
-                body = body.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            Button::new("preset-new-structured")
-                                .label("New Structured")
-                                .tooltip("Name + Direct|Proxy|Block catch-all rule")
-                                .on_click(move |_, window, cx| {
-                                    structured_view.update(cx, |view, cx| {
-                                        view.open_preset_structured_dialog(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("preset-new-remote")
-                                .label("New Remote")
-                                .tooltip("Name + preset URL (explicit fetch fills the rules)")
-                                .on_click(move |_, window, cx| {
-                                    remote_view.update(cx, |view, cx| {
-                                        view.open_preset_remote_dialog(window, cx);
-                                    });
-                                }),
-                        ),
-                );
-            }
             body = body.child(form.clone().element(cx));
             dialog
                 .title("Routing presets")

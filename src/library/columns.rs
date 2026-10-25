@@ -107,16 +107,8 @@ pub(crate) fn sort_header_cell(
     view: Entity<AppView>,
     cx: &App,
 ) -> AnyElement {
-    let active = sort_header_keys(column).contains(&sort.key);
-    let marker = if active {
-        match sort.key {
-            LibrarySortKey::TypeSecurity => " ·",
-            _ if sort.direction == SortDirection::Descending => " ↓",
-            _ => " ↑",
-        }
-    } else {
-        ""
-    };
+    let active = sort.key != LibrarySortKey::None && sort_header_keys(column).contains(&sort.key);
+    let marker = if active { sort_header_marker(sort) } else { "" };
     let tip = if active {
         format!(
             "{label} — sorted by {} ({}) — right-click to change",
@@ -139,7 +131,10 @@ pub(crate) fn sort_header_cell(
         } else {
             cx.theme().muted_foreground
         })
-        .aria_label(tip)
+        // K12/A5-1: the accessible name mirrors the visible text (label plus
+        // the word marker), so the header can never read as `Health 1` to a
+        // screen reader or a UI test. The longer grammar lives in the tooltip.
+        .aria_label(format!("{label}{marker}"))
         .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tooltip_text.clone())).into())
         .child(format!("{label}{marker}"))
         .context_menu(move |menu, _, _| AppView::sort_header_menu(menu, column, sort, &view))

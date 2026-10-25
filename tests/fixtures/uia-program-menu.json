@@ -1,1 +1,1 @@
-{"items":[{"id":"menu-add-config","name":"Add configuration","role":"MenuItem"},{"id":"menu-import-config","name":"Import","role":"MenuItem"},{"id":"import-clipboard","name":"From clipboard","role":"MenuItem"},{"id":"import-files","name":"From file(s)","role":"MenuItem"},{"id":"export-library","name":"Export","role":"MenuItem"},{"id":"about-dialog","name":"About","role":"MenuItem"}],"menu":"program-menu"}
+{"items":[{"id":"export-library","name":"Export","role":"MenuItem"},{"id":"about-dialog","name":"About","role":"MenuItem"}],"menu":"program-menu"}

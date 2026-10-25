@@ -14,8 +14,9 @@ use crate::*;
 pub(crate) struct RowMetrics {
     /// The occupancy lamp and the checkbox share this fixed leading cell.
     pub(crate) lamp_check: f32,
-    /// The numeral check chip's slot. It is always reserved, so a checked
-    /// row never shifts its name out of the header's alignment.
+    /// The reserved slot after the lamp/checkbox cell. K4 removed the numeral
+    /// chip, but the slot stays reserved so the column grid (and the header
+    /// strip that mirrors it) never shifts.
     pub(crate) check_slot: f32,
     /// The name column's minimum width; it flexes into the leftover space.
     pub(crate) name_min: f32,
@@ -46,9 +47,8 @@ impl RowMetrics {
     pub(crate) const CARD_GAP: f32 = 1.;
 
     pub(crate) const LAMP_CHECK: f32 = 28.;
-    /// The chip shows the checked position; three digits need ~31px with
-    /// `px_1` + a 1px border, so the slot is 32. It stays reserved whether or
-    /// not a row is checked.
+    /// The empty slot keeps the name column aligned with the header strip.
+    /// The constant is geometry, not a chip width, since K4 dropped numerals.
     pub(crate) const CHECK_SLOT: f32 = 32.;
     pub(crate) const NAME_MIN: f32 = 160.;
     pub(crate) const GROUP: f32 = 100.;

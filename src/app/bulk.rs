@@ -1,5 +1,38 @@
 use crate::*;
 
+/// K4/A3-2: one menu row for the bulk bar's overflow. The row carries its own
+/// stable id so the menu contents are provable in the completed frame; Delete
+/// is the only danger row. K17 ruling (spec line 91): pressing it deletes at
+/// once — no blocking confirm — and the Undo toast is the safety net.
+fn bulk_menu_item(
+    id: &'static str,
+    label: &'static str,
+    danger: bool,
+    view: Entity<AppView>,
+    act: impl Fn(&mut AppView, &mut Window, &mut Context<AppView>) + 'static,
+) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        let row = div()
+            .id(id)
+            .test_support()
+            .role(Role::MenuItem)
+            .aria_label(label)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(label);
+        if danger {
+            row.text_color(cx.theme().danger)
+        } else {
+            row
+        }
+    })
+    .on_click(move |_, window, cx| {
+        view.update(cx, |view, cx| act(view, window, cx));
+    })
+}
+
 impl AppView {
     pub(crate) fn render_bulk_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.libraries.read(cx).delegate().bulk_label();
@@ -7,18 +40,23 @@ impl AppView {
             return div().id("bulk-bar").test_support().into_any_element();
         }
 
+        let more_view = cx.entity();
+
         Self::motion_enter(
             div()
                 .id("bulk-bar")
                 .test_support()
                 .flex()
                 .flex_row()
-
-                .flex_wrap()
+                // K4/A3-2: the bar is ONE line. The five secondary verbs moved
+                // behind More, so Start/Stop/More never wrap and never run
+                // under the inspector drawer at the 880px minimum width.
+                .flex_nowrap()
                 .items_center()
                 .gap_2()
                 .px_2()
                 .py_1()
+                .min_w_0()
                 .bg(cx.theme().group_box)
                 .border_b_1()
                 .border_color(cx.theme().border)
@@ -26,40 +64,21 @@ impl AppView {
                     div()
                         .id("bulk-label")
                         .test_support()
+                        .flex_shrink_0()
                         .tooltip(|_, cx| {
                             cx.new(|_| {
                                 Tooltip::new(
-                                    "Blue wash = selected (F5). Blue rim + number = checked (bulk).",
+                                    "Blue wash = selected (F5). Blue bar + filled checkbox = checked (bulk).",
                                 )
                             })
                             .into()
                         })
                         .child(label),
                 )
-
-                .child(
-                    Button::new("bulk-select-visible")
-                        .small()
-                        .label("Check all visible")
-                        .tooltip("Check every visible row")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.select_visible_checked(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-clear")
-                        .small()
-                        .label("Uncheck all")
-                        .tooltip("Uncheck all (Esc)")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.clear_checked(window, cx);
-                        })),
-                )
-                .child(Separator::vertical())
                 .child(
                     Button::new("bulk-start")
                         .small()
-                        .label("Start checked")
+                        .label("Start")
                         .tooltip("Start every checked endpoint")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_start(window, cx);
@@ -68,60 +87,72 @@ impl AppView {
                 .child(
                     Button::new("bulk-stop")
                         .small()
-                        .label("Stop checked")
+                        .label("Stop")
                         .tooltip("Stop every checked endpoint")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_stop(window, cx);
                         })),
                 )
-                .child(Separator::vertical())
                 .child(
-                    Button::new("bulk-enable")
+                    Button::new("bulk-more")
                         .small()
-                        .label("Enable")
-                        .tooltip("Enable every checked row")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.commit_bulk_enable(true, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-disable")
-                        .small()
-                        .label("Disable")
-                        .tooltip("Disable every checked row")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.commit_bulk_enable(false, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-move")
-                        .small()
-                        .label("Move to group")
-                        .tooltip("Move every checked row")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.open_bulk_move_dialog(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-copy")
-                        .small()
-                        .label("Copy proxies")
-                        .tooltip("Copy the running endpoints as name + URL")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.commit_bulk_copy_proxies(window, cx);
-                        })),
-                )
-
-                .child(Separator::vertical())
-                .child(
-                    Button::new("bulk-delete")
-                        .danger()
-                        .small()
-                        .label("Delete")
-                        .tooltip("Delete every checked row")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.open_bulk_delete_confirm(window, cx);
-                        })),
+                        .label("More")
+                        .dropdown_caret(true)
+                        .accessibility_label("More bulk actions")
+                        .tooltip("Enable, disable, move, copy, or delete the checked rows")
+                        .dropdown_menu(move |menu, _, _| {
+                            menu.item(bulk_menu_item(
+                                "bulk-more-select-visible",
+                                "Check all visible",
+                                false,
+                                more_view.clone(),
+                                |view, window, cx| view.select_visible_checked(window, cx),
+                            ))
+                            .item(bulk_menu_item(
+                                "bulk-more-clear",
+                                "Uncheck all",
+                                false,
+                                more_view.clone(),
+                                |view, window, cx| view.clear_checked(window, cx),
+                            ))
+                            .separator()
+                            .item(bulk_menu_item(
+                                "bulk-more-enable",
+                                "Enable",
+                                false,
+                                more_view.clone(),
+                                |view, window, cx| view.commit_bulk_enable(true, window, cx),
+                            ))
+                            .item(bulk_menu_item(
+                                "bulk-more-disable",
+                                "Disable",
+                                false,
+                                more_view.clone(),
+                                |view, window, cx| view.commit_bulk_enable(false, window, cx),
+                            ))
+                            .item(bulk_menu_item(
+                                "bulk-more-move",
+                                "Move to group",
+                                false,
+                                more_view.clone(),
+                                |view, window, cx| view.open_bulk_move_dialog(window, cx),
+                            ))
+                            .item(bulk_menu_item(
+                                "bulk-more-copy",
+                                "Copy proxies",
+                                false,
+                                more_view.clone(),
+                                |view, window, cx| view.commit_bulk_copy_proxies(window, cx),
+                            ))
+                            .separator()
+                            .item(bulk_menu_item(
+                                "bulk-more-delete",
+                                "Delete",
+                                true,
+                                more_view.clone(),
+                                |view, window, cx| view.bulk_delete_checked(window, cx),
+                            ))
+                        }),
                 )
                 .into_any_element(),
             "bulk-bar-enter",
@@ -536,45 +567,20 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_bulk_delete_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// K17 ruling (spec line 91): bulk More ▾ Delete is immediate — the
+    /// blocking confirm is gone, and the K5 delete→undo pipeline is the only
+    /// safety net (same stash, one batched Undo toast).
+    pub(crate) fn bulk_delete_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.libraries.read(cx).delegate().checked_rows();
         if rows.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         }
-        let view = cx.entity();
         let targets: Vec<(String, String)> = rows
             .iter()
             .map(|row| (row.id.clone(), row.name.clone()))
             .collect();
-
-        if self.store.skip_delete_confirm() {
-            view.update(cx, |view, cx| view.commit_bulk_delete(&targets, window, cx));
-            return;
-        }
-        let names: Vec<String> = targets.iter().map(|(_, name)| name.clone()).collect();
-        let count = targets.len();
-        let description = bulk_delete_confirm_description(count, &names);
-        open_app_alert_dialog(window, cx, move |alert, _, _| {
-            let view = view.clone();
-            let targets = targets.clone();
-            let description = description.clone();
-            alert
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .ok_text("Delete")
-                        .ok_variant(ButtonVariant::Danger),
-                )
-                .title(format!("Delete {count} configurations?"))
-                .description(description)
-                .on_ok(move |_, window, cx| {
-                    let targets = targets.clone();
-                    view.update(cx, |view, cx| view.commit_bulk_delete(&targets, window, cx));
-                    true
-                })
-        });
+        self.commit_bulk_delete(&targets, window, cx);
     }
 
     pub(crate) fn commit_bulk_delete(
@@ -584,6 +590,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let mut removed: Vec<String> = Vec::new();
+        let mut undo_rows: Vec<ProxyConfig> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for (id, name) in targets {
             let (was_active, stop_error) = self.engine.stop_one_result(id);
@@ -591,8 +598,18 @@ impl AppView {
                 failed.push(name.clone());
                 continue;
             }
+            // K17: the whole row is captured BEFORE removal — one batch key
+            // covers the whole checked set through the same stash the
+            // single-row delete uses, so expiry stays permanent and Undo
+            // restores names + groups at once.
+            let captured = self.store.get(id).ok().flatten();
             match self.store.remove(id) {
-                Ok(true) => removed.push(name.clone()),
+                Ok(true) => {
+                    removed.push(name.clone());
+                    if let Some(row) = captured {
+                        undo_rows.push(row);
+                    }
+                }
                 _ => failed.push(name.clone()),
             }
         }
@@ -607,13 +624,14 @@ impl AppView {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         }
-        let text = bulk_delete_result_message(&removed, &failed);
-        if failed.is_empty() {
-            window.push_notification(Notification::success(text), cx);
-        } else if removed.is_empty() {
-            window.push_notification(Notification::error(text), cx);
+        let note = bulk_delete_note(&removed, &failed);
+        if removed.is_empty() {
+            // Nothing was removed: an honest outcome, nothing to undo.
+            window.push_notification(note, cx);
         } else {
-            window.push_notification(Notification::warning(text), cx);
+            let batch = next_undo_batch_id();
+            stash_undo_rows(undo_rows, batch);
+            self.push_delete_undo_toast(batch, note, window, cx);
         }
     }
 
