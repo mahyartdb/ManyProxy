@@ -1044,7 +1044,7 @@ pins from the official upstream URLs below:
 | Engine (file in the ZIP) | Upstream project | Version pinned | License | License text in this bundle |
 | ------------------------ | ---------------- | -------------- | ------- | -------------------------- |
 | `sing-box.exe` | SagerNet/sing-box | `1.14.2` (same pin as `.github/workflows/live.yml`) | GNU GPL v3 or later (GPL-3.0-or-later) | `licenses/GPL-3.0.txt` |
-| `sing-box-awg.exe` | Leadaxe/sing-box-lx (sing-box fork adding AmneziaWG 2.0/3.x + XHTTP; named in `.planning/research/02-amnezia-xray.md`) | `1.14.3-lx.21` | GNU GPL v3 or later (the fork keeps sing-box's LICENSE) | `licenses/GPL-3.0.txt` |
+| `sing-box-awg.exe` | Leadaxe/sing-box-lx (sing-box fork adding AmneziaWG 2.0/3.x + XHTTP) | `1.14.3-lx.21` | GNU GPL v3 or later (the fork keeps sing-box's LICENSE) | `licenses/GPL-3.0.txt` |
 | `xray.exe` | XTLS/Xray-core | `26.3.27` | Mozilla Public License 2.0 (MPL-2.0) | `licenses/MPL-2.0.txt` |
 
 Per-engine detail — exact upstream source, release asset, and license URL:

@@ -14,10 +14,10 @@ changed.
 ## Supported platform
 
 - **Windows 10/11, x64 (windows-amd64)** — the only supported target today.
-- `windows-arm64` is drafted behind a gated release row (ticket T-04); it is not
-  supported yet.
-- Linux and macOS are tracked as an aspiration only (`EPIC-linux-macos-port.md`),
-  not supported.
+- `windows-arm64` is drafted behind a gated release row (see
+  `.github/workflows/release.yml`); it is not supported yet.
+- Linux and macOS are tracked as an aspiration only (issue
+  [#6](https://github.com/mahyartdb/ManyProxy/issues/6)), not supported.
 
 There is no web, mobile, or CLI edition — only the native desktop app.
 

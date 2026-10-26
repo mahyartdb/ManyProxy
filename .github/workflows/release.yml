@@ -17,8 +17,8 @@ name: release
 #   cross-link. SagerNet publishes no checksum asset for that release, so the
 #   identity check is the binary reporting the pinned version (the same
 #   check live.yml performs).
-# - sing-box-awg (AmneziaWG+XHTTP fork — research: .planning/research/
-#   02-amnezia-xray.md) — the fork's own release page is the upstream for
+# - sing-box-awg (AmneziaWG+XHTTP fork) - the fork's own release page is the
+#   upstream for
 #   this binary: Leadaxe/sing-box-lx, tag v1.14.3-lx.21, asset
 #   sing-box-1.14.3-lx.21-windows-amd64.zip, which the SAME release covers
 #   with a SHA256SUMS manifest (verified at ticket time: the windows-amd64

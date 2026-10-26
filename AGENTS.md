@@ -64,11 +64,15 @@ Most code changes do not need an internal documentation change. Agents can read 
 - Keep user docs in the shipped product's voice, without implementation details or contributor tooling. Update the relevant feature section when how to use it changes. A UI tweak does not need a documentation entry, and a new control does not need its own page.
 - `docs/operations/` holds maintainer setup, release, and debugging procedures. Keep instructions for operating an installed Manyproxy server in the user guides.
 
-## Plans and work artifacts
+## Work artifacts: the board lifecycle
 
-- Do not commit implementation plans, research notes, or agent scratch files. Keep temporary working material outside the worktree. `.plans/` is gitignored only as a safety net for legacy tooling.
-- Track active maintainer work in the GitHub issue or project item that owns it. External proposals follow `CONTRIBUTING.md` and belong in Ideas discussions.
-- A merged PR is the implementation record. Close or update its tracking item when the work lands; do not preserve a second checklist in the repository.
+Boards, plans, and progress checklists exist while work is in flight and are consumed when it lands. They are working material, not records.
+
+- **In flight.** A ticket board, hunt report, or checklist may sit in the worktree and stay dirty. Never build durable structure on it, never track it.
+- **Landing.** The commit that lands the work records the outcome in `CHANGELOG.md` (Keep a Changelog). User-visible changes go in verbatim; engineering-only outcomes get one line. Decisions that outlive the work move to `PRODUCT.md` (ratified never-builds, parked candidates, future epics) or `docs/internals/` (architectural why). Open work moves to the GitHub issue tracker.
+- **Consumed.** The board files are deleted in the same landing commit, and git history keeps their full text. Never commit `.planning/`, `.scratch/`, `.plans/`, `.impeccable/`, research notes, or consumed ticket files. Keep temporary working material outside the worktree; `.plans/` is a gitignored safety net only.
+
+A landed outcome that leaves its board behind is not landed.
 
 ## How it works
 
