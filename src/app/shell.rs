@@ -128,14 +128,6 @@ impl AppView {
                 view.set_inspector_tab(InspectorTab::Health);
                 cx.notify();
             }))
-            .on_action(cx.listener(|view, _: &InspectorPresets, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.set_inspector_tab(InspectorTab::Presets);
-                cx.notify();
-            }))
             .on_action(cx.listener(|view, _: &InspectorLogs, window, cx| {
                 if overlay_open(window, cx) {
                     refuse_shortcut_under_overlay(window, cx);

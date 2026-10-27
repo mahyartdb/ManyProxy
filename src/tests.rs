@@ -16077,7 +16077,6 @@ fn palette_op_at_covers_both_groups() {
         PaletteOp::ClearChecked,
         PaletteOp::DetailsTab,
         PaletteOp::HealthTab,
-        PaletteOp::PresetsTab,
         PaletteOp::ImportClipboard,
         PaletteOp::ExportLibrary,
     ];
@@ -16141,6 +16140,63 @@ fn command_palette_opens_and_runs_add(cx: &mut TestAppContext) {
         "Add op opens the Add dialog"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
+}
+
+/// F8: the palette stopped advertising commands the app does not run. The
+/// "Show Presets tab" row is gone and "Clear selection" (which cleared
+/// checkboxes) is "Clear checked". The filter reads labels AND keywords, so
+/// the query counts below are the label truth, not a snapshot of pixels.
+#[gpui_kit::test]
+fn f08_palette_rows_stop_lying(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_palette(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let state = view.read_with(cx, |view, _| view.palette.clone().expect("palette state"));
+    let matched = |cx: &mut VisualTestContext, query: &str| -> usize {
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_query(query, window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        state.read_with(cx, |state, _| state.matched_count())
+    };
+
+    assert_eq!(
+        matched(cx, "presets"),
+        1,
+        "only Routing presets matches: the Show Presets tab row is gone"
+    );
+    assert_eq!(
+        matched(cx, "selection"),
+        0,
+        "no row says 'selection' any more"
+    );
+    assert_eq!(
+        matched(cx, "checked"),
+        1,
+        "the renamed row matches on its label"
+    );
+    assert_eq!(
+        matched(cx, "uncheck"),
+        1,
+        "the rename's keyword resolves too"
+    );
+    assert_eq!(
+        matched(cx, "escape"),
+        1,
+        "the Esc binding keyword still finds the row"
+    );
+    // The surviving row is the ClearChecked op, at its renumbered path.
+    assert_eq!(
+        crate::AppView::palette_op_at(gpui_kit::component::IndexPath::new(9).section(0)),
+        Some(crate::PaletteOp::ClearChecked),
+        "Clear checked stays on the op it names"
+    );
 }
 
 #[gpui_kit::test]
@@ -16270,7 +16326,7 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.run_palette_op(IndexPath::new(14).section(0), window, cx)
+            view.run_palette_op(IndexPath::new(13).section(0), window, cx)
         });
     });
     cx.run_until_parked();
@@ -16286,7 +16342,7 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
     let before = notification_count(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.run_palette_op(IndexPath::new(13).section(0), window, cx)
+            view.run_palette_op(IndexPath::new(12).section(0), window, cx)
         });
     });
     cx.run_until_parked();
@@ -16690,11 +16746,6 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
     for (tab, name) in [
         (crate::InspectorTab::Details, "Details"),
         (crate::InspectorTab::Health, "Health"),
-        // Legacy Ctrl-3 value: no pane of its own, renders Details.
-        (
-            crate::InspectorTab::Presets,
-            "Presets (legacy, renders Details)",
-        ),
         (crate::InspectorTab::Logs, "Logs"),
         (crate::InspectorTab::Connections, "Connections"),
         (crate::InspectorTab::Traffic, "Traffic"),
@@ -17522,7 +17573,6 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
                 }
             }
             crate::InspectorTab::Health
-            | crate::InspectorTab::Presets
             | crate::InspectorTab::Logs
             | crate::InspectorTab::Connections
             | crate::InspectorTab::Traffic => {
@@ -17550,10 +17600,6 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
                     "config-history renders on the Health pane"
                 );
             }
-            crate::InspectorTab::Presets => {
-                // Legacy Ctrl-3 target: it has no pane of its own any more.
-                assert_painted(cx, "config-usage");
-            }
             crate::InspectorTab::Logs => {
                 assert_painted(cx, "config-logs");
             }
@@ -17565,19 +17611,6 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
             }
         }
     }
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, _| {
-            view.set_inspector_tab(crate::InspectorTab::Presets);
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    // K1: the legacy Ctrl-3 Presets target has no pane of its own — it lands
-    // on Details (the usage module), never on a Presets panel.
-    assert_painted(cx, "config-usage");
 }
 
 #[gpui_kit::test]
@@ -19634,9 +19667,9 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
     );
     press(cx, "ctrl-3");
     assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab.index()),
-        crate::InspectorTab::Details.index(),
-        "Ctrl-3 keeps its legacy binding but lands on Details (no Presets pane)"
+        view.read_with(cx, |view, _| view.inspector_tab),
+        crate::InspectorTab::Details,
+        "Ctrl-3 lands on Details (there is no Presets pane)"
     );
     press(cx, "ctrl-4");
     assert_eq!(
@@ -22272,7 +22305,6 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
 
     assert_eq!(crate::InspectorTab::Details.a11y_label(), "Details");
     assert_eq!(crate::InspectorTab::Health.a11y_label(), "Health");
-    assert_eq!(crate::InspectorTab::Presets.a11y_label(), "Presets");
     assert_eq!(crate::InspectorTab::Logs.a11y_label(), "Logs");
     assert_eq!(crate::InspectorTab::Connections.a11y_label(), "Connections");
     assert_eq!(crate::InspectorTab::Traffic.a11y_label(), "Traffic");
@@ -22395,9 +22427,9 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
     );
     press(cx, "ctrl-3");
     assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab.index()),
-        crate::InspectorTab::Details.index(),
-        "Ctrl-3 keeps its legacy binding but lands on Details (no Presets pane)"
+        view.read_with(cx, |view, _| view.inspector_tab),
+        crate::InspectorTab::Details,
+        "Ctrl-3 lands on Details (there is no Presets pane)"
     );
     press(cx, "ctrl-4");
     assert_eq!(
@@ -28563,7 +28595,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Focus search", "Ctrl-F"),
         ("Inspector details", "Ctrl-1"),
         ("Inspector health", "Ctrl-2"),
-        ("Inspector presets", "Ctrl-3"),
+        ("Inspector details", "Ctrl-3"),
         ("Inspector logs", "Ctrl-4"),
         ("Inspector connections", "Ctrl-5"),
         ("Inspector traffic", "Ctrl-6"),

@@ -247,9 +247,9 @@ impl AppView {
                                 self.render_inspector_health(cx, config).into_any_element()
                             }
                             InspectorTab::Logs => self.render_inspector_logs(cx).into_any_element(),
-                            // Details and the legacy Ctrl-3 Presets target share
-                            // the Details pane — presets live in Routing now.
-                            _ => self.render_inspector_details(cx, config).into_any_element(),
+                            InspectorTab::Details => {
+                                self.render_inspector_details(cx, config).into_any_element()
+                            }
                         },
                         format!("inspector-pane-enter-{}", self.inspector_tab.index()),
                         cx,
@@ -1696,9 +1696,9 @@ impl AppView {
 
 impl AppView {
     /// K1/A4-1: ONE segmented switcher — Details · Health · Logs ·
-    /// Connections · Traffic, one row. Presets has no tab of its home here
-    /// (Routing is its home); the legacy Ctrl-3 target lands on Details. The
-    /// Ctrl-1…5 keys live in Settings → Shortcuts, not on the tab labels.
+    /// Connections · Traffic, one row. Presets has no tab of its own here
+    /// (Routing is its home). The Ctrl-1…5 keys live in Settings → Shortcuts,
+    /// not on the tab labels.
     pub(crate) fn render_inspector_tabs(
         &self,
         window: &mut Window,

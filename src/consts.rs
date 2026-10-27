@@ -28,7 +28,7 @@ pub(crate) const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Focus search", "Ctrl-F"),
     ("Inspector details", "Ctrl-1"),
     ("Inspector health", "Ctrl-2"),
-    ("Inspector presets", "Ctrl-3"),
+    ("Inspector details", "Ctrl-3"),
     ("Inspector logs", "Ctrl-4"),
     ("Inspector connections", "Ctrl-5"),
     ("Inspector traffic", "Ctrl-6"),

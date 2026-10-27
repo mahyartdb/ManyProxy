@@ -160,7 +160,6 @@ actions!(
         FocusSearch,
         InspectorDetails,
         InspectorHealth,
-        InspectorPresets,
         InspectorLogs,
         InspectorConnections,
         InspectorTraffic,

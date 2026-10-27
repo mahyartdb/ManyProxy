@@ -18,6 +18,7 @@ impl AppView {
 
         let running = self.engine.running_count();
         let busy = self.start_in_flight;
+        let show_security = self.libraries.read(cx).delegate().show_security;
         let (glyph, name) = global_toggle_present(running, busy);
         let toggle_tip = if busy {
             "Starting every endpoint…"
@@ -452,6 +453,7 @@ impl AppView {
                                     None,
                                 )
                             })
+                            .checked(show_security)
                             .on_click({
                                 let view = tools_view.clone();
                                 move |_, window, cx| {

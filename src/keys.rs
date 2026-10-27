@@ -2,9 +2,9 @@ use gpui_kit::*;
 
 use crate::{
     AddConfig, ClearChecked, CopyUrls, DeleteSelected, EditSelected, FocusSearch, ImportConfigs,
-    InspectorConnections, InspectorDetails, InspectorHealth, InspectorLogs, InspectorPresets,
-    InspectorTraffic, OpenPalette, PasteImport, StartSelected, StopSelected, StopTesting,
-    TestSelected, UpdateCurrentGroup,
+    InspectorConnections, InspectorDetails, InspectorHealth, InspectorLogs, InspectorTraffic,
+    OpenPalette, PasteImport, StartSelected, StopSelected, StopTesting, TestSelected,
+    UpdateCurrentGroup,
 };
 
 pub(crate) const APP_KEY_CONTEXT: &str = "manyproxy-library";
@@ -22,7 +22,7 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("ctrl-f", FocusSearch, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-1", InspectorDetails, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-2", InspectorHealth, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-3", InspectorPresets, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-3", InspectorDetails, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-4", InspectorLogs, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-5", InspectorConnections, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-6", InspectorTraffic, Some(APP_KEY_CONTEXT)),

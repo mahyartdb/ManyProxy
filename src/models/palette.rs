@@ -12,7 +12,6 @@ pub(crate) enum PaletteOp {
     ClearChecked,
     DetailsTab,
     HealthTab,
-    PresetsTab,
     Subscriptions,
     PresetManager,
     Groups,

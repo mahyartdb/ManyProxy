@@ -736,18 +736,14 @@ impl AppView {
                                 .label("Focus search field")
                                 .keywords(["search", "find", "filter"]),
                             CommandItem::new()
-                                .label("Clear selection")
-                                .keywords(["clear", "escape", "deselect"]),
+                                .label("Clear checked")
+                                .keywords(["clear", "uncheck", "escape"]),
                             CommandItem::new()
                                 .label("Show Details tab")
                                 .keywords(["details", "tab"]),
                             CommandItem::new()
                                 .label("Show Health tab")
                                 .keywords(["health", "tab"]),
-                            CommandItem::new()
-                                .label("Show Presets tab")
-                                .keywords(["preset", "tab"]),
-
                             CommandItem::new()
                                 .label("Import from clipboard")
                                 .keywords(["clipboard", "paste", "import"]),
