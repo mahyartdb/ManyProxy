@@ -40,7 +40,7 @@ pub(crate) fn group_row_views(
             let feeding = feeding.get(name).cloned().unwrap_or_default();
             let count = counts_map.get(name).copied().unwrap_or(0);
             let kind = if feeding.is_empty() {
-                "Basic".to_string()
+                "Basic group".to_string()
             } else {
                 format!("Subscription ({})", feeding.len())
             };

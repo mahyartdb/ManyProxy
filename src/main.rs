@@ -425,7 +425,10 @@ fn main() {
         .skip(1)
         .find_map(|arg| classify_open_with(&arg));
     let startup_geometry = stored_window_geometry();
-    gpui_kit::application().run(move |cx| {
+    // F13: with no asset source every kit icon renders as an empty box, which
+    // is what made the sheet header close unreadable.
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    app.run(move |cx| {
         gpui_kit::init(cx);
 
         bind_app_keys(cx);

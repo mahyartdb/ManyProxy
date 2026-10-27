@@ -16071,6 +16071,44 @@ fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.close_sheet(cx));
 }
 
+/// F13: the sheet header close is a kit icon-only button, so it reads as an exit
+/// only when the kit asset source is registered (main does that). Pins both
+/// halves: the icon bytes resolve, and the control paints real bounds.
+#[gpui_kit::test]
+fn f13_sheet_header_close_paints_and_closes(cx: &mut TestAppContext) {
+    use gpui::AssetSource as _;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    let icon = gpui_kit::assets::Assets
+        .load("icons/close.svg")
+        .expect("the kit asset source answers")
+        .expect("icons/close.svg ships with the kit");
+    assert!(!icon.is_empty(), "the close icon has bytes to paint");
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_sheet(cx)),
+        "Logs opens a sheet"
+    );
+    assert_painted(cx, "close");
+
+    cx.update(|window, cx| window.click("close", cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(
+        !cx.update(|window, cx| window.has_active_sheet(cx)),
+        "the header close is a working exit"
+    );
+}
+
 #[gpui_kit::test]
 fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
@@ -18841,7 +18879,7 @@ fn t08_group_rows_kind_quota_skip() {
     );
     assert_eq!(rows.len(), 3, "union of row groups + fed groups");
     assert_eq!(rows[0].name, "basic");
-    assert_eq!(rows[0].kind, "Basic");
+    assert_eq!(rows[0].kind, "Basic group");
     assert_eq!(rows[0].quota, None);
     assert!(!rows[0].skip);
     assert!(rows[0].sub_ids.is_empty());
@@ -18940,6 +18978,9 @@ fn t08_groups_sheet_paints_update_edit_quota(cx: &mut TestAppContext) {
     assert_painted(cx, "group-update-travel");
     assert_painted(cx, "group-kind-travel");
     assert_painted(cx, "group-quota-travel");
+    assert_painted(cx, "groups-dialog-ok");
+    // F13: the footer Close is the sheet's one labelled exit.
+    assert_absent(cx, "groups-dialog-cancel".to_string());
 }
 
 #[gpui_kit::test]

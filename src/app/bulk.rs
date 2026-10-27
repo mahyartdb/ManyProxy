@@ -909,7 +909,7 @@ impl AppView {
                 .size(px(520.))
                 .footer(sheet_footer(
                     "groups-dialog-ok",
-                    "groups-dialog-cancel",
+                    None,
                     footer_commit_label("groups"),
                     commit_click,
                 ))

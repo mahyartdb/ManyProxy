@@ -1246,7 +1246,7 @@ impl AppView {
                 })
                 .footer(sheet_footer(
                     "logs-dialog-ok",
-                    "logs-dialog-cancel",
+                    Some("logs-dialog-cancel"),
 
                     footer_commit_label("logs"),
                     commit_click,
@@ -2824,7 +2824,7 @@ impl AppView {
                 })
                 .footer(sheet_footer(
                     "subscriptions-dialog-ok",
-                    "subscriptions-dialog-cancel",
+                    Some("subscriptions-dialog-cancel"),
 
                     footer_commit_label("subscriptions"),
                     commit_click,

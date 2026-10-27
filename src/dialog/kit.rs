@@ -62,9 +62,11 @@ pub(crate) fn dialog_footer(
         )
 }
 
+/// F13: `cancel_id` is None where the sheet's primary button already is the
+/// only exit — Groups had Cancel and Close beside the header close.
 pub(crate) fn sheet_footer(
     ok_id: &'static str,
-    cancel_id: &'static str,
+    cancel_id: Option<&'static str>,
     ok_label: &'static str,
     commit: DialogCommit,
 ) -> DialogFooter {
@@ -73,8 +75,9 @@ pub(crate) fn sheet_footer(
         "Ticket 05: honest footers never use a bare OK label"
     );
     let commit_click = commit.clone();
-    DialogFooter::new()
-        .child(
+    let mut footer = DialogFooter::new();
+    if let Some(cancel_id) = cancel_id {
+        footer = footer.child(
             Button::new(cancel_id)
                 .small()
                 .label("Cancel")
@@ -82,19 +85,20 @@ pub(crate) fn sheet_footer(
                     window.close_sheet(cx);
                     reclaim_shell_focus(window, cx);
                 }),
-        )
-        .child(
-            Button::new(ok_id)
-                .small()
-                .primary()
-                .label(ok_label)
-                .on_click(move |_, window, cx| {
-                    if commit_click(window, cx) {
-                        window.close_sheet(cx);
-                    }
-                    reclaim_shell_focus(window, cx);
-                }),
-        )
+        );
+    }
+    footer.child(
+        Button::new(ok_id)
+            .small()
+            .primary()
+            .label(ok_label)
+            .on_click(move |_, window, cx| {
+                if commit_click(window, cx) {
+                    window.close_sheet(cx);
+                }
+                reclaim_shell_focus(window, cx);
+            }),
+    )
 }
 
 pub(crate) fn footer_commit_label(dialog: &str) -> &'static str {
