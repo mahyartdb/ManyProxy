@@ -20092,6 +20092,67 @@ fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppCon
     );
 }
 
+/// F1: the drawer is an input-occluding overlay. A click on its blank padding
+/// at the y of a non-selected row must not reach — and select — that row.
+#[gpui_kit::test]
+fn t03_inspector_drawer_occludes_blank_clicks(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let _first = store
+        .add(facet_seed("First", "vless", "team", "10801"))
+        .expect("seed works");
+    let selected_row = store
+        .add(facet_seed("Second", "vless", "team", "10802"))
+        .expect("seed works");
+    let other_row = store
+        .add(facet_seed("Third", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &selected_row.id);
+
+    // The drawer's p_2 padding is blank: 3px inside its left edge sits on no
+    // control, so pre-fix the click falls through to the row card at that y.
+    let offset = cx.update(|window, _| {
+        let drawer = window
+            .try_find("inspector-drawer")
+            .expect("the drawer paints")
+            .bounds();
+        let covered = window
+            .try_find(format!("row-card-{}", other_row.id))
+            .expect("the non-selected row paints")
+            .bounds();
+        point(px(3.), covered.center().y - drawer.origin.y)
+    });
+    cx.update(|window, cx| window.click_at("inspector-drawer", offset, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let selected = view.read_with(cx, |view, cx| {
+        view.libraries
+            .read(cx)
+            .delegate()
+            .selected_row()
+            .map(|row| row.id)
+    });
+    assert_eq!(
+        selected.as_deref(),
+        Some(selected_row.id.as_str()),
+        "a blank drawer click leaves the inspector's subject alone"
+    );
+
+    // The occluding root must not swallow the drawer's own controls.
+    cx.update(|window, cx| window.click("inspector-drawer-close", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let open = view.read_with(cx, |view, _| view.inspector_drawer_open);
+    assert!(
+        !open,
+        "the close button still works under the drawer's occluding hitbox"
+    );
+}
+
 #[gpui_kit::test]
 fn t03_row_pitch_holds_at_the_minimum_window(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
@@ -20278,6 +20339,10 @@ fn t03_row_copy_proxy_copies_that_row(cx: &mut TestAppContext) {
     paint_frame(cx);
     // The OTHER row is selected: a selection-scoped copy would carry Beta.
     select_library_row(&view, cx, &beta.id);
+    // F1: the open drawer occludes the row's trailing Copy cell; this test
+    // is about row-scoped copy, so put the action back in reach.
+    view.update(cx, |view, _| view.inspector_drawer_open = false);
+    paint_frame(cx);
     let alpha_bind = view.read_with(cx, |view, _| {
         view.store
             .get(&alpha.id)
@@ -30116,6 +30181,12 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
+    // F1: the open drawer occludes the columns it covers, and this test is
+    // about the sort menus, so keep the inspector closed at full table width.
+    view.update(cx, |view, cx| {
+        view.inspector_drawer_open = false;
+        cx.notify();
+    });
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
