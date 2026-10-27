@@ -1428,20 +1428,25 @@ impl ListDelegate for LibraryDelegate {
             );
         }
 
-        // A1-3/K11: Add and Import stay single-entry (the toolbar); the empty
-        // canvas keeps only the explanation, so there is one way in.
+        // F18: with no configurations the empty canvas carries the two
+        // intake actions under the sentence that names them.
+        let empty = Empty::new().header(
+            EmptyHeader::new()
+                .title(EmptyTitle::new().child(empty_library_title()))
+                .description(EmptyDescription::new().child(empty_library_text())),
+        );
+        let empty = match self.app_view.clone() {
+            Some(app_view) => {
+                empty.content(EmptyContent::new().child(AppView::render_empty_ctas(app_view)))
+            }
+            None => empty,
+        };
         div()
             .id("library-empty")
             .test_support()
             .flex()
             .flex_col()
             .size_full()
-            .child(
-                Empty::new().header(
-                    EmptyHeader::new()
-                        .title(EmptyTitle::new().child(empty_library_title()))
-                        .description(EmptyDescription::new().child(empty_library_text())),
-                ),
-            )
+            .child(empty)
     }
 }

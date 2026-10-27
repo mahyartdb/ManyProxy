@@ -645,6 +645,53 @@ fn shell_boots_with_empty_library(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn f18_empty_library_offers_add_and_import(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        0,
+        "the empty canvas is this test's subject"
+    );
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+
+    // Both intake actions the sentence names sit under it, sharing the
+    // toolbar's handlers.
+    assert_painted(cx, "empty-add");
+    assert_painted(cx, "empty-import");
+
+    cx.update(|window, cx| window.click("empty-add", cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert_painted(cx, "field-guided-server");
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    cx.update(|window, cx| window.click("empty-import", cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert_painted(cx, "import-guide");
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+}
+
+#[gpui_kit::test]
 fn library_lists_stored_rows(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
 
@@ -17855,12 +17902,10 @@ fn empty_library_points_at_the_toolbar_only(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-
-    // K11/A1-3: Add and Import have one home — the toolbar. The empty canvas
-    // explains the state, it does not duplicate the entry points.
-    assert_absent(cx, "empty-library-ctas".to_string());
-    assert_absent(cx, "empty-add".to_string());
-    assert_absent(cx, "empty-import".to_string());
+    // F18: the canvas now carries the CTAs; the toolbar keeps working as the
+    // intake home for populated libraries.
+    assert_painted(cx, "empty-add");
+    assert_painted(cx, "empty-import");
     assert_painted(cx, "toolbar-add-config");
     assert_painted(cx, "toolbar-import");
 
@@ -22257,10 +22302,11 @@ fn empty_library_offers_one_entry_point(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    // K11/A1-3: Add/Import live in the toolbar only.
-    assert_absent(cx, "empty-library-ctas".to_string());
-    assert_absent(cx, "empty-add".to_string());
-    assert_absent(cx, "empty-import".to_string());
+    // F18: the canvas repeats the toolbar's two intake actions under the
+    // sentence that names them; the toolbar stays home when rows exist.
+    assert_painted(cx, "empty-library-ctas");
+    assert_painted(cx, "empty-add");
+    assert_painted(cx, "empty-import");
     assert_painted(cx, "toolbar-add-config");
     assert_painted(cx, "toolbar-import");
 }
@@ -22275,14 +22321,10 @@ fn t06_empty_library_describer_teaches_next_step(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    // K11/A1-3: the next step is announced in the toolbar, not duplicated on
-    // the empty canvas.
-    for id in ["empty-add", "empty-import"] {
-        assert!(
-            cx.update(|window, _| window.try_find(id.to_string()).is_none()),
-            "{id} stays retired"
-        );
-    }
+    // F18: the next step is the actions the sentence names — inline now,
+    // with the toolbar still carrying them when rows exist.
+    assert_painted(cx, "empty-add");
+    assert_painted(cx, "empty-import");
     assert_painted(cx, "toolbar-add-config");
     assert_painted(cx, "toolbar-import");
     let (total, enabled) =
@@ -22311,11 +22353,11 @@ fn t04_empty_library_actions_live_in_toolbar(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    // K11/A1-3: the empty canvas describes the state; the toolbar is the one
-    // place Add/Import live, so the canvas holds no duplicate CTAs.
-    assert_absent(cx, "empty-library-ctas".to_string());
-    assert_absent(cx, "empty-add".to_string());
-    assert_absent(cx, "empty-import".to_string());
+    // F18: the canvas holds the intake CTAs and the toolbar keeps its pair,
+    // both bound to the same handlers.
+    assert_painted(cx, "empty-library-ctas");
+    assert_painted(cx, "empty-add");
+    assert_painted(cx, "empty-import");
     for id in ["toolbar-add-config", "toolbar-import"] {
         assert_painted(cx, id);
         assert_within_frame(cx, id);

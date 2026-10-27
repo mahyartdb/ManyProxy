@@ -1,6 +1,15 @@
 use crate::*;
 
 impl AppView {
+    /// F18: the toolbar and the empty canvas share these two handlers.
+    pub(crate) fn open_add_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_add_dialog(window, cx);
+    }
+
+    pub(crate) fn open_import_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+    }
+
     pub(crate) fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let program_view = cx.entity();
         let groups_view = cx.entity();
@@ -523,7 +532,7 @@ impl AppView {
                     .accessibility_label("Import")
                     .tooltip("Import share links or files (Ctrl-O)")
                     .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                        view.open_import_config(window, cx);
                     })),
             )
             .child(
@@ -534,7 +543,7 @@ impl AppView {
                     .accessibility_label("Add configuration")
                     .tooltip("Add a proxy configuration (Ctrl-N)")
                     .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_add_dialog(window, cx);
+                        view.open_add_config(window, cx);
                     })),
             )
 

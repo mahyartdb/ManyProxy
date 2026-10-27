@@ -39,8 +39,40 @@ impl InspectorLayout {
 }
 
 impl AppView {
-    pub(crate) fn render_empty_ctas(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().id("empty-ctas").test_support()
+    /// F18: the empty canvas names the two intake actions and calls the same
+    /// AppView methods the toolbar buttons use.
+    pub(crate) fn render_empty_ctas(app: Entity<Self>) -> impl IntoElement {
+        let add_view = app.clone();
+        let import_view = app;
+        div()
+            .id("empty-library-ctas")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Button::new("empty-add")
+                    .small()
+                    .primary()
+                    .label("+ Add configuration")
+                    .accessibility_label("Add configuration")
+                    .tooltip("Add a proxy configuration (Ctrl-N)")
+                    .on_click(move |_, window, cx| {
+                        add_view.update(cx, |view, cx| view.open_add_config(window, cx));
+                    }),
+            )
+            .child(
+                Button::new("empty-import")
+                    .small()
+                    .label("Import")
+                    .accessibility_label("Import")
+                    .tooltip("Import share links or files (Ctrl-O)")
+                    .on_click(move |_, window, cx| {
+                        import_view.update(cx, |view, cx| view.open_import_config(window, cx));
+                    }),
+            )
     }
 
     /// T-03: the window width decides the inspector's shape. At or above the
@@ -98,7 +130,6 @@ impl Render for AppView {
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let column_headers = self.render_library_column_headers(cx);
-        let empty_ctas = self.render_empty_ctas(cx);
         let mut list_pane = div()
             .id("config-list")
             .test_support()
@@ -113,7 +144,6 @@ impl Render for AppView {
         if drawer_visible {
             list_pane = list_pane.pr(px(layout.drawer_w));
         }
-        list_pane = list_pane.child(empty_ctas);
 
         let split = if docked {
             h_resizable("main-split")
