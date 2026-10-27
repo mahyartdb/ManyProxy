@@ -68,8 +68,8 @@ impl InspectorTabFitMeasure {
 
 impl AppView {
     /// T-03: below the breakpoint the inspector slides OVER the table as a
-    /// drawer. It is an overlay: the table keeps its full width underneath,
-    /// so the list is never squeezed under its floor. The root occludes input,
+    /// drawer. It is an overlay: the table keeps its own pane beside it, so
+    /// the list is never squeezed under its floor. The root occludes input,
     /// or a blank click reaches the rows behind it and retargets the inspector.
     pub(crate) fn render_inspector_drawer(
         &self,

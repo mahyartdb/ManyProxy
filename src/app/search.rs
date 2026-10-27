@@ -110,17 +110,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.sync_facet_pickers(window, cx);
-        // The drawer is an overlay below 1080px, so the table's full width is
-        // still painted underneath it. Reserve the drawer's share in the
-        // facet bar while it is open: otherwise the count's Clear search
-        // button lands under the overlay and cannot be clicked. This makes the
-        // bar wrap to a second line instead of hiding controls.
-        let drawer_reserve = if !self.inspector_docked(window) && self.inspector_drawer_open {
-            self.inspector_width(cx) + 12.
-        } else {
-            0.
-        };
-        let right_pad = 8. + drawer_reserve;
+        let right_pad = 8.;
         let has_facets = self.libraries.read(cx).delegate().facets_active();
         // T-19: the facet area carries the same per-group opt-in switch for
         // the focused group; has no group to protect by design.

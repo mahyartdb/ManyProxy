@@ -85,21 +85,28 @@ impl RowMetrics {
         }
     }
 
-    /// The width budget: which optional columns fit the table. The protocol
-    /// column goes first, then the group column; the name, endpoint, health
-    /// and copy columns never go. The group column also honours the user's
-    /// own toggle — the budget can only take a column away, never add one.
+    /// The width budget: which optional columns fit the table. The group
+    /// column goes first, then the protocol column, then upstream; the name,
+    /// endpoint, health and copy columns never go. An optional column also
+    /// honours the user's own toggle — the budget can only take a column
+    /// away, never add one.
     pub(crate) fn for_table_width(table_width: f32, columns: RowColumns) -> RowMetrics {
         let both = RowMetrics::row_width(columns, true, true);
         let protocol_only = RowMetrics::row_width(columns, false, true);
-        let (budget_group, budget_protocol) = if table_width >= both {
-            (true, true)
+        let upstream_only = RowMetrics::row_width(columns, false, false);
+        let (budget_group, budget_protocol, budget_upstream) = if table_width >= both {
+            (true, true, true)
         } else if table_width >= protocol_only {
-            (false, true)
+            (false, true, true)
+        } else if table_width >= upstream_only {
+            (false, false, true)
         } else {
-            (false, false)
+            (false, false, false)
         };
-        RowMetrics::widths(columns.group && budget_group, budget_protocol, columns)
+        let mut metrics =
+            RowMetrics::widths(columns.group && budget_group, budget_protocol, columns);
+        metrics.show_upstream = columns.upstream && budget_upstream;
+        metrics
     }
 
     /// The row's minimum width: every cell at its width, the name at its

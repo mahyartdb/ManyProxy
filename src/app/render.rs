@@ -1,5 +1,43 @@
 use crate::*;
 
+/// F2: the one owner of the inspector's geometry. The column headers, the
+/// rows, the facet bar and the drawer all read these two numbers, so the
+/// table can never lay itself out under the drawer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct InspectorLayout {
+    pub(crate) drawer_w: f32,
+    pub(crate) table_w: f32,
+}
+
+impl InspectorLayout {
+    /// `drawer_visible` only matters below the dock breakpoint; the drawer
+    /// width is clamped so the table never drops under its floor.
+    pub(crate) fn compute(
+        viewport: f32,
+        inspector_w: f32,
+        docked: bool,
+        drawer_visible: bool,
+    ) -> Self {
+        if docked {
+            return Self {
+                drawer_w: 0.,
+                table_w: (viewport - inspector_w).max(RowMetrics::TABLE_MIN),
+            };
+        }
+        if drawer_visible {
+            let drawer_w = inspector_w.min(viewport - RowMetrics::TABLE_MIN).max(0.);
+            return Self {
+                drawer_w,
+                table_w: viewport - drawer_w,
+            };
+        }
+        Self {
+            drawer_w: 0.,
+            table_w: viewport,
+        }
+    }
+}
+
 impl AppView {
     pub(crate) fn render_empty_ctas(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div().id("empty-ctas").test_support()
@@ -7,8 +45,7 @@ impl AppView {
 
     /// T-03: the window width decides the inspector's shape. At or above the
     /// breakpoint the inspector docks to the right and takes its share; below
-    /// it the inspector becomes a slide-over drawer and the table keeps the
-    /// whole window.
+    /// it the inspector becomes a slide-over drawer beside the table.
     pub(crate) fn inspector_docked(&self, window: &Window) -> bool {
         window.viewport_size().width.as_f32() >= INSPECTOR_DRAWER_BREAKPOINT
     }
@@ -23,26 +60,23 @@ impl AppView {
             .filter(|width| *width >= INSPECTOR_WIDTH_MIN && *width <= INSPECTOR_WIDTH_MAX)
             .unwrap_or(INSPECTOR_WIDTH)
     }
-
-    /// T-03: the width the library table may spend. Below the drawer's
-    /// window width the inspector stops taking space from the list, so the
-    /// table keeps the whole window; above it, the docked inspector takes
-    /// its share and the table keeps at least `RowMetrics::TABLE_MIN`.
-    pub(crate) fn library_table_width(&self, window: &Window, cx: &App) -> f32 {
-        let window_width = window.viewport_size().width.as_f32();
-        if !self.inspector_docked(window) {
-            return window_width;
-        }
-        (window_width - self.inspector_width(cx)).max(RowMetrics::TABLE_MIN)
-    }
 }
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let app_entity = cx.entity();
-        // T-03: one geometry spec, decided once per frame and handed to both
-        // the header strip and the row.
-        let table_width = self.library_table_width(window, cx);
+        // T-03/F2: one geometry spec, computed once per frame and handed to
+        // the header strip, the rows and the list pane's drawer reserve.
+        let show_detail = self.config_count(cx) != 0;
+        let docked = self.inspector_docked(window);
+        let inspector_width = self.inspector_width(cx);
+        let drawer_visible = !docked && show_detail && self.inspector_drawer_open;
+        let layout = InspectorLayout::compute(
+            window.viewport_size().width.as_f32(),
+            inspector_width,
+            docked,
+            drawer_visible,
+        );
         self.libraries.update(cx, |state, cx| {
             let list_focus = state.focus_handle(cx);
             let delegate = state.delegate_mut();
@@ -50,7 +84,7 @@ impl Render for AppView {
                 delegate.app_view = Some(app_entity);
                 cx.notify();
             }
-            let metrics = RowMetrics::for_table_width(table_width, delegate.row_columns);
+            let metrics = RowMetrics::for_table_width(layout.table_w, delegate.row_columns);
             delegate.set_row_metrics(metrics);
             // T-06: the row cards paint the kit focus ring while the list holds
             // the keyboard; the handle lives on the ListState, the app owns the
@@ -58,7 +92,6 @@ impl Render for AppView {
             delegate.list_focus = Some(list_focus);
         });
 
-        let show_detail = self.config_count(cx) != 0;
         // T-26: the titlebar label carries the same `· N running` text the OS
         // title gets, both composed from the one shared helper.
         let current_title = window_title_text(self.engine.running_count());
@@ -77,10 +110,11 @@ impl Render for AppView {
             .child(bulk_bar)
             .child(column_headers)
             .child(List::new(&self.libraries).flex_1());
+        if drawer_visible {
+            list_pane = list_pane.pr(px(layout.drawer_w));
+        }
         list_pane = list_pane.child(empty_ctas);
 
-        let docked = self.inspector_docked(window);
-        let inspector_width = self.inspector_width(cx);
         let split = if docked {
             h_resizable("main-split")
                 .with_state(&self.split_state)
@@ -106,8 +140,8 @@ impl Render for AppView {
                 .flex_1()
                 .min_h_0()
                 .child(list_pane)
-                .children(if show_detail && self.inspector_drawer_open {
-                    vec![self.render_inspector_drawer(inspector_width, window, cx)]
+                .children(if drawer_visible {
+                    vec![self.render_inspector_drawer(layout.drawer_w, window, cx)]
                 } else {
                     Vec::new()
                 })

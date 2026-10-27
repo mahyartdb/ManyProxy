@@ -20054,22 +20054,28 @@ fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppCon
         "the inspector opens at 260px by default (240-360 range), got {inspector_width}"
     );
 
-    // Narrow: the inspector slides OVER the table as a drawer, so the table
-    // keeps the whole window and never drops under its floor.
+    // Narrow: the inspector slides over the table as a drawer, and the list
+    // pane reserves the drawer's share so the table keeps its 640px floor.
     paint_frame_at(cx, 1000., 700.);
     assert_painted(cx, "inspector-drawer");
-    let narrow_list = cx.update(|window, _| {
-        window
+    let (narrow_table, narrow_drawer) = cx.update(|window, _| {
+        let list = window
             .try_find("config-list".to_string())
             .expect("the table paints")
-            .bounds()
-            .size
-            .width
-            .as_f32()
+            .bounds();
+        let drawer = window
+            .try_find("inspector-drawer".to_string())
+            .expect("the drawer paints")
+            .bounds();
+        (
+            list.size.width.as_f32() - drawer.size.width.as_f32(),
+            drawer.size.width.as_f32(),
+        )
     });
+    assert_eq!(narrow_drawer, 260., "the drawer opens at its 260px width");
     assert!(
-        narrow_list >= 640.,
-        "the table keeps the whole window in the drawer, got {narrow_list}"
+        narrow_table >= 640.,
+        "the table keeps its 640px floor in the drawer, got {narrow_table}"
     );
 
     // Esc closes the drawer and hands focus back to the list.
@@ -20150,6 +20156,99 @@ fn t03_inspector_drawer_occludes_blank_clicks(cx: &mut TestAppContext) {
     assert!(
         !open,
         "the close button still works under the drawer's occluding hitbox"
+    );
+}
+
+/// F2: the layout contract is pure, so both presentations pin exact numbers —
+/// including the 880px clamp that keeps the drawer table on its 640px floor.
+#[test]
+fn t03_inspector_layout_pins_the_drawer_contract() {
+    use crate::app::render::InspectorLayout;
+
+    let cases = [
+        (1000., 260., false, true, 260., 740.),
+        (1000., 260., false, false, 0., 1000.),
+        (880., 260., false, true, 240., 640.),
+        (1080., 260., true, true, 0., 820.),
+    ];
+    for (viewport, inspector, docked, visible, drawer_w, table_w) in cases {
+        let layout = InspectorLayout::compute(viewport, inspector, docked, visible);
+        assert_eq!(
+            layout.drawer_w, drawer_w,
+            "drawer at {viewport}px, docked={docked}, visible={visible}"
+        );
+        assert_eq!(
+            layout.table_w, table_w,
+            "table at {viewport}px, docked={docked}, visible={visible}"
+        );
+    }
+}
+
+/// F2: upstream is the third budget drop. At 740 the protocol column is gone
+/// but upstream still fits; at the 640 floor it goes too, so the minimum row
+/// (562px) never overflows the table.
+#[test]
+fn t03_row_budget_drops_upstream_after_protocol() {
+    use crate::{RowColumns, RowMetrics};
+
+    let columns = RowColumns::default();
+    let at_740 = RowMetrics::for_table_width(740., columns);
+    assert!(!at_740.show_protocol, "protocol drops at 740");
+    assert!(at_740.show_upstream, "upstream still fits at 740");
+    assert!(at_740.show_health, "health is never budgeted away");
+
+    let at_640 = RowMetrics::for_table_width(640., columns);
+    assert!(!at_640.show_protocol, "protocol drops at 640");
+    assert!(!at_640.show_upstream, "upstream drops at 640");
+    assert!(at_640.show_health, "health is never budgeted away");
+
+    // Name, endpoint, health and copy never drop. The row that remains once
+    // protocol and upstream are gone fits the floor with room to spare.
+    let min_row = RowMetrics::LAMP_CHECK
+        + RowMetrics::CHECK_SLOT
+        + RowMetrics::NAME_MIN
+        + RowMetrics::ENDPOINT
+        + RowMetrics::HEALTH
+        + RowMetrics::COPY
+        + 5. * RowMetrics::GAP;
+    assert_eq!(min_row, 562.);
+    assert!(min_row <= RowMetrics::TABLE_MIN);
+    assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 710.);
+}
+
+/// F2: at the default 1000px frame the table reserves the drawer's 260px, so
+/// the row Copy action paints left of the drawer instead of under it.
+#[gpui_kit::test]
+fn t03_drawer_table_keeps_copy_left_of_the_drawer(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(facet_seed("Drawer", "vless", "team", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &row.id);
+    paint_frame(cx);
+
+    assert_painted(cx, "inspector-drawer");
+    let copy_id = format!("row-copy-{}", row.id);
+    assert_painted(cx, &copy_id);
+
+    let (copy_right, drawer_left) = cx.update(|window, _| {
+        let copy = window
+            .try_find(copy_id.clone())
+            .expect("the row copy button paints")
+            .bounds();
+        let drawer = window
+            .try_find("inspector-drawer")
+            .expect("the drawer paints")
+            .bounds();
+        (copy.right().as_f32(), drawer.origin.x.as_f32())
+    });
+    assert!(
+        copy_right <= drawer_left,
+        "the row Copy action ends at {copy_right}px, left of the drawer at {drawer_left}px"
     );
 }
 
