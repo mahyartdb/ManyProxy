@@ -1,3 +1,4 @@
+use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
@@ -34,6 +35,10 @@ pub(crate) fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
 }
 pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(resolve_appearance_mode(appearance), window, cx);
+    // F5: the kit has no per-scrollbar mode switch, only the theme's. Always
+    // keeps the dialog body's scrollbar visible while it overflows instead of
+    // fading out after two seconds.
+    Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
     // K5: `Theme::change` rebuilds the notification settings with the theme,
     // so the toast park rides along on every re-appearance.
     crate::configure_notification_toasts(cx);

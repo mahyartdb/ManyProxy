@@ -3169,6 +3169,53 @@ pub fn fold_guided_into_params(
     }
 }
 
+/// F5: Name is the first row in the form, so it is named before any other.
+pub fn blank_name(name: &str) -> Option<(&'static str, String)> {
+    let mut errors = Vec::new();
+    validated_name(name, &mut errors)
+        .is_none()
+        .then(|| (errors[0].field, errors[0].message.clone()))
+}
+
+/// F5: which guided row is blank in the params the form would store.
+///
+/// `store.add` can only blame the folded `params` JSON, which the guided
+/// protocols never show — so the form asks here first and names the input that
+/// fills the gap. Only rows the form actually renders are reported: virtual
+/// protocols author their params raw, and only vless/vmess/tuic/xray put the
+/// credential in a protocol block.
+pub fn guided_blank_field(params_raw: &str, protocol: &str) -> Option<(&'static str, String)> {
+    let canonical = canonical_protocol(protocol)?;
+    if is_virtual_protocol(&canonical) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(params_raw).ok()?;
+    let obj = value.as_object()?;
+
+    let server_ok = lookup_case_insensitive(obj, &["server", "address"])
+        .is_some_and(|server| !server.chars().any(|c| c.is_whitespace() || c.is_control()));
+    if !server_ok {
+        return Some(("guided_server", "Server is required".to_string()));
+    }
+    let port_ok = ["server_port", "port", "serverPort"].iter().any(|key| {
+        let valid = |number: u64| (1..=65_535).contains(&number);
+        match obj.get(*key) {
+            Some(serde_json::Value::Number(number)) => number.as_u64().is_some_and(valid),
+            Some(serde_json::Value::String(text)) => text.trim().parse::<u64>().is_ok_and(valid),
+            _ => false,
+        }
+    });
+    if !port_ok {
+        return Some(("guided_port", "Server port is required".to_string()));
+    }
+    if matches!(canonical.as_str(), "vless" | "vmess" | "tuic" | "xray")
+        && lookup_case_insensitive(obj, &["uuid", "id"]).is_none()
+    {
+        return Some(("uuid", "UUID is required".to_string()));
+    }
+    None
+}
+
 fn value_is_import_shaped(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
     let has_kind = obj.contains_key("type") || obj.contains_key("protocol");
     let has_host = obj.contains_key("server") || obj.contains_key("address");

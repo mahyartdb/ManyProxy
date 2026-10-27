@@ -42,6 +42,18 @@ impl AppView {
             return false;
         }
 
+        // F5: name the first blank row in reading order before `store.add`
+        // can only blame the folded params JSON.
+        let field_gate =
+            blank_name(&input.name).or_else(|| guided_blank_field(&input.params, &input.protocol));
+        if let Some((field, message)) = field_gate {
+            *form_error.borrow_mut() = Some((field.to_string(), message.clone()));
+            form.focus_field(field, window, cx);
+            window.push_notification(Notification::error(message), cx);
+            cx.notify();
+            return false;
+        }
+
         if input.protocol == "extra-core" {
             if let Err(reason) = validate_extra_params(&input.params) {
                 *form_error.borrow_mut() = Some(("params".to_string(), reason.clone()));
@@ -232,6 +244,18 @@ impl AppView {
                     window.push_notification(Notification::error(reason), cx);
                     cx.notify();
                     return false;
+                }
+
+                if patch.params.is_some() {
+                    let params = patch.params.as_deref().unwrap_or(&existing.params);
+                    let protocol = patch.protocol.as_deref().unwrap_or(&existing.protocol);
+                    if let Some((field, message)) = guided_blank_field(params, protocol) {
+                        *form_error.borrow_mut() = Some((field.to_string(), message.clone()));
+                        form.focus_field(field, window, cx);
+                        window.push_notification(Notification::error(message), cx);
+                        cx.notify();
+                        return false;
+                    }
                 }
 
                 if patch.params.is_some() && existing.protocol == "extra-core" {

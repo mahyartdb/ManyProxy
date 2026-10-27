@@ -14983,14 +14983,17 @@ fn f12_add_under_excluding_filter_keeps_selection(cx: &mut TestAppContext) {
     );
 }
 
+/// F5: the guided gate names the empty row before `store.add`, so the dialog
+/// can point at the UUID input instead of opening the raw JSON textarea.
 #[gpui_kit::test]
-fn t05_guided_blank_identity_stays_open_naming_params(cx: &mut TestAppContext) {
+fn f5_guided_blank_uuid_names_the_field_and_focuses_it(cx: &mut TestAppContext) {
     use crate::ConfigForm;
+    use gpui_kit::Focusable as _;
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
     let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
-    let closed = cx.update(|window, cx| {
+    let (closed, focused, advanced) = cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let form = ConfigForm::blank(window, cx);
             form.name.update(cx, |state, cx| {
@@ -15000,22 +15003,169 @@ fn t05_guided_blank_identity_stays_open_naming_params(cx: &mut TestAppContext) {
                 state.set_value("198.51.100.9", window, cx);
             });
             let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
-            assert!(*form.advanced.borrow(), "params error expands Advanced");
-            closed
+            let handle = form.vless_uuid.read(cx).focus_handle(cx);
+            let focused = window.focused(cx).as_ref() == Some(&handle);
+            let advanced = *form.advanced.borrow();
+            (closed, focused, advanced)
         })
     });
     assert!(!closed, "invalid commit keeps the dialog open");
     let (field, message) = form_error.borrow().clone().expect("inline error recorded");
-    assert_eq!(field, "params", "inline error names the field");
+    assert_eq!(field, "uuid", "the error names the UUID row");
+    assert_eq!(message, "UUID is required");
+    assert!(focused, "focus lands on the UUID input");
     assert!(
-        message.contains("uuid"),
-        "names the missing credential: {message}"
+        !advanced,
+        "a guided protocol never opens the raw JSON textarea"
     );
     assert_eq!(
         view.read_with(cx, |view, cx| view.config_count(cx)),
         0,
         "nothing stored"
     );
+}
+
+/// F5: the guided error paints under its own row, not at the form foot.
+#[gpui_kit::test]
+fn f5_guided_error_renders_beside_the_uuid_row(cx: &mut TestAppContext) {
+    use crate::ConfigForm;
+    use gpui_kit::ParentElement as _;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let form = cx.update(|window, cx| view.update(cx, |_, cx| ConfigForm::blank(window, cx)));
+    let element_view = view.clone();
+    cx.update(|window, cx| {
+        crate::open_app_dialog(window, cx, move |dialog, _, cx| {
+            let error = Some(("uuid".to_string(), "UUID is required".to_string()));
+            dialog
+                .title("Add proxy configuration")
+                .w(px(560.))
+                .child(form.clone().element(
+                    element_view.clone(),
+                    cx,
+                    None,
+                    error,
+                    false,
+                    None,
+                ))
+                .footer(crate::dialog_footer(
+                    "uuid-dialog-ok",
+                    "uuid-dialog-cancel",
+                    "Add",
+                    Rc::new(|_: &mut Window, _: &mut gpui_kit::App| false),
+                ))
+        });
+    });
+    paint_dialog_open(cx);
+    assert_painted(cx, "vless-uuid");
+    assert_painted(cx, "uuid-field-error");
+    let y_of = |id: &str, cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+                .origin
+                .y
+        })
+    };
+    let row = y_of("vless-uuid", cx);
+    let error = y_of("uuid-field-error", cx);
+    assert!(
+        error > row,
+        "the error sits under the UUID row ({row:?} < {error:?})"
+    );
+    assert_absent(cx, "form-field-error".to_string());
+}
+
+/// F5: server and port are guided inputs too — each names itself.
+#[gpui_kit::test]
+fn f5_guided_blank_server_and_port_name_their_rows(cx: &mut TestAppContext) {
+    use crate::ConfigForm;
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+    let run = |name: &str, server: &str, port: &str, cx: &mut VisualTestContext| {
+        let field = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value(name, window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value(server, window, cx);
+                });
+                form.guided_port.update(cx, |state, cx| {
+                    state.set_value(port, window, cx);
+                });
+                assert!(!view.commit_add_with_focus(&form, &form_error, window, cx));
+            });
+            form_error
+                .borrow()
+                .clone()
+                .expect("inline error recorded")
+                .0
+        });
+        form_error.borrow_mut().take();
+        field
+    };
+    assert_eq!(run("Half", "", "443", cx), "guided_server");
+    assert_eq!(run("Half", "198.51.100.9", "0", cx), "guided_port");
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        0,
+        "nothing stored"
+    );
+}
+
+/// F5(a): the rendered dialog puts the protocol identity between Common and
+/// Advanced, so expanding Advanced never hides the UUID.
+#[gpui_kit::test]
+fn f5_dialog_orders_identity_between_common_and_advanced(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+    });
+    paint_tall_dialog(cx);
+    cx.run_until_parked();
+    paint_tall_dialog(cx);
+    let y_of = |id: &str, cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+                .origin
+                .y
+        })
+    };
+    let common = y_of("common-section", cx);
+    let identity = y_of("vless-uuid", cx);
+    let advanced = y_of("advanced-settings-caption", cx);
+    assert!(
+        common < identity && identity < advanced,
+        "order is Common ({common:?}) -> identity ({identity:?}) -> Advanced ({advanced:?})"
+    );
+}
+
+/// F5(c): the kit owns the dialog scrollbar, so the theme sets its mode — a
+/// body that overflows keeps its scrollbar instead of fading after two seconds.
+#[gpui_kit::test]
+fn f5_scrollbar_mode_stays_visible(cx: &mut TestAppContext) {
+    use gpui_kit::component::scroll::ScrollbarMode;
+    use gpui_kit::component::Theme;
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let _ = mount_view(store, cx);
+    cx.update(|cx| {
+        assert_eq!(Theme::global(cx).scrollbar_mode, ScrollbarMode::Always);
+    });
 }
 
 #[gpui_kit::test]
@@ -28350,7 +28500,6 @@ fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
         "field-guided-server",
         "field-guided-port",
         "guided-hint",
-        "advanced-settings-caption",
         "add-dialog-ok",
         "add-dialog-cancel",
     ] {
@@ -28387,28 +28536,10 @@ fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame_min(cx);
-    cx.update(|window, cx| {
-        window.click("advanced-settings", cx);
-    });
-    cx.run_until_parked();
-    paint_frame_min(cx);
-    cx.run_until_parked();
-    paint_frame_min(cx);
-    // K2: the disclosure unfolds in place; a guided protocol never grows the
-    // raw JSON row. The min-frame form scrolls, so advanced rows only need to
-    // exist in the completed frame.
-    for id in [
-        "advanced-settings-section",
-        "s1-caption",
-        "s2-caption",
-        "s3-caption",
-        "s4-caption",
-    ] {
-        assert!(
-            cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders inside the min-frame form"
-        );
-    }
+    // F5: identity sits between Common and Advanced, so at the minimum frame
+    // the Advanced toggle is below the fold and the body scrolls to reach it.
+    // Unfolding the disclosure is covered at height by t02_vless_panels_paint;
+    // a guided protocol never grows the raw JSON row either way.
     assert_absent(cx, "field-params".to_string());
 }
 

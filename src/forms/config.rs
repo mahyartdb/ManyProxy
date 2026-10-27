@@ -127,6 +127,23 @@ pub(crate) fn panel_toggle_button(
         })
 }
 
+/// F5: a guided field's error belongs beside that field, not at the form foot.
+fn local_field_error(
+    id: &'static str,
+    form_error: Option<&(String, String)>,
+    field: &str,
+) -> Option<AnyElement> {
+    let (name, message) = form_error?;
+    (name == field).then(|| {
+        div()
+            .id(id)
+            .test_support()
+            .text_sm()
+            .child(message.clone())
+            .into_any_element()
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct ConfigForm {
     pub(crate) name: Entity<InputState>,
@@ -1653,6 +1670,7 @@ impl ConfigForm {
         view: &Entity<AppView>,
         secret: &Entity<InputState>,
         id_prefix: &str,
+        error: Option<AnyElement>,
         cx: &App,
     ) -> impl IntoElement {
         let secret_entity = secret.clone();
@@ -1702,7 +1720,8 @@ impl ConfigForm {
                         .test_support()
                         .text_sm()
                         .child(presence),
-                ),
+                )
+                .children(error),
         )
     }
 
@@ -2319,10 +2338,11 @@ impl ConfigForm {
         &self,
         view: &Entity<AppView>,
         _repaint: &DialogRepaint,
+        uuid_error: Option<AnyElement>,
         cx: &App,
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess", cx));
+        block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess", uuid_error, cx));
         block = block.child(
             field().label("Alter ID".to_string()).child(
                 div()
@@ -2918,6 +2938,7 @@ impl ConfigForm {
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
+        uuid_error: Option<AnyElement>,
         cx: &App,
     ) -> impl IntoElement {
         let switch_row = |id: &'static str,
@@ -2946,7 +2967,7 @@ impl ConfigForm {
             )
         };
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic", cx));
+        block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic", uuid_error, cx));
         block = block.child(password_row(
             "Password *",
             "tuic-password",
@@ -3477,11 +3498,12 @@ impl ConfigForm {
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
+        uuid_error: Option<AnyElement>,
         _cx: &App,
     ) -> impl IntoElement {
         let _ = repaint;
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(self.uuid_row(view, &self.xray_uuid, "xray", _cx));
+        block = block.child(self.uuid_row(view, &self.xray_uuid, "xray", uuid_error, _cx));
         block = block
             .child(
                 field().label("Encryption".to_string()).child(
@@ -3799,11 +3821,12 @@ impl ConfigForm {
         &self,
         view: &Entity<AppView>,
         _repaint: &DialogRepaint,
+        uuid_error: Option<AnyElement>,
         cx: &App,
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
 
-        block = block.child(self.uuid_row(view, &self.vless_uuid, "vless", cx));
+        block = block.child(self.uuid_row(view, &self.vless_uuid, "vless", uuid_error, cx));
         let flow_select = self.vless_flow.clone();
         let packet_select = self.vless_packet_encoding.clone();
         block = block.child(
@@ -3874,9 +3897,16 @@ impl ConfigForm {
         // K2: the protocol-specific rows render directly. The stream-transport
         // / TLS / mux / camouflage / dial panels left this match and moved into
         // the single `Advanced Settings` disclosure further down.
+        let uuid_error = local_field_error("uuid-field-error", form_error.as_ref(), "uuid");
         let protocol_section = match protocol_text.as_str() {
-            "vless" => Some(self.vless_block(&view, &repaint, cx).into_any_element()),
-            "vmess" => Some(self.vmess_block(&view, &repaint, cx).into_any_element()),
+            "vless" => Some(
+                self.vless_block(&view, &repaint, uuid_error, cx)
+                    .into_any_element(),
+            ),
+            "vmess" => Some(
+                self.vmess_block(&view, &repaint, uuid_error, cx)
+                    .into_any_element(),
+            ),
             "trojan" => Some(self.trojan_block(&view, &repaint, cx).into_any_element()),
             "shadowsocks" => Some(
                 self.shadowsocks_block(&view, &repaint, cx)
@@ -3887,7 +3917,10 @@ impl ConfigForm {
             "hysteria" | "hysteria2" => {
                 Some(self.hysteria_block(&view, &repaint, cx).into_any_element())
             }
-            "tuic" => Some(self.tuic_block(&view, &repaint, cx).into_any_element()),
+            "tuic" => Some(
+                self.tuic_block(&view, &repaint, uuid_error, cx)
+                    .into_any_element(),
+            ),
 
             "socks" => Some(self.socks_block(&view, &repaint, cx).into_any_element()),
             "http" | "https" => Some(self.http_block(&view, &repaint, cx).into_any_element()),
@@ -3897,7 +3930,10 @@ impl ConfigForm {
 
             "snell" => Some(self.snell_block(&view, &repaint, cx).into_any_element()),
             "shadowtls" => Some(self.shadowtls_block(&view, &repaint, cx).into_any_element()),
-            "xray" => Some(self.xray_block(&view, &repaint, cx).into_any_element()),
+            "xray" => Some(
+                self.xray_block(&view, &repaint, uuid_error, cx)
+                    .into_any_element(),
+            ),
             "chain" => Some(self.chain_block(&view, &repaint, cx).into_any_element()),
             "extra-core" => Some(self.extra_block(&view, &repaint, cx).into_any_element()),
             _ => None,
@@ -4061,7 +4097,12 @@ impl ConfigForm {
                                         div()
                                             .id("field-guided-server")
                                             .test_support()
-                                            .child(Input::new(&self.guided_server)),
+                                            .child(Input::new(&self.guided_server))
+                                            .children(local_field_error(
+                                                "field-guided-server-error",
+                                                form_error.as_ref(),
+                                                "guided_server",
+                                            )),
                                     ),
                             ),
                         ),
@@ -4080,7 +4121,12 @@ impl ConfigForm {
                                         div()
                                             .id("field-guided-port")
                                             .test_support()
-                                            .child(Input::new(&self.guided_port)),
+                                            .child(Input::new(&self.guided_port))
+                                            .children(local_field_error(
+                                                "field-guided-port-error",
+                                                form_error.as_ref(),
+                                                "guided_port",
+                                            )),
                                     ),
                             ),
                         ),
@@ -4136,9 +4182,19 @@ impl ConfigForm {
                 .label_indent(false)
                 .child(div().id("common-section").test_support().child(common)),
         );
+        let guided_block = protocol_section.is_some();
+        // F5: identity sits under Common, above Advanced — expanding Advanced
+        // must never push UUID/Flow/Packet out of sight.
+        if let Some(section) = protocol_section {
+            form = form.child(
+                field()
+                    .label_indent(false)
+                    .child(div().id("protocol-section").test_support().child(section)),
+            );
+        }
         // The raw params row only exists where no guided block can author the
         // row (see above) — every guided protocol is textarea-free.
-        if protocol_section.is_none() {
+        if !guided_block {
             form = form.child(field().label_indent(false).child(params_row));
         }
         // K2: ONE full-width `Advanced Settings` expander — the merged home of
@@ -4185,14 +4241,6 @@ impl ConfigForm {
                     ),
                 );
             }
-        }
-        // K2: the protocol-specific rows, directly (no per-protocol Show page).
-        if let Some(section) = protocol_section {
-            form = form.child(
-                field()
-                    .label_indent(false)
-                    .child(div().id("protocol-section").test_support().child(section)),
-            );
         }
         // K2: Group / Bind / Port ride one compact secondary row above the
         // footer instead of three full-width rows.
@@ -4256,14 +4304,21 @@ impl ConfigForm {
             );
         }
         if let Some((field_name, message)) = form_error {
-            form = form.child(
-                field().label_indent(false).child(
-                    div()
-                        .id("form-field-error")
-                        .test_support()
-                        .child(format!("{field_name}: {message}")),
-                ),
-            );
+            // Guided fields carry their error beside themselves; the foot line
+            // stays for everything else (params, port, test_url).
+            if !matches!(
+                field_name.as_str(),
+                "uuid" | "guided_server" | "guided_port"
+            ) {
+                form = form.child(
+                    field().label_indent(false).child(
+                        div()
+                            .id("form-field-error")
+                            .test_support()
+                            .child(format!("{field_name}: {message}")),
+                    ),
+                );
+            }
         }
         form
     }
@@ -4285,6 +4340,14 @@ impl ConfigForm {
             "bind_ip" => Some(AnyInputState::from(self.bind.clone())),
             "port" => Some(AnyInputState::from(self.port.clone())),
             "test_url" => Some(AnyInputState::from(self.test_url.clone())),
+            "guided_server" => Some(AnyInputState::from(self.guided_server.clone())),
+            "guided_port" => Some(AnyInputState::from(self.guided_port.clone())),
+            "uuid" => Some(AnyInputState::from(match self.protocol_text(cx).as_str() {
+                "vmess" => self.vmess_uuid.clone(),
+                "tuic" => self.tuic_uuid.clone(),
+                "xray" => self.xray_uuid.clone(),
+                _ => self.vless_uuid.clone(),
+            })),
             _ => None,
         };
         if let Some(state) = target {
