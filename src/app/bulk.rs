@@ -99,7 +99,7 @@ impl AppView {
                         .label("More")
                         .dropdown_caret(true)
                         .accessibility_label("More bulk actions")
-                        .tooltip("Enable, disable, move, copy, or delete the checked rows")
+                        .tooltip("Move, copy, or delete the checked rows")
                         .dropdown_menu(move |menu, _, _| {
                             menu.item(bulk_menu_item(
                                 "bulk-more-select-visible",
@@ -116,20 +116,6 @@ impl AppView {
                                 |view, window, cx| view.clear_checked(window, cx),
                             ))
                             .separator()
-                            .item(bulk_menu_item(
-                                "bulk-more-enable",
-                                "Enable",
-                                false,
-                                more_view.clone(),
-                                |view, window, cx| view.commit_bulk_enable(true, window, cx),
-                            ))
-                            .item(bulk_menu_item(
-                                "bulk-more-disable",
-                                "Disable",
-                                false,
-                                more_view.clone(),
-                                |view, window, cx| view.commit_bulk_enable(false, window, cx),
-                            ))
                             .item(bulk_menu_item(
                                 "bulk-more-move",
                                 "Move to group",
@@ -195,47 +181,6 @@ impl AppView {
         }
         self.clear_checked(window, cx);
         true
-    }
-
-    pub(crate) fn commit_bulk_enable(
-        &mut self,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let ids: Vec<String> = self
-            .libraries
-            .read(cx)
-            .delegate()
-            .checked_rows()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect();
-        if ids.is_empty() {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        }
-        let mut ok = 0usize;
-        let mut failed = 0usize;
-        for id in &ids {
-            match self.store.set_enabled(id, enabled) {
-                Ok(_) => ok += 1,
-                Err(_) => failed += 1,
-            }
-        }
-        self.reload(window, cx);
-        let verb = if enabled { "Enabled" } else { "Disabled" };
-        if failed == 0 {
-            window.push_notification(
-                Notification::success(format!("{verb} {ok} configuration(s)")),
-                cx,
-            );
-        } else {
-            window.push_notification(
-                Notification::warning(format!("{verb} {ok}, {failed} failed")),
-                cx,
-            );
-        }
     }
 
     /// T-05: the bulk copy — one TAB-separated line per checked-and-running

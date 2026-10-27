@@ -26,7 +26,9 @@ impl AppView {
             .flex_row()
             .items_center()
             .gap_2()
-            .min_w(px(210.))
+            // Wide enough for the longest count ("2 configurations · 1 set
+            // for launch") so a plural never shifts the neighbouring slots.
+            .min_w(px(260.))
             .child({
                 let tip = count_text.clone();
                 div()

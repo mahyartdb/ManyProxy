@@ -1541,7 +1541,7 @@ impl AppView {
                             .id("kebab-auto-start")
                             .test_support()
                             .role(Role::MenuItem)
-                            .aria_label("Auto-start")
+                            .aria_label("Restore on launch")
                             .flex()
                             .flex_row()
                             .items_center()
@@ -1549,13 +1549,13 @@ impl AppView {
                             .tooltip(|_, cx| {
                                 cx.new(|_| {
                                     Tooltip::new(
-                                        "Auto-start with Start-all — Start/Stop control serving now",
+                                        "Restore this row on launch — Start and Stop control serving now",
                                     )
                                 })
                                 .into()
                             })
                             .child(format!(
-                                "Auto-start · {}",
+                                "Restore on launch · {}",
                                 if auto_start { "On" } else { "Off" }
                             ))
                     })

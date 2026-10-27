@@ -12195,8 +12195,6 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     for id in [
         "bulk-more-select-visible",
         "bulk-more-clear",
-        "bulk-more-enable",
-        "bulk-more-disable",
         "bulk-more-move",
         "bulk-more-copy",
         "bulk-more-delete",
@@ -12325,8 +12323,6 @@ fn k04_bulk_bar_single_line_within_min_frame(cx: &mut TestAppContext) {
     let items = [
         "bulk-more-select-visible",
         "bulk-more-clear",
-        "bulk-more-enable",
-        "bulk-more-disable",
         "bulk-more-move",
         "bulk-more-copy",
         "bulk-more-delete",
@@ -13160,60 +13156,6 @@ fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
         "1 checked · 1 shown"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
-}
-
-#[gpui_kit::test]
-fn t44_ui_bulk_enable_commits(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let first = store
-        .add(row19_seed("Work", "a.example.com", "10811"))
-        .expect("seed works");
-    let second = store
-        .add(row19_seed("Home", "b.example.com", "10812"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.run_until_parked();
-
-    let before = notification_count(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_enable(true, window, cx));
-    });
-    assert_eq!(notification_count(cx), before + 1);
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&first.id);
-                state.delegate_mut().toggle_checked(&second.id);
-                list_cx.notify();
-            });
-        });
-    });
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_enable(true, window, cx));
-    });
-    let enabled: Vec<bool> = view.read_with(cx, |view, _| {
-        view.store
-            .list()
-            .expect("list works")
-            .iter()
-            .map(|row| row.enabled)
-            .collect()
-    });
-    assert!(enabled.iter().all(|&flag| flag), "both enabled");
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_enable(false, window, cx));
-    });
-    let enabled: Vec<bool> = view.read_with(cx, |view, _| {
-        view.store
-            .list()
-            .expect("list works")
-            .iter()
-            .map(|row| row.enabled)
-            .collect()
-    });
-    assert!(enabled.iter().all(|&flag| !flag), "both disabled");
 }
 
 #[gpui_kit::test]
@@ -17034,9 +16976,9 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
+    // F6: Enable/Disable left the bulk menu — the flag is restore-on-launch,
+    // not a bulk operation.
     let menu = [
-        "bulk-more-enable",
-        "bulk-more-disable",
         "bulk-more-move",
         "bulk-more-copy",
         "bulk-more-delete",
@@ -19084,11 +19026,14 @@ fn enabled_flag_message_names_row_and_meaning() {
     use crate::enabled_flag_message;
     let on = enabled_flag_message("Work", true);
     assert!(on.contains("Work"), "names the row: {on}");
-    assert!(on.contains("flag only"), "one semantic: {on}");
-    assert!(on.contains("Start"), "points at Start: {on}");
+    assert!(on.contains("restore on launch"), "one semantic: {on}");
+    assert!(!on.contains("flag only"), "the old vague label is gone: {on}");
     let off = enabled_flag_message("Work", false);
     assert!(off.contains("Work"), "names the row: {off}");
-    assert!(off.contains("Stop"), "points at Stop: {off}");
+    assert!(
+        off.contains("will not restore on launch"),
+        "the off state names its meaning: {off}"
+    );
 }
 
 #[gpui_kit::test]
@@ -27660,7 +27605,7 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     assert_eq!(engine_text, "engine running");
     assert_eq!(
         crate::status_count_text(total, 3),
-        "3 configurations · 3 enabled"
+        "3 configurations · 3 set for launch"
     );
     let totals = totals.expect("traffic totals render once bytes flow");
     assert_eq!(totals, "out 1.0 KB · in 2.0 KB", "traffic totals read");
@@ -27843,8 +27788,8 @@ fn k12_status_bar_three_segments(cx: &mut TestAppContext) {
 
     assert_eq!(
         label_of("status-count", cx),
-        "1 configuration · 1 enabled",
-        "left segment counts configs"
+        "1 configuration · 1 set for launch",
+        "left segment counts restore flags"
     );
     assert_eq!(
         label_of("engine-status", cx),
@@ -27897,7 +27842,7 @@ fn k12_status_bar_no_stray_dash(cx: &mut TestAppContext) {
     );
     assert_eq!(
         label_of("status-count", cx),
-        "0 configurations · 0 enabled",
+        "0 configurations · 0 set for launch",
         "empty counts stay honest"
     );
     assert_eq!(

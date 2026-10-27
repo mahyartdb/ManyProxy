@@ -74,10 +74,12 @@ folder is never read or migrated. The `MANYPROXY_DB`, `MANYPROXY_EXPORT` and
    file dropped on the window, clipboard text, or a WireGuard `.conf`.
 2. Leave **Port** blank to auto-assign from the primary range `10801–10999`
    (spillover `18081–18380`), or type a port.
-3. Select the row and press **Start** (`F5`), or **Start all** for every enabled
+3. Select the row and press **Start** (`F5`), or **Start all** to start every
    row. Starting regenerates one combined engine config, runs the engine's own
    `check`, then (re)starts the sidecar. Stop with **Stop** (`Shift-F5`) or
-   **Stop all**; stopping clears the enabled flag.
+   **Stop all**; stopping clears the row's restore-on-launch flag. That flag
+   (row menu → **Restore on launch**) decides which rows the next launch
+   reopens — Start all ignores it and starts every row.
 4. **Copy URLs** (`Ctrl-U`) copies both forms for the row:
    `socks5://127.0.0.1:<port>` and `http://127.0.0.1:<port>`. Point one app at
    one endpoint — apps with separate SOCKS5/HTTP fields take the matching line.

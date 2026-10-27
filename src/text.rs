@@ -586,9 +586,10 @@ pub(crate) fn search_count_text(visible: usize, total: usize) -> String {
     format!("{visible} of {total}")
 }
 /// K12/A5-1: the status strip's first segment — library totals, singular at 1.
+/// F6: the flag it counts means restore-on-launch, not "will start now".
 pub(crate) fn status_count_text(total: usize, enabled: usize) -> String {
     format!(
-        "{} {} · {} enabled",
+        "{} {} · {} set for launch",
         total,
         if total == 1 {
             "configuration"
@@ -642,9 +643,9 @@ pub(crate) fn save_listen_gate(name: &str, bind_raw: &str, port_raw: &str) -> Re
 }
 pub(crate) fn enabled_flag_message(name: &str, enabled: bool) -> String {
     if enabled {
-        format!("\"{name}\" enabled (flag only — Start to serve)")
+        format!("\"{name}\" will restore on launch (Start serves it now)")
     } else {
-        format!("\"{name}\" disabled (flag only — Stop to close the endpoint)")
+        format!("\"{name}\" will not restore on launch (Stop closes the endpoint now)")
     }
 }
 pub(crate) fn db_list_error_message(error: &StoreError) -> String {
