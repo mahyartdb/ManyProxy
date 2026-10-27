@@ -3,6 +3,32 @@ use crate::*;
 const SING_BOX_RELEASES_URL: &str = "https://github.com/SagerNet/sing-box/releases";
 const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
 
+/// F10: the footer hint the palette carries, in one place so the test pins the
+/// same string the user reads.
+pub(crate) const PALETTE_FOOTER_HINT: &str = "↑↓ move · Enter run · Esc close";
+
+/// A palette row that shows the key that runs it. The kit draws its own chip
+/// only from `CommandItem::action`, and an action on a palette row dispatches
+/// twice on Enter (the row's confirm plus the action), so the row renders its
+/// label and chip as content instead.
+fn palette_item(
+    label: &'static str,
+    keystroke: &'static str,
+    fallback: &'static str,
+) -> CommandItem {
+    CommandItem::new().label(label).child(move |_, _| {
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().min_w_0().child(label))
+            .child(shortcut_kbd(keystroke, fallback))
+            .into_any_element()
+    })
+}
+
 impl AppView {
     pub(crate) fn open_alert_dialog_after_root<F>(
         &mut self,
@@ -706,90 +732,81 @@ impl AppView {
             dialog.title("Command palette").child(
                 Command::new(&state)
                     .placeholder("Type a command…")
+                    .footer(|_, _, cx| {
+                        div()
+                            .id("palette-footer")
+                            .test_support()
+                            .w_full()
+                            .px_2()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .aria_label(PALETTE_FOOTER_HINT)
+                            .child(PALETTE_FOOTER_HINT)
+                    })
                     .group(CommandGroup::new().label("Library").items(vec![
-                            CommandItem::new()
-                                .label("Add configuration")
-                                .keywords(["new", "create"]),
-                            CommandItem::new()
-                                .label("Import configurations")
-                                .keywords(["import", "link", "file"]),
-                            CommandItem::new()
-                                .label("Start selected")
-                                .keywords(["start", "serve", "f5"]),
-                            CommandItem::new().label("Stop selected").keywords(["stop"]),
-                            CommandItem::new()
-                                .label("Test selected")
-                                .keywords(["test", "probe", "health"]),
-                            CommandItem::new().label("Copy URLs").keywords([
-                                "copy",
-                                "clipboard",
-                                "url",
-                                "endpoint",
-                            ]),
-                            CommandItem::new()
-                                .label("Edit selected")
-                                .keywords(["edit", "rename"]),
-                            CommandItem::new()
-                                .label("Delete selected")
-                                .keywords(["delete", "remove"]),
-                            CommandItem::new()
-                                .label("Focus search field")
-                                .keywords(["search", "find", "filter"]),
-                            CommandItem::new()
-                                .label("Clear checked")
-                                .keywords(["clear", "uncheck", "escape"]),
-                            CommandItem::new()
-                                .label("Show Details tab")
-                                .keywords(["details", "tab"]),
-                            CommandItem::new()
-                                .label("Show Health tab")
-                                .keywords(["health", "tab"]),
-                            CommandItem::new()
-                                .label("Import from clipboard")
-                                .keywords(["clipboard", "paste", "import"]),
-                            CommandItem::new()
-                                .label("Export library")
-                                .keywords(["export", "backup", "json"]),
-                        ]))
+                        palette_item("Add configuration", "ctrl-n", "Ctrl+N")
+                            .keywords(["new", "create"]),
+                        palette_item("Import configurations", "ctrl-o", "Ctrl+O")
+                            .keywords(["import", "link", "file"]),
+                        palette_item("Start selected", "f5", "F5")
+                            .keywords(["start", "serve", "f5"]),
+                        palette_item("Stop selected", "shift-f5", "Shift+F5")
+                            .keywords(["stop"]),
+                        palette_item("Test selected", "ctrl-t", "Ctrl+T")
+                            .keywords(["test", "probe", "health"]),
+                        palette_item("Copy URLs", "ctrl-u", "Ctrl+U")
+                            .keywords(["copy", "clipboard", "url", "endpoint"]),
+                        palette_item("Edit selected", "ctrl-e", "Ctrl+E")
+                            .keywords(["edit", "rename"]),
+                        palette_item("Delete selected", "delete", "Delete")
+                            .keywords(["delete", "remove"]),
+                        palette_item("Focus search field", "ctrl-f", "Ctrl+F")
+                            .keywords(["search", "find", "filter"]),
+                        palette_item("Clear checked", "escape", "Esc")
+                            .keywords(["clear", "uncheck", "escape"]),
+                        palette_item("Show Details tab", "ctrl-1", "Ctrl+1")
+                            .keywords(["details", "tab"]),
+                        palette_item("Show Health tab", "ctrl-2", "Ctrl+2")
+                            .keywords(["health", "tab"]),
+                        palette_item("Import from clipboard", "ctrl-v", "Ctrl+V")
+                            .keywords(["clipboard", "paste", "import"]),
+                        CommandItem::new()
+                            .label("Export library")
+                            .keywords(["export", "backup", "json"]),
+                    ]))
                     .group(CommandGroup::new().label("Manage").items(vec![
-                            CommandItem::new()
-                                .label("Subscriptions")
-                                .keywords(["subscription", "refresh"]),
-                            CommandItem::new()
-                                .label("Routing presets")
-                                .keywords(["preset", "routing", "rules"]),
-                            CommandItem::new()
-                                .label("Groups")
-                                .keywords(["group", "move"]),
-                            CommandItem::new().label("Logs").keywords(["log", "output"]),
-                            CommandItem::new()
-                                .label("Settings")
-                                .keywords(["settings", "options", "test url"]),
-                            CommandItem::new().label("About").keywords([
-                                "about",
-                                "version",
-                                "shortcuts",
-                            ]),
-                            CommandItem::new()
-                                .label("Start all")
-                                .keywords(["start", "all", "serve"]),
-                            CommandItem::new()
-                                .label("Stop all")
-                                .keywords(["stop", "all"]),
-                            CommandItem::new()
-                                .label("Test all")
-                                .keywords(["test", "all", "probe"]),
-
-                            CommandItem::new()
-                                .label("Runtime stats")
-                                .keywords(["runtime", "stats", "health", "cpu", "memory"]),
-                            CommandItem::new()
-                                .label("Traffic stats")
-                                .keywords(["traffic", "stats", "usage", "profile"]),
-                            CommandItem::new()
-                                .label("Row columns")
-                                .keywords(["column", "columns", "rows", "display"]),
-                        ]))
+                        CommandItem::new()
+                            .label("Subscriptions")
+                            .keywords(["subscription", "refresh"]),
+                        CommandItem::new()
+                            .label("Routing presets")
+                            .keywords(["preset", "routing", "rules"]),
+                        CommandItem::new().label("Groups").keywords(["group", "move"]),
+                        CommandItem::new().label("Logs").keywords(["log", "output"]),
+                        CommandItem::new()
+                            .label("Settings")
+                            .keywords(["settings", "options", "test url"]),
+                        CommandItem::new()
+                            .label("About")
+                            .keywords(["about", "version", "shortcuts"]),
+                        CommandItem::new()
+                            .label("Start all")
+                            .keywords(["start", "all", "serve"]),
+                        CommandItem::new().label("Stop all").keywords(["stop", "all"]),
+                        CommandItem::new()
+                            .label("Test all")
+                            .keywords(["test", "all", "probe"]),
+                        CommandItem::new()
+                            .label("Runtime stats")
+                            .keywords(["runtime", "stats", "health", "cpu", "memory"]),
+                        CommandItem::new()
+                            .label("Traffic stats")
+                            .keywords(["traffic", "stats", "usage", "profile"]),
+                        CommandItem::new()
+                            .label("Row columns")
+                            .keywords(["column", "columns", "rows", "display"]),
+                    ]))
                     .on_confirm(move |index, window, cx| {
                         view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
                     }),

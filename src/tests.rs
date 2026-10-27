@@ -16317,6 +16317,84 @@ fn f08_palette_rows_stop_lying(cx: &mut TestAppContext) {
     );
 }
 
+/// F10: the palette states its keys, and every row that really is bound wears
+/// that key as a chip. The chip is row content (an action would dispatch
+/// twice), so the chip's own debug id is the proof it painted.
+#[gpui_kit::test]
+fn f10_palette_footer_and_bound_row_chips(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_palette(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_painted(cx, "palette-footer");
+    assert_eq!(
+        label_of("palette-footer", cx),
+        crate::app::open::PALETTE_FOOTER_HINT,
+        "the footer spells the keys that move, run and close the palette"
+    );
+    assert_eq!(
+        crate::app::open::PALETTE_FOOTER_HINT,
+        "↑↓ move · Enter run · Esc close"
+    );
+
+    const BOUND_CHIPS: [&str; 13] = [
+        "kbd:ctrl-n",
+        "kbd:ctrl-o",
+        "kbd:f5",
+        "kbd:shift-f5",
+        "kbd:ctrl-t",
+        "kbd:ctrl-u",
+        "kbd:ctrl-e",
+        "kbd:delete",
+        "kbd:ctrl-f",
+        "kbd:escape",
+        "kbd:ctrl-1",
+        "kbd:ctrl-2",
+        "kbd:ctrl-v",
+    ];
+    // The palette opens on the whole list, so the first rows and their chips
+    // are the ones on screen.
+    assert!(
+        cx.debug_bounds("kbd:ctrl-n").is_some(),
+        "Add configuration wears Ctrl+N"
+    );
+    assert!(
+        cx.debug_bounds("kbd:ctrl-o").is_some(),
+        "Import configurations wears Ctrl+O"
+    );
+
+    let state = view.read_with(cx, |view, _| view.palette.clone().expect("palette state"));
+    let filter = |cx: &mut VisualTestContext, query: &str| {
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_query(query, window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        state.read_with(cx, |state, _| state.matched_count())
+    };
+
+    assert_eq!(filter(cx, "add"), 1, "only Add configuration matches");
+    assert!(
+        cx.debug_bounds("kbd:ctrl-n").is_some(),
+        "the chip rides along when the row is filtered to the top"
+    );
+
+    // Export library is the one Library row with no key of its own.
+    assert_eq!(filter(cx, "export"), 1, "only Export library matches");
+    for chip in BOUND_CHIPS {
+        assert!(
+            cx.debug_bounds(chip).is_none(),
+            "{chip} stays off a row that has no binding"
+        );
+    }
+}
+
 #[gpui_kit::test]
 fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
     use gpui_kit::Keystroke;
