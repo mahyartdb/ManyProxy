@@ -585,10 +585,13 @@ impl LibraryDelegate {
         if self.checked.is_empty() {
             return String::new();
         }
-        // K4: the count keeps its checked set first and the visible scope in
-        // parentheses. The bar never says "visible" twice, and M stays the
-        // visible row count so the number is honest after a filter.
-        format!("{} checked (of {})", self.checked.len(), self.visible.len())
+        // F3: M is the visible row count, so it must read as the current
+        // scope of the bar, never as the library total.
+        format!(
+            "{} checked · {} shown",
+            self.checked.len(),
+            self.visible.len()
+        )
     }
 
     pub(crate) fn checked_rows(&self) -> Vec<ProxyConfig> {
@@ -910,7 +913,19 @@ impl ListDelegate for LibraryDelegate {
                     state.delegate_mut().toggle_checked(&toggle_id);
                     cx.notify();
                 });
+                // F3: checking is a bulk-set edit, not a selection gesture.
+                // The parent list item would otherwise select the row and
+                // move the inspector on every check/uncheck.
+                cx.stop_propagation();
             });
+        // The kit checkbox owns no observed element id, so tests click this
+        // content-sized wrapper; it only exists in the test build.
+        #[cfg(test)]
+        let checkbox = div()
+            .id(format!("check-target-{row_id}"))
+            .test_support()
+            .flex()
+            .child(checkbox);
 
         let port_stored = row.port.to_string();
         self.ensure_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);

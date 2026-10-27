@@ -11728,12 +11728,12 @@ fn t44_checked_set_honest_label_and_prune() {
     delegate.toggle_checked("3");
     delegate.toggle_checked("ghost");
     assert_eq!(delegate.checked.len(), 2, "unknown ids never check");
-    assert_eq!(delegate.bulk_label(), "2 checked (of 3)");
+    assert_eq!(delegate.bulk_label(), "2 checked · 3 shown");
 
     delegate.query = "alpha".to_string();
     delegate.apply_filter();
     assert_eq!(delegate.checked.len(), 2);
-    assert_eq!(delegate.bulk_label(), "2 checked (of 1)");
+    assert_eq!(delegate.bulk_label(), "2 checked · 1 shown");
     let checked: Vec<String> = delegate
         .checked_rows()
         .iter()
@@ -11743,12 +11743,12 @@ fn t44_checked_set_honest_label_and_prune() {
 
     delegate.query = String::new();
     delegate.set_facet_group(Some("nope".to_string()));
-    assert_eq!(delegate.bulk_label(), "2 checked (of 0)");
+    assert_eq!(delegate.bulk_label(), "2 checked · 0 shown");
     delegate.clear_facets();
 
     delegate.set_rows(vec![row("1", "Alpha", "g"), row("2", "Beta", "g")]);
     assert_eq!(delegate.checked.len(), 1);
-    assert_eq!(delegate.bulk_label(), "1 checked (of 2)");
+    assert_eq!(delegate.bulk_label(), "1 checked · 2 shown");
     delegate.toggle_checked("1");
     assert_eq!(delegate.bulk_label(), "");
     delegate.clear_checked();
@@ -11862,7 +11862,7 @@ fn t01_checked_positions_and_selection_stay_distinct() {
         None,
         "the selected-only row carries no chip"
     );
-    assert_eq!(delegate.bulk_label(), "2 checked (of 3)");
+    assert_eq!(delegate.bulk_label(), "2 checked · 3 shown");
     assert_eq!(
         delegate.selected_row().map(|row| row.name),
         Some("Gamma".to_string()),
@@ -11880,12 +11880,77 @@ fn t01_checked_positions_and_selection_stay_distinct() {
 
     delegate.toggle_checked("1");
     assert_eq!(delegate.checked_position("3"), Some(1));
-    assert_eq!(delegate.bulk_label(), "1 checked (of 3)");
+    assert_eq!(delegate.bulk_label(), "1 checked · 3 shown");
     delegate.selected = None;
     assert_eq!(
         delegate.checked.len(),
         1,
         "checks survive a selection clear"
+    );
+}
+
+/// F3: the checkbox is a bulk-set edit, not a selection gesture. A real
+/// pointer click on another row's checkbox must check that row without
+/// moving the selection, and the second click must leave both alone.
+#[gpui_kit::test]
+fn f03_checkbox_click_keeps_checked_and_selected_independent(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let first = store
+        .add(row19_seed("First", "a.example.com", "10801"))
+        .expect("seed works");
+    let second = store
+        .add(row19_seed("Second", "b.example.com", "10802"))
+        .expect("seed works");
+    let _third = store
+        .add(row19_seed("Third", "c.example.com", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &first.id);
+
+    let check = format!("check-target-{}", second.id);
+    assert_painted(cx, &check);
+    cx.update(|window, cx| window.click(check.clone(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let (checked, selected) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        (
+            delegate.checked.iter().cloned().collect::<Vec<_>>(),
+            delegate.selected_row().map(|row| row.id),
+        )
+    });
+    assert_eq!(
+        checked,
+        vec![second.id.clone()],
+        "the click checks exactly its own row"
+    );
+    assert_eq!(
+        selected.as_deref(),
+        Some(first.id.as_str()),
+        "checking never selects the checked row"
+    );
+
+    // The bulk bar appears after the first click, so the second click reads
+    // the fresh bounds rather than the pre-bar ones.
+    cx.update(|window, cx| window.click(check, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let (checked, selected) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        (
+            delegate.checked.len(),
+            delegate.selected_row().map(|row| row.id),
+        )
+    });
+    assert_eq!(checked, 0, "the second click unchecks");
+    assert_eq!(
+        selected.as_deref(),
+        Some(first.id.as_str()),
+        "unchecking does not restore or move the selection"
     );
 }
 
@@ -12081,7 +12146,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "1 checked (of 2)");
+    assert_eq!(label, "1 checked · 2 shown");
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -12096,7 +12161,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "1 checked (of 1)");
+    assert_eq!(label, "1 checked · 1 shown");
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.select_visible_checked(window, cx));
@@ -12104,7 +12169,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "2 checked (of 1)");
+    assert_eq!(label, "2 checked · 1 shown");
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.clear_checked(window, cx));
     });
@@ -12353,7 +12418,7 @@ fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "2 checked (of 3)");
+    assert_eq!(label, "2 checked · 3 shown");
 }
 
 #[gpui_kit::test]
@@ -12943,7 +13008,7 @@ fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
         (delegate.checked_position(&only.id), delegate.bulk_label())
     });
     assert_eq!(position, Some(1), "the checked set keeps its order");
-    assert_eq!(label, "1 checked (of 1)");
+    assert_eq!(label, "1 checked · 1 shown");
 }
 
 #[gpui_kit::test]
@@ -13025,7 +13090,7 @@ fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
         view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         }),
-        "1 checked (of 1)"
+        "1 checked · 1 shown"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
 }
@@ -16787,7 +16852,7 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
         view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         }),
-        "2 checked (of 2)"
+        "2 checked · 2 shown"
     );
 
     let (bar_bounds, button_height) = cx.update(|window, _| {
@@ -17467,7 +17532,7 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
         view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         }),
-        "1 checked (of 1)"
+        "1 checked · 1 shown"
     );
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.clear_checked(window, cx));
@@ -28167,7 +28232,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
             .read(cx)
             .delegate()
             .bulk_label()),
-        "1 checked (of 1)"
+        "1 checked · 1 shown"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -28194,7 +28259,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
             .read(cx)
             .delegate()
             .bulk_label()),
-        "1 checked (of 1)",
+        "1 checked · 1 shown",
         "arrows keep the checks"
     );
 }
