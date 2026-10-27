@@ -20598,6 +20598,36 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
     assert!(checked >= 4, "several columns are checked, got {checked}");
 }
 
+/// F14: the name tooltip triggers on the text, not the whole flexible cell,
+/// so hovering the blank remainder of a short name does nothing.
+#[gpui_kit::test]
+fn f14_name_tooltip_targets_the_text_not_the_cell(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Net", "a.example.com", "10801"))
+        .expect("seed works");
+    let (_view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    let (cell, text) = cx.update(|window, _| {
+        (
+            window
+                .try_find(format!("row-name-{}", row.id))
+                .expect("name cell paints")
+                .bounds(),
+            window
+                .try_find(format!("row-name-text-{}", row.id))
+                .expect("name text paints")
+                .bounds(),
+        )
+    });
+    assert!(
+        text.size.width < cell.size.width,
+        "a short name leaves blank cell space outside the tooltip trigger: text {text:?}, cell {cell:?}"
+    );
+}
+
 #[gpui_kit::test]
 fn t03_row_copy_proxy_copies_that_row(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

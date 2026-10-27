@@ -1302,12 +1302,22 @@ impl ListDelegate for LibraryDelegate {
                         .test_support()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .tooltip({
-                            let tip = full_route.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .child(Label::new(name)),
+                        .flex()
+                        .child(
+                            div()
+                                .id(format!("row-name-text-{row_id}"))
+                                .test_support()
+                                .max_w(relative(1.))
+                                .truncate()
+                                // F14: the tooltip belongs to the text, not the
+                                // flexible cell, so blank space after a short
+                                // name does not open the full route.
+                                .tooltip({
+                                    let tip = full_route.clone();
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .child(Label::new(name)),
+                        ),
                 )
                 .children(cells);
             card = card.child(header);
