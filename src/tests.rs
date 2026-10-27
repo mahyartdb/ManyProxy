@@ -8,11 +8,14 @@ use crate::store::{
     AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError, WindowGeometry,
 };
 use crate::AppView;
+use crate::ConfigForm;
 use crate::ExitTraffic;
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{point, px, size, AppContext, Bounds, Entity, Hsla, TestAppContext};
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -6915,6 +6918,23 @@ fn loopback_single_start_skips_confirm(cx: &mut TestAppContext) {
 }
 
 use gpui_kit::VisualTestContext;
+
+fn guided_add_form(name: &str, window: &mut Window, cx: &mut Context<AppView>) -> ConfigForm {
+    let form = ConfigForm::blank(window, cx);
+    form.name.update(cx, |state, cx| {
+        state.set_value(name, window, cx);
+    });
+    form.guided_server.update(cx, |state, cx| {
+        state.set_value("198.51.100.9", window, cx);
+    });
+    form.guided_port.update(cx, |state, cx| {
+        state.set_value("443", window, cx);
+    });
+    form.guided_identity.update(cx, |state, cx| {
+        state.set_value("11111111-2222-4333-8444-555555555555", window, cx);
+    });
+    form
+}
 
 fn mount_view(store: Store, cx: &mut TestAppContext) -> (Entity<AppView>, &mut VisualTestContext) {
     let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
@@ -14807,6 +14827,95 @@ fn t05_guided_add_without_json_creates_row(cx: &mut TestAppContext) {
             .params
             .contains("11111111-2222-4333-8444-555555555555"),
         "identity folds in"
+    );
+}
+
+/// F12: a successful Add confirms by selecting the row it created.
+#[gpui_kit::test]
+fn f12_add_selects_the_created_row(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let existing = store
+        .add(row19_seed("Existing", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &existing.id);
+
+    let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+    let closed = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let form = guided_add_form("Fresh", window, cx);
+            view.commit_add_with_focus(&form, &form_error, window, cx)
+        })
+    });
+    assert!(closed, "the guided form commits and closes");
+
+    let (created, selected) = view.read_with(cx, |view, cx| {
+        let rows = view.store.list().expect("list reads");
+        let created = rows
+            .iter()
+            .find(|row| row.name == "Fresh")
+            .expect("created row persists")
+            .id
+            .clone();
+        (
+            created,
+            view.libraries
+                .read(cx)
+                .delegate()
+                .selected_row()
+                .map(|row| row.id),
+        )
+    });
+    assert_eq!(
+        selected.as_deref(),
+        Some(created.as_str()),
+        "Add lands on the row it created"
+    );
+}
+
+/// F12: a filter that hides the new row cannot land on it, so the previous
+/// selection must stay exactly where the user left it.
+#[gpui_kit::test]
+fn f12_add_under_excluding_filter_keeps_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.set_query("alpha", window, list_cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &alpha.id);
+
+    let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+    let closed = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let form = guided_add_form("Fresh", window, cx);
+            view.commit_add_with_focus(&form, &form_error, window, cx)
+        })
+    });
+    assert!(closed, "the guided form commits and closes");
+    let selected = view.read_with(cx, |view, cx| {
+        view.libraries
+            .read(cx)
+            .delegate()
+            .selected_row()
+            .map(|row| row.id)
+    });
+    assert_eq!(
+        selected.as_deref(),
+        Some(alpha.id.as_str()),
+        "a hidden new row leaves the selection unchanged"
     );
 }
 

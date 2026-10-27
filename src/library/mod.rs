@@ -783,6 +783,30 @@ impl LibraryDelegate {
     }
 }
 
+pub(crate) fn select_first_visible(
+    state: &mut ListState<LibraryDelegate>,
+    ids: &[String],
+    window: &mut Window,
+    cx: &mut Context<ListState<LibraryDelegate>>,
+) -> bool {
+    let picked = {
+        let delegate = state.delegate_mut();
+        delegate.visible.iter().position(|&visible_ix| {
+            delegate
+                .rows
+                .get(visible_ix)
+                .is_some_and(|row| ids.contains(&row.id))
+        })
+    };
+    match picked {
+        Some(position) => {
+            state.set_selected_index(Some(IndexPath::new(position)), window, cx);
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) struct LogLinesDelegate {
     pub(crate) lines: Vec<String>,
 }

@@ -56,7 +56,14 @@ impl AppView {
             Ok(created) => {
                 *form_error.borrow_mut() = None;
                 let message = row_action_message("Added", &created.name);
+                let created_id = created.id.clone();
                 self.reload(window, cx);
+                // F12: the new row is the confirmation. A filter that hides
+                // it leaves the previous selection alone.
+                self.libraries.update(cx, |list_state, list_cx| {
+                    select_first_visible(list_state, &[created_id], window, list_cx);
+                    list_cx.notify();
+                });
                 window.push_notification(Notification::success(message), cx);
                 true
             }
