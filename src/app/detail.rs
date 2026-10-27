@@ -1330,7 +1330,7 @@ impl AppView {
         // minimum-width test budgets four 24px lines plus gaps inside
         // `detail-operate`, and a 1px top border would push the row to 121px.
         // K1/A4-8: ONE tier now — Start · Stop · Test plus the `…` kebab
-        // holding Auto-start, Ping, Logs, Copy URLs, Copy proxy. The draft
+        // holding Auto-start, Ping, Logs, Copy URLs, Copy SOCKS. The draft
         // warning travels with the editors into the endpoints block (A4-4).
         div()
             .w_full()
@@ -1429,8 +1429,8 @@ impl AppView {
         .item(Self::row_menu_item(
             "copy-proxy",
             row_id,
-            "Copy proxy",
-            "Copy this row's proxy URL",
+            "Copy SOCKS",
+            "Copy this row's SOCKS proxy URL only",
             view,
             AppView::copy_row_socks,
         ))
@@ -1514,7 +1514,7 @@ impl AppView {
 
     /// K1/A4-8: the operate row's overflow — ONE `…` trigger holding the five
     /// actions that no longer earn a button: Auto-start (writes the stored
-    /// flag only), Ping, Logs, Copy URLs, Copy proxy. Row management (Edit /
+    /// flag only), Ping, Logs, Copy URLs, Copy SOCKS. Row management (Edit /
     /// Delete / Duplicate / Reset) lives in the row's context menu — this
     /// button used to duplicate half of it above itself.
     pub(crate) fn render_row_menu(
@@ -1647,15 +1647,15 @@ impl AppView {
                             .id("kebab-copy-proxy")
                             .test_support()
                             .role(Role::MenuItem)
-                            .aria_label("Copy proxy")
+                            .aria_label("Copy SOCKS")
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
                             .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Copy this row's proxy URL")).into()
+                                cx.new(|_| Tooltip::new("Copy this row's SOCKS proxy URL only")).into()
                             })
-                            .child("Copy proxy")
+                            .child("Copy SOCKS")
                     })
                     .on_click({
                         let view = row_view.clone();

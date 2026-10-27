@@ -1219,13 +1219,13 @@ impl ListDelegate for LibraryDelegate {
                         Button::new(format!("row-copy-{row_id}"))
                             .small()
                             // Pinned row test: 72px cell. The default small
-                            // padding clipped "Copy proxy"; compact keeps the
-                            // full label inside the cell.
+                            // padding clipped the label; compact keeps the
+                            // full "Copy SOCKS" inside the cell.
                             .compact()
-                            .label("Copy proxy")
-                            .accessibility_label(format!("Copy proxy URL for {copy_name}"))
+                            .label("Copy SOCKS")
+                            .accessibility_label(format!("Copy SOCKS URL for {copy_name}"))
                             .tooltip(format!(
-                                "Copy this row's proxy URL — socks5://{copy_bind}:{copy_port}"
+                                "Copy this row's SOCKS proxy URL only — socks5://{copy_bind}:{copy_port}"
                             ))
                             .on_click(move |_, window, cx| {
                                 if let Some(app) = copy_view.clone() {

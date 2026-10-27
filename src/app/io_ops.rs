@@ -2,7 +2,7 @@ use crate::*;
 
 impl AppView {
     /// T-03: the one SOCKS copy. It reads the row by id and uses the STORED
-    /// bind host, so the row's own `Copy proxy` and the inspector's SOCKS
+    /// bind host, so the row's own `Copy SOCKS` and the inspector's SOCKS
     /// control always copy the row they belong to — never the selection.
     pub(crate) fn copy_row_socks(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {

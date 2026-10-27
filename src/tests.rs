@@ -17189,7 +17189,7 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
             "clipboard carries bind+port only, found {canary}: {clip}"
         );
     }
-    // The kebab's Copy proxy is the row-scoped SOCKS copy: bind:port only,
+    // The kebab's Copy SOCKS is the row-scoped copy: bind:port only,
     // never the HTTP form and never the selection's other rows.
     cx.update(|window, cx| {
         window.click("row-menu", cx);
@@ -17201,7 +17201,7 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let clip = read_clip(cx);
-    assert_eq!(clip, socks, "Copy proxy copies the SOCKS URL alone: {clip}");
+    assert_eq!(clip, socks, "Copy SOCKS copies the SOCKS URL alone: {clip}");
     assert!(!clip.contains(&http), "no HTTP form: {clip}");
     for canary in ["11111111", "198.51.100.9", "uuid", "password"] {
         assert!(
@@ -20545,8 +20545,8 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
     assert!(
         copy_label
             .as_deref()
-            .is_some_and(|label| label.starts_with("Copy proxy")),
-        "the row carries a Copy proxy action, got {copy_label:?}"
+            .is_some_and(|label| label.starts_with("Copy SOCKS")),
+        "the row carries a Copy SOCKS action, got {copy_label:?}"
     );
     let copy_width = cx.update(|window, _| {
         window
