@@ -27632,6 +27632,137 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     }
 }
 
+/// F4: the last engine error outlives the toast. A failed start leaves the
+/// controller's error set while the status is merely `stopped`; the strip must
+/// carry the reason until a later start clears it.
+#[gpui_kit::test]
+fn f04_last_engine_error_paints_after_the_toast(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "192.0.2.10", "10801"))
+        .expect("seed works");
+    let rows = store.list().expect("list works");
+    let (mut engine, handle) = EngineController::fake();
+    handle.fail_check("boom: bad field");
+    engine.start_all(&rows).expect_err("the fake check fails");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| view.engine = engine);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "engine-status");
+    let text = label_of("engine-last-error", cx);
+    assert!(
+        text.contains("boom: bad field"),
+        "the failed start stays on the bar: {text}"
+    );
+    assert_eq!(
+        label_of("engine-status", cx),
+        "engine stopped",
+        "the strip still names the engine state"
+    );
+}
+
+/// F4: the persistent line is only as useful as its install hint — the missing
+/// core path must say what to install, not just that a file is absent.
+#[test]
+fn f04_missing_binary_error_carries_the_install_hint() {
+    use crate::engine::EngineError;
+    let error = EngineError::MissingBinary {
+        binary: "sing-box.exe".to_string(),
+        searched: "C:\\app".to_string(),
+    };
+    let text = error.to_string();
+    assert!(text.contains("engine binary not found"), "{text}");
+    assert!(text.contains("install sing-box"), "{text}");
+    assert!(
+        text.contains("never downloads executables silently"),
+        "{text}"
+    );
+}
+
+/// F4: Settings names the source the persistent error line points at.
+#[gpui_kit::test]
+fn f04_settings_offer_the_core_guide(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    cx.update(|window, cx| {
+        window.click("settings-rail-engine", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_painted(cx, "settings-engine-cores-help");
+    cx.update(|window, cx| {
+        window.click("settings-engine-cores-help", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_painted(cx, "cores-help-body");
+    assert_painted(cx, "cores-help-open-sing-box");
+    assert_painted(cx, "cores-help-open-xray");
+    assert_painted(cx, "cores-help-dialog-close");
+}
+
+/// F6: the flag means restore-on-launch. Two rows with one flag cleared: the
+/// count says `1 set for launch` — never "enabled", which read as "will
+/// start" while Start all started every row — and the row menu offers the
+/// renamed toggle.
+#[gpui_kit::test]
+fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let on = store
+        .add(row19_seed("Work", "192.0.2.11", "10801"))
+        .expect("seed works");
+    let off = store
+        .add(row19_seed("Home", "192.0.2.12", "10802"))
+        .expect("seed works");
+    store.set_enabled(&on.id, true).expect("flag sets");
+    store.set_enabled(&off.id, false).expect("flag clears");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        label_of("status-count", cx),
+        "2 configurations · 1 set for launch",
+        "the count names the launch contract, not a start promise"
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, _| {
+                state.delegate_mut().selected = Some(IndexPath::new(0));
+            });
+        });
+    });
+    paint_frame(cx);
+    assert_painted(cx, "row-menu");
+    cx.update(|window, cx| {
+        window.click("row-menu", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "kebab-auto-start");
+    assert_eq!(
+        label_of("kebab-auto-start", cx),
+        "Restore on launch",
+        "the menu item names what the flag does"
+    );
+}
+
 #[gpui_kit::test]
 fn t11_status_strip_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

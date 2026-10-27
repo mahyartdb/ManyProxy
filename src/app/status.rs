@@ -3,12 +3,14 @@ use crate::*;
 impl AppView {
     /// K12/A5-1: three segments, one grammar.
     ///
-    /// `configs · enabled` | `engine <state> · health X live · Y dead` |
-    /// `out <bytes> · in <bytes>`
+    /// `configs · N set for launch` | `engine <state> · health X live · Y dead
+    /// [· last engine error]` | `out <bytes> · in <bytes>`
     ///
     /// Ports and connection counters left the strip: ports belong to the
     /// engine's own surface, and the connections count lives in the
-    /// Connections inspector tab (its group title already carries `(N)`).
+    /// Connections inspector tab (its group title already carries `(N)`). The
+    /// error segment rides F4: the toast hides in five seconds, this line
+    /// persists until a start succeeds and the controller clears it.
     pub(crate) fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let libraries = self.libraries.read(cx);
         let delegate = libraries.delegate();
@@ -18,6 +20,13 @@ impl AppView {
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
         let usage_text = summed_traffic_text(&self.store);
+        // A crash names its cause in `status_text` and stores the same words
+        // as the last error; showing both would read the failure twice.
+        let engine_error = self
+            .engine
+            .last_error()
+            .map(str::to_string)
+            .filter(|error| error != &engine_text);
 
         let mut left = div()
             .id("status-left")
@@ -96,7 +105,20 @@ impl AppView {
                             .aria_label(health_text.clone())
                             .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                             .child(health_text)
-                    }),
+                    })
+                    .children(engine_error.map(|error| {
+                        let tip = error.clone();
+                        div()
+                            .id("engine-last-error")
+                            .test_support()
+                            .min_w_0()
+                            .max_w(px(280.))
+                            .truncate()
+                            .text_color(cx.theme().danger)
+                            .aria_label(error.clone())
+                            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                            .child(error)
+                    })),
             );
 
         let mut right = div()

@@ -638,6 +638,31 @@ impl SettingsState {
             );
         }
 
+        // F4: the durable "where do I get cores" entry point — the status line
+        // names the missing core, this names the source.
+        let cores_view = self.view.clone();
+        body = body.child(
+            div()
+                .id("settings-engine-cores-help-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("settings-engine-cores-help")
+                        .small()
+                        .label("Where do I get cores?")
+                        .tooltip(
+                            "Opens the guide to installing sing-box, sing-box-awg and xray yourself",
+                        )
+                        .on_click(move |_, window, cx| {
+                            cores_view
+                                .update(cx, |view, cx| view.open_cores_help_dialog(window, cx));
+                        }),
+                ),
+        );
+
         let auto_restart_cell = self.auto_restart.clone();
         let auto_restart_view = self.view.clone();
         let auto_restart_on = *auto_restart_cell.borrow();

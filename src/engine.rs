@@ -7754,8 +7754,7 @@ impl EngineController {
         }
     }
 
-    #[cfg(test)]
-    pub fn last_error(&self) -> Option<&str> {
+    pub(crate) fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
 

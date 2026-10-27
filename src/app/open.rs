@@ -1,5 +1,8 @@
 use crate::*;
 
+const SING_BOX_RELEASES_URL: &str = "https://github.com/SagerNet/sing-box/releases";
+const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
+
 impl AppView {
     pub(crate) fn open_alert_dialog_after_root<F>(
         &mut self,
@@ -610,6 +613,81 @@ impl AppView {
                 .footer(dialog_footer(
                     "update-dialog-ok",
                     "update-dialog-cancel",
+                    "Close",
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
+    /// F4: the missing-core hint needs somewhere actionable after its toast
+    /// hides. No markdown viewer exists in the kit, so this dialog renders
+    /// `docs/user/cores.md`'s three facts in place, with the project pages one
+    /// browser-open away — the same affordance the update dialog uses.
+    pub(crate) fn open_cores_help_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
+            let body = div()
+                .id("cores-help-body")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_sm()
+                .child(format!(
+                    "ManyProxy runs executables you place beside ManyProxy.exe — {} (stock), {} (AmneziaWG fork, only AmneziaWG/Noise/XHTTP rows need it) and {} (only Xray-only rows).",
+                    engine_binary_file_name(),
+                    fork_binary_file_name(),
+                    xray_binary_file_name(),
+                ))
+                .child(
+                    Button::new("cores-help-open-sing-box")
+                        .small()
+                        .label("Open sing-box releases in browser")
+                        .tooltip(format!(
+                            "Opens {} in your own browser — the app downloads nothing",
+                            SING_BOX_RELEASES_URL
+                        ))
+                        .on_click({
+                            let url = SING_BOX_RELEASES_URL.to_string();
+                            move |_, window, cx| {
+                                if let Err(why) = open_release_in_browser(&url) {
+                                    window.push_notification(Notification::error(why), cx);
+                                }
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("cores-help-open-xray")
+                        .small()
+                        .label("Open Xray-core releases in browser")
+                        .tooltip(format!(
+                            "Opens {} in your own browser — the app downloads nothing",
+                            XRAY_RELEASES_URL
+                        ))
+                        .on_click({
+                            let url = XRAY_RELEASES_URL.to_string();
+                            move |_, window, cx| {
+                                if let Err(why) = open_release_in_browser(&url) {
+                                    window.push_notification(Notification::error(why), cx);
+                                }
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .id("cores-help-note")
+                        .test_support()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "Engines are read from the app folder only; PATH is never searched. ManyProxy never downloads executables silently — you download and install them yourself.",
+                        ),
+                );
+            dialog
+                .title("Where do I get cores?")
+                .child(body)
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "cores-help-dialog-close",
+                    "cores-help-dialog-cancel",
                     "Close",
                     Rc::new(|_, _| true),
                 ))
