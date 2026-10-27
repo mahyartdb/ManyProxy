@@ -269,6 +269,11 @@ struct AppView {
 
     preset_form: Option<PresetForm>,
 
+    /// F7: the open Import form, so a window drop lands in its textarea the
+    /// way Browse does. `Some` only while the Import dialog is up; every
+    /// close path clears it, and a stale marker self-heals on the next drop.
+    import_form: Option<ImportForm>,
+
     /// T-19: the row whose ConfigForm edit dialog is open, while it is open —
     /// auto-clear never removes the row under edit.
     edit_form_open: Option<String>,

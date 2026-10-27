@@ -199,12 +199,34 @@ impl AppView {
         self.import_text_direct(text, window, cx);
     }
 
+    /// F7: every dropped file lands in the Import dialog when it is open —
+    /// the same merge the Browse button runs — instead of being refused. Any
+    /// other overlay still refuses; only the Import form absorbs drops.
     pub(crate) fn import_dropped_files(
         &mut self,
         paths: &ExternalPaths,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(form) = self.import_form.clone() {
+            if window.has_active_dialog(cx) {
+                let text = form.text.read(cx).value().to_string();
+                let group = form.group.read(cx).value().to_string();
+                let (files, unreadable) = Self::read_dropped_import_files(paths);
+                if files.iter().all(|(_, content)| content.trim().is_empty()) {
+                    window.push_notification(
+                        Notification::warning(Self::drop_refusal_text(&unreadable)),
+                        cx,
+                    );
+                    return;
+                }
+                self.finish_browse_pick(text, group, files, unreadable, window, cx);
+                return;
+            }
+            // The dialog is gone without its close path running (another
+            // surface cleared the layer); never route into a dead form.
+            self.import_form = None;
+        }
         if overlay_open(window, cx) {
             window.push_notification(
                 Notification::warning(
@@ -214,39 +236,17 @@ impl AppView {
             );
             return;
         }
-        let mut merged = String::new();
-        let mut names: Vec<String> = Vec::new();
-        let mut files: Vec<(String, String)> = Vec::new();
-        let mut unreadable: Vec<String> = Vec::new();
-
-        for path in paths.0.iter() {
-            let display = path.to_string_lossy().into_owned();
-            match read_import_file(path) {
-                ImportFileRead::Text(content) => {
-                    if !merged.is_empty() {
-                        merged.push('\n');
-                    }
-                    merged.push_str(&content);
-                    names.push(display.clone());
-                    files.push((display, content));
-                }
-                ImportFileRead::Unreadable => {
-                    unreadable.push(file_basename(&display));
-                }
-                ImportFileRead::Refused(reason) => {
-                    unreadable.push(format!("{} ({reason})", file_basename(&display)));
-                }
-            }
-        }
+        let (files, unreadable) = Self::read_dropped_import_files(paths);
+        let merged = files
+            .iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         if merged.trim().is_empty() {
-            if unreadable.is_empty() {
-                window.push_notification(Notification::warning("No readable files dropped"), cx);
-            } else {
-                window.push_notification(
-                    Notification::warning(unreadable_drop_message(&unreadable)),
-                    cx,
-                );
-            }
+            window.push_notification(
+                Notification::warning(Self::drop_refusal_text(&unreadable)),
+                cx,
+            );
             return;
         }
         if !unreadable.is_empty() {
@@ -255,8 +255,8 @@ impl AppView {
                 cx,
             );
         }
-        if names.len() == 1 {
-            let file_hint = names.into_iter().next();
+        if files.len() == 1 {
+            let file_hint = files.into_iter().next().map(|(name, _)| name);
             self.open_import_dialog(&merged, DEFAULT_GROUP, file_hint, window, cx);
         } else {
             self.open_import_dialog_with_files(
@@ -267,6 +267,30 @@ impl AppView {
                 window,
                 cx,
             );
+        }
+    }
+
+    fn read_dropped_import_files(paths: &ExternalPaths) -> (Vec<(String, String)>, Vec<String>) {
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        for path in paths.0.iter() {
+            let display = path.to_string_lossy().into_owned();
+            match read_import_file(path) {
+                ImportFileRead::Text(content) => files.push((display, content)),
+                ImportFileRead::Unreadable => unreadable.push(file_basename(&display)),
+                ImportFileRead::Refused(reason) => {
+                    unreadable.push(format!("{} ({reason})", file_basename(&display)))
+                }
+            }
+        }
+        (files, unreadable)
+    }
+
+    fn drop_refusal_text(unreadable: &[String]) -> String {
+        if unreadable.is_empty() {
+            "No readable files dropped".to_string()
+        } else {
+            unreadable_drop_message(unreadable)
         }
     }
 

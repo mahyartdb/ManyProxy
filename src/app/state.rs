@@ -191,6 +191,7 @@ impl AppView {
             group_test_in_flight: false,
             subs_form: None,
             preset_form: None,
+            import_form: None,
             edit_form_open: None,
             rule_set_download_in_flight: false,
             import_parse_in_flight: false,

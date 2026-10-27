@@ -1716,6 +1716,9 @@ impl AppView {
             }
             None => ImportForm::new(window, cx, prefill_text, prefill_group, file_hint, None),
         };
+        // F7: the open form is the drop target, and a stale marker must never
+        // outlive its dialog — every close below clears it.
+        self.import_form = Some(form.clone());
         let view = cx.entity();
         let reader = form.clone();
 
@@ -1734,6 +1737,8 @@ impl AppView {
         let commit_key = commit.clone();
         let cancel_view = view.clone();
         let close_view = view.clone();
+        let ok_view = view.clone();
+        let drop_view = view.clone();
         focus_shell_before_overlay(window, cx);
         // Snapshot before the builder runs: reading `AppView` inside the
         // dialog-builder closure re-enters the entity mid-update and panics.
@@ -1743,13 +1748,18 @@ impl AppView {
             let commit_click = commit.clone();
             let cancel_view = cancel_view.clone();
             let close_view = close_view.clone();
+            let ok_view = ok_view.clone();
+            let drop_view = drop_view.clone();
             let footer = DialogFooter::new()
                 .child(
                     Button::new("import-dialog-cancel")
                         .small()
                         .label("Cancel")
                         .on_click(move |_, window, cx| {
-                            cancel_view.update(cx, |view, cx| view.cancel_import_parse(cx));
+                            cancel_view.update(cx, |view, cx| {
+                                view.import_form = None;
+                                view.cancel_import_parse(cx);
+                            });
                             window.close_all_dialogs(cx);
                             reclaim_shell_focus(window, cx);
                         }),
@@ -1768,6 +1778,7 @@ impl AppView {
                         .disabled(in_flight)
                         .on_click(move |_, window, cx| {
                             if commit_click(window, cx) {
+                                drop_view.update(cx, |view, _| view.import_form = None);
                                 window.close_all_dialogs(cx);
                                 reclaim_shell_focus(window, cx);
                             }
@@ -1777,13 +1788,20 @@ impl AppView {
                 .title("Import proxy configurations")
                 .close_button(false)
                 .child(form.clone().element(element_view.clone(), cx))
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
+                .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
+                    move |_, window, cx| {
+                        let committed = commit_key(window, cx);
+                        if committed {
+                            ok_view.update(cx, |view, _| view.import_form = None);
+                        }
+                        committed
+                    },
+                ))
                 .on_close(move |_, window, cx| {
-                    close_view.update(cx, |view, cx| view.cancel_import_parse(cx));
+                    close_view.update(cx, |view, cx| {
+                        view.import_form = None;
+                        view.cancel_import_parse(cx);
+                    });
                     reclaim_shell_focus(window, cx);
                 })
                 .footer(footer)

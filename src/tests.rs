@@ -10780,6 +10780,81 @@ fn t03_drop_while_dialog_open_refuses_honestly(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn f07_drop_into_open_import_dialog_fills_textarea(cx: &mut TestAppContext) {
+    use gpui_kit::ExternalPaths;
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let dir = std::env::temp_dir();
+    let tag = format!("manyproxy-f07-open-{}", std::process::id());
+    let dropped = dir.join(format!("{tag}-dropped.txt"));
+    std::fs::write(&dropped, b"vless://dropped@d.example.com:443#dropped")
+        .expect("temp write works");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_import_dialog("", "travel", None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    let before = notification_count(cx);
+    let paths = ExternalPaths(vec![dropped.clone()].into());
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.import_dropped_files(&paths, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        before,
+        "an open Import dialog absorbs the drop instead of refusing it"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .import_form
+            .clone()
+            .expect("import form stashed")
+            .text
+            .read(cx)
+            .value()
+            .to_string()),
+        "vless://dropped@d.example.com:443#dropped",
+        "the drop lands in the same textarea Browse fills"
+    );
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "the dialog stays up"
+    );
+    // `close_all_dialogs` clears the layer without running the dialog's
+    // on_close, so the stash self-heals on the next drop instead: a fresh
+    // dialog must carry only the new bytes, never the dead form's text.
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+    cx.run_until_parked();
+    let second = dir.join(format!("{tag}-second.txt"));
+    std::fs::write(&second, b"trojan://second@s.example.com:443#second").expect("write works");
+    let paths = ExternalPaths(vec![second.clone()].into());
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.import_dropped_files(&paths, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .import_form
+            .clone()
+            .expect("fresh form stashed")
+            .text
+            .read(cx)
+            .value()
+            .to_string()),
+        "trojan://second@s.example.com:443#second",
+        "a stale stash never swallows the next drop"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+    let _ = std::fs::remove_file(dropped);
+    let _ = std::fs::remove_file(second);
+}
+
+#[gpui_kit::test]
 fn ticket43_chrome_paints(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
