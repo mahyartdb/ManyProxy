@@ -46,13 +46,14 @@ impl AppView {
                     .label("Program")
                     .accessibility_label("Program")
                     .tooltip("App and single-config intake")
+                    .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "export-library",
-                                    "Export",
-                                    "Export",
+                                    "Export…",
+                                    "Export…",
                                     "Export library to JSON",
                                     None,
                                 )
@@ -102,16 +103,17 @@ impl AppView {
             .child(
                 Button::new("groups-menu")
                     .small()
-                    .label("Library…")
-                    .accessibility_label("Library…")
+                    .label("Library")
+                    .accessibility_label("Library")
                     .tooltip("Subscriptions, groups, and cleanup")
+                    .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "subscriptions",
-                                    "Subscriptions",
-                                    "Subscriptions",
+                                    "Subscriptions…",
+                                    "Subscriptions…",
                                     "Manage subscription lists",
                                     None,
                                 )
@@ -129,8 +131,8 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "menu-groups-dialog",
-                                    "Groups",
-                                    "Groups",
+                                    "Groups…",
+                                    "Groups…",
                                     "Rename or merge groups",
                                     None,
                                 )
@@ -246,6 +248,7 @@ impl AppView {
                     .label("Routing")
                     .accessibility_label("Routing")
                     .tooltip("Routing presets and settings")
+                    .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
@@ -313,6 +316,7 @@ impl AppView {
                     .label("Tools")
                     .accessibility_label("Tools")
                     .tooltip("Selection, diagnostics, and commands")
+                    .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
@@ -486,8 +490,8 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "menu-row-columns",
-                                    "Row columns…",
-                                    "Row columns…",
+                                    "Row columns",
+                                    "Row columns",
                                     "Choose which columns each library row shows",
                                     None,
                                 )

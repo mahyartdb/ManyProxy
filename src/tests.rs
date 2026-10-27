@@ -9817,7 +9817,7 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
     for (id, pinned) in [
         ("program-menu", "Program"),
         ("settings-menu", "Settings"),
-        ("groups-menu", "Library…"),
+        ("groups-menu", "Library"),
         ("routing-menu", "Routing"),
         ("tools-menu", "Tools"),
         ("global-start-stop", "Start all"),
@@ -9839,13 +9839,13 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
     for (trigger, items) in [
         (
             "program-menu",
-            &[("export-library", "Export"), ("about-dialog", "About")][..],
+            &[("export-library", "Export…"), ("about-dialog", "About")][..],
         ),
         (
             "groups-menu",
             &[
-                ("subscriptions", "Subscriptions"),
-                ("menu-groups-dialog", "Groups"),
+                ("subscriptions", "Subscriptions…"),
+                ("menu-groups-dialog", "Groups…"),
                 ("prune-duplicates", "Remove duplicates"),
                 ("prune-unavailable", "Remove unavailable"),
                 ("prune-invalid", "Remove invalid"),
@@ -9871,7 +9871,7 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
                 ("traffic-stats", "Traffic stats"),
                 ("show-security", "Show security"),
                 ("check-for-updates", "Check for updates"),
-                ("menu-row-columns", "Row columns…"),
+                ("menu-row-columns", "Row columns"),
                 ("open-palette", "Command palette"),
             ][..],
         ),
@@ -9905,6 +9905,124 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
         cx.run_until_parked();
         paint_frame(cx);
     }
+}
+
+/// F9: four menu triggers carry a caret and Settings stays a direct action.
+/// The caret has no element id, so it is pinned by geometry: it is the only
+/// variable in the trigger's trailing slot, and it is what pushes the three
+/// seven-letter triggers past the caret-free eight-letter Settings button.
+#[gpui_kit::test]
+fn f09_nav_carets_and_ellipsis_rule(cx: &mut TestAppContext) {
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (_view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    let trigger_width = |cx: &mut VisualTestContext, id: &str| -> gpui_kit::Pixels {
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+                .size
+                .width
+        })
+    };
+    // Measured floors: a caret adds ~13px to the label-only button.
+    for (id, floor) in [
+        ("program-menu", px(95.)),
+        ("groups-menu", px(95.)),
+        ("routing-menu", px(95.)),
+        ("tools-menu", px(78.)),
+    ] {
+        let width = trigger_width(cx, id);
+        assert!(
+            width >= floor,
+            "{id} holds the caret slot: {width:?} >= {floor:?}"
+        );
+    }
+    let settings = trigger_width(cx, "settings-menu");
+    assert!(
+        settings <= px(88.),
+        "Settings stays a direct action with no caret: {settings:?}"
+    );
+    // "Program", "Library" and "Routing" are shorter words than "Settings";
+    // without a caret they would sit under it, so the caret is the difference.
+    for id in ["program-menu", "groups-menu", "routing-menu"] {
+        let width = trigger_width(cx, id);
+        assert!(
+            width > settings,
+            "{id} is wider than the caret-free Settings trigger: {width:?} > {settings:?}"
+        );
+    }
+
+    // The ellipsis marks only a surface that needs input before it applies.
+    assert_eq!(
+        label_of("groups-menu", cx),
+        "Library",
+        "a menu trigger needs no ellipsis"
+    );
+    let open = |cx: &mut VisualTestContext, trigger: &'static str| {
+        cx.update(|window, cx| window.click(trigger, cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+    };
+    let close = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    };
+
+    open(cx, "program-menu");
+    assert_eq!(
+        label_of("export-library", cx),
+        "Export…",
+        "Export asks first"
+    );
+    assert_eq!(
+        label_of("about-dialog", cx),
+        "About",
+        "About applies at once"
+    );
+    close(cx);
+
+    open(cx, "groups-menu");
+    assert_eq!(
+        label_of("subscriptions", cx),
+        "Subscriptions…",
+        "Subscriptions asks first"
+    );
+    assert_eq!(
+        label_of("menu-groups-dialog", cx),
+        "Groups…",
+        "Groups asks first"
+    );
+    assert_eq!(
+        label_of("prune-clear-tests", cx),
+        "Clear tests",
+        "a confirm applies on one click, no ellipsis"
+    );
+    assert_eq!(
+        label_of("prune-duplicates", cx),
+        "Remove duplicates",
+        "prune rows are confirms, no ellipsis"
+    );
+    close(cx);
+
+    open(cx, "tools-menu");
+    assert_eq!(
+        label_of("menu-row-columns", cx),
+        "Row columns",
+        "Row columns applies on the spot, no ellipsis"
+    );
+    close(cx);
 }
 
 #[gpui_kit::test]

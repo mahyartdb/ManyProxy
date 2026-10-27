@@ -8,7 +8,7 @@ use crate::*;
 /// column of stacked cards.
 ///
 /// `RowColumns` stays the VISIBILITY flags (what the user toggled in
-/// Tools → Row columns…); `RowMetrics` is the GEOMETRY (how wide each cell
+/// Tools → Row columns); `RowMetrics` is the GEOMETRY (how wide each cell
 /// is and which optional cells the width budget still affords).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RowMetrics {
