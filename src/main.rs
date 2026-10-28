@@ -316,10 +316,11 @@ struct AppView {
     /// follow the drag, so the owner reads the live size from here.
     split_state: Entity<ResizableState>,
 
-    /// T-03: below the drawer breakpoint the inspector slides over the table
-    /// instead of squeezing it. Esc closes it and hands focus back to the
-    /// list; picking a row opens it again.
-    inspector_drawer_open: bool,
+    /// F19: ONE flag owns the inspector's presence in both presentations —
+    /// docked (≥1080) and the slide-over drawer below it. It starts closed;
+    /// picking a row or an inspector shortcut opens it, Esc or the close
+    /// button shuts it. Esc hands focus back to the list.
+    inspector_visible: bool,
 
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
 

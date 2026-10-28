@@ -863,15 +863,15 @@ impl ListDelegate for LibraryDelegate {
         cx: &mut Context<ListState<Self>>,
     ) {
         self.selected = index;
-        // T-03: picking a row opens the inspector drawer again — it is the
-        // only way back to the row's controls once Esc closed it. The update
-        // is deferred: the selection often changes inside the shell's own
+        // F19: picking a row opens the inspector again — it is the only way
+        // back to the row's controls once Esc closed it. The update is
+        // deferred: the selection often changes inside the shell's own
         // update, and an entity cannot be updated while it is updating.
         if index.is_some() {
             if let Some(app_view) = self.app_view.clone() {
                 window.defer(cx, move |_, cx| {
                     app_view.update(cx, |view, _| {
-                        view.open_inspector_drawer();
+                        view.open_inspector();
                     });
                 });
             }

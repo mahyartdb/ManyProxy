@@ -136,7 +136,7 @@ impl AppView {
             libraries: libraries.clone(),
             detail_scroll: ScrollHandle::new(),
             split_state,
-            inspector_drawer_open: true,
+            inspector_visible: false,
             store,
             write_blocked,
             write_blocked_folder,
@@ -2186,9 +2186,23 @@ impl AppView {
             .child(child)
     }
 
+    /// F19: picking a tab is a way in — the shortcut and the tab strip both
+    /// land here, so a hidden inspector can never keep a chosen tab to itself.
     pub(crate) fn set_inspector_tab(&mut self, tab: InspectorTab) {
+        self.inspector_visible = true;
         self.inspector_tab = tab;
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
+    }
+
+    /// F19: Ctrl-1 is the one key that owns presence, so it toggles the panel
+    /// shut instead of only ever opening it. Another tab key still opens.
+    pub(crate) fn toggle_inspector(&mut self, tab: InspectorTab) {
+        let already = self.inspector_visible && self.inspector_tab == tab;
+        if already {
+            self.inspector_visible = false;
+            return;
+        }
+        self.set_inspector_tab(tab);
     }
 
     pub(crate) fn adjust_conn_column_widths(

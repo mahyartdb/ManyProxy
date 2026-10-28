@@ -723,6 +723,17 @@ fn library_lists_stored_rows(cx: &mut TestAppContext) {
             "stored row renders with a stable domain id"
         );
     }
+    // F19: the inspector starts closed and only a pick opens it.
+    assert!(cx.update(|window, _| window.try_find("inspector-drawer").is_none()));
+    view.update(cx, |view, cx| {
+        view.open_inspector();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
     assert!(cx.update(|window, _| window.try_find("config-detail").is_some()));
 }
 
@@ -5683,6 +5694,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -5783,6 +5795,9 @@ fn t74_conn_setup<'a>(
                 state.delegate_mut().selected = Some(IndexPath::new(0));
                 list_cx.notify();
             });
+            // F19: setting the selection by hand skips the row pick that opens
+            // the inspector.
+            view.open_inspector();
             cx.notify();
         });
     });
@@ -7121,6 +7136,16 @@ fn select_library_row(view: &Entity<AppView>, cx: &mut VisualTestContext, id: &s
             .map(|row| row.id)
     });
     assert_eq!(selected.as_deref(), Some(id), "the row is selected");
+}
+
+/// F19: the inspector starts closed and opens from a row pick. Tests that set
+/// the selection by hand skip that pick, so they open it the way the app would.
+fn open_inspector(view: &Entity<AppView>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, cx| {
+        view.open_inspector();
+        cx.notify();
+    });
+    cx.run_until_parked();
 }
 
 #[test]
@@ -12651,6 +12676,7 @@ fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     // K4: checked rows carry a 3px leading accent bar, not a rim and not a
     // numeral chip; the selected-only row carries no check mark at all.
@@ -13247,6 +13273,7 @@ fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -16000,6 +16027,7 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -16083,6 +16111,7 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -16164,6 +16193,7 @@ fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
             });
         });
         cx.run_until_parked();
+        open_inspector(&view, cx);
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
@@ -16758,6 +16788,7 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -16820,6 +16851,7 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -16953,6 +16985,7 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
             });
         });
         cx.run_until_parked();
+        open_inspector(&view, cx);
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
@@ -17038,6 +17071,7 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
             });
         });
         cx.run_until_parked();
+        open_inspector(&view, cx);
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
@@ -17134,6 +17168,7 @@ fn t04_detail_fits_minimum_window(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
@@ -17184,6 +17219,7 @@ fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
@@ -17250,6 +17286,7 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -17537,6 +17574,7 @@ fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -17612,6 +17650,7 @@ fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
             });
         });
         cx.run_until_parked();
+        open_inspector(&view, cx);
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
@@ -17648,6 +17687,7 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -17753,6 +17793,7 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
             });
         });
         cx.run_until_parked();
+        open_inspector(&view, cx);
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
@@ -17887,6 +17928,7 @@ fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -18091,6 +18133,7 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
             });
         });
         cx.run_until_parked();
+        open_inspector(&view, cx);
         paint_frame(cx);
         assert_painted(cx, "inspector-tabs");
         assert_painted(cx, "config-detail-body");
@@ -18199,6 +18242,7 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -18417,6 +18461,7 @@ fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
         })
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -20683,11 +20728,13 @@ fn paint_frame_at(cx: &mut VisualTestContext, width: f32, height: f32) {
 fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
-    store
+    let work = store
         .add(row19_seed("Work", "a.example.com", "10801"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
+    // F19: the inspector starts closed; picking the row is the way in.
+    select_library_row(&view, cx, &work.id);
     paint_frame_at(cx, 1400., 800.);
 
     // Docked: the inspector takes its place on the right, the table keeps
@@ -20746,7 +20793,7 @@ fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppCon
     cx.run_until_parked();
     let (open, checked) = view.read_with(cx, |view, cx| {
         (
-            view.inspector_drawer_open,
+            view.inspector_visible,
             view.libraries.read(cx).delegate().checked.len(),
         )
     });
@@ -20811,7 +20858,7 @@ fn t03_inspector_drawer_occludes_blank_clicks(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.click("inspector-drawer-close", cx));
     cx.run_until_parked();
     paint_frame(cx);
-    let open = view.read_with(cx, |view, _| view.inspector_drawer_open);
+    let open = view.read_with(cx, |view, _| view.inspector_visible);
     assert!(
         !open,
         "the close button still works under the drawer's occluding hitbox"
@@ -20829,6 +20876,9 @@ fn t03_inspector_layout_pins_the_drawer_contract() {
         (1000., 260., false, false, 0., 1000.),
         (880., 260., false, true, 240., 640.),
         (1080., 260., true, true, 0., 820.),
+        // F19: a closed inspector costs the table nothing in either mode.
+        (1080., 260., true, false, 0., 1080.),
+        (1400., 260., true, false, 0., 1400.),
     ];
     for (viewport, inspector, docked, visible, drawer_w, table_w) in cases {
         let layout = InspectorLayout::compute(viewport, inspector, docked, visible);
@@ -20841,6 +20891,140 @@ fn t03_inspector_layout_pins_the_drawer_contract() {
             "table at {viewport}px, docked={docked}, visible={visible}"
         );
     }
+}
+
+/// F19: the inspector starts closed in both presentations — a fresh view
+/// paints no drawer and no docked pane, so the table takes the whole frame.
+#[gpui_kit::test]
+fn f19_inspector_starts_closed_in_both_presentations(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    let row_width = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find(format!("library-row-{}", work.id))
+                .expect("the row paints")
+                .bounds()
+                .size
+                .width
+                .as_f32()
+        })
+    };
+
+    // Below the breakpoint: no drawer, and the row owns the full frame.
+    paint_frame_at(cx, 1000., 700.);
+    assert_absent(cx, "inspector-drawer".to_string());
+    assert_absent(cx, "config-detail".to_string());
+    let narrow = row_width(cx);
+    assert!(
+        (narrow - 1000.).abs() <= 1.,
+        "a closed drawer costs the table nothing, got {narrow}"
+    );
+
+    // Docked: the split pane's inspector side is gone, not just empty.
+    paint_frame_at(cx, 1400., 800.);
+    assert_absent(cx, "config-detail".to_string());
+    let wide = row_width(cx);
+    assert!(
+        (wide - 1400.).abs() <= 1.,
+        "a closed dock takes no split space, got {wide}"
+    );
+    assert!(!view.read_with(cx, |view, _| view.inspector_visible));
+}
+
+/// F19: a row pick is the way in and Esc is the way out — the same flag, the
+/// same result, in both presentations.
+#[gpui_kit::test]
+fn f19_selection_opens_and_esc_closes_in_both_presentations(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let next = store
+        .add(row19_seed("Home", "b.example.com", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    // Drawer: the real click path opens it.
+    paint_frame_at(cx, 1000., 700.);
+    select_library_row(&view, cx, &work.id);
+    assert_painted(cx, "inspector-drawer");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.clear_checked_unless_dialog(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1000., 700.);
+    assert_absent(cx, "inspector-drawer".to_string());
+    assert!(!view.read_with(cx, |view, _| view.inspector_visible));
+
+    // Docked: the same click opens the split pane, the same Esc closes it.
+    paint_frame_at(cx, 1400., 800.);
+    cx.update(|window, cx| window.click(format!("library-row-{}", next.id), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 800.);
+    assert_painted(cx, "config-detail");
+    assert_absent(cx, "inspector-drawer".to_string());
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.clear_checked_unless_dialog(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 800.);
+    assert_absent(cx, "config-detail".to_string());
+    assert!(!view.read_with(cx, |view, _| view.inspector_visible));
+}
+
+/// F19: Ctrl-1 owns presence, so it toggles; another tab key is a way in.
+#[gpui_kit::test]
+fn f19_inspector_shortcut_toggles_presence(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1000., 700.);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.focus.focus(window, cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::InspectorDetails), cx);
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1000., 700.);
+    assert_painted(cx, "inspector-drawer");
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::InspectorDetails), cx);
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1000., 700.);
+    assert_absent(cx, "inspector-drawer".to_string());
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::InspectorHealth), cx);
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1000., 700.);
+    assert_painted(cx, "inspector-drawer");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.inspector_tab),
+        crate::InspectorTab::Health,
+        "another tab key opens the inspector on that tab"
+    );
 }
 
 /// F2: upstream is the third budget drop. At 740 the protocol column is gone
@@ -21129,7 +21313,7 @@ fn t03_row_copy_proxy_copies_that_row(cx: &mut TestAppContext) {
     select_library_row(&view, cx, &beta.id);
     // F1: the open drawer occludes the row's trailing Copy cell; this test
     // is about row-scoped copy, so put the action back in reach.
-    view.update(cx, |view, _| view.inspector_drawer_open = false);
+    view.update(cx, |view, _| view.inspector_visible = false);
     paint_frame(cx);
     let alpha_bind = view.read_with(cx, |view, _| {
         view.store
@@ -21958,6 +22142,7 @@ fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -22433,6 +22618,7 @@ fn t20_inspector_tab_row_fits_the_default_drawer(cx: &mut TestAppContext) {
         // The first paint measures the painted strip, the next paints the
         // settled scale; two passes keep the assertion frame-order-proof.
         for _ in 0..2 {
+            open_inspector(&view, cx);
             paint_frame_at(cx, width, height);
         }
         assert_painted(cx, "inspector-tabs");
@@ -27729,6 +27915,7 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -27868,6 +28055,7 @@ fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
@@ -27961,6 +28149,7 @@ fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
     paint_frame(cx);
     let label = cx.update(|window, _| {
         window
@@ -28240,6 +28429,7 @@ fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
             });
         });
     });
+    open_inspector(&view, cx);
     paint_frame(cx);
     assert_painted(cx, "row-menu");
     cx.update(|window, cx| {
@@ -30469,6 +30659,9 @@ fn t65_mount_with_failed_probe<'a>(
                 state.delegate_mut().selected = Some(IndexPath::new(0));
                 list_cx.notify();
             });
+            // F19: setting the selection by hand skips the row pick that opens
+            // the inspector.
+            view.open_inspector();
         });
     });
     let selected = view.read_with(cx, |view, cx| {
@@ -31080,7 +31273,7 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
     // F1: the open drawer occludes the columns it covers, and this test is
     // about the sort menus, so keep the inspector closed at full table width.
     view.update(cx, |view, cx| {
-        view.inspector_drawer_open = false;
+        view.inspector_visible = false;
         cx.notify();
     });
     paint_frame(cx);

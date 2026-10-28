@@ -176,7 +176,7 @@ impl AppView {
         // T-03: in the narrow drawer the inspector is the top layer — Esc
         // closes it and hands focus back to the list, and the checked set
         // survives (one overlay layer per Esc).
-        if self.close_inspector_drawer(window, cx) {
+        if self.close_inspector(window, cx) {
             return false;
         }
         self.clear_checked(window, cx);

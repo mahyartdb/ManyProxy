@@ -111,7 +111,7 @@ impl AppView {
                             .tooltip("Close the inspector drawer (Esc)")
                             .on_click(move |_, window, cx| {
                                 close_view.update(cx, |view, cx| {
-                                    view.close_inspector_drawer(window, cx);
+                                    view.close_inspector(window, cx);
                                 });
                             }),
                     ),
@@ -119,26 +119,25 @@ impl AppView {
             .into_any_element()
     }
 
-    /// T-03: picking a row opens the drawer again.
-    pub(crate) fn open_inspector_drawer(&mut self) {
-        self.inspector_drawer_open = true;
+    /// F19: picking a row opens the inspector again — it is the only way back
+    /// to the row's controls once Esc closed it.
+    pub(crate) fn open_inspector(&mut self) {
+        self.inspector_visible = true;
     }
 
-    /// T-03: Esc closes the drawer and hands focus back to the list. It
-    /// reports whether it closed anything, so the caller can leave the
-    /// checked set alone — one overlay layer per Esc.
-    pub(crate) fn close_inspector_drawer(
+    /// F19: Esc and the close button shut the inspector in BOTH presentations
+    /// and hand focus back to the list. It reports whether it closed
+    /// anything, so the caller can leave the checked set alone — one overlay
+    /// layer per Esc.
+    pub(crate) fn close_inspector(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if window.viewport_size().width.as_f32() >= INSPECTOR_DRAWER_BREAKPOINT {
+        if !self.inspector_visible {
             return false;
         }
-        if !self.inspector_drawer_open {
-            return false;
-        }
-        self.inspector_drawer_open = false;
+        self.inspector_visible = false;
         window.focus(&self.focus, cx);
         cx.notify();
         true

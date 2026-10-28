@@ -117,7 +117,9 @@ impl AppView {
                     refuse_shortcut_under_overlay(window, cx);
                     return;
                 }
-                view.set_inspector_tab(InspectorTab::Details);
+                // F19: Ctrl-1 is the one key that owns presence — it toggles
+                // the panel shut when it is already showing Details.
+                view.toggle_inspector(InspectorTab::Details);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {

@@ -10,30 +10,31 @@ pub(crate) struct InspectorLayout {
 }
 
 impl InspectorLayout {
-    /// `drawer_visible` only matters below the dock breakpoint; the drawer
-    /// width is clamped so the table never drops under its floor.
+    /// F19: a hidden inspector costs the table nothing in either presentation,
+    /// so the list takes the whole viewport. A visible drawer is clamped so the
+    /// table never drops under its floor.
     pub(crate) fn compute(
         viewport: f32,
         inspector_w: f32,
         docked: bool,
-        drawer_visible: bool,
+        visible: bool,
     ) -> Self {
+        if !visible {
+            return Self {
+                drawer_w: 0.,
+                table_w: viewport,
+            };
+        }
         if docked {
             return Self {
                 drawer_w: 0.,
                 table_w: (viewport - inspector_w).max(RowMetrics::TABLE_MIN),
             };
         }
-        if drawer_visible {
-            let drawer_w = inspector_w.min(viewport - RowMetrics::TABLE_MIN).max(0.);
-            return Self {
-                drawer_w,
-                table_w: viewport - drawer_w,
-            };
-        }
+        let drawer_w = inspector_w.min(viewport - RowMetrics::TABLE_MIN).max(0.);
         Self {
-            drawer_w: 0.,
-            table_w: viewport,
+            drawer_w,
+            table_w: viewport - drawer_w,
         }
     }
 }
@@ -102,12 +103,12 @@ impl Render for AppView {
         let show_detail = self.config_count(cx) != 0;
         let docked = self.inspector_docked(window);
         let inspector_width = self.inspector_width(cx);
-        let drawer_visible = !docked && show_detail && self.inspector_drawer_open;
+        let inspector_visible = show_detail && self.inspector_visible;
         let layout = InspectorLayout::compute(
             window.viewport_size().width.as_f32(),
             inspector_width,
             docked,
-            drawer_visible,
+            inspector_visible,
         );
         self.libraries.update(cx, |state, cx| {
             let list_focus = state.focus_handle(cx);
@@ -141,11 +142,15 @@ impl Render for AppView {
             .child(bulk_bar)
             .child(column_headers)
             .child(List::new(&self.libraries).flex_1());
-        if drawer_visible {
+        if !docked && inspector_visible {
             list_pane = list_pane.pr(px(layout.drawer_w));
         }
 
-        let split = if docked {
+        let split = if docked && !inspector_visible {
+            // F19: a closed docked panel takes no space at all — the list gets
+            // the whole viewport instead of an empty split half.
+            list_pane.into_any_element()
+        } else if docked {
             h_resizable("main-split")
                 .with_state(&self.split_state)
                 .child(
@@ -155,7 +160,6 @@ impl Render for AppView {
                 )
                 .child(
                     resizable_panel()
-                        .visible(show_detail)
                         .size(px(inspector_width))
                         .size_range(px(INSPECTOR_WIDTH_MIN)..px(INSPECTOR_WIDTH_MAX))
                         .child(self.render_detail(window, cx)),
@@ -170,7 +174,7 @@ impl Render for AppView {
                 .flex_1()
                 .min_h_0()
                 .child(list_pane)
-                .children(if drawer_visible {
+                .children(if inspector_visible {
                     vec![self.render_inspector_drawer(layout.drawer_w, window, cx)]
                 } else {
                     Vec::new()
