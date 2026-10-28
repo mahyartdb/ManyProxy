@@ -1302,23 +1302,19 @@ impl AppView {
             )
     }
 
-    pub(crate) fn row_menu_item(
-        verb: &str,
-        row_id: &str,
-        label: &str,
-        tip: &str,
-        view: &Entity<AppView>,
-        act: impl Fn(&mut AppView, &str, &mut Window, &mut Context<AppView>) + 'static,
-    ) -> PopupMenuItem {
-        let id = format!("rowctx-{verb}-{row_id}");
-        let label = label.to_string();
-        let tip = tip.to_string();
+    /// A context-menu row for one table action. The target row travels by id
+    /// and is resolved when the handler runs, never at render.
+    fn context_menu_item(id: &'static str, row_id: &str, view: &Entity<AppView>) -> PopupMenuItem {
+        let def = action(id);
+        let element_id = format!("rowctx-{}-{row_id}", def.id);
+        let label = def.label.to_string();
+        let tip = def.tooltip.unwrap_or(def.label).to_string();
         let target = row_id.to_string();
         let view = view.clone();
         PopupMenuItem::element(move |_, _| {
             let tip = tip.clone();
             div()
-                .id(id.clone())
+                .id(element_id.clone())
                 .test_support()
                 .role(Role::MenuItem)
                 .aria_label(label.clone())
@@ -1330,9 +1326,8 @@ impl AppView {
                 .child(label.clone())
         })
         .on_click(move |_, window, cx| {
-            let target = target.clone();
             view.update(cx, |view, cx| {
-                act(view, &target, window, cx);
+                run_action(view, id, ActionTarget::Row(&target), window, cx);
             });
         })
     }
@@ -1347,117 +1342,30 @@ impl AppView {
         // K8/A6-2: 7 core verbs at top level (Reset… is its own submenu) and
         // the demoted row chores behind `More ▾`. Speedtest / Resolve Out-IP /
         // Resolve domain are retired (K8): they appear in no menu at all.
+        let menu = ["start", "stop", "test", "copy-proxy", "edit"]
+            .into_iter()
+            .fold(menu, |menu, id| {
+                menu.item(Self::context_menu_item(id, row_id, view))
+            });
         let reset_id = row_id.to_string();
         let reset_view = view.clone();
+        let menu = menu
+            .submenu("Reset…", window, cx, move |menu, _, _| {
+                ["reset-traffic", "reset-usage"]
+                    .into_iter()
+                    .fold(menu, |menu, id| {
+                        menu.item(Self::context_menu_item(id, &reset_id, &reset_view))
+                    })
+            })
+            .item(Self::context_menu_item("delete", row_id, view));
         let more_id = row_id.to_string();
         let more_view = view.clone();
-        menu.item(Self::row_menu_item(
-            "start",
-            row_id,
-            "Start",
-            "Start this row's endpoint",
-            view,
-            AppView::start_row,
-        ))
-        .item(Self::row_menu_item(
-            "stop",
-            row_id,
-            "Stop",
-            "Stop this row's endpoint",
-            view,
-            AppView::stop_row,
-        ))
-        .item(Self::row_menu_item(
-            "test",
-            row_id,
-            "Test",
-            "URL-test this row's endpoint",
-            view,
-            AppView::test_row,
-        ))
-        .item(Self::row_menu_item(
-            "copy-proxy",
-            row_id,
-            "Copy SOCKS",
-            "Copy this row's SOCKS proxy URL only",
-            view,
-            AppView::copy_row_socks,
-        ))
-        .item(Self::row_menu_item(
-            "edit",
-            row_id,
-            "Edit",
-            "Edit this row",
-            view,
-            AppView::open_edit_for_row,
-        ))
-        .submenu("Reset…", window, cx, move |menu, _, _| {
-            menu.item(Self::row_menu_item(
-                "reset-traffic",
-                &reset_id,
-                "Reset traffic",
-                "Reset this row's traffic counters",
-                &reset_view,
-                AppView::open_traffic_reset_for_row,
-            ))
-            .item(Self::row_menu_item(
-                "reset-usage",
-                &reset_id,
-                "Reset usage",
-                "Reset this row's usage counters",
-                &reset_view,
-                AppView::open_usage_reset_for_row,
-            ))
-        })
-        .item(Self::row_menu_item(
-            "delete",
-            row_id,
-            "Delete",
-            "Delete this row",
-            view,
-            AppView::open_remove_for_row,
-        ))
-        .submenu("More ▾", window, cx, move |menu, _, _| {
-            menu.item(Self::row_menu_item(
-                "move",
-                &more_id,
-                "Move to group",
-                "Move this row to a group",
-                &more_view,
-                AppView::open_row_move_dialog,
-            ))
-            .item(Self::row_menu_item(
-                "copy",
-                &more_id,
-                "Copy URLs",
-                "Copy bind endpoints (no secrets)",
-                &more_view,
-                AppView::copy_row_urls,
-            ))
-            .item(Self::row_menu_item(
-                "share",
-                &more_id,
-                "Share…",
-                "Copy this row's share link (carries credentials)",
-                &more_view,
-                AppView::open_share_for_row,
-            ))
-            .item(Self::row_menu_item(
-                "duplicate",
-                &more_id,
-                "Duplicate",
-                "Duplicate this row (disabled copy)",
-                &more_view,
-                AppView::commit_duplicate,
-            ))
-            .item(Self::row_menu_item(
-                "ping",
-                &more_id,
-                "Ping",
-                "TCP-ping this row's endpoint",
-                &more_view,
-                AppView::ping_row,
-            ))
+        menu.submenu("More ▾", window, cx, move |menu, _, _| {
+            ["move", "copy-urls", "share", "duplicate", "ping"]
+                .into_iter()
+                .fold(menu, |menu, id| {
+                    menu.item(Self::context_menu_item(id, &more_id, &more_view))
+                })
         })
     }
 
@@ -1472,8 +1380,7 @@ impl AppView {
         config: &ProxyConfig,
     ) -> impl IntoElement {
         let row_view = cx.entity();
-        let row_id = config.id.clone();
-        let auto_start = config.enabled;
+        let auto_note = (if config.enabled { "On" } else { "Off" }).to_string();
 
         Button::new("row-menu")
             .small()
@@ -1482,142 +1389,50 @@ impl AppView {
             .tooltip("More actions for the selected endpoint")
             .dropdown_menu(move |menu, _, _| {
                 let view = row_view.clone();
-                let toggle_id = row_id.clone();
-                let copy_id = row_id.clone();
-                menu.item(
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .id("kebab-auto-start")
-                            .test_support()
-                            .role(Role::MenuItem)
-                            .aria_label("Restore on launch")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| {
-                                    Tooltip::new(
-                                        "Restore this row on launch — Start and Stop control serving now",
-                                    )
-                                })
-                                .into()
-                            })
-                            .child(format!(
-                                "Restore on launch · {}",
-                                if auto_start { "On" } else { "Off" }
-                            ))
+                let note = auto_note.clone();
+                ["auto-start", "ping", "logs", "copy-urls", "copy-proxy"]
+                    .into_iter()
+                    .fold(menu, |menu, id| {
+                        menu.item(Self::selection_menu_item(id, Some(note.clone()), &view))
                     })
-                    .on_click(move |_, window, cx| {
-                        let enabled = !auto_start;
-                        view.update(cx, |view, cx| {
-                            view.commit_enabled_flag(&toggle_id, enabled, window, cx);
-                        });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("kebab-ping")
-                            .test_support()
-                            .role(Role::MenuItem)
-                            .aria_label("Ping")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("TCP-ping the selected endpoint")).into()
-                            })
-                            .child("Ping")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.ping_selected(window, cx);
-                            });
-                        }
-                    }),
-                )
-                .item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("kebab-logs")
-                            .test_support()
-                            .role(Role::MenuItem)
-                            .aria_label("Logs")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Open logs for the selection")).into()
-                            })
-                            .child("Logs")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.open_logs_dialog(window, cx);
-                            });
-                        }
-                    }),
-                )
-                .item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("kebab-copy-urls")
-                            .test_support()
-                            .role(Role::MenuItem)
-                            .aria_label("Copy URLs")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Copy bind endpoints (no secrets)")).into()
-                            })
-                            .child("Copy URLs")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.copy_selected_urls(window, cx);
-                            });
-                        }
-                    }),
-                )
-                .item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("kebab-copy-proxy")
-                            .test_support()
-                            .role(Role::MenuItem)
-                            .aria_label("Copy SOCKS")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Copy this row's SOCKS proxy URL only")).into()
-                            })
-                            .child("Copy SOCKS")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                // SOCKS bind:port only, no secrets — the row
-                                // id captured above keeps it row-scoped.
-                                view.copy_row_socks(&copy_id, window, cx);
-                            });
-                        }
-                    }),
-                )
             })
+    }
+
+    /// An inspector-menu row for one table action against the selection. Only
+    /// the auto-start row carries a state suffix; the label is the table's.
+    fn selection_menu_item(
+        id: &'static str,
+        note: Option<String>,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let def = action(id);
+        let element_id = format!("kebab-{}", def.id);
+        let label = def.label.to_string();
+        let text = match note {
+            Some(note) => format!("{label} · {note}"),
+            None => label.clone(),
+        };
+        let tip = def.tooltip.unwrap_or(def.label).to_string();
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            let tip = tip.clone();
+            div()
+                .id(element_id.clone())
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(label.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .child(text.clone())
+        })
+        .on_click(move |_, window, cx| {
+            view.update(cx, |view, cx| {
+                run_action(view, id, ActionTarget::Selection, window, cx);
+            });
+        })
     }
 
     pub(crate) fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {

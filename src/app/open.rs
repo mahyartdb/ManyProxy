@@ -9,26 +9,37 @@ const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
 /// same string the user reads.
 pub(crate) const PALETTE_FOOTER_HINT: &str = "↑↓ move · Enter run · Esc close";
 
-/// A palette row that shows the key that runs it. The kit draws its own chip
-/// only from `CommandItem::action`, and an action on a palette row dispatches
-/// twice on Enter (the row's confirm plus the action), so the row renders its
-/// label and chip as content instead.
-fn palette_item(
-    label: &'static str,
-    keystroke: &'static str,
-    fallback: &'static str,
-) -> CommandItem {
-    CommandItem::new().label(label).child(move |_, _| {
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .items_center()
-            .gap_2()
-            .child(div().flex_1().min_w_0().child(label))
-            .child(shortcut_kbd(keystroke, fallback))
-            .into_any_element()
-    })
+/// A palette row for one table action. The row carries the action's label,
+/// keywords and first shortcut chip; the table owns those, and the confirm
+/// handler resolves them through `run_action`, so a palette row cannot drift
+/// from the menus that show the same verb.
+fn palette_item(def: &'static ActionDef) -> CommandItem {
+    let label = def.label;
+    let mut item = CommandItem::new()
+        .label(label)
+        .keywords(def.keywords.iter().copied());
+    if let Some(&(keystroke, chip)) = def.shortcuts.first() {
+        item = item.child(move |_, _| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(label))
+                .child(shortcut_kbd(keystroke, chip))
+                .into_any_element()
+        });
+    }
+    item
+}
+
+fn palette_items(group: usize) -> Vec<CommandItem> {
+    PALETTE_GROUPS[group]
+        .1
+        .iter()
+        .map(|id| palette_item(action(id)))
+        .collect()
 }
 
 impl AppView {
@@ -746,69 +757,16 @@ impl AppView {
                             .aria_label(PALETTE_FOOTER_HINT)
                             .child(PALETTE_FOOTER_HINT)
                     })
-                    .group(CommandGroup::new().label("Library").items(vec![
-                        palette_item("Add configuration", "ctrl-n", "Ctrl+N")
-                            .keywords(["new", "create"]),
-                        palette_item("Import configurations", "ctrl-o", "Ctrl+O")
-                            .keywords(["import", "link", "file"]),
-                        palette_item("Start selected", "f5", "F5")
-                            .keywords(["start", "serve", "f5"]),
-                        palette_item("Stop selected", "shift-f5", "Shift+F5")
-                            .keywords(["stop"]),
-                        palette_item("Test selected", "ctrl-t", "Ctrl+T")
-                            .keywords(["test", "probe", "health"]),
-                        palette_item("Copy URLs", "ctrl-u", "Ctrl+U")
-                            .keywords(["copy", "clipboard", "url", "endpoint"]),
-                        palette_item("Edit selected", "ctrl-e", "Ctrl+E")
-                            .keywords(["edit", "rename"]),
-                        palette_item("Delete selected", "delete", "Delete")
-                            .keywords(["delete", "remove"]),
-                        palette_item("Focus search field", "ctrl-f", "Ctrl+F")
-                            .keywords(["search", "find", "filter"]),
-                        palette_item("Clear checked", "escape", "Esc")
-                            .keywords(["clear", "uncheck", "escape"]),
-                        palette_item("Show Details tab", "ctrl-1", "Ctrl+1")
-                            .keywords(["details", "tab"]),
-                        palette_item("Show Health tab", "ctrl-2", "Ctrl+2")
-                            .keywords(["health", "tab"]),
-                        palette_item("Import from clipboard", "ctrl-v", "Ctrl+V")
-                            .keywords(["clipboard", "paste", "import"]),
-                        CommandItem::new()
-                            .label("Export library")
-                            .keywords(["export", "backup", "json"]),
-                    ]))
-                    .group(CommandGroup::new().label("Manage").items(vec![
-                        CommandItem::new()
-                            .label("Subscriptions")
-                            .keywords(["subscription", "refresh"]),
-                        CommandItem::new()
-                            .label("Routing presets")
-                            .keywords(["preset", "routing", "rules"]),
-                        CommandItem::new().label("Groups").keywords(["group", "move"]),
-                        CommandItem::new().label("Logs").keywords(["log", "output"]),
-                        CommandItem::new()
-                            .label("Settings")
-                            .keywords(["settings", "options", "test url"]),
-                        CommandItem::new()
-                            .label("About")
-                            .keywords(["about", "version", "shortcuts"]),
-                        CommandItem::new()
-                            .label("Start all")
-                            .keywords(["start", "all", "serve"]),
-                        CommandItem::new().label("Stop all").keywords(["stop", "all"]),
-                        CommandItem::new()
-                            .label("Test all")
-                            .keywords(["test", "all", "probe"]),
-                        CommandItem::new()
-                            .label("Runtime stats")
-                            .keywords(["runtime", "stats", "health", "cpu", "memory"]),
-                        CommandItem::new()
-                            .label("Traffic stats")
-                            .keywords(["traffic", "stats", "usage", "profile"]),
-                        CommandItem::new()
-                            .label("Row columns")
-                            .keywords(["column", "columns", "rows", "display"]),
-                    ]))
+                    .group(
+                        CommandGroup::new()
+                            .label(PALETTE_GROUPS[0].0)
+                            .items(palette_items(0)),
+                    )
+                    .group(
+                        CommandGroup::new()
+                            .label(PALETTE_GROUPS[1].0)
+                            .items(palette_items(1)),
+                    )
                     .on_confirm(move |index, window, cx| {
                         view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
                     }),

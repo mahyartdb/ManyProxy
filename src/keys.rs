@@ -1,34 +1,39 @@
+use crate::*;
+
 use gpui_kit::*;
 
-use crate::{
-    AddConfig, ClearChecked, CopyUrls, DeleteSelected, EditSelected, FocusSearch, ImportConfigs,
-    InspectorDetails, InspectorHealth, InspectorLinks, InspectorLogs, InspectorTraffic,
-    OpenPalette, PasteImport, StartSelected, StopSelected, StopTesting, TestSelected,
-    UpdateCurrentGroup,
-};
-
+/// The context the shortcuts below live in; the shell sets it as its
+/// `key_context`, so a focused text input still wins.
 pub(crate) const APP_KEY_CONTEXT: &str = "manyproxy-library";
+
+/// Binds one table action's keystrokes. The keystrokes live in the action
+/// table, so a shortcut cannot exist here and nowhere else.
+fn bind<A: Action + Clone>(out: &mut Vec<KeyBinding>, id: &str, event: A) {
+    for &(keystroke, _) in action(id).shortcuts {
+        out.push(KeyBinding::new(keystroke, event.clone(), Some(APP_KEY_CONTEXT)));
+    }
+}
+
 pub(crate) fn bind_app_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-o", ImportConfigs, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-v", PasteImport, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("f5", StartSelected, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("shift-f5", StopSelected, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-t", TestSelected, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("escape", ClearChecked, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-e", EditSelected, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("delete", DeleteSelected, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-f", FocusSearch, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-1", InspectorDetails, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-2", InspectorHealth, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-3", InspectorDetails, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-4", InspectorLogs, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-5", InspectorLinks, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-6", InspectorTraffic, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-k", OpenPalette, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-u", CopyUrls, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-r", UpdateCurrentGroup, Some(APP_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-.", StopTesting, Some(APP_KEY_CONTEXT)),
-    ]);
+    let mut keys: Vec<KeyBinding> = Vec::new();
+    bind(&mut keys, "add", AddConfig);
+    bind(&mut keys, "import", ImportConfigs);
+    bind(&mut keys, "paste-import", PasteImport);
+    bind(&mut keys, "start", StartSelected);
+    bind(&mut keys, "stop", StopSelected);
+    bind(&mut keys, "test", TestSelected);
+    bind(&mut keys, "stop-testing", StopTesting);
+    bind(&mut keys, "clear-checked", ClearChecked);
+    bind(&mut keys, "open-palette", OpenPalette);
+    bind(&mut keys, "copy-urls", CopyUrls);
+    bind(&mut keys, "update-current-group", UpdateCurrentGroup);
+    bind(&mut keys, "edit", EditSelected);
+    bind(&mut keys, "delete", DeleteSelected);
+    bind(&mut keys, "focus-search", FocusSearch);
+    bind(&mut keys, "inspector-details", InspectorDetails);
+    bind(&mut keys, "inspector-health", InspectorHealth);
+    bind(&mut keys, "inspector-logs", InspectorLogs);
+    bind(&mut keys, "inspector-links", InspectorLinks);
+    bind(&mut keys, "inspector-traffic", InspectorTraffic);
+    cx.bind_keys(keys);
 }

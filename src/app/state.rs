@@ -664,37 +664,8 @@ impl AppView {
         }
     }
 
-    pub(crate) fn palette_op_at(index: IndexPath) -> Option<PaletteOp> {
-        match (index.section, index.row) {
-            (0, 0) => Some(PaletteOp::Add),
-            (0, 1) => Some(PaletteOp::Import),
-            (0, 2) => Some(PaletteOp::StartSelected),
-            (0, 3) => Some(PaletteOp::StopSelected),
-            (0, 4) => Some(PaletteOp::TestSelected),
-            (0, 5) => Some(PaletteOp::CopyUrls),
-            (0, 6) => Some(PaletteOp::EditSelected),
-            (0, 7) => Some(PaletteOp::DeleteSelected),
-            (0, 8) => Some(PaletteOp::FocusSearch),
-            (0, 9) => Some(PaletteOp::ClearChecked),
-            (0, 10) => Some(PaletteOp::DetailsTab),
-            (0, 11) => Some(PaletteOp::HealthTab),
-            (0, 12) => Some(PaletteOp::ImportClipboard),
-            (0, 13) => Some(PaletteOp::ExportLibrary),
-            (1, 0) => Some(PaletteOp::Subscriptions),
-            (1, 1) => Some(PaletteOp::PresetManager),
-            (1, 2) => Some(PaletteOp::Groups),
-            (1, 3) => Some(PaletteOp::Logs),
-            (1, 4) => Some(PaletteOp::Settings),
-            (1, 5) => Some(PaletteOp::About),
-            (1, 6) => Some(PaletteOp::StartAll),
-            (1, 7) => Some(PaletteOp::StopAll),
-            (1, 8) => Some(PaletteOp::TestAll),
-
-            (1, 9) => Some(PaletteOp::RuntimeStats),
-            (1, 10) => Some(PaletteOp::TrafficStats),
-            (1, 11) => Some(PaletteOp::RowColumns),
-            _ => None,
-        }
+    pub(crate) fn palette_op_at(index: IndexPath) -> Option<&'static str> {
+        palette_action_at(index)
     }
 
     pub(crate) fn run_palette_op(
@@ -703,41 +674,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(op) = Self::palette_op_at(index) else {
+        let Some(id) = Self::palette_op_at(index) else {
             return;
         };
         window.close_all_dialogs(cx);
-        match op {
-            PaletteOp::Add => window.dispatch_action(Box::new(AddConfig), cx),
-            PaletteOp::Import => window.dispatch_action(Box::new(ImportConfigs), cx),
-            PaletteOp::StartSelected => window.dispatch_action(Box::new(StartSelected), cx),
-            PaletteOp::StopSelected => window.dispatch_action(Box::new(StopSelected), cx),
-            PaletteOp::TestSelected => window.dispatch_action(Box::new(TestSelected), cx),
-            PaletteOp::CopyUrls => window.dispatch_action(Box::new(CopyUrls), cx),
-            PaletteOp::EditSelected => window.dispatch_action(Box::new(EditSelected), cx),
-            PaletteOp::DeleteSelected => window.dispatch_action(Box::new(DeleteSelected), cx),
-            PaletteOp::FocusSearch => window.dispatch_action(Box::new(FocusSearch), cx),
-            PaletteOp::ClearChecked => window.dispatch_action(Box::new(ClearChecked), cx),
-            PaletteOp::DetailsTab => window.dispatch_action(Box::new(InspectorDetails), cx),
-            PaletteOp::HealthTab => window.dispatch_action(Box::new(InspectorHealth), cx),
-            PaletteOp::Subscriptions => self.open_subscriptions_dialog(window, cx),
-            PaletteOp::PresetManager => self.open_presets_dialog(window, cx),
-            PaletteOp::Groups => self.open_groups_dialog(window, cx),
-            PaletteOp::Logs => self.open_logs_dialog(window, cx),
-            PaletteOp::Settings => self.open_settings_dialog(window, cx),
-            PaletteOp::About => self.open_about_dialog(window, cx),
-            PaletteOp::StartAll => self.start_all_engines(window, cx),
-            PaletteOp::StopAll => self.stop_all_engines(window, cx),
-            PaletteOp::TestAll => {
-                self.test_all_health(window, cx);
-            }
-            PaletteOp::RuntimeStats => self.open_runtime_stats_dialog(window, cx),
-            PaletteOp::TrafficStats => self.open_traffic_stats_dialog(window, cx),
-            PaletteOp::RowColumns => self.open_row_columns_dialog(window, cx),
-
-            PaletteOp::ImportClipboard => self.open_import_from_clipboard(window, cx),
-            PaletteOp::ExportLibrary => self.open_export_dialog(window, cx),
-        }
+        run_action(self, id, ActionTarget::Selection, window, cx);
         // T-06: the palette's second overlay opens first; the reclaim runs last,
         // and its predicate leaves the new overlay's focus alone.
         reclaim_shell_focus(window, cx);
@@ -1004,14 +945,6 @@ impl AppView {
     ) {
         let direction = self.libraries.read(cx).delegate().sort.direction;
         self.commit_library_sort(LibrarySort::new(key, direction), window, cx);
-    }
-
-    pub(crate) fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.selected_config(cx) else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        };
-        self.ping_row(&config.id, window, cx);
     }
 
     pub(crate) fn ping_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {

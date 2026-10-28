@@ -14,14 +14,6 @@ impl AppView {
         window.push_notification(Notification::success("Copied SOCKS URL"), cx);
     }
 
-    pub(crate) fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.selected_config(cx) else {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        };
-        self.copy_row_urls(&config.id, window, cx);
-    }
-
     pub(crate) fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);

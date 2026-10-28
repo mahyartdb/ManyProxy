@@ -604,6 +604,21 @@ impl AppView {
         false
     }
 
+    /// The row's auto-start flag flipped to its current opposite. Read now, at
+    /// invocation, so the menu never acts on a stale render.
+    pub(crate) fn toggle_row_enabled(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        self.commit_enabled_flag(&config.id, !config.enabled, window, cx);
+    }
+
     pub(crate) fn commit_enabled_flag(
         &mut self,
         id: &str,

@@ -129,6 +129,7 @@ pub(crate) const INSPECTOR_WIDTH: f32 = 260.;
 pub(crate) const INSPECTOR_WIDTH_MIN: f32 = 240.;
 pub(crate) const INSPECTOR_WIDTH_MAX: f32 = 360.;
 
+use app::actions::*;
 use app::bits::*;
 use app::focus::*;
 use app::kit_bits::*;

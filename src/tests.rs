@@ -8803,7 +8803,15 @@ fn ticket43_no_selection_toasts(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.stop_selected_engine(window, cx));
     });
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        view.update(cx, |view, cx| {
+            crate::app::actions::run_action(
+                view,
+                "copy-urls",
+                crate::app::actions::ActionTarget::Selection,
+                window,
+                cx,
+            )
+        });
     });
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.toggle_selected_enabled(window, cx));
@@ -8812,7 +8820,15 @@ fn ticket43_no_selection_toasts(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.test_selected_health(window, cx));
     });
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.ping_selected(window, cx));
+        view.update(cx, |view, cx| {
+            crate::app::actions::run_action(
+                view,
+                "ping",
+                crate::app::actions::ActionTarget::Selection,
+                window,
+                cx,
+            )
+        });
     });
     assert_eq!(notification_count(cx), before + 5, "every action toasts");
 }
@@ -16234,57 +16250,189 @@ fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
     }
 }
 
+/// F16: the table is the single source. Ids are unique and round-trip, every
+/// palette row points at a real action, no two actions claim one keystroke,
+/// and rows past a group's end resolve to nothing.
 #[test]
-fn palette_op_at_covers_both_groups() {
-    use crate::{AppView, PaletteOp};
+fn action_table_is_the_single_source() {
+    use crate::app::actions::{ACTIONS, PALETTE_GROUPS, action, palette_action_at};
     use gpui_kit::component::IndexPath;
-    let library = [
-        PaletteOp::Add,
-        PaletteOp::Import,
-        PaletteOp::StartSelected,
-        PaletteOp::StopSelected,
-        PaletteOp::TestSelected,
-        PaletteOp::CopyUrls,
-        PaletteOp::EditSelected,
-        PaletteOp::DeleteSelected,
-        PaletteOp::FocusSearch,
-        PaletteOp::ClearChecked,
-        PaletteOp::DetailsTab,
-        PaletteOp::HealthTab,
-        PaletteOp::ImportClipboard,
-        PaletteOp::ExportLibrary,
-    ];
-    for (row, want) in library.into_iter().enumerate() {
+    use std::collections::HashMap;
+
+    let mut ids = std::collections::HashSet::new();
+    let mut keystrokes: HashMap<&str, &str> = HashMap::new();
+    for def in ACTIONS {
+        assert!(ids.insert(def.id), "duplicate action id {}", def.id);
+        assert_eq!(action(def.id).id, def.id, "{} round-trips", def.id);
+        assert!(
+            !def.label.is_empty(),
+            "{} needs a label every surface can show",
+            def.id
+        );
+        for &(keystroke, _) in def.shortcuts {
+            assert!(
+                gpui_kit::Keystroke::parse(keystroke).is_ok(),
+                "{} binds an unparseable keystroke {keystroke}",
+                def.id
+            );
+            if let Some(other) = keystrokes.insert(keystroke, def.id) {
+                panic!("{keystroke} is claimed by both {other} and {}", def.id);
+            }
+        }
+    }
+    for (section, (label, group)) in PALETTE_GROUPS.iter().enumerate() {
+        for (row, id) in group.iter().enumerate() {
+            assert_eq!(
+                palette_action_at(IndexPath::new(row).section(section)),
+                Some(*id),
+                "{label} row {row}"
+            );
+            assert!(ids.contains(id), "palette {label} row {row} names a real action");
+        }
         assert_eq!(
-            AppView::palette_op_at(IndexPath::new(row).section(0)),
-            Some(want),
-            "library row {row}"
+            palette_action_at(IndexPath::new(group.len()).section(section)),
+            None,
+            "{label} ends after its last row"
         );
     }
-    let manage = [
-        PaletteOp::Subscriptions,
-        PaletteOp::PresetManager,
-        PaletteOp::Groups,
-        PaletteOp::Logs,
-        PaletteOp::Settings,
-        PaletteOp::About,
-        PaletteOp::StartAll,
-        PaletteOp::StopAll,
-        PaletteOp::TestAll,
-        PaletteOp::RuntimeStats,
-        PaletteOp::TrafficStats,
-        PaletteOp::RowColumns,
-    ];
-    for (row, want) in manage.into_iter().enumerate() {
-        assert_eq!(
-            AppView::palette_op_at(IndexPath::new(row).section(1)),
-            Some(want),
-            "manage row {row}"
+    assert_eq!(
+        palette_action_at(IndexPath::new(0).section(PALETTE_GROUPS.len())),
+        None,
+        "there is no third group"
+    );
+}
+
+/// F16: the palette, the row's context menu and the inspector's `…` menu all
+/// read one `ActionDef`, and the keymap binds the keystroke that same def
+/// carries — so "Copy URLs" is one verb with one label and one enabled state.
+#[gpui_kit::test]
+fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
+    use crate::app::actions::{ActionTarget, PALETTE_GROUPS, action, palette_action_at};
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().selected = Some(IndexPath::new(0));
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let def = action("copy-urls");
+    let palette_row = PALETTE_GROUPS[0]
+        .1
+        .iter()
+        .position(|id| *id == def.id)
+        .expect("the palette lists Copy URLs");
+    assert_eq!(
+        palette_action_at(IndexPath::new(palette_row).section(0)),
+        Some(def.id),
+        "the palette row resolves to the table id"
+    );
+    assert_eq!(
+        def.shortcuts.first().map(|(keystroke, _)| *keystroke),
+        Some("ctrl-u"),
+        "the keymap binds the def's keystroke"
+    );
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(
+            (def.enabled)(view, ActionTarget::Row(&row.id), cx),
+            "a row target enables the verb"
         );
-    }
-    assert_eq!(AppView::palette_op_at(IndexPath::new(15).section(0)), None);
-    assert_eq!(AppView::palette_op_at(IndexPath::new(12).section(1)), None);
-    assert_eq!(AppView::palette_op_at(IndexPath::new(0).section(2)), None);
+        assert!(
+            (def.enabled)(view, ActionTarget::Selection, cx),
+            "the selection enables it too"
+        );
+    });
+
+    let card = format!("row-card-{}", row.id);
+    cx.update(|window, cx| window.right_click(card, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    // Copy URLs sits in the card menu's `More ▾` submenu: one Up opens it.
+    cx.update(|window, cx| {
+        let up = gpui_kit::Keystroke::parse("up").expect("test keystroke parses");
+        window.dispatch_keystroke(up, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let ctx_id = format!("rowctx-{}-{}", def.id, row.id);
+    assert_eq!(
+        label_of(&ctx_id, cx),
+        def.label,
+        "the context menu shows the table's label"
+    );
+    let escape = || gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(escape(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    open_inspector(&view, cx);
+    paint_frame(cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.click("row-menu", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let kebab = format!("kebab-{}", def.id);
+    assert_eq!(
+        label_of(&kebab, cx),
+        def.label,
+        "the inspector menu shows the table's label"
+    );
+    cx.update(|window, cx| window.dispatch_keystroke(escape(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // The palette runs the very same handler.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.run_palette_op(IndexPath::new(palette_row).section(0), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let clip = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+            .to_string()
+    });
+    assert!(
+        clip.contains("socks5://") && clip.contains('\n'),
+        "the palette row ran copy-urls: {clip:?}"
+    );
+
+    // enabled-when is the table's too: no selection, no selection target.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().selected = None;
+                list_cx.notify();
+            });
+        });
+    });
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(
+            !(def.enabled)(view, ActionTarget::Selection, cx),
+            "no selection refuses the selection target"
+        );
+        assert!(
+            (def.enabled)(view, ActionTarget::Row(&row.id), cx),
+            "the context menu's row target still runs"
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -16368,7 +16516,7 @@ fn f08_palette_rows_stop_lying(cx: &mut TestAppContext) {
     // The surviving row is the ClearChecked op, at its renumbered path.
     assert_eq!(
         crate::AppView::palette_op_at(gpui_kit::component::IndexPath::new(9).section(0)),
-        Some(crate::PaletteOp::ClearChecked),
+        Some("clear-checked"),
         "Clear checked stays on the op it names"
     );
 }
@@ -17894,7 +18042,15 @@ fn t10_copy_selected_urls_carry_binds_not_secrets(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let before = notification_count(cx);
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        view.update(cx, |view, cx| {
+            crate::app::actions::run_action(
+                view,
+                "copy-urls",
+                crate::app::actions::ActionTarget::Selection,
+                window,
+                cx,
+            )
+        });
     });
     let clip = cx.update(|_, cx| {
         cx.read_from_clipboard()
@@ -29185,7 +29341,15 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     assert_eq!(notification_count(cx), before + 1, "start toasts once");
 
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        view.update(cx, |view, cx| {
+            crate::app::actions::run_action(
+                view,
+                "copy-urls",
+                crate::app::actions::ActionTarget::Selection,
+                window,
+                cx,
+            )
+        });
     });
     let clip = cx.update(|_, cx| {
         cx.read_from_clipboard()
@@ -29922,7 +30086,15 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     assert_no_canaries(&cached, "inspector upstream");
 
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        view.update(cx, |view, cx| {
+            crate::app::actions::run_action(
+                view,
+                "copy-urls",
+                crate::app::actions::ActionTarget::Selection,
+                window,
+                cx,
+            )
+        });
     });
     let clip = cx.update(|_, cx| {
         cx.read_from_clipboard()

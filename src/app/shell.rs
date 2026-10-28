@@ -11,148 +11,65 @@ impl AppView {
             .track_focus(&self.focus)
             .key_context(APP_KEY_CONTEXT)
             .on_action(cx.listener(|view, _: &AddConfig, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.open_add_dialog(window, cx);
+                shortcut_action(view, "add", window, cx);
             }))
             .on_action(cx.listener(|view, _: &ImportConfigs, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                shortcut_action(view, "import", window, cx);
             }))
             .on_action(cx.listener(|view, _: &PasteImport, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.open_import_from_clipboard(window, cx);
+                shortcut_action(view, "paste-import", window, cx);
             }))
             .on_action(cx.listener(|view, _: &StartSelected, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.start_selected_engine(window, cx);
+                shortcut_action(view, "start", window, cx);
             }))
             .on_action(cx.listener(|view, _: &StopSelected, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.stop_selected_engine(window, cx);
+                shortcut_action(view, "stop", window, cx);
             }))
             .on_action(cx.listener(|view, _: &TestSelected, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.test_selected_health(window, cx);
+                shortcut_action(view, "test", window, cx);
             }))
             .on_action(cx.listener(|view, _: &StopTesting, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.stop_group_tests(window, cx);
+                shortcut_action(view, "stop-testing", window, cx);
             }))
+            // Escape reaches here with a dialog open on purpose: clearing the
+            // check is the one shortcut the overlay does not own.
             .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
-                view.clear_checked_unless_dialog(window, cx);
+                run_action(view, "clear-checked", ActionTarget::Selection, window, cx);
             }))
             .on_action(cx.listener(|view, _: &OpenPalette, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.open_palette(window, cx);
+                shortcut_action(view, "open-palette", window, cx);
             }))
             .on_action(cx.listener(|view, _: &CopyUrls, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.copy_selected_urls(window, cx);
+                shortcut_action(view, "copy-urls", window, cx);
             }))
             .on_action(cx.listener(|view, _: &UpdateCurrentGroup, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.update_current_group(window, cx);
+                shortcut_action(view, "update-current-group", window, cx);
             }))
             .on_action(cx.listener(|view, _: &EditSelected, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                if let Some(config) = view.selected_config(cx) {
-                    view.open_edit_dialog(config, window, cx);
-                } else {
-                    window.push_notification(Notification::info(no_selection_message()), cx);
-                }
+                shortcut_action(view, "edit", window, cx);
             }))
             .on_action(cx.listener(|view, _: &DeleteSelected, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                if let Some(config) = view.selected_config(cx) {
-                    view.open_remove_confirm(config, window, cx);
-                } else {
-                    window.push_notification(Notification::info(no_selection_message()), cx);
-                }
+                shortcut_action(view, "delete", window, cx);
             }))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.focus_library_search(window, cx);
+                shortcut_action(view, "focus-search", window, cx);
             }))
             .on_action(cx.listener(|view, _: &InspectorDetails, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
                 // F19: Ctrl-1 is the one key that owns presence — it toggles
                 // the panel shut when it is already showing Details.
-                view.toggle_inspector(InspectorTab::Details);
-                cx.notify();
+                shortcut_action(view, "inspector-details", window, cx);
             }))
             .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.set_inspector_tab(InspectorTab::Health);
-                cx.notify();
+                shortcut_action(view, "inspector-health", window, cx);
             }))
             .on_action(cx.listener(|view, _: &InspectorLogs, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.set_inspector_tab(InspectorTab::Logs);
-                cx.notify();
+                shortcut_action(view, "inspector-logs", window, cx);
             }))
             .on_action(cx.listener(|view, _: &InspectorLinks, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.set_inspector_tab(InspectorTab::Links);
-                cx.notify();
+                shortcut_action(view, "inspector-links", window, cx);
             }))
             .on_action(cx.listener(|view, _: &InspectorTraffic, window, cx| {
-                if overlay_open(window, cx) {
-                    refuse_shortcut_under_overlay(window, cx);
-                    return;
-                }
-                view.set_inspector_tab(InspectorTab::Traffic);
-                cx.notify();
+                shortcut_action(view, "inspector-traffic", window, cx);
             }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
