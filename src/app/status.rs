@@ -159,6 +159,9 @@ impl AppView {
                 .flex()
                 .flex_row()
                 .items_center()
+                // B19: the chip is one fixed token, so the zone's squeeze
+                // lands on the traffic numbers (they truncate), never here.
+                .flex_shrink_0()
                 .aria_label("Command palette (Ctrl+K)")
                 .child(shortcut_kbd("ctrl-k", "Ctrl+K")),
         );

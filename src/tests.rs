@@ -34265,3 +34265,135 @@ fn k5_update_feed_failure_copy() {
         "no internals ride along"
     );
 }
+
+/// B19: the audit read "no UIA actions at all" off the chrome strip, the bulk
+/// More, the row More and Close inspector. Each of those is a kit Button, and
+/// a Button with a click listener adds `Action::Click` to its accessibility
+/// node, so what UIA sees is role Button + a name. This walks every chrome id
+/// and pins both, so no plain div (no role, no click action) creeps back in.
+#[gpui_kit::test]
+fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    store
+        .add(row19_seed("Home", "b.example.com", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &work.id);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.select_visible_checked(window, cx));
+    });
+    paint_frame(cx);
+
+    let snapshot = |cx: &mut VisualTestContext, id: &str| {
+        cx.update(|window, _| {
+            let found = window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders in the completed frame"));
+            (
+                found.role().map(|role| format!("{role:?}")),
+                found.label().map(str::to_string),
+            )
+        })
+    };
+
+    for (id, pinned) in [
+        ("program-menu", "Program"),
+        ("settings-menu", "Settings"),
+        ("groups-menu", "Library"),
+        ("routing-menu", "Routing"),
+        ("tools-menu", "Tools"),
+        ("toolbar-import", "Import"),
+        ("toolbar-add-config", "Add configuration"),
+        ("global-start-stop", "Start all"),
+        ("bulk-start", "Start"),
+        ("bulk-stop", "Stop"),
+        ("bulk-more", "More bulk actions"),
+        ("row-menu", "More actions"),
+        ("inspector-drawer-close", "Close inspector"),
+    ] {
+        let (role, label) = snapshot(cx, id);
+        assert_eq!(
+            role.as_deref(),
+            Some("Button"),
+            "{id} exposes the Button role (and its click action)"
+        );
+        assert_eq!(label.as_deref(), Some(pinned), "{id} announces its name");
+    }
+
+    // The operate row's verbs carry the accesskit names, not their visible
+    // shorthand, so only the shape is pinned here.
+    for id in ["engine-start", "engine-stop", "health-test"] {
+        let (role, label) = snapshot(cx, id);
+        assert_eq!(role.as_deref(), Some("Button"), "{id} exposes Button");
+        assert!(
+            label.as_ref().is_some_and(|label| !label.is_empty()),
+            "{id} announces a name: {label:?}"
+        );
+    }
+
+    // Static segments: no action, but each still names itself.
+    for id in ["bulk-label", "palette-hint"] {
+        let (_, label) = snapshot(cx, id);
+        assert!(
+            label.as_ref().is_some_and(|label| !label.is_empty()),
+            "{id} announces its text: {label:?}"
+        );
+    }
+}
+
+/// B19: the Ctrl+K chip lives in the bar's right zone, which clips whatever
+/// overflows it. A Kbd that wraps grows taller than the bar and the chip's
+/// last pixels fall off the frame edge. Pin the chip inside its row and the
+/// frame at the restore size and at the minimum, with the drawer + bulk bar
+/// up (the state the audit photographed).
+#[gpui_kit::test]
+fn b19_palette_hint_fits_the_status_bar_row(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &work.id);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.select_visible_checked(window, cx));
+    });
+
+    for (width, height) in [(1000., 700.), (880., 620.)] {
+        paint_frame_at(cx, width, height);
+        assert_painted(cx, "palette-hint");
+        let (hint, right) = cx.update(|window, _| {
+            let bounds = |id: &str| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders at {width}x{height}"))
+                    .bounds()
+            };
+            (bounds("palette-hint"), bounds("status-right"))
+        });
+        let frame = size(px(width), px(height));
+        assert!(
+            hint.size.height <= right.size.height,
+            "the chip never wraps taller than its row at {width}x{height}: {hint:?} in {right:?}"
+        );
+        assert!(
+            hint.origin.x >= px(0.)
+                && hint.origin.y >= px(0.)
+                && hint.origin.x + hint.size.width <= frame.width
+                && hint.origin.y + hint.size.height <= frame.height,
+            "the chip paints whole inside the frame at {width}x{height}: {hint:?} in {frame:?}"
+        );
+        assert!(
+            hint.origin.x + hint.size.width <= right.origin.x + right.size.width,
+            "the right zone does not clip the chip at {width}x{height}: {hint:?} in {right:?}"
+        );
+    }
+}

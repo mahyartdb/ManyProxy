@@ -65,6 +65,9 @@ impl AppView {
                         .id("bulk-label")
                         .test_support()
                         .flex_shrink_0()
+                        // B19: the count is the bar's only status text, so it
+                        // names itself like every other bar segment does.
+                        .aria_label(label.clone())
                         .tooltip(|_, cx| {
                             cx.new(|_| {
                                 Tooltip::new(
