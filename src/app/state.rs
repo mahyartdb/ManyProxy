@@ -1,5 +1,7 @@
 use crate::*;
 
+use gpui_kit::component::list::ListState;
+
 impl AppView {
     /// Defect: boot runs inside `cx.open_window`'s closure, and the window only
     /// adopts its `gpui_component::Root` layer after that closure returns —

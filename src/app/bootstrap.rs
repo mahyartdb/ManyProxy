@@ -1,5 +1,7 @@
 use crate::*;
 
+use std::path::Path;
+
 impl AppView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         match Store::open_file(&Store::default_path()) {

@@ -69,6 +69,10 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
+// `gpui_kit::*` re-exports gpui itself, so it also brings gpui's `Path` and
+// `ListState` into scope alongside the kit's own types. Modules that need the
+// kit's `ListState` or std's `Path` import them by name, which shadows the
+// glob and keeps name resolution unambiguous.
 use gpui_kit::*;
 use qrcodegen::{QrCode, QrCodeEcc};
 

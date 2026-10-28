@@ -1,5 +1,7 @@
 use crate::*;
 
+use gpui_kit::component::list::ListState;
+
 const SING_BOX_RELEASES_URL: &str = "https://github.com/SagerNet/sing-box/releases";
 const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
 

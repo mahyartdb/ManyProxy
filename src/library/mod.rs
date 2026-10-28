@@ -1,5 +1,6 @@
 use crate::*;
 
+use gpui_kit::component::list::ListState;
 use gpui_kit::component::ThemeStyled as _;
 
 mod columns;
