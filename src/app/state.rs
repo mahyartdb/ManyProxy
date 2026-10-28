@@ -775,7 +775,7 @@ impl AppView {
     /// T-25: `N active · M TCP · K UDP` from the last merged clash snapshot.
     /// Hidden while no core runs — there is no collection to report, and zeros
     /// would read as a measured idle instead of "nothing is being polled".
-    /// K12/A5-1: the strip no longer renders this count; the Connections
+    /// K12/A5-1: the strip no longer renders this count; the Links
     /// inspector tab carries it. Retained for the counter merge tests only.
     #[cfg(test)]
     pub(crate) fn conn_counter_text(&self) -> Option<String> {

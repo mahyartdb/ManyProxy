@@ -30,7 +30,7 @@ pub(crate) const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Inspector health", "Ctrl-2"),
     ("Inspector details", "Ctrl-3"),
     ("Inspector logs", "Ctrl-4"),
-    ("Inspector connections", "Ctrl-5"),
+    ("Inspector links", "Ctrl-5"),
     ("Inspector traffic", "Ctrl-6"),
     ("Uncheck all", "Esc"),
     ("Copy URLs", "Ctrl-U"),

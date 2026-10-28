@@ -8,7 +8,7 @@ impl AppView {
     ///
     /// Ports and connection counters left the strip: ports belong to the
     /// engine's own surface, and the connections count lives in the
-    /// Connections inspector tab (its group title already carries `(N)`). The
+    /// Links inspector tab (its group title already carries `(N)`). The
     /// error segment rides F4: the toast hides in five seconds, this line
     /// persists until a start succeeds and the controller clears it.
     pub(crate) fn render_status_bar(&self, cx: &App) -> impl IntoElement {

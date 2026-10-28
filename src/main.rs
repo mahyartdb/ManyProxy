@@ -61,7 +61,6 @@ use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Disableable as _;
@@ -161,7 +160,7 @@ actions!(
         InspectorDetails,
         InspectorHealth,
         InspectorLogs,
-        InspectorConnections,
+        InspectorLinks,
         InspectorTraffic,
         OpenPalette,
         CopyUrls,

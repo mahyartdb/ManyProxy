@@ -113,7 +113,7 @@ pub(crate) fn aggregate_exit_traffic(
 }
 
 pub(crate) fn traffic_poll_due(tab: InspectorTab, now: i64, last_poll_at: i64) -> bool {
-    if matches!(tab, InspectorTab::Connections | InspectorTab::Traffic) {
+    if matches!(tab, InspectorTab::Links | InspectorTab::Traffic) {
         return true;
     }
     now.saturating_sub(last_poll_at) >= TRAFFIC_TICK_SECS as i64

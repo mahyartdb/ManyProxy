@@ -8,63 +8,12 @@ pub(crate) const OPERATE_START_TOOLTIP: &str = "Start the selected endpoint (F5)
 pub(crate) const OPERATE_STOP_TOOLTIP: &str = "Stop the selected endpoint (Shift-F5)";
 pub(crate) const OPERATE_TEST_TOOLTIP: &str = "Test the selected endpoint (Ctrl-T)";
 
-/// K20/D1 metrics for the inspector tab strip: labels at the kit's xsmall text
-/// step with segmented chrome measured in fixed pixels, so the fit below and
-/// the layout above can never drift apart.
-const TAB_LABEL_REM: f32 = 0.75;
-const TAB_LABEL_PAD_X: f32 = 3.;
-const TAB_LABEL_GAP: f32 = 2.;
-/// Everything the row adds around the labels themselves: 5 × (2 × padding)
-/// + 4 gaps + the bar's own 2×2 inset.
-const TAB_LABEL_CHROME: f32 = 2. * 5. * TAB_LABEL_PAD_X + 4. * TAB_LABEL_GAP + 4.;
-
-/// The measured fit of the inspector tab strip across frames.
-///
-/// Labels report their painted width and the strip its capacity through
-/// prepaint (the channel the kit's own tab indicator uses); the *next* render
-/// normalizes those widths by the scale that painted them and re-solves the
-/// scale that keeps all five labels inside the drawer. `settle` reports false
-/// once the solved scale matches the applied one — the row is at rest.
-#[derive(Clone, Copy)]
-struct InspectorTabFit {
-    scale: f32,
-}
-
-impl InspectorTabFit {
-    const ONE: Self = Self { scale: 1.0 };
-
-    fn settle(&mut self, measured: (f32, f32)) -> bool {
-        let (labels, capacity) = measured;
-        if labels <= 0. || capacity <= TAB_LABEL_CHROME {
-            return false;
-        }
-        // 2% of capacity is air for the sub-pixel rounding between measure
-        // and paint; without it the solver would tick 0.5px round-trips.
-        let want = (capacity - TAB_LABEL_CHROME) / (labels / self.scale) * 0.98;
-        // One 1/128 step at a time, so the settled scale stops moving once
-        // the sub-pixel rounding can no longer meaningfully change it.
-        let want = (want.clamp(0.5, 1.0) * 128.).round() / 128.;
-        if (want - self.scale).abs() < 0.008 {
-            return false;
-        }
-        self.scale = want;
-        true
-    }
-}
-
-#[derive(Default)]
-struct InspectorTabFitMeasure {
-    /// Per-tab label widths in px from the last completed frame.
-    labels: [f32; 5],
-    /// Strip capacity in px from the last completed frame.
-    container: f32,
-}
-
-impl InspectorTabFitMeasure {
-    fn report(&self) -> (f32, f32) {
-        (self.labels.iter().sum(), self.container)
-    }
-}
+/// K20/D1 metrics for the inspector tab strip: one fixed text size for all
+/// five, pinned so `Details · Health · Logs · Links · Traffic` fit whole at the
+/// 240px drawer floor. Nothing scales them.
+const TAB_LABEL_REM: f32 = 0.6875;
+const TAB_LABEL_PAD_X: f32 = 2.;
+const TAB_LABEL_GAP: f32 = 1.;
 
 impl AppView {
     /// T-03: below the breakpoint the inspector slides OVER the table as a
@@ -129,11 +78,7 @@ impl AppView {
     /// and hand focus back to the list. It reports whether it closed
     /// anything, so the caller can leave the checked set alone — one overlay
     /// layer per Esc.
-    pub(crate) fn close_inspector(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub(crate) fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.inspector_visible {
             return false;
         }
@@ -208,7 +153,7 @@ impl AppView {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .child(self.render_inspector_tabs(window, cx))
+            .child(self.render_inspector_tabs(cx))
             // K1/A4-2: ONE scroll for the whole pane — header, endpoints (with
             // their editors), the pane module, then the operate row. Nothing
             // is pinned to the panel bottom: actions follow content, so the
@@ -236,7 +181,7 @@ impl AppView {
                     .child(self.render_inspector_overview(window, cx, config))
                     .child(Self::motion_enter(
                         match self.inspector_tab {
-                            InspectorTab::Connections => {
+                            InspectorTab::Links => {
                                 self.render_inspector_connections(cx).into_any_element()
                             }
                             InspectorTab::Traffic => {
@@ -402,14 +347,14 @@ impl AppView {
 
         let dest_width_px = self.store.conn_column_widths()[0] as f32;
         let mut pane = div()
-            .id("config-connections")
+            .id("config-links")
             .test_support()
             .flex()
             .flex_col()
             .gap_1()
             .child(
                 GroupBox::new()
-                    .title(format!("Connections ({})", rows.len()))
+                    .title(format!("Links ({})", rows.len()))
                     .gap_1()
                     .child(div().text_sm().child(
                         "Destination · Exit · Proto · Traffic ↓↑ · Session Δ — click a destination to copy it.",
@@ -482,7 +427,7 @@ impl AppView {
         if rows.is_empty() {
             pane = pane.child(
                 div()
-                    .id("config-connections-empty")
+                    .id("config-links-empty")
                     .test_support()
                     .text_sm()
                     .child("No live connections yet — start an exit to see flows here. Health probes never appear."),
@@ -648,11 +593,11 @@ impl AppView {
         pane
     }
 
-    /// K1/A4-3: ONE non-wrapping header line — acting echo, protocol tag, and
-    /// the dirty dot on the left; group tag and the single serving badge flush
-    /// right (a spacer, not a wrap). The badge is a lamp div plus
-    /// `<state> · <bind:port> · <latency>` text: no `●`/`○` glyph, no kit
-    /// overlay dot, and `dead` is never co-signed with `Running`.
+    /// K1/A4-3: ONE non-wrapping header line — acting echo and the dirty dot on
+    /// the left, the single serving badge flush right (a spacer, not a wrap).
+    /// The badge is a lamp div plus `<state> · <bind:port> · <latency>` text: no
+    /// `●`/`○` glyph, no kit overlay dot, and `dead` is never co-signed with
+    /// `Running`.
     pub(crate) fn render_detail_header(
         &self,
         cx: &mut Context<Self>,
@@ -690,9 +635,9 @@ impl AppView {
             .test_support()
             .flex()
             .flex_row()
-            // K1/A4-3 keeps the group chip and badge on the same line via a
-            // spacer, but a narrow pane (240px default) cannot fit the name +
-            // tag + a ~220px badge side by side. Wrapping is the fallback that
+            // K1/A4-3 keeps the badge on the same line via a spacer, but a
+            // narrow pane (240px default) cannot fit the name + a ~220px badge
+            // side by side. Wrapping is the fallback that
             // keeps the badge INSIDE the panel instead of overflowing past the
             // window edge (invisible). With room to spare the spacer still
             // pushes the badge flush right on one line.
@@ -711,7 +656,6 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child(acting_on_label(config)),
             )
-            .child(Tag::new().child(config.protocol.clone()))
             .child({
                 // T-03: the dirty marker rides the inspector's row header —
                 // the row is one line and has no room for it.
@@ -741,11 +685,10 @@ impl AppView {
                         .into_any_element()
                 }
             })
-            // K1/A4-3: the group chip and the badge stay on the SAME line —
-            // the spacer pushes them flush right instead of letting a long
-            // name wrap them onto a second line.
+            // K1/A4-3: the badge stays on the SAME line — the spacer pushes it
+            // flush right instead of letting a long name wrap it onto a second
+            // line.
             .child(div().flex_1().min_w_0())
-            .child(Tag::new().child(config.group.clone()))
             .child(
                 div()
                     .id("detail-serving")
@@ -1278,6 +1221,11 @@ impl AppView {
             .on_click(cx.listener(|view, _, window, cx| {
                 view.start_selected_engine(window, cx);
             }));
+        // F11: Start is the primary action only while the endpoint is stopped;
+        // Stop and Test only mean something while it runs.
+        if !is_running {
+            start = start.primary();
+        }
         if self.start_in_flight {
             start = start.child(
                 div()
@@ -1293,6 +1241,7 @@ impl AppView {
             .accessibility_label("Stop")
             .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
             .tooltip(OPERATE_STOP_TOOLTIP)
+            .disabled(!is_running)
             .loading(self.start_in_flight)
             .on_click(cx.listener(|view, _, window, cx| {
                 view.stop_selected_engine(window, cx);
@@ -1312,6 +1261,7 @@ impl AppView {
             .accessibility_label("Test")
             .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
             .tooltip(OPERATE_TEST_TOOLTIP)
+            .disabled(!is_running)
             .loading(self.probe_kind_in_flight(false))
             .on_click(cx.listener(|view, _, window, cx| {
                 view.test_selected_health(window, cx);
@@ -1695,18 +1645,10 @@ impl AppView {
 
 impl AppView {
     /// K1/A4-1: ONE segmented switcher — Details · Health · Logs ·
-    /// Connections · Traffic, one row. Presets has no tab of its own here
+    /// Links · Traffic, one row. Presets has no tab of its own here
     /// (Routing is its home). The Ctrl-1…5 keys live in Settings → Shortcuts,
     /// not on the tab labels.
-    pub(crate) fn render_inspector_tabs(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        use gpui_kit::base::ElementExt as _;
+    pub(crate) fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::prelude::FluentBuilder as _;
 
         let view = cx.entity();
@@ -1722,32 +1664,14 @@ impl AppView {
         };
         let pill_radius = (radius - px(2.)).max(px(0.));
 
-        // K20/D1: the five labels size the row instead of splitting 242px into
-        // five equal `flex_1` slots — under the drawer the upstream bar clipped
-        // Connections and hid Traffic whole. Labels are content-fit; when the
-        // measured content still overruns the capacity, ONE uniform scale-down
-        // keeps every label painted: the row never wraps, never shortens.
-        let fit = window.use_keyed_state("inspector-tab-fit", cx, |_, _| InspectorTabFit::ONE);
-        let measure = window
-            .use_keyed_state("inspector-tab-fit-measure", cx, |_, _| {
-                Rc::new(RefCell::new(InspectorTabFitMeasure::default()))
-            })
-            .read(cx)
-            .clone();
-        let mut current_fit = *fit.read(cx);
-        if current_fit.settle(measure.borrow().report()) {
-            fit.update(cx, |state, _| *state = current_fit);
-            // Paint the settled scale on the next frame; this frame is already
-            // committed to its own (possibly just-measured) size.
-            window.refresh();
-        }
-        let scale = current_fit.scale;
+        // K20/D1: the five labels size the row instead of splitting it into
+        // five equal `flex_1` slots — that clipped the last tab whole.
 
         let tabs = [
             InspectorTab::Details,
             InspectorTab::Health,
             InspectorTab::Logs,
-            InspectorTab::Connections,
+            InspectorTab::Links,
             InspectorTab::Traffic,
         ];
 
@@ -1794,15 +1718,9 @@ impl AppView {
                         div()
                             .id(format!("inspector-tab-{slug}"))
                             .test_support()
-                            .text_size(rems(TAB_LABEL_REM * scale))
+                            .text_size(rems(TAB_LABEL_REM))
                             .line_height(relative(1.0))
                             .whitespace_nowrap()
-                            .on_prepaint({
-                                let measure = measure.clone();
-                                move |bounds, _, _| {
-                                    measure.borrow_mut().labels[index] = bounds.size.width.into();
-                                }
-                            })
                             .child(label),
                     ),
             );
@@ -1816,12 +1734,6 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
-            .on_prepaint({
-                let measure = measure.clone();
-                move |bounds, _, _| {
-                    measure.borrow_mut().container = bounds.size.width.into();
-                }
-            })
             .child(
                 div()
                     .id("inspector-tab-bar")

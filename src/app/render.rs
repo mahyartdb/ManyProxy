@@ -13,12 +13,7 @@ impl InspectorLayout {
     /// F19: a hidden inspector costs the table nothing in either presentation,
     /// so the list takes the whole viewport. A visible drawer is clamped so the
     /// table never drops under its floor.
-    pub(crate) fn compute(
-        viewport: f32,
-        inspector_w: f32,
-        docked: bool,
-        visible: bool,
-    ) -> Self {
+    pub(crate) fn compute(viewport: f32, inspector_w: f32, docked: bool, visible: bool) -> Self {
         if !visible {
             return Self {
                 drawer_w: 0.,

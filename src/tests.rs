@@ -5684,7 +5684,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.inspector_tab = crate::InspectorTab::Connections;
+            view.inspector_tab = crate::InspectorTab::Links;
             view.conn_selected_only = false;
             view.libraries.update(cx, |state, list_cx| {
                 state.delegate_mut().selected = Some(IndexPath::new(0));
@@ -5698,7 +5698,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "config-connections");
+    assert_painted(cx, "config-links");
     assert!(
         cx.update(|window, _| window.try_find("conn-copy-0".to_string()).is_some()),
         "first flow copies"
@@ -5788,7 +5788,7 @@ fn t74_conn_setup<'a>(
                 },
             )];
             view.conn_delta = std::collections::HashMap::new();
-            view.inspector_tab = crate::InspectorTab::Connections;
+            view.inspector_tab = crate::InspectorTab::Links;
             view.conn_selected_only = false;
             view.conn_sort_desc = true;
             view.libraries.update(cx, |state, list_cx| {
@@ -5831,7 +5831,7 @@ fn t74_conn_setup<'a>(
 fn t74_click_dest_copies_exact_string(cx: &mut TestAppContext) {
     let dest = "flow-0.example.com";
     let (_view, cx, _endpoint) = t74_conn_setup(cx, dest);
-    assert_painted(cx, "config-connections");
+    assert_painted(cx, "config-links");
     assert_painted(cx, "conn-copy-0");
 
     cx.update(|window, cx| {
@@ -6379,7 +6379,7 @@ fn t05_traffic_poll_cadence_visible_fast_hidden_slow(cx: &mut TestAppContext) {
     use crate::InspectorTab;
     let now = 1_000_000i64;
     assert!(
-        crate::traffic_poll_due(InspectorTab::Connections, now, now),
+        crate::traffic_poll_due(InspectorTab::Links, now, now),
         "visible Connections polls immediately"
     );
     assert!(
@@ -15187,14 +15187,10 @@ fn f5_guided_error_renders_beside_the_uuid_row(cx: &mut TestAppContext) {
             dialog
                 .title("Add proxy configuration")
                 .w(px(560.))
-                .child(form.clone().element(
-                    element_view.clone(),
-                    cx,
-                    None,
-                    error,
-                    false,
-                    None,
-                ))
+                .child(
+                    form.clone()
+                        .element(element_view.clone(), cx, None, error, false, None),
+                )
                 .footer(crate::dialog_footer(
                     "uuid-dialog-ok",
                     "uuid-dialog-cancel",
@@ -16124,7 +16120,7 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
         "inspector-tab-details",
         "inspector-tab-health",
         "inspector-tab-logs",
-        "inspector-tab-connections",
+        "inspector-tab-links",
         "inspector-tab-traffic",
     ] {
         assert!(
@@ -16179,7 +16175,7 @@ fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
         crate::InspectorTab::Details,
         crate::InspectorTab::Health,
         crate::InspectorTab::Logs,
-        crate::InspectorTab::Connections,
+        crate::InspectorTab::Links,
         crate::InspectorTab::Traffic,
     ] {
         cx.update(|_, cx| {
@@ -16975,7 +16971,7 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
         (crate::InspectorTab::Details, "Details"),
         (crate::InspectorTab::Health, "Health"),
         (crate::InspectorTab::Logs, "Logs"),
-        (crate::InspectorTab::Connections, "Connections"),
+        (crate::InspectorTab::Links, "Links"),
         (crate::InspectorTab::Traffic, "Traffic"),
     ] {
         cx.update(|_, cx| {
@@ -17071,7 +17067,7 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
             });
         });
         cx.run_until_parked();
-        open_inspector(&view, cx);
+        open_inspector(view, cx);
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
@@ -17525,11 +17521,7 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
     paint_frame_min(cx);
     // F6: Enable/Disable left the bulk menu — the flag is restore-on-launch,
     // not a bulk operation.
-    let menu = [
-        "bulk-more-move",
-        "bulk-more-copy",
-        "bulk-more-delete",
-    ];
+    let menu = ["bulk-more-move", "bulk-more-copy", "bulk-more-delete"];
     let mut menu_order = Vec::new();
     for id in menu {
         assert_painted(cx, id);
@@ -17636,7 +17628,7 @@ fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
         crate::InspectorTab::Details,
         crate::InspectorTab::Health,
         crate::InspectorTab::Logs,
-        crate::InspectorTab::Connections,
+        crate::InspectorTab::Links,
         crate::InspectorTab::Traffic,
     ] {
         cx.update(|_, cx| {
@@ -17779,7 +17771,7 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
         crate::InspectorTab::Details,
         crate::InspectorTab::Health,
         crate::InspectorTab::Logs,
-        crate::InspectorTab::Connections,
+        crate::InspectorTab::Links,
         crate::InspectorTab::Traffic,
     ] {
         cx.update(|_, cx| {
@@ -17811,7 +17803,7 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
             }
             crate::InspectorTab::Health
             | crate::InspectorTab::Logs
-            | crate::InspectorTab::Connections
+            | crate::InspectorTab::Links
             | crate::InspectorTab::Traffic => {
                 for id in [
                     "endpoint-value-socks",
@@ -17840,8 +17832,8 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
             crate::InspectorTab::Logs => {
                 assert_painted(cx, "config-logs");
             }
-            crate::InspectorTab::Connections => {
-                assert_painted(cx, "config-connections");
+            crate::InspectorTab::Links => {
+                assert_painted(cx, "config-links");
             }
             crate::InspectorTab::Traffic => {
                 assert_painted(cx, "config-traffic");
@@ -18123,7 +18115,7 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
         (0, "config-usage"),
         (1, "config-health"),
         (2, "config-logs"),
-        (3, "config-connections"),
+        (3, "config-links"),
         (4, "config-traffic"),
     ] {
         cx.update(|_, cx| {
@@ -19567,7 +19559,10 @@ fn enabled_flag_message_names_row_and_meaning() {
     let on = enabled_flag_message("Work", true);
     assert!(on.contains("Work"), "names the row: {on}");
     assert!(on.contains("restore on launch"), "one semantic: {on}");
-    assert!(!on.contains("flag only"), "the old vague label is gone: {on}");
+    assert!(
+        !on.contains("flag only"),
+        "the old vague label is gone: {on}"
+    );
     let off = enabled_flag_message("Work", false);
     assert!(off.contains("Work"), "names the row: {off}");
     assert!(
@@ -19921,7 +19916,7 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
     press(cx, "ctrl-5");
     assert_eq!(
         view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Connections,
+        crate::InspectorTab::Links,
         "Ctrl-5 switches pane"
     );
     press(cx, "ctrl-6");
@@ -21025,6 +21020,116 @@ fn f19_inspector_shortcut_toggles_presence(cx: &mut TestAppContext) {
         crate::InspectorTab::Health,
         "another tab key opens the inspector on that tab"
     );
+}
+
+/// F11: Start leads while the endpoint is stopped; Stop and Test only mean
+/// something once it runs, so a stopped row ignores their presses.
+#[gpui_kit::test]
+fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
+    use gpui_kit::component::IndexPath;
+
+    let has_spinner = |cx: &mut VisualTestContext, id: &str| {
+        cx.update(|window, _| window.try_find(id.to_string()).is_some())
+    };
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(t26_engine_seed("Work", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let (engine, _) = crate::engine::EngineController::fake();
+            view.engine = engine;
+            let (prober, _) = crate::health::FakeHealthProber::shared();
+            view.prober = Box::new(prober);
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().selected = Some(IndexPath::new(0));
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame(cx);
+
+    let notifications = notification_count(cx);
+    cx.update(|window, cx| {
+        window.click("engine-stop", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        0,
+        "a stopped endpoint has nothing to stop"
+    );
+    assert_eq!(
+        notification_count(cx),
+        notifications,
+        "the disabled Stop does not toast"
+    );
+
+    cx.update(|window, cx| {
+        window.click("health-test", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !has_spinner(cx, "health-test-spinner"),
+        "a stopped endpoint has nothing to test"
+    );
+
+    cx.update(|window, cx| {
+        window.click("engine-start", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        1,
+        "start stays live while stopped"
+    );
+
+    let after_start = notification_count(cx);
+    cx.update(|window, cx| {
+        window.click("health-test", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        notification_count(cx) > after_start,
+        "test wakes once the endpoint runs"
+    );
+}
+
+/// F11: the header is the acting echo and the serving badge — the protocol and
+/// group tags that used to bracket them are gone.
+#[gpui_kit::test]
+fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppContext) {
+    use gpui_kit::component::IndexPath;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().selected = Some(IndexPath::new(0));
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame(cx);
+
+    assert_painted(cx, "detail-header-line");
+    assert_painted(cx, "detail-acting-on");
+    assert_painted(cx, "detail-serving");
 }
 
 /// F2: upstream is the third budget drop. At 740 the protocol column is gone
@@ -22588,15 +22693,14 @@ fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
 }
 
 // K20/D1: the inspector switcher sizes to its five labels instead of five
-// fixed slots. At the 1000x700 default frame the drawer leaves 242px for the
-// strip and the flex `TabBar` truncated Connections and hid Traffic whole;
-// content-fit with one uniform scale-down paints every label at the default
+// fixed slots, at one fixed text size — `Details · Health · Logs · Links ·
+// Traffic` fit whole, so nothing scales them. Checked at the default drawer
 // width, on the wide side panel, and at the 240px panel floor.
 #[gpui_kit::test]
-fn t20_inspector_tab_row_fits_the_default_drawer(cx: &mut TestAppContext) {
+fn t20_inspector_tab_row_fits_the_narrowest_drawer(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
 
-    const SLUGS: [&str; 5] = ["details", "health", "logs", "connections", "traffic"];
+    const SLUGS: [&str; 5] = ["details", "health", "logs", "links", "traffic"];
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -22613,14 +22717,10 @@ fn t20_inspector_tab_row_fits_the_default_drawer(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+    open_inspector(&view, cx);
 
-    for (width, height) in [(1000., 700.), (1400., 800.)] {
-        // The first paint measures the painted strip, the next paints the
-        // settled scale; two passes keep the assertion frame-order-proof.
-        for _ in 0..2 {
-            open_inspector(&view, cx);
-            paint_frame_at(cx, width, height);
-        }
+    for (width, height) in [(1000., 700.), (1400., 800.), (880., 700.)] {
+        paint_frame_at(cx, width, height);
         assert_painted(cx, "inspector-tabs");
         for slug in SLUGS {
             assert_painted(cx, &format!("inspector-tab-button-{slug}"));
@@ -22688,7 +22788,7 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
     assert_eq!(crate::InspectorTab::Details.a11y_label(), "Details");
     assert_eq!(crate::InspectorTab::Health.a11y_label(), "Health");
     assert_eq!(crate::InspectorTab::Logs.a11y_label(), "Logs");
-    assert_eq!(crate::InspectorTab::Connections.a11y_label(), "Connections");
+    assert_eq!(crate::InspectorTab::Links.a11y_label(), "Links");
     assert_eq!(crate::InspectorTab::Traffic.a11y_label(), "Traffic");
 
     cx.update(|_, cx| {
@@ -22706,7 +22806,7 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
         (crate::InspectorTab::Details, "config-usage"),
         (crate::InspectorTab::Health, "config-health"),
         (crate::InspectorTab::Logs, "config-logs"),
-        (crate::InspectorTab::Connections, "config-connections"),
+        (crate::InspectorTab::Links, "config-links"),
         (crate::InspectorTab::Traffic, "config-traffic"),
     ] {
         cx.update(|_, cx| {
@@ -22723,7 +22823,7 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
             "inspector-tab-details",
             "inspector-tab-health",
             "inspector-tab-logs",
-            "inspector-tab-connections",
+            "inspector-tab-links",
             "inspector-tab-traffic",
         ] {
             assert!(
@@ -22822,7 +22922,7 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
     press(cx, "ctrl-5");
     assert_eq!(
         view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Connections,
+        crate::InspectorTab::Links,
         "Ctrl-5 switches pane"
     );
     press(cx, "ctrl-6");
@@ -22870,7 +22970,7 @@ fn throne04_inspector_overview_shared_across_panes(cx: &mut TestAppContext) {
         (crate::InspectorTab::Details, "config-usage"),
         (crate::InspectorTab::Health, "config-health"),
         (crate::InspectorTab::Logs, "config-logs"),
-        (crate::InspectorTab::Connections, "config-connections"),
+        (crate::InspectorTab::Links, "config-links"),
         (crate::InspectorTab::Traffic, "config-traffic"),
     ] {
         cx.update(|_, cx| {
@@ -27976,7 +28076,7 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
         "inspector-tab-details",
         "inspector-tab-health",
         "inspector-tab-logs",
-        "inspector-tab-connections",
+        "inspector-tab-links",
         "inspector-tab-traffic",
         "engine-start",
         "engine-stop",
@@ -28983,7 +29083,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Inspector health", "Ctrl-2"),
         ("Inspector details", "Ctrl-3"),
         ("Inspector logs", "Ctrl-4"),
-        ("Inspector connections", "Ctrl-5"),
+        ("Inspector links", "Ctrl-5"),
         ("Inspector traffic", "Ctrl-6"),
         ("Uncheck all", "Esc"),
         ("Copy URLs", "Ctrl-U"),

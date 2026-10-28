@@ -138,12 +138,12 @@ impl AppView {
                 view.set_inspector_tab(InspectorTab::Logs);
                 cx.notify();
             }))
-            .on_action(cx.listener(|view, _: &InspectorConnections, window, cx| {
+            .on_action(cx.listener(|view, _: &InspectorLinks, window, cx| {
                 if overlay_open(window, cx) {
                     refuse_shortcut_under_overlay(window, cx);
                     return;
                 }
-                view.set_inspector_tab(InspectorTab::Connections);
+                view.set_inspector_tab(InspectorTab::Links);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &InspectorTraffic, window, cx| {
