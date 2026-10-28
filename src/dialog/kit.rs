@@ -77,15 +77,12 @@ pub(crate) fn sheet_footer(
     let commit_click = commit.clone();
     let mut footer = DialogFooter::new();
     if let Some(cancel_id) = cancel_id {
-        footer = footer.child(
-            Button::new(cancel_id)
-                .small()
-                .label("Cancel")
-                .on_click(|_, window, cx| {
-                    window.close_sheet(cx);
-                    reclaim_shell_focus(window, cx);
-                }),
-        );
+        footer = footer.child(Button::new(cancel_id).small().label("Cancel").on_click(
+            |_, window, cx| {
+                window.close_sheet(cx);
+                reclaim_shell_focus(window, cx);
+            },
+        ));
     }
     footer.child(
         Button::new(ok_id)
