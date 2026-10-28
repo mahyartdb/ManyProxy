@@ -33,8 +33,19 @@ pub(crate) fn appearance_theme_mode(appearance: &str, system_light: bool) -> The
 pub(crate) fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
     appearance_theme_mode(appearance, windows_apps_light_theme().unwrap_or(false))
 }
+/// F17: the kit's light scrim is `#0000000d` (~5%), which a modal over a
+/// near-white page barely reads as a backdrop. Dark keeps the kit's 20%. The
+/// dialog backdrop paints this exact token (`Theme::overlay`).
+pub(crate) const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
+
 pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
-    Theme::change(resolve_appearance_mode(appearance), window, cx);
+    let mode = resolve_appearance_mode(appearance);
+    Theme::change(mode, window, cx);
+    if !mode.is_dark() {
+        Theme::global_mut(cx).overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
+        // Theme::change already refreshed the window; the override landed after.
+        cx.refresh_windows();
+    }
     // F5: the kit has no per-scrollbar mode switch, only the theme's. Always
     // keeps the dialog body's scrollbar visible while it overflows instead of
     // fading out after two seconds.

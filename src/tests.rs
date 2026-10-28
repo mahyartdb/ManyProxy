@@ -15309,6 +15309,36 @@ fn f5_scrollbar_mode_stays_visible(cx: &mut TestAppContext) {
     });
 }
 
+/// F17: the modal scrim paints `Theme::overlay`, so this reads the exact value
+/// the backdrop draws. Light reads as a backdrop (15%); dark keeps the kit's
+/// 20% and survives the light override rather than inheriting it.
+#[gpui_kit::test]
+fn f17_light_modal_scrim_alpha(cx: &mut TestAppContext) {
+    use gpui_kit::component::Theme;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| crate::apply_appearance("light", None, cx));
+    cx.update(|cx| {
+        let overlay = Theme::global(cx).overlay;
+        assert_eq!(
+            overlay.a,
+            crate::LIGHT_MODAL_OVERLAY_ALPHA,
+            "light scrim uses the 15% alpha"
+        );
+        assert!(
+            overlay.h == 0. && overlay.s == 0. && overlay.l == 0.,
+            "scrim stays black, got {overlay:?}"
+        );
+    });
+    cx.update(|cx| crate::apply_appearance("dark", None, cx));
+    cx.update(|cx| {
+        let alpha = Theme::global(cx).overlay.a;
+        assert!(
+            (alpha - 0.2).abs() < 1e-6,
+            "dark keeps the kit's 20% scrim, got {alpha}"
+        );
+    });
+}
+
 #[gpui_kit::test]
 fn t05_edit_prefills_guided_and_collapses_advanced(cx: &mut TestAppContext) {
     use crate::ConfigForm;
