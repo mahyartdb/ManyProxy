@@ -10,7 +10,11 @@ pub(crate) const APP_KEY_CONTEXT: &str = "manyproxy-library";
 /// table, so a shortcut cannot exist here and nowhere else.
 fn bind<A: Action + Clone>(out: &mut Vec<KeyBinding>, id: &str, event: A) {
     for &(keystroke, _) in action(id).shortcuts {
-        out.push(KeyBinding::new(keystroke, event.clone(), Some(APP_KEY_CONTEXT)));
+        out.push(KeyBinding::new(
+            keystroke,
+            event.clone(),
+            Some(APP_KEY_CONTEXT),
+        ));
     }
 }
 

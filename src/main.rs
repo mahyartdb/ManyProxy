@@ -134,6 +134,7 @@ use app::bits::*;
 use app::focus::*;
 use app::kit_bits::*;
 use app::open::*;
+use app::state::{ConnectionState, LogsState, RefreshBatch};
 use app::window::*;
 use appearance::*;
 use consts::*;
@@ -199,17 +200,8 @@ struct AppView {
     engine: EngineController,
 
     health_store: HealthStore,
-    logs: LogStore,
-    log_filter: String,
 
-    log_level: Option<LogLevel>,
-    log_tail: bool,
-    logs_open: bool,
-
-    logs_seen: u64,
-
-    log_inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
-    log_cap_input: Option<Entity<InputState>>,
+    logs: LogsState,
 
     /// T-04: the Settings dialog's Enter-commit subscriptions. The dialog owns
     /// its text fields, so the subscriptions live as long as it does.
@@ -218,13 +210,6 @@ struct AppView {
     /// T-04: the timestamp of the last update check, mirrored into the open
     /// Settings dialog so the Updates section can show it.
     settings_last_check: Option<Rc<RefCell<Option<i64>>>>,
-
-    /// Captured just before a control-driven sheet swap. The live input text
-    /// wins over the committed filter fields so typed-but-unapplied text
-    /// survives the swap, then is consumed once on the next open.
-    log_reopen_draft: Option<(String, String, String)>,
-
-    log_list: Option<Entity<ListState<LogLinesDelegate>>>,
 
     expanded_subs: HashSet<String>,
 
@@ -241,24 +226,7 @@ struct AppView {
     prober: Box<dyn HealthProber + Send + Sync>,
     ticks_enabled: bool,
 
-    refresh_batch_total: usize,
-    refresh_batch_members: HashSet<String>,
-    refresh_batch_added: usize,
-    refresh_batch_updated: usize,
-    refresh_batch_removed: usize,
-    refresh_batch_failed: usize,
-    refresh_batch_conflicts: usize,
-    refresh_batch_in_use: usize,
-    refresh_batch_added_names: Vec<String>,
-    refresh_batch_updated_names: Vec<String>,
-    refresh_batch_removed_names: Vec<String>,
-    refresh_batch_in_use_names: Vec<String>,
-    refresh_generation: u64,
-    inflight_refreshes: HashSet<String>,
-    /// T-20: refreshes whose completion carries the named `[+]/[~]/[-]/[=]`
-    /// report — set for manual origins only, so due-tick refreshes finish
-    /// count-only.
-    inflight_named_refreshes: HashSet<String>,
+    refresh: RefreshBatch,
 
     probe_url_in_flight: bool,
     probe_ping_in_flight: bool,
@@ -326,27 +294,7 @@ struct AppView {
     /// button shuts it. Esc hands focus back to the list.
     inspector_visible: bool,
 
-    conn_snapshot: Vec<(String, crate::health::ClashConn)>,
-
-    /// T-25: counts derived from `conn_snapshot` on the traffic tick, so the
-    /// status bar never walks the snapshot per frame.
-    conn_counts: crate::health::ConnCounts,
-
-    conn_delta: HashMap<String, (u64, u64)>,
-
-    conn_selected_only: bool,
-
-    conn_sort_desc: bool,
-
-    conn_copied: Option<ConnCopyTarget>,
-
-    conn_copied_generation: u64,
-
-    last_traffic_poll_at: i64,
-
-    log_exclude: String,
-
-    log_regex: String,
+    conn: ConnectionState,
 
     palette: Option<Entity<CommandState>>,
 

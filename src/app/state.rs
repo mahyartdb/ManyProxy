@@ -2,6 +2,69 @@ use crate::*;
 
 use gpui_kit::component::list::ListState;
 
+/// F16: the refresh batch's progress counters and the in-flight set, together
+/// so a refresh starts, reports and clears as one unit. `AppView` reads
+/// `refresh_batch_progress` through it; nothing else may be added here without
+/// belonging to that lifecycle.
+#[derive(Default)]
+pub(crate) struct RefreshBatch {
+    pub(crate) total: usize,
+    pub(crate) members: HashSet<String>,
+    pub(crate) added: usize,
+    pub(crate) updated: usize,
+    pub(crate) removed: usize,
+    pub(crate) failed: usize,
+    pub(crate) conflicts: usize,
+    pub(crate) in_use: usize,
+    pub(crate) added_names: Vec<String>,
+    pub(crate) updated_names: Vec<String>,
+    pub(crate) removed_names: Vec<String>,
+    pub(crate) in_use_names: Vec<String>,
+    pub(crate) generation: u64,
+    pub(crate) inflight: HashSet<String>,
+    /// T-20: refreshes whose completion carries the named `[+]/[~]/[-]/[=]`
+    /// report — set for manual origins only, so due-tick refreshes finish
+    /// count-only.
+    pub(crate) inflight_named: HashSet<String>,
+}
+
+/// F16: everything the Logs sheet owns — the record store plus the filters,
+/// tail/seen marks and the list/input entities the sheet rebuilds.
+#[derive(Default)]
+pub(crate) struct LogsState {
+    pub(crate) store: LogStore,
+    pub(crate) filter: String,
+    pub(crate) exclude: String,
+    pub(crate) regex: String,
+    pub(crate) level: Option<LogLevel>,
+    pub(crate) tail: bool,
+    pub(crate) open: bool,
+    pub(crate) seen: u64,
+    pub(crate) inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
+    pub(crate) cap_input: Option<Entity<InputState>>,
+    /// Captured just before a control-driven sheet swap. The live input text
+    /// wins over the committed filter fields so typed-but-unapplied text
+    /// survives the swap, then is consumed once on the next open.
+    pub(crate) reopen_draft: Option<(String, String, String)>,
+    pub(crate) list: Option<Entity<ListState<LogLinesDelegate>>>,
+}
+
+/// F16: the Traffic sheet's snapshot and its view state, replaced in place on
+/// every poll.
+#[derive(Default)]
+pub(crate) struct ConnectionState {
+    pub(crate) snapshot: Vec<(String, crate::health::ClashConn)>,
+    /// T-25: counts derived from `snapshot` on the traffic tick, so the status
+    /// bar never walks the snapshot per frame.
+    pub(crate) counts: crate::health::ConnCounts,
+    pub(crate) delta: HashMap<String, (u64, u64)>,
+    pub(crate) selected_only: bool,
+    pub(crate) sort_desc: bool,
+    pub(crate) copied: Option<ConnCopyTarget>,
+    pub(crate) copied_generation: u64,
+    pub(crate) last_poll_at: i64,
+}
+
 impl AppView {
     /// Defect: boot runs inside `cx.open_window`'s closure, and the window only
     /// adopts its `gpui_component::Root` layer after that closure returns —
@@ -145,22 +208,13 @@ impl AppView {
             write_blocked_pinned,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
-            logs: LogStore::with_capacity(log_cap),
-            log_filter: String::new(),
-            log_exclude: String::new(),
-            log_regex: String::new(),
-            log_level: None,
-            log_tail: true,
-            logs_open: false,
-            logs_seen: 0,
-
-            log_inputs: None,
-            log_cap_input: None,
+            logs: LogsState {
+                store: LogStore::with_capacity(log_cap),
+                tail: true,
+                ..LogsState::default()
+            },
             settings_subscriptions: Vec::new(),
             settings_last_check: None,
-            log_reopen_draft: None,
-
-            log_list: None,
             expanded_subs: HashSet::new(),
             out_ip_by_row: HashMap::new(),
             traffic_last_seen: TrafficSeenMap::default(),
@@ -170,21 +224,7 @@ impl AppView {
                 probe_timeout_secs,
             ))),
             ticks_enabled: true,
-            refresh_batch_total: 0,
-            refresh_batch_members: HashSet::new(),
-            refresh_batch_added: 0,
-            refresh_batch_updated: 0,
-            refresh_batch_removed: 0,
-            refresh_batch_failed: 0,
-            refresh_batch_conflicts: 0,
-            refresh_batch_in_use: 0,
-            refresh_batch_added_names: Vec::new(),
-            refresh_batch_updated_names: Vec::new(),
-            refresh_batch_removed_names: Vec::new(),
-            refresh_batch_in_use_names: Vec::new(),
-            refresh_generation: 0,
-            inflight_refreshes: HashSet::new(),
-            inflight_named_refreshes: HashSet::new(),
+            refresh: RefreshBatch::default(),
             probe_url_in_flight: false,
             probe_ping_in_flight: false,
 
@@ -232,14 +272,11 @@ impl AppView {
             facet_group,
             row_columns,
             inspector_tab: InspectorTab::Details,
-            conn_snapshot: Vec::new(),
-            conn_counts: crate::health::ConnCounts::default(),
-            conn_delta: HashMap::new(),
-            conn_selected_only: true,
-            conn_sort_desc: true,
-            conn_copied: None,
-            conn_copied_generation: 0,
-            last_traffic_poll_at: 0,
+            conn: ConnectionState {
+                selected_only: true,
+                sort_desc: true,
+                ..ConnectionState::default()
+            },
             palette: None,
             traffic_period: store::TrafficPeriod::Day,
             shard_rings: BTreeMap::new(),
@@ -725,7 +762,7 @@ impl AppView {
         if self.engine.running_count() == 0 {
             return None;
         }
-        Some(self.conn_counts.status_text())
+        Some(self.conn.counts.status_text())
     }
 
     pub(crate) fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
@@ -893,7 +930,7 @@ impl AppView {
             return None;
         }
         let editing = self.edit_form_open.clone();
-        let batch_members = self.refresh_batch_members.clone();
+        let batch_members = self.refresh.members.clone();
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         let mut skip = HashSet::new();
         let mut reasons_seen: HashSet<&'static str> = HashSet::new();
@@ -1104,14 +1141,14 @@ impl AppView {
 
     pub(crate) fn visible_log_lines(&self, cx: &App) -> Vec<String> {
         let selected = self.selected_config(cx).map(|config| config.id);
-        let filter = self.log_filter.trim().to_lowercase();
-        let level = self.log_level;
+        let filter = self.logs.filter.trim().to_lowercase();
+        let level = self.logs.level;
         let render = |level: &str, message: &str| {
             format!("[{}] {}", level, redact_secrets(&strip_ansi_codes(message)))
         };
         let records: Vec<&crate::health::LogRecord> = match selected.as_deref() {
-            Some(id) => self.logs.for_config(id),
-            None => self.logs.all().iter().collect(),
+            Some(id) => self.logs.store.for_config(id),
+            None => self.logs.store.all().iter().collect(),
         };
         let mut lines: Vec<String> = records
             .iter()
@@ -1122,8 +1159,8 @@ impl AppView {
             lines.retain(|line| line.to_lowercase().contains(&filter));
         }
 
-        let exclude = self.log_exclude.trim().to_lowercase();
-        let raw_pattern = self.log_regex.trim();
+        let exclude = self.logs.exclude.trim().to_lowercase();
+        let raw_pattern = self.logs.regex.trim();
         let pattern = if raw_pattern.is_empty() {
             None
         } else {
@@ -1133,7 +1170,7 @@ impl AppView {
             lines.retain(|line| Self::log_line_passes_filters(line, &exclude, pattern.as_ref()));
         }
         if lines.len() > 200 {
-            if self.log_tail {
+            if self.logs.tail {
                 lines = lines.split_off(lines.len() - 200);
             } else {
                 lines.truncate(200);
@@ -1148,12 +1185,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.log_level = level;
-        if self.logs_open && window.has_active_sheet(cx) {
-            self.log_reopen_draft = self.log_input_draft(cx);
+        self.logs.level = level;
+        if self.logs.open && window.has_active_sheet(cx) {
+            self.logs.reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
             reclaim_shell_focus(window, cx);
-            self.logs_open = false;
+            self.logs.open = false;
             self.open_logs_dialog(window, cx);
         } else {
             cx.notify();
@@ -1161,19 +1198,19 @@ impl AppView {
     }
 
     pub(crate) fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.log_filter.clear();
+        self.logs.filter.clear();
 
-        self.log_exclude.clear();
-        self.log_regex.clear();
-        self.log_level = None;
+        self.logs.exclude.clear();
+        self.logs.regex.clear();
+        self.logs.level = None;
         // Drop any in-progress draft so the reopen seeds empty, not the text
         // the user was about to discard.
-        self.log_reopen_draft = None;
-        self.log_inputs = None;
-        if self.logs_open && window.has_active_sheet(cx) {
+        self.logs.reopen_draft = None;
+        self.logs.inputs = None;
+        if self.logs.open && window.has_active_sheet(cx) {
             window.close_sheet(cx);
             reclaim_shell_focus(window, cx);
-            self.logs_open = false;
+            self.logs.open = false;
             self.open_logs_dialog(window, cx);
         } else {
             cx.notify();
@@ -1182,7 +1219,7 @@ impl AppView {
 
     /// Live text of the open sheet's three inputs (typed but not yet applied).
     pub(crate) fn log_input_draft(&self, cx: &App) -> Option<(String, String, String)> {
-        self.log_inputs.as_ref().map(|(filter, exclude, pattern)| {
+        self.logs.inputs.as_ref().map(|(filter, exclude, pattern)| {
             (
                 filter.read(cx).value().to_string(),
                 exclude.read(cx).value().to_string(),
@@ -1467,41 +1504,38 @@ impl AppView {
         removed_names: &[String],
         kept_in_use_names: &[String],
     ) -> bool {
-        if !self.refresh_batch_members.remove(sub_id) {
+        if !self.refresh.members.remove(sub_id) {
             return false;
         }
-        self.refresh_batch_added += added;
-        self.refresh_batch_updated += updated;
-        self.refresh_batch_removed += removed;
-        self.refresh_batch_failed += failed;
-        self.refresh_batch_conflicts += conflicts;
-        self.refresh_batch_in_use += in_use;
-        self.refresh_batch_added_names
-            .extend(added_names.iter().cloned());
-        self.refresh_batch_updated_names
+        self.refresh.added += added;
+        self.refresh.updated += updated;
+        self.refresh.removed += removed;
+        self.refresh.failed += failed;
+        self.refresh.conflicts += conflicts;
+        self.refresh.in_use += in_use;
+        self.refresh.added_names.extend(added_names.iter().cloned());
+        self.refresh
+            .updated_names
             .extend(updated_names.iter().cloned());
-        self.refresh_batch_removed_names
+        self.refresh
+            .removed_names
             .extend(removed_names.iter().cloned());
-        self.refresh_batch_in_use_names
+        self.refresh
+            .in_use_names
             .extend(kept_in_use_names.iter().cloned());
-        self.refresh_batch_members.is_empty()
+        self.refresh.members.is_empty()
     }
 
     pub(crate) fn is_batch_member(&self, sub_id: &str) -> bool {
-        self.refresh_batch_members.contains(sub_id)
+        self.refresh.members.contains(sub_id)
     }
 
     pub(crate) fn refresh_batch_progress(&self) -> Option<(usize, usize)> {
-        if self.refresh_batch_members.is_empty() {
+        if self.refresh.members.is_empty() {
             return None;
         }
-        let total = self
-            .refresh_batch_total
-            .max(self.refresh_batch_members.len());
-        Some((
-            total.saturating_sub(self.refresh_batch_members.len()),
-            total,
-        ))
+        let total = self.refresh.total.max(self.refresh.members.len());
+        Some((total.saturating_sub(self.refresh.members.len()), total))
     }
 
     pub(crate) fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
@@ -1513,7 +1547,7 @@ impl AppView {
     }
 
     pub(crate) fn push_refresh_log(&mut self, line: &str) {
-        self.logs.push_raw(line, &LogTagIndex::default());
+        self.logs.store.push_raw(line, &LogTagIndex::default());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1561,8 +1595,8 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.refresh_batch_members.remove(sub_id) {
-            self.refresh_batch_total = self.refresh_batch_total.saturating_sub(1);
+        if self.refresh.members.remove(sub_id) {
+            self.refresh.total = self.refresh.total.saturating_sub(1);
         }
         let started = match self.store.get_subscription(sub_id) {
             Ok(Some(sub)) => self.start_subscription_refresh(sub, true, cx),
@@ -1586,7 +1620,7 @@ impl AppView {
     }
 
     pub(crate) fn note_refresh_started(&mut self, sub_id: &str) -> bool {
-        self.inflight_refreshes.insert(sub_id.to_string())
+        self.refresh.inflight.insert(sub_id.to_string())
     }
 
     pub(crate) fn sync_presets_to_engine(&mut self) -> Result<(), String> {
@@ -1993,10 +2027,10 @@ impl AppView {
         }
 
         let now = now_unix();
-        if !traffic_poll_due(self.inspector_tab, now, self.last_traffic_poll_at) {
+        if !traffic_poll_due(self.inspector_tab, now, self.conn.last_poll_at) {
             return 0;
         }
-        self.last_traffic_poll_at = now;
+        self.conn.last_poll_at = now;
         let targets = self.engine.live_clash_targets();
         if targets.is_empty() {
             return 0;

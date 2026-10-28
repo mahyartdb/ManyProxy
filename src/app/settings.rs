@@ -1094,7 +1094,7 @@ impl AppView {
         }
 
         let log_cap = draft.log_cap.trim();
-        if log_cap != self.logs.cap().to_string() {
+        if log_cap != self.logs.store.cap().to_string() {
             // `commit_log_cap` toasts its own refusal and returns nothing; the
             // parse is the one failure that must keep the dialog open.
             self.commit_log_cap(window, log_cap, cx);
@@ -1548,13 +1548,13 @@ impl AppView {
                 .placeholder("3")
                 .default_value(timeout_text)
         });
-        let cap_text = self.logs.cap().to_string();
+        let cap_text = self.logs.store.cap().to_string();
         let cap_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("500–50,000")
                 .default_value(cap_text)
         });
-        self.log_cap_input = Some(cap_state.clone());
+        self.logs.cap_input = Some(cap_state.clone());
         let bind_host_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20 or fd00::7"));
 

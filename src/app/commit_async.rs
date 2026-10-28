@@ -201,8 +201,8 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.inflight_refreshes.remove(sub_id);
-        let named = self.inflight_named_refreshes.remove(sub_id);
+        self.refresh.inflight.remove(sub_id);
+        let named = self.refresh.inflight_named.remove(sub_id);
 
         match self.store.get_subscription(sub_id) {
             Ok(None) => {
@@ -415,8 +415,8 @@ impl AppView {
         now: i64,
         cx: &mut Context<Self>,
     ) {
-        self.inflight_refreshes.remove(sub_id);
-        let named = self.inflight_named_refreshes.remove(sub_id);
+        self.refresh.inflight.remove(sub_id);
+        let named = self.refresh.inflight_named.remove(sub_id);
 
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
@@ -514,7 +514,7 @@ impl AppView {
                 self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
             }
         }
-        if self.refresh_batch_members.is_empty() {
+        if self.refresh.members.is_empty() {
             self.take_batch_counts();
         }
         self.reload_quiet(cx);

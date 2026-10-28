@@ -880,7 +880,7 @@ impl AppView {
             window.push_notification(
                 Notification::warning(format!(
                     "Maximum kept log lines must be a whole number (500–50,000) — keeping {}",
-                    self.logs.cap()
+                    self.logs.store.cap()
                 )),
                 cx,
             );
@@ -893,15 +893,15 @@ impl AppView {
             );
             return;
         }
-        if let Some(input) = self.log_cap_input.clone() {
+        if let Some(input) = self.logs.cap_input.clone() {
             input.update(cx, |state, cx| state.set_value(cap.to_string(), window, cx));
         }
-        if cap == self.logs.cap() {
+        if cap == self.logs.store.cap() {
             return;
         }
-        self.logs = LogStore::with_capacity(cap);
-        self.logs_seen = 0;
-        if let Some(list) = self.log_list.clone() {
+        self.logs.store = LogStore::with_capacity(cap);
+        self.logs.seen = 0;
+        if let Some(list) = self.logs.list.clone() {
             let lines = self.log_lines(cx);
             list.update(cx, |state, cx| {
                 state.delegate_mut().lines = lines;

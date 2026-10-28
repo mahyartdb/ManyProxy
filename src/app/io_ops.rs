@@ -299,28 +299,28 @@ impl AppView {
         &mut self,
     ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         (
-            std::mem::take(&mut self.refresh_batch_added_names),
-            std::mem::take(&mut self.refresh_batch_updated_names),
-            std::mem::take(&mut self.refresh_batch_removed_names),
-            std::mem::take(&mut self.refresh_batch_in_use_names),
+            std::mem::take(&mut self.refresh.added_names),
+            std::mem::take(&mut self.refresh.updated_names),
+            std::mem::take(&mut self.refresh.removed_names),
+            std::mem::take(&mut self.refresh.in_use_names),
         )
     }
 
     pub(crate) fn take_batch_counts(
         &mut self,
     ) -> (usize, usize, usize, usize, usize, usize, usize) {
-        self.refresh_batch_members.clear();
-        let total = std::mem::take(&mut self.refresh_batch_total);
-        let added = std::mem::take(&mut self.refresh_batch_added);
-        let updated = std::mem::take(&mut self.refresh_batch_updated);
-        let removed = std::mem::take(&mut self.refresh_batch_removed);
-        let failed = std::mem::take(&mut self.refresh_batch_failed);
-        let conflicts = std::mem::take(&mut self.refresh_batch_conflicts);
-        let in_use = std::mem::take(&mut self.refresh_batch_in_use);
-        self.refresh_batch_added_names.clear();
-        self.refresh_batch_updated_names.clear();
-        self.refresh_batch_removed_names.clear();
-        self.refresh_batch_in_use_names.clear();
+        self.refresh.members.clear();
+        let total = std::mem::take(&mut self.refresh.total);
+        let added = std::mem::take(&mut self.refresh.added);
+        let updated = std::mem::take(&mut self.refresh.updated);
+        let removed = std::mem::take(&mut self.refresh.removed);
+        let failed = std::mem::take(&mut self.refresh.failed);
+        let conflicts = std::mem::take(&mut self.refresh.conflicts);
+        let in_use = std::mem::take(&mut self.refresh.in_use);
+        self.refresh.added_names.clear();
+        self.refresh.updated_names.clear();
+        self.refresh.removed_names.clear();
+        self.refresh.in_use_names.clear();
         (total, added, updated, removed, failed, conflicts, in_use)
     }
 
@@ -415,9 +415,9 @@ impl AppView {
         if !self.copy_connection_dest(value, window, cx) {
             return;
         }
-        self.conn_copied = Some(target);
-        self.conn_copied_generation = self.conn_copied_generation.wrapping_add(1);
-        let generation = self.conn_copied_generation;
+        self.conn.copied = Some(target);
+        self.conn.copied_generation = self.conn.copied_generation.wrapping_add(1);
+        let generation = self.conn.copied_generation;
         cx.notify();
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_entity, cx| {
@@ -426,8 +426,8 @@ impl AppView {
                 .await;
             cx.update(|cx| {
                 weak.update(cx, |view, cx| {
-                    if view.conn_copied_generation == generation {
-                        view.conn_copied = None;
+                    if view.conn.copied_generation == generation {
+                        view.conn.copied = None;
                         cx.notify();
                     }
                 })

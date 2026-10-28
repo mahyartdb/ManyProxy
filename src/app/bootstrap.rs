@@ -69,16 +69,16 @@ impl AppView {
             );
         }
 
-        if self.logs_open
-            && self.log_tail
-            && self.logs.push_seq() != self.logs_seen
+        if self.logs.open
+            && self.logs.tail
+            && self.logs.store.push_seq() != self.logs.seen
             && root_ready
             && window.has_active_sheet(cx)
         {
-            self.log_reopen_draft = self.log_input_draft(cx);
+            self.logs.reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
             reclaim_shell_focus(window, cx);
-            self.logs_open = false;
+            self.logs.open = false;
             self.open_logs_dialog(window, cx);
             return;
         }

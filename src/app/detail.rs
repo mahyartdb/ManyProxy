@@ -207,7 +207,7 @@ impl AppView {
         let lines = self.visible_log_lines(cx);
 
         const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
-        let current_level = self.log_level;
+        let current_level = self.logs.level;
         let selected_level = LOG_LEVEL_LABELS
             .iter()
             .position(|label| LogLevel::from_label(label) == current_level);
@@ -234,16 +234,16 @@ impl AppView {
             );
         }
         let mut parts = Vec::new();
-        if !self.log_filter.trim().is_empty() {
-            parts.push(format!("include {:?}", self.log_filter.trim()));
+        if !self.logs.filter.trim().is_empty() {
+            parts.push(format!("include {:?}", self.logs.filter.trim()));
         }
-        if !self.log_exclude.trim().is_empty() {
-            parts.push(format!("exclude {:?}", self.log_exclude.trim()));
+        if !self.logs.exclude.trim().is_empty() {
+            parts.push(format!("exclude {:?}", self.logs.exclude.trim()));
         }
-        if !self.log_regex.trim().is_empty() {
-            parts.push(format!("regex {:?}", self.log_regex.trim()));
+        if !self.logs.regex.trim().is_empty() {
+            parts.push(format!("regex {:?}", self.logs.regex.trim()));
         }
-        if let Some(level) = self.log_level {
+        if let Some(level) = self.logs.level {
             parts.push(format!("level {}", level.as_str()));
         }
         let summary = if parts.is_empty() {
@@ -251,10 +251,10 @@ impl AppView {
         } else {
             format!("Filters: {}", parts.join(" · "))
         };
-        let filter_active = !self.log_filter.trim().is_empty()
-            || !self.log_exclude.trim().is_empty()
-            || !self.log_regex.trim().is_empty()
-            || self.log_level.is_some();
+        let filter_active = !self.logs.filter.trim().is_empty()
+            || !self.logs.exclude.trim().is_empty()
+            || !self.logs.regex.trim().is_empty()
+            || self.logs.level.is_some();
         let mut pane = div()
             .id("config-logs")
             .test_support()
@@ -337,11 +337,11 @@ impl AppView {
     pub(crate) fn render_inspector_connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_config(cx).map(|config| config.id);
         let rows = build_conn_rows(
-            &self.conn_snapshot,
-            &self.conn_delta,
+            &self.conn.snapshot,
+            &self.conn.delta,
             selected.as_deref(),
-            self.conn_selected_only,
-            self.conn_sort_desc,
+            self.conn.selected_only,
+            self.conn.sort_desc,
         );
         let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
 
@@ -369,28 +369,28 @@ impl AppView {
                             .child(
                                 Button::new("conn-toggle-scope")
                                     .small()
-                                    .label(if self.conn_selected_only {
+                                    .label(if self.conn.selected_only {
                                         "Selected row only: on"
                                     } else {
                                         "Selected row only: off"
                                     })
                                     .tooltip("Show only the selected row's flows (all when nothing is selected)")
                                     .on_click(cx.listener(|view, _, _, cx| {
-                                        view.conn_selected_only = !view.conn_selected_only;
+                                        view.conn.selected_only = !view.conn.selected_only;
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 Button::new("conn-toggle-sort")
                                     .small()
-                                    .label(if self.conn_sort_desc {
+                                    .label(if self.conn.sort_desc {
                                         "Sort: traffic ↓"
                                     } else {
                                         "Sort: traffic ↑"
                                     })
                                     .tooltip("Sort connections by cumulative traffic")
                                     .on_click(cx.listener(|view, _, _, cx| {
-                                        view.conn_sort_desc = !view.conn_sort_desc;
+                                        view.conn.sort_desc = !view.conn.sort_desc;
                                         cx.notify();
                                     })),
                             )
@@ -468,7 +468,7 @@ impl AppView {
                                 );
                             })),
                     );
-                if self.conn_copied == Some(ConnCopyTarget::Dest(ix)) {
+                if self.conn.copied == Some(ConnCopyTarget::Dest(ix)) {
                     dest_cell = dest_cell.child(
                         div()
                             .id(format!("conn-copied-dest-{ix}"))
@@ -509,7 +509,7 @@ impl AppView {
                     .child(name)
                     .child("·")
                     .child(endpoint_button);
-                if self.conn_copied == Some(ConnCopyTarget::Endpoint(ix)) {
+                if self.conn.copied == Some(ConnCopyTarget::Endpoint(ix)) {
                     meta = meta.child(
                         div()
                             .id(format!("conn-copied-endpoint-{ix}"))

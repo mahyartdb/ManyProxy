@@ -320,7 +320,7 @@ fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            view.logs.push_raw(
+            view.logs.store.push_raw(
                 "\u{1b}[31mERROR\u{1b}[0m[0033] dial tcp 127.0.0.1:8388: refused",
                 &crate::health::LogTagIndex::default(),
             );
@@ -329,6 +329,7 @@ fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
     let stored = cx.update(|_, cx| {
         view.update(cx, |view, _| {
             view.logs
+                .store
                 .all()
                 .iter()
                 .map(|r| r.message.clone())
@@ -458,7 +459,7 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
     store.set_log_max_lines(500).expect("cap writes");
     let (view, cx) = mount_view(store, cx);
     assert_eq!(
-        view.read_with(cx, |view, _| view.logs.cap()),
+        view.read_with(cx, |view, _| view.logs.store.cap()),
         500,
         "with_store hydrates the meta cap"
     );
@@ -490,12 +491,12 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
                     for line in &source {
                         logs.push_raw(line, &tags);
                     }
-                    view.logs = logs;
-                    view.log_filter = filter.to_string();
-                    view.log_exclude = exclude.to_string();
-                    view.log_regex = pattern.to_string();
-                    view.log_level = level;
-                    view.log_tail = tail;
+                    view.logs.store = logs;
+                    view.logs.filter = filter.to_string();
+                    view.logs.exclude = exclude.to_string();
+                    view.logs.regex = pattern.to_string();
+                    view.logs.level = level;
+                    view.logs.tail = tail;
                     view.visible_log_lines(cx)
                 })
             });
@@ -517,12 +518,12 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
             for line in &source {
                 logs.push_raw(line, &tags);
             }
-            view.logs = logs;
-            view.log_filter.clear();
-            view.log_exclude.clear();
-            view.log_regex.clear();
-            view.log_level = None;
-            view.log_tail = true;
+            view.logs.store = logs;
+            view.logs.filter.clear();
+            view.logs.exclude.clear();
+            view.logs.regex.clear();
+            view.logs.level = None;
+            view.logs.tail = true;
             view.visible_log_lines(cx)
         })
     });
@@ -533,12 +534,12 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.logs.push_raw("info before cap change", &tags);
+            view.logs.store.push_raw("info before cap change", &tags);
             view.commit_log_cap(window, "50,000", cx);
         });
     });
     assert_eq!(
-        view.read_with(cx, |view, _| view.logs.cap()),
+        view.read_with(cx, |view, _| view.logs.store.cap()),
         50_000,
         "a typed save rebuilds the ring at the clamped cap"
     );
@@ -548,7 +549,7 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
         "the new cap persists"
     );
     assert!(
-        view.read_with(cx, |view, _| view.logs.all().is_empty()),
+        view.read_with(cx, |view, _| view.logs.store.all().is_empty()),
         "the fresh ring truncates instead of carrying lines over"
     );
 
@@ -556,7 +557,7 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.commit_log_cap(window, "1", cx));
     });
     assert_eq!(
-        view.read_with(cx, |view, _| view.logs.cap()),
+        view.read_with(cx, |view, _| view.logs.store.cap()),
         500,
         "saving below the window clamps to 500"
     );
@@ -564,7 +565,7 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.commit_log_cap(window, "junk", cx));
     });
     assert_eq!(
-        view.read_with(cx, |view, _| view.logs.cap()),
+        view.read_with(cx, |view, _| view.logs.store.cap()),
         500,
         "junk keeps the previous cap"
     );
@@ -5299,7 +5300,7 @@ fn bug18_custom_global_test_url_excluded_from_traffic(cx: &mut TestAppContext) {
         Some(&(1000, 50)),
         "gstatic and the custom-url probe bytes are both excluded"
     );
-    let snapshot = view.read_with(cx, |view, _| view.conn_snapshot.clone());
+    let snapshot = view.read_with(cx, |view, _| view.conn.snapshot.clone());
     assert_eq!(snapshot.len(), 1, "no probe flow reaches the snapshot");
     server.join().expect("stub drains");
 }
@@ -5631,7 +5632,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
     assert_eq!(updated, 2, "both exits gain data-plane bytes");
 
-    let snapshot = view.read_with(cx, |view, _| view.conn_snapshot.clone());
+    let snapshot = view.read_with(cx, |view, _| view.conn.snapshot.clone());
     assert_eq!(snapshot.len(), 2, "probe flow never reaches the snapshot");
     for (_, entry) in &snapshot {
         assert!(
@@ -5642,7 +5643,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     }
 
     let (first, second) = view.read_with(cx, |view, _| {
-        let rows = crate::build_conn_rows(&view.conn_snapshot, &view.conn_delta, None, false, true);
+        let rows = crate::build_conn_rows(&view.conn.snapshot, &view.conn.delta, None, false, true);
         (rows[0].row_id.clone(), rows[1].row_id.clone())
     });
     assert_eq!(first.as_deref(), Some(beta.id.as_str()), "heaviest first");
@@ -5673,7 +5674,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
 
     let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
     assert_eq!(updated, 2, "grown connections persist the delta");
-    let deltas = view.read_with(cx, |view, _| view.conn_delta.clone());
+    let deltas = view.read_with(cx, |view, _| view.conn.delta.clone());
     assert_eq!(deltas.get("stock/conn-0"), Some(&(500, 20)));
     assert_eq!(deltas.get("stock/conn-1"), Some(&(600, 30)));
     let throttled = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
@@ -5685,7 +5686,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.inspector_tab = crate::InspectorTab::Links;
-            view.conn_selected_only = false;
+            view.conn.selected_only = false;
             view.libraries.update(cx, |state, list_cx| {
                 state.delegate_mut().selected = Some(IndexPath::new(0));
                 list_cx.notify();
@@ -5709,7 +5710,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     );
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.conn_selected_only = true;
+            view.conn.selected_only = true;
             view.libraries.update(cx, |state, list_cx| {
                 state.delegate_mut().selected = Some(IndexPath::new(1));
                 list_cx.notify();
@@ -5776,7 +5777,7 @@ fn t74_conn_setup<'a>(
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.conn_snapshot = vec![(
+            view.conn.snapshot = vec![(
                 "stock".to_string(),
                 ClashConn {
                     id: "conn-0".to_string(),
@@ -5787,10 +5788,10 @@ fn t74_conn_setup<'a>(
                     network: "tcp".to_string(),
                 },
             )];
-            view.conn_delta = std::collections::HashMap::new();
+            view.conn.delta = std::collections::HashMap::new();
             view.inspector_tab = crate::InspectorTab::Links;
-            view.conn_selected_only = false;
-            view.conn_sort_desc = true;
+            view.conn.selected_only = false;
+            view.conn.sort_desc = true;
             view.libraries.update(cx, |state, list_cx| {
                 state.delegate_mut().selected = Some(IndexPath::new(0));
                 list_cx.notify();
@@ -5816,11 +5817,11 @@ fn t74_conn_setup<'a>(
         let rows = view.libraries.read(cx).delegate().rows.clone();
         let selected = view.selected_config(cx).map(|config| config.id);
         let built = crate::build_conn_rows(
-            &view.conn_snapshot,
-            &view.conn_delta,
+            &view.conn.snapshot,
+            &view.conn.delta,
             selected.as_deref(),
-            view.conn_selected_only,
-            view.conn_sort_desc,
+            view.conn.selected_only,
+            view.conn.sort_desc,
         );
         crate::conn_exit_of(&rows, built[0].row_id.as_deref()).1
     });
@@ -6104,7 +6105,7 @@ fn t75_counter_hidden_when_no_running_cores(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             // A stale snapshot must not leak numbers once every core stops.
-            view.conn_snapshot = vec![(
+            view.conn.snapshot = vec![(
                 "stock".to_string(),
                 ClashConn {
                     id: "conn-0".to_string(),
@@ -6115,7 +6116,7 @@ fn t75_counter_hidden_when_no_running_cores(cx: &mut TestAppContext) {
                     network: "tcp".to_string(),
                 },
             )];
-            view.conn_counts = ConnCounts {
+            view.conn.counts = ConnCounts {
                 active: 1,
                 tcp: 1,
                 udp: 0,
@@ -6323,29 +6324,31 @@ fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
         view.update(cx, |view, _| {
             let tags = crate::health::LogTagIndex::default();
             view.logs
+                .store
                 .push_raw("info alpha connection established", &tags);
-            view.logs.push_raw("info alpha probe finished", &tags);
+            view.logs.store.push_raw("info alpha probe finished", &tags);
             view.logs
+                .store
                 .push_raw("error beta failed password=hunter2-secret", &tags);
-            view.log_tail = true;
+            view.logs.tail = true;
         });
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.log_filter = "alpha".to_string();
-            view.log_exclude.clear();
-            view.log_regex.clear();
-            view.log_level = None;
+            view.logs.filter = "alpha".to_string();
+            view.logs.exclude.clear();
+            view.logs.regex.clear();
+            view.logs.level = None;
             assert_eq!(view.visible_log_lines(cx).len(), 2, "include narrows");
-            view.log_exclude = "probe".to_string();
+            view.logs.exclude = "probe".to_string();
             assert_eq!(
                 view.visible_log_lines(cx),
                 vec!["[info] info alpha connection established".to_string()],
                 "exclude drops the noisy leg"
             );
-            view.log_filter.clear();
-            view.log_exclude.clear();
-            view.log_regex = "established|failed".to_string();
+            view.logs.filter.clear();
+            view.logs.exclude.clear();
+            view.logs.regex = "established|failed".to_string();
             let visible = view.visible_log_lines(cx);
             assert_eq!(visible.len(), 2, "regex replaces the keywords");
             for line in &visible {
@@ -6354,14 +6357,14 @@ fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
                     "redacted on the regex leg: {line}"
                 );
             }
-            view.log_regex = "((".to_string();
+            view.logs.regex = "((".to_string();
             assert_eq!(
                 view.visible_log_lines(cx).len(),
                 3,
                 "invalid regex fails open, never a silent empty"
             );
-            view.log_regex.clear();
-            view.log_level = Some(crate::health::LogLevel::Error);
+            view.logs.regex.clear();
+            view.logs.level = Some(crate::health::LogLevel::Error);
             let visible = view.visible_log_lines(cx);
             assert_eq!(visible.len(), 1, "level still composes");
             assert!(visible[0].starts_with("[error]"));
@@ -6498,11 +6501,12 @@ fn live_sidecar_lines_appear_under_right_config_redacted(cx: &mut TestAppContext
     let (alpha_lines, beta_lines) = view.read_with(cx, |view, _| {
         (
             view.logs
+                .store
                 .for_config(&alpha.id)
                 .iter()
                 .map(|record| record.message.clone())
                 .collect::<Vec<_>>(),
-            view.logs.for_config(&beta.id).len(),
+            view.logs.store.for_config(&beta.id).len(),
         )
     });
     assert_eq!(alpha_lines.len(), 1, "only its lines show");
@@ -6797,19 +6801,20 @@ fn logs_dialog_filters_to_selected_and_redacts(cx: &mut TestAppContext) {
             });
             let rows = vec![config.clone()];
             let tags = crate::health::LogTagIndex::build(&rows);
-            view.logs.push_raw(
+            view.logs.store.push_raw(
                 &format!(
                     "warn {}: dial failed password=hunter2",
                     inbound_tag(&config.id)
                 ),
                 &tags,
             );
-            view.logs.push_raw("info engine started", &tags);
+            view.logs.store.push_raw("info engine started", &tags);
         });
     });
 
     let lines = view.read_with(cx, |view, _cx| {
         view.logs
+            .store
             .for_config(&config.id)
             .iter()
             .map(|record| record.message.clone())
@@ -7319,18 +7324,21 @@ fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
             view.logs
+                .store
                 .push_raw("error boom one", &crate::health::LogTagIndex::default());
             view.logs
+                .store
                 .push_raw("info chatter", &crate::health::LogTagIndex::default());
             view.logs
+                .store
                 .push_raw("warn boom two", &crate::health::LogTagIndex::default());
-            view.log_tail = true;
+            view.logs.tail = true;
         });
     });
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.log_level = Some(LogLevel::Error);
+            view.logs.level = Some(LogLevel::Error);
             let visible = view.visible_log_lines(cx);
             assert_eq!(visible, vec!["[error] error boom one".to_string()]);
         });
@@ -7338,9 +7346,9 @@ fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.log_level = None;
-            view.log_tail = false;
-            view.log_filter = "boom".to_string();
+            view.logs.level = None;
+            view.logs.tail = false;
+            view.logs.filter = "boom".to_string();
             let visible = view.visible_log_lines(cx);
             assert_eq!(
                 visible,
@@ -7383,7 +7391,7 @@ fn laneb_logs_single_level_control(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_level),
+        view.read_with(cx, |view, _| view.logs.level),
         Some(LogLevel::Error),
         "level row narrows the filter"
     );
@@ -9421,11 +9429,11 @@ fn ticket43_logs_level_and_copy(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            view.logs.push_raw(
+            view.logs.store.push_raw(
                 "panic: sidecar blew up",
                 &crate::health::LogTagIndex::default(),
             );
-            view.logs.push_raw(
+            view.logs.store.push_raw(
                 "listening on 127.0.0.1:10861",
                 &crate::health::LogTagIndex::default(),
             );
@@ -9465,7 +9473,7 @@ fn laneb_logs_redact_and_save_gate(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            view.logs.push_raw(
+            view.logs.store.push_raw(
                 "warn dial failed password=hunter2",
                 &crate::health::LogTagIndex::default(),
             );
@@ -9521,12 +9529,12 @@ fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
             let tags = LogTagIndex::default();
             for i in 0..10_000 {
                 if i % 7 == 0 {
-                    view.logs.push_raw(
+                    view.logs.store.push_raw(
                         &format!("error boom {i} password=hunter2 token=secret-abc"),
                         &tags,
                     );
                 } else if i % 11 == 0 {
-                    view.logs.push_raw(
+                    view.logs.store.push_raw(
                         &format!(
                             "warn wobble {i} \
                                  vless://11111111-2222-4333-8444-555555555555@h.example.com:443"
@@ -9534,10 +9542,10 @@ fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
                         &tags,
                     );
                 } else {
-                    view.logs.push_raw(&format!("info line {i}"), &tags);
+                    view.logs.store.push_raw(&format!("info line {i}"), &tags);
                 }
             }
-            view.log_tail = true;
+            view.logs.tail = true;
         });
     });
 
@@ -9626,7 +9634,7 @@ fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_level),
+        view.read_with(cx, |view, _| view.logs.level),
         Some(LogLevel::Error),
         "level row narrows the filter"
     );
@@ -14450,7 +14458,7 @@ fn logs_footer_commits_filter_while_cancel_discards(cx: &mut TestAppContext) {
         });
     });
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_filter.clone()),
+        view.read_with(cx, |view, _| view.logs.filter.clone()),
         "boom",
         "footer commit stores the filter"
     );
@@ -14477,7 +14485,7 @@ fn logs_footer_commits_filter_while_cancel_discards(cx: &mut TestAppContext) {
         "Cancel closes"
     );
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_filter.clone()),
+        view.read_with(cx, |view, _| view.logs.filter.clone()),
         "boom",
         "Cancel discards the edit instead of storing it"
     );
@@ -16255,7 +16263,7 @@ fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
 /// and rows past a group's end resolve to nothing.
 #[test]
 fn action_table_is_the_single_source() {
-    use crate::app::actions::{ACTIONS, PALETTE_GROUPS, action, palette_action_at};
+    use crate::app::actions::{action, palette_action_at, ACTIONS, PALETTE_GROUPS};
     use gpui_kit::component::IndexPath;
     use std::collections::HashMap;
 
@@ -16287,7 +16295,10 @@ fn action_table_is_the_single_source() {
                 Some(*id),
                 "{label} row {row}"
             );
-            assert!(ids.contains(id), "palette {label} row {row} names a real action");
+            assert!(
+                ids.contains(id),
+                "palette {label} row {row} names a real action"
+            );
         }
         assert_eq!(
             palette_action_at(IndexPath::new(group.len()).section(section)),
@@ -16307,7 +16318,7 @@ fn action_table_is_the_single_source() {
 /// carries — so "Copy URLs" is one verb with one label and one enabled state.
 #[gpui_kit::test]
 fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
-    use crate::app::actions::{ActionTarget, PALETTE_GROUPS, action, palette_action_at};
+    use crate::app::actions::{action, palette_action_at, ActionTarget, PALETTE_GROUPS};
     use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -16912,7 +16923,7 @@ fn t08_refresh_batch_progress_and_streaming_rows(cx: &mut TestAppContext) {
                 view.accumulate_batch_member(&b, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]),
                 "last member closes the batch"
             );
-            view.inflight_refreshes.remove(&b);
+            view.refresh.inflight.remove(&b);
         });
     });
     assert_eq!(
@@ -19192,13 +19203,13 @@ fn batch_union_never_resets_open_batch(cx: &mut TestAppContext) {
         ids.push((sub.id.clone(), sub.label.clone()));
     }
     let (view, cx) = mount_view(store, cx);
-    let gen0 = view.read_with(cx, |view, _| view.refresh_generation);
+    let gen0 = view.read_with(cx, |view, _| view.refresh.generation);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
             view.begin_refresh_batch(&[ids[0].0.clone(), ids[1].0.clone()]);
         });
     });
-    let gen1 = view.read_with(cx, |view, _| view.refresh_generation);
+    let gen1 = view.read_with(cx, |view, _| view.refresh.generation);
     assert_eq!(gen1, gen0 + 1, "fresh batch bumps the generation");
 
     cx.update(|window, cx| {
@@ -19224,13 +19235,11 @@ fn batch_union_never_resets_open_batch(cx: &mut TestAppContext) {
             view.begin_refresh_batch(&[ids[2].0.clone()]);
         });
     });
-    let (gen2, total) = view.read_with(cx, |view, _| {
-        (view.refresh_generation, view.refresh_batch_total)
-    });
+    let (gen2, total) = view.read_with(cx, |view, _| (view.refresh.generation, view.refresh.total));
     assert_eq!(gen2, gen1, "union keeps the epoch");
     assert_eq!(total, 3, "union grows the total");
     assert_eq!(
-        view.read_with(cx, |view, _| view.refresh_batch_added),
+        view.read_with(cx, |view, _| view.refresh.added),
         1,
         "accumulated churn survives the union"
     );
@@ -19353,6 +19362,7 @@ fn t08_manual_refresh_commits_quota_and_logs(cx: &mut TestAppContext) {
             .expect("sub there");
         let lines: Vec<String> = view
             .logs
+            .store
             .all()
             .iter()
             .map(|record| record.message.clone())
@@ -19415,6 +19425,7 @@ fn t08_refresh_failure_names_subscription_and_logs(cx: &mut TestAppContext) {
             .clone();
         let lines: Vec<String> = view
             .logs
+            .store
             .all()
             .iter()
             .map(|record| record.message.clone())
@@ -20300,7 +20311,7 @@ fn t70_named_report_renders_markers_and_kept_line(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.inflight_named_refreshes.insert(sub_id.clone());
+            view.refresh.inflight_named.insert(sub_id.clone());
             view.finish_subscription_refresh(
                 &sub_id,
                 "Nightly",
@@ -20318,6 +20329,7 @@ fn t70_named_report_renders_markers_and_kept_line(cx: &mut TestAppContext) {
     assert_eq!(notification_count(cx), 1, "manual refresh pops once");
     let lines = view.read_with(cx, |view, _| {
         view.logs
+            .store
             .all()
             .iter()
             .map(|record| record.message.clone())
@@ -20415,11 +20427,12 @@ fn t70_auto_refresh_keeps_count_only_text(cx: &mut TestAppContext) {
     });
     assert_eq!(notification_count(cx), 1, "one batch, one count-only toast");
     assert!(
-        view.read_with(cx, |view, _| view.refresh_batch_added_names.is_empty()),
+        view.read_with(cx, |view, _| view.refresh.added_names.is_empty()),
         "auto refresh never aggregates names"
     );
     let lines = view.read_with(cx, |view, _| {
         view.logs
+            .store
             .all()
             .iter()
             .map(|record| record.message.clone())
@@ -20432,7 +20445,7 @@ fn t70_auto_refresh_keeps_count_only_text(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.inflight_named_refreshes.insert(beta_id.clone());
+            view.refresh.inflight_named.insert(beta_id.clone());
             view.finish_subscription_refresh(
                 &beta_id,
                 "Beta",
@@ -20450,6 +20463,7 @@ fn t70_auto_refresh_keeps_count_only_text(cx: &mut TestAppContext) {
     assert_eq!(notification_count(cx), 2, "manual twin pops once");
     let lines = view.read_with(cx, |view, _| {
         view.logs
+            .store
             .all()
             .iter()
             .map(|record| record.message.clone())
@@ -23324,7 +23338,7 @@ fn t04_log_no_lines_empty_clears_filter(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.log_filter = "zzz-no-hit".to_string();
+            view.logs.filter = "zzz-no-hit".to_string();
             view.open_logs_dialog(window, cx);
         });
     });
@@ -23353,7 +23367,7 @@ fn t04_log_no_lines_empty_clears_filter(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_filter.clone()),
+        view.read_with(cx, |view, _| view.logs.filter.clone()),
         String::new(),
         "Clear filter restores the full tail"
     );
@@ -24145,7 +24159,7 @@ fn k9_settings_one_footer_saves_dirty_text_and_cancel_discards(cx: &mut TestAppC
     // Save commits the one dirty text field, silently, and closes.
     let before = notification_count(cx);
     let cap = view
-        .read_with(cx, |view, _| view.log_cap_input.clone())
+        .read_with(cx, |view, _| view.logs.cap_input.clone())
         .expect("the log-cap field exists while Settings is open");
     cx.update(|window, cx| {
         cap.update(cx, |state, cx| state.set_value("1234", window, cx));
@@ -24171,7 +24185,7 @@ fn k9_settings_one_footer_saves_dirty_text_and_cancel_discards(cx: &mut TestAppC
     // Cancel discards a dirty field.
     open(&view, cx);
     let cap = view
-        .read_with(cx, |view, _| view.log_cap_input.clone())
+        .read_with(cx, |view, _| view.logs.cap_input.clone())
         .expect("the log-cap field exists while Settings is open");
     cx.update(|window, cx| {
         cap.update(cx, |state, cx| state.set_value("999", window, cx));
@@ -24192,7 +24206,7 @@ fn k9_settings_one_footer_saves_dirty_text_and_cancel_discards(cx: &mut TestAppC
     // Esc is the same discard route.
     open(&view, cx);
     let cap = view
-        .read_with(cx, |view, _| view.log_cap_input.clone())
+        .read_with(cx, |view, _| view.logs.cap_input.clone())
         .expect("the log-cap field exists while Settings is open");
     cx.update(|window, cx| {
         cap.update(cx, |state, cx| state.set_value("777", window, cx));
@@ -29574,7 +29588,7 @@ fn t69_sweep_clears_only_dead_excluding_running_and_editing(cx: &mut TestAppCont
             let (engine, _) = EngineController::fake();
             view.engine = engine;
             view.prober = Box::new(prober);
-            view.refresh_batch_members.insert("sub-e".to_string());
+            view.refresh.members.insert("sub-e".to_string());
         });
     });
     cx.update(|window, cx| {
@@ -30111,7 +30125,7 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
             view.update(cx, |view, _| {
-                view.logs.push_raw(
+                view.logs.store.push_raw(
                     "dial tcp 127.0.0.1:10982: password=hunter2 uuid=SECRET-UUID-08 token=tok-abc123-08",
                     &crate::health::LogTagIndex::default(),
                 );
@@ -30120,6 +30134,7 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     let (stored, visible) = view.read_with(cx, |view, cx| {
         let stored = view
             .logs
+            .store
             .all()
             .iter()
             .map(|record| record.message.clone())
@@ -30369,31 +30384,33 @@ fn bug15_log_tail_gate_uses_push_seq_past_ring_cap(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| {
             let tags = LogTagIndex::default();
             for i in 0..cap {
-                view.logs.push_raw(&format!("info line {i}"), &tags);
+                view.logs.store.push_raw(&format!("info line {i}"), &tags);
             }
-            assert_eq!(view.logs.all().len(), cap, "ring pins at the cap");
+            assert_eq!(view.logs.store.all().len(), cap, "ring pins at the cap");
             view.open_logs_dialog(window, cx);
         });
     });
     paint_dialog_open(cx);
-    let seen = view.read_with(cx, |view, _| view.logs_seen);
+    let seen = view.read_with(cx, |view, _| view.logs.seen);
     assert_eq!(
         seen,
-        view.read_with(cx, |view, _| view.logs.push_seq()),
+        view.read_with(cx, |view, _| view.logs.store.push_seq()),
         "opening seeds the sequence"
     );
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            view.logs.push_raw("info one more", &LogTagIndex::default());
+            view.logs
+                .store
+                .push_raw("info one more", &LogTagIndex::default());
         });
     });
     assert_eq!(
-        view.read_with(cx, |view, _| view.logs.all().len()),
+        view.read_with(cx, |view, _| view.logs.store.all().len()),
         cap,
         "length stays pinned at the cap (a length gate would freeze)"
     );
     assert!(
-        view.read_with(cx, |view, _| view.logs.push_seq()) > seen,
+        view.read_with(cx, |view, _| view.logs.store.push_seq()) > seen,
         "push sequence still advances past the cap"
     );
     cx.update(|window, cx| {
@@ -30401,7 +30418,7 @@ fn bug15_log_tail_gate_uses_push_seq_past_ring_cap(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert_eq!(
-        view.read_with(cx, |view, _| view.logs_seen),
+        view.read_with(cx, |view, _| view.logs.seen),
         seen + 1,
         "the sequence gate fires past the cap and re-seeds"
     );
@@ -30599,14 +30616,14 @@ fn bug37_logs_sheet_keeps_typed_draft_across_control_change(cx: &mut TestAppCont
     paint_dialog_open(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            let (filter, _, _) = view.log_inputs.clone().expect("inputs stored");
+            let (filter, _, _) = view.logs.inputs.clone().expect("inputs stored");
             filter.update(cx, |input, cx| {
                 input.set_value("draft-only".to_string(), window, cx);
             });
         });
     });
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_filter.clone()),
+        view.read_with(cx, |view, _| view.logs.filter.clone()),
         "",
         "typing alone never commits"
     );
@@ -30615,7 +30632,8 @@ fn bug37_logs_sheet_keeps_typed_draft_across_control_change(cx: &mut TestAppCont
     });
     cx.run_until_parked();
     let typed = view.read_with(cx, |view, cx| {
-        view.log_inputs
+        view.logs
+            .inputs
             .as_ref()
             .expect("inputs stored")
             .0
@@ -30625,7 +30643,7 @@ fn bug37_logs_sheet_keeps_typed_draft_across_control_change(cx: &mut TestAppCont
     });
     assert_eq!(typed, "draft-only", "typed draft survives the control swap");
     assert_eq!(
-        view.read_with(cx, |view, _| view.log_filter.clone()),
+        view.read_with(cx, |view, _| view.logs.filter.clone()),
         "",
         "commit-on-Apply is unchanged"
     );

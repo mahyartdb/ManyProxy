@@ -355,9 +355,10 @@ impl AppView {
             .collect();
         let traffic_line =
             summed_traffic_text(&self.store).unwrap_or_else(|| "usage unavailable".to_string());
-        let conns = self.conn_snapshot.len();
+        let conns = self.conn.snapshot.len();
         let (delta_rx, delta_tx) = self
-            .conn_delta
+            .conn
+            .delta
             .values()
             .fold((0u64, 0u64), |(rx, tx), (d_rx, d_tx)| {
                 (rx.saturating_add(*d_rx), tx.saturating_add(*d_tx))
@@ -963,11 +964,11 @@ impl AppView {
         // A control-driven swap hands over the live draft; otherwise seed from
         // the committed filter fields.
         let (current, current_exclude, current_pattern) =
-            self.log_reopen_draft.take().unwrap_or_else(|| {
+            self.logs.reopen_draft.take().unwrap_or_else(|| {
                 (
-                    self.log_filter.clone(),
-                    self.log_exclude.clone(),
-                    self.log_regex.clone(),
+                    self.logs.filter.clone(),
+                    self.logs.exclude.clone(),
+                    self.logs.regex.clone(),
                 )
             });
         let filter_state = cx.new(|cx| {
@@ -986,7 +987,7 @@ impl AppView {
                 .placeholder("Regex (empty = off)")
                 .default_value(current_pattern)
         });
-        self.log_inputs = Some((
+        self.logs.inputs = Some((
             filter_state.clone(),
             exclude_state.clone(),
             pattern_state.clone(),
@@ -997,7 +998,7 @@ impl AppView {
         let pattern_reader = pattern_state.clone();
         let lines = self.log_lines(cx);
 
-        self.log_list = Some(cx.new(|cx| {
+        self.logs.list = Some(cx.new(|cx| {
             ListState::new(
                 LogLinesDelegate {
                     lines: lines.clone(),
@@ -1007,7 +1008,7 @@ impl AppView {
             )
             .selectable(false)
         }));
-        let log_list_state = self.log_list.clone();
+        let log_list_state = self.logs.list.clone();
         let title = match self.selected_config(cx) {
             Some(config) => format!("Logs — {}", config.name),
             None => "Logs".to_string(),
@@ -1024,14 +1025,14 @@ impl AppView {
             true
         });
 
-        self.logs_open = true;
-        self.logs_seen = self.logs.push_seq();
+        self.logs.open = true;
+        self.logs.seen = self.logs.store.push_seq();
 
         let chrome_view = view.clone();
-        let chrome_level = self.log_level;
-        let chrome_tail = self.log_tail;
+        let chrome_level = self.logs.level;
+        let chrome_tail = self.logs.tail;
 
-        let chrome_filter_active = !self.log_filter.trim().is_empty();
+        let chrome_filter_active = !self.logs.filter.trim().is_empty();
         focus_shell_before_overlay(window, cx);
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
@@ -1213,7 +1214,7 @@ impl AppView {
                 .size(px(520.))
                 .on_close(move |_, window, cx| {
                     close_view.update(cx, |view, _| {
-                        view.logs_open = false;
+                        view.logs.open = false;
                     });
                     reclaim_shell_focus(window, cx);
                 })
@@ -1870,12 +1871,12 @@ impl AppView {
         if ids.is_empty() {
             return;
         }
-        if self.refresh_batch_members.is_empty() {
-            self.refresh_generation += 1;
+        if self.refresh.members.is_empty() {
+            self.refresh.generation += 1;
         }
         for id in ids {
-            if self.refresh_batch_members.insert(id.clone()) {
-                self.refresh_batch_total += 1;
+            if self.refresh.members.insert(id.clone()) {
+                self.refresh.total += 1;
             }
         }
     }
@@ -2695,7 +2696,7 @@ impl AppView {
             .count();
 
         let batch_progress = self.refresh_batch_progress();
-        let refreshing_rows = self.inflight_refreshes.clone();
+        let refreshing_rows = self.refresh.inflight.clone();
         focus_shell_before_overlay(window, cx);
         let kill_view = view.clone();
         let due_view = view.clone();

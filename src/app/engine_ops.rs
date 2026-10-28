@@ -489,25 +489,25 @@ impl AppView {
 
         let tags = LogTagIndex::build(active);
         for line in &lines {
-            self.logs.push_raw(line, &tags);
+            self.logs.store.push_raw(line, &tags);
         }
     }
 
     pub(crate) fn toggle_log_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.log_tail = !self.log_tail;
+        self.logs.tail = !self.logs.tail;
         window.push_notification(
-            Notification::info(if self.log_tail {
+            Notification::info(if self.logs.tail {
                 "Log tail resumed"
             } else {
                 "Log tail paused"
             }),
             cx,
         );
-        if self.logs_open && window.has_active_sheet(cx) {
-            self.log_reopen_draft = self.log_input_draft(cx);
+        if self.logs.open && window.has_active_sheet(cx) {
+            self.logs.reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
             reclaim_shell_focus(window, cx);
-            self.logs_open = false;
+            self.logs.open = false;
             self.open_logs_dialog(window, cx);
         } else {
             cx.notify();
@@ -516,7 +516,7 @@ impl AppView {
 
     #[cfg(test)]
     pub(crate) fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
-        self.log_filter = filter;
+        self.logs.filter = filter;
         cx.notify();
     }
 
@@ -527,9 +527,9 @@ impl AppView {
         pattern: String,
         cx: &mut Context<Self>,
     ) {
-        self.log_filter = include;
-        self.log_exclude = exclude;
-        self.log_regex = pattern;
+        self.logs.filter = include;
+        self.logs.exclude = exclude;
+        self.logs.regex = pattern;
         cx.notify();
     }
 
@@ -543,7 +543,7 @@ impl AppView {
             return false;
         }
         if named {
-            self.inflight_named_refreshes.insert(sub.id.clone());
+            self.refresh.inflight_named.insert(sub.id.clone());
         }
         let client = cx.http_client();
         let weak = cx.entity().downgrade();
@@ -887,11 +887,11 @@ impl AppView {
         self.traffic_last_seen
             .sweep(now, &ok_cores, &seen, &live_cores);
 
-        self.conn_snapshot = snapshot;
-        self.conn_counts =
-            crate::health::ConnCounts::from_conns(self.conn_snapshot.iter().map(|(_, conn)| conn));
-        self.conn_delta = conn_deltas;
-        self.last_traffic_poll_at = now;
+        self.conn.snapshot = snapshot;
+        self.conn.counts =
+            crate::health::ConnCounts::from_conns(self.conn.snapshot.iter().map(|(_, conn)| conn));
+        self.conn.delta = conn_deltas;
+        self.conn.last_poll_at = now;
         let mut updated = 0;
 
         if !deltas.is_empty() {
