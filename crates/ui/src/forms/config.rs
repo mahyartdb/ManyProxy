@@ -4824,3 +4824,27 @@ impl ConfigForm {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{dialog_protocol_choices, protocol_choices};
+
+    /// The dialog's protocol list is derived from the same table the picker
+    /// reads, so a protocol added there can never go missing from the dialog.
+    #[test]
+    fn dialog_protocol_choices_mirror_the_picker_table() {
+        let choices = dialog_protocol_choices();
+        let source = protocol_choices();
+        assert!(!choices.is_empty(), "the dialog offers protocols");
+        assert_eq!(choices.len(), source.len(), "same table, same length");
+        for (choice, expected) in choices.iter().zip(source.iter()) {
+            assert_eq!(choice.value, expected.value, "order follows the table");
+            assert_eq!(choice.title, expected.value, "title is the protocol");
+            assert_eq!(
+                choice.id,
+                format!("protocol-option-{}", expected.value),
+                "ids stay stable for the tests that click them"
+            );
+        }
+    }
+}

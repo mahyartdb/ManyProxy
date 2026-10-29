@@ -1420,3 +1420,104 @@ impl ListDelegate for LibraryDelegate {
             .child(empty)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FacetStatus, LibraryDelegate};
+    use crate::store::ProxyConfig;
+    use std::collections::{HashMap, HashSet};
+
+    fn row(id: &str, name: &str, group: &str, enabled: bool) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{}".to_string(),
+            group: group.to_string(),
+            enabled,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn delegate(rows: Vec<ProxyConfig>) -> LibraryDelegate {
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(rows);
+        delegate
+    }
+
+    /// Search and facet gating decide which rows the list paints, and the bulk
+    /// bar's scope is the visible set — never the library total.
+    #[test]
+    fn filter_facets_and_bulk_scope_agree() {
+        let mut delegate = delegate(vec![
+            row("1", "alpha", "work", true),
+            row("2", "beta", "home", false),
+            row("3", "alpine", "work", true),
+        ]);
+        assert_eq!(delegate.visible_rows().len(), 3, "unfiltered shows all");
+
+        delegate.query = "alp".to_string();
+        delegate.apply_filter();
+        assert_eq!(delegate.counts(), (3, 2), "counts ignore the filter");
+        assert_eq!(
+            delegate
+                .visible_rows()
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "alpine"],
+            "name search narrows the visible set"
+        );
+
+        delegate.set_facet_status(Some(FacetStatus::Disabled));
+        assert!(delegate.visible_rows().is_empty(), "no disabled alp rows");
+
+        delegate.clear_facets();
+        delegate.query.clear();
+        delegate.set_facet_group(Some("work".to_string()));
+        delegate.check_ids(&["1".to_string(), "2".to_string()]);
+        assert_eq!(
+            delegate.bulk_label(),
+            "2 checked · 2 shown",
+            "checked counts the whole set, shown counts the visible scope"
+        );
+        assert_eq!(
+            delegate.checked_position("1"),
+            Some(1),
+            "positions follow the library order"
+        );
+        assert_eq!(
+            delegate
+                .checked_rows()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2"],
+            "checked rows come back in library order"
+        );
+    }
+
+    /// A status facet reads the same serving tone the row lamp paints, so a
+    /// running row can never answer `Dead`.
+    #[test]
+    fn status_facet_matches_the_lamp_tone() {
+        let row = row("1", "alpha", "work", true);
+        let empty = HashSet::new();
+        let no_health = HashMap::new();
+        let running: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let dead: HashMap<String, String> = [("1".to_string(), "dead".to_string())]
+            .into_iter()
+            .collect();
+
+        assert!(FacetStatus::Running.matches(&row, &running, &no_health, &empty));
+        assert!(FacetStatus::Dead.matches(&row, &running, &dead, &empty));
+        assert!(!FacetStatus::Running.matches(&row, &running, &dead, &empty));
+        assert!(FacetStatus::Stopped.matches(&row, &empty, &no_health, &empty));
+        assert!(FacetStatus::Enabled.matches(&row, &empty, &no_health, &empty));
+        assert!(!FacetStatus::Disabled.matches(&row, &empty, &no_health, &empty));
+    }
+}

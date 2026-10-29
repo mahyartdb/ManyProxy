@@ -183,3 +183,179 @@ impl RowColumns {
         names.join(",")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: format!("row {id}"),
+            protocol: "vless".to_string(),
+            params: "{}".to_string(),
+            group: String::new(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn sort(key: LibrarySortKey, direction: SortDirection) -> LibrarySort {
+        LibrarySort::new(key, direction)
+    }
+
+    fn context<'a>(
+        latency: &'a HashMap<String, u64>,
+        out_ips: &'a HashMap<String, String>,
+    ) -> SortContext<'a> {
+        SortContext {
+            latency,
+            data_traffic: &EMPTY_PAIRS,
+            totals: &EMPTY_PAIRS,
+            out_ips,
+        }
+    }
+
+    static EMPTY_PAIRS: std::sync::LazyLock<HashMap<String, (u64, u64)>> =
+        std::sync::LazyLock::new(HashMap::new);
+
+    /// Row ids are numeric strings, so "2" must precede "10" or the tie-break
+    /// reorders a list between ticks.
+    #[test]
+    fn row_ids_order_numerically_then_by_bytes() {
+        assert_eq!(row_id_order("2", "10"), Ordering::Less);
+        assert_eq!(row_id_order("10", "2"), Ordering::Greater);
+        assert_eq!(row_id_order("7", "7"), Ordering::Equal);
+        assert_eq!(row_id_order("alpha", "beta"), Ordering::Less);
+        assert_eq!(row_id_order("2", "alpha"), Ordering::Less, "numeric wins");
+    }
+
+    /// Missing values stay last in both directions, so toggling the direction
+    /// never floats unmeasured rows to the top.
+    #[test]
+    fn missing_values_pin_last_in_both_directions() {
+        let latency = HashMap::from([("1".to_string(), 40u64), ("2".to_string(), 90u64)]);
+        let out_ips = HashMap::new();
+        let context = context(&latency, &out_ips);
+        let (fast, slow, unknown) = (row("1"), row("2"), row("3"));
+
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            let sort = sort(LibrarySortKey::Latency, direction);
+            assert_eq!(
+                compare_library_rows(&context, sort, &unknown, &fast),
+                Ordering::Greater,
+                "unmeasured sorts after measured ({direction:?})"
+            );
+            assert_eq!(
+                compare_library_rows(&context, sort, &fast, &unknown),
+                Ordering::Less
+            );
+        }
+        assert_eq!(
+            compare_library_rows(
+                &context,
+                sort(LibrarySortKey::Latency, SortDirection::Ascending),
+                &fast,
+                &slow
+            ),
+            Ordering::Less,
+            "ascending ranks the lower latency first"
+        );
+        assert_eq!(
+            compare_library_rows(
+                &context,
+                sort(LibrarySortKey::Latency, SortDirection::Descending),
+                &fast,
+                &slow
+            ),
+            Ordering::Greater,
+            "descending flips the measured order"
+        );
+        assert_eq!(
+            compare_library_rows(
+                &context,
+                sort(LibrarySortKey::Latency, SortDirection::Ascending),
+                &row("3"),
+                &row("12")
+            ),
+            Ordering::Less,
+            "two unmeasured rows fall back to numeric id order"
+        );
+    }
+
+    /// The egress-IP key ranks text and treats blank as unmeasured, matching
+    /// the numeric keys' pinned-last rule.
+    #[test]
+    fn out_ip_key_ranks_text_and_pins_blanks() {
+        let latency = HashMap::new();
+        let out_ips = HashMap::from([
+            ("1".to_string(), "203.0.113.9".to_string()),
+            ("2".to_string(), "198.51.100.1".to_string()),
+            ("3".to_string(), "   ".to_string()),
+        ]);
+        let context = context(&latency, &out_ips);
+        let ascending = sort(LibrarySortKey::OutIp, SortDirection::Ascending);
+        assert_eq!(
+            compare_library_rows(&context, ascending, &row("2"), &row("1")),
+            Ordering::Less,
+            "text order, not numeric order"
+        );
+        assert_eq!(
+            compare_library_rows(&context, ascending, &row("3"), &row("1")),
+            Ordering::Greater,
+            "blank egress counts as unmeasured"
+        );
+        assert_eq!(
+            compare_library_rows(
+                &context,
+                sort(LibrarySortKey::OutIp, SortDirection::Descending),
+                &row("2"),
+                &row("1")
+            ),
+            Ordering::Greater,
+            "descending flips the text order"
+        );
+    }
+
+    /// Each sortable header offers its own key set, and `None` always leads so
+    /// the menu can reset the sort.
+    #[test]
+    fn header_keys_split_between_traffic_and_health() {
+        assert_eq!(
+            sort_header_keys("traffic").first(),
+            Some(&LibrarySortKey::None)
+        );
+        assert_eq!(
+            sort_header_keys("health").first(),
+            Some(&LibrarySortKey::None)
+        );
+        assert!(sort_header_keys("traffic").contains(&LibrarySortKey::TrafficTotal));
+        assert!(!sort_header_keys("traffic").contains(&LibrarySortKey::Latency));
+        assert!(sort_header_keys("health").contains(&LibrarySortKey::TypeSecurity));
+        assert!(!sort_header_keys("health").contains(&LibrarySortKey::TrafficDown));
+        assert_eq!(
+            sort_header_keys("unknown-column"),
+            sort_header_keys("health"),
+            "only the traffic header owns the counters"
+        );
+    }
+
+    /// The stored column set round-trips through its text form, and an empty
+    /// value means the defaults rather than "no columns".
+    #[test]
+    fn row_columns_round_trip() {
+        assert_eq!(RowColumns::parse(""), RowColumns::default());
+        assert_eq!(RowColumns::parse("  "), RowColumns::default());
+        let parsed = RowColumns::parse("traffic, group ,bogus");
+        assert!(parsed.traffic && parsed.group && !parsed.upstream && !parsed.health);
+        assert_eq!(parsed.display(), "group,traffic", "display follows ORDER");
+        assert_eq!(RowColumns::parse(&parsed.display()), parsed, "round trip");
+        let none = RowColumns::parse("none");
+        assert_eq!(none.display(), "none", "no known token reads as none");
+        assert_eq!(RowColumns::parse(&none.display()), none);
+    }
+}
