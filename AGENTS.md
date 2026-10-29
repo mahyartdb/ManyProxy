@@ -18,6 +18,12 @@ Lots of apps have gotten bogged down with bad tech decisions and "slop". i have 
 
 - use gpui-kit and rust skills when needed
 
+## Errors
+
+- A fallible call crossing a module boundary returns `Result<_, T>` where `T` is that module's typed error (`StoreError`, `EngineError`, `ImportError`). Plain `String` errors stay inside the module that raises them.
+- The UI never panics on a failure the user can cause: surface it through the status strip, a toast, or the affected field's inline message — whichever surface the user is already looking at.
+- No `unwrap`/`expect` outside tests and genuinely infallible spots (a static regex, a literal that was just matched). If the call can fail, handle it.
+
 ## A small glossary
 
 We need to be on the same page with terminology. When communicating, use this language:
