@@ -4269,21 +4269,40 @@ dependencies = [
 name = "manyproxy"
 version = "0.0.1"
 dependencies = [
- "base64 0.22.1",
  "embed-resource",
+ "manyproxy-core",
+ "manyproxy-ui",
+]
+
+[[package]]
+name = "manyproxy-core"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
  "futures",
  "getrandom 0.4.3",
- "gpui-kit",
  "interprocess",
+ "regex",
+ "rusqlite",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
+name = "manyproxy-ui"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "gpui-kit",
+ "manyproxy-core",
  "png 0.18.1",
  "qrcodegen",
  "raw-window-handle",
  "regex",
- "rusqlite",
  "serde_json",
  "tray-icon",
  "winreg",
- "zeroize",
 ]
 
 [[package]]
