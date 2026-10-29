@@ -4951,6 +4951,9 @@ pub fn startup_reap_and_sweep(
     report
 }
 
+// Production-only: the sweep is exercised by `startup_reap_and_sweep` with
+// injected probes, so test builds never need these OS-tool wrappers.
+#[cfg(not(test))]
 fn system_tool(name: &str) -> PathBuf {
     #[cfg(windows)]
     {
@@ -4963,6 +4966,7 @@ fn system_tool(name: &str) -> PathBuf {
     }
 }
 
+#[cfg(not(test))]
 pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
     let netstat_output = if cfg!(windows) {
         let mut cmd = std::process::Command::new(system_tool("netstat.exe"));

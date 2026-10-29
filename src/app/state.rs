@@ -169,6 +169,10 @@ impl AppView {
         // K5: the toast park rides `apply_appearance` (bottom-right above the
         // status bar, max 2) so it survives every theme change for free.
 
+        // The sweep shells out to netstat/tasklist; the suite mounts hundreds of
+        // views and proves nothing by reaping the runner's process table. The
+        // sweep itself is unit-tested with injected probes.
+        #[cfg(not(test))]
         {
             let our_ports: Vec<u16> = store
                 .list()
