@@ -1,3 +1,6 @@
+//! The config add/edit form: protocol pickers, field validation, params folding.
+//! Belongs: form fields and their pure validation/fold helpers.
+//! Not here: store commits or dialog chrome.
 use crate::*;
 
 /// K2: the protocol picker renders its value inside the trigger like any other

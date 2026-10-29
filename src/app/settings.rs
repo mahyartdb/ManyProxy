@@ -1,3 +1,6 @@
+//! The Settings surface: sections, rows, data-folder and shortcut text.
+//! Belongs: settings layout and the view state it edits.
+//! Not here: dialog chrome or unrelated feature panels.
 use crate::*;
 use gpui_kit::prelude::FluentBuilder as _;
 

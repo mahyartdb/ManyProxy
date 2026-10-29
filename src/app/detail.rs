@@ -1,3 +1,6 @@
+//! The inspector: selected-row detail, operate row, connections and traffic tabs.
+//! Belongs: everything rendered in the right-hand inspector.
+//! Not here: library rows or dialog bodies.
 use crate::*;
 use gpui_kit::component::scroll::ScrollableElement as _;
 

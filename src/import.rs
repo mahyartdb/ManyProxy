@@ -1,3 +1,6 @@
+//! Share-link and subscription parsing into `NewConfig`, plus open-with classification.
+//! Belongs: turning text and URLs into import candidates and batch results.
+//! Not here: dialogs, store commits, engine calls.
 use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;

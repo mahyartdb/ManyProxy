@@ -1,3 +1,6 @@
+//! Copy and label helpers shared by more than one view.
+//! Belongs: pure string builders that must not drift between surfaces.
+//! Not here: layout, styling or one-off strings.
 use gpui_kit::*;
 
 use crate::*;

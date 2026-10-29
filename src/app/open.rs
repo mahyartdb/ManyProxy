@@ -1,3 +1,6 @@
+//! Dialog openers and palette items: every `open_*` that builds a kit dialog.
+//! Belongs: assembling a dialog or sheet from view state.
+//! Not here: commit handlers (see `commit_forms`) or plain rendering.
 use crate::*;
 
 use gpui_kit::component::list::ListState;

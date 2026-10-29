@@ -1,3 +1,6 @@
+//! The library list delegate: rows, visibility, filtering, selection, row render.
+//! Belongs: list state and the per-row element; it reads the store, never writes it.
+//! Not here: dialogs or engine actions — those call back into `AppView`.
 use crate::*;
 
 use gpui_kit::component::list::ListState;

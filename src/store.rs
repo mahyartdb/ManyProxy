@@ -1,3 +1,6 @@
+//! The SQLite store: schema, queries, DPAPI-sealed secrets and the data dir.
+//! Belongs: every row/subscription/settings read and write plus their error types.
+//! Not here: UI state, engine processes, dialog strings.
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};

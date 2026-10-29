@@ -1,3 +1,6 @@
+//! Bundled presets: parsing, matching, served actions and rule sets.
+//! Belongs: preset data shapes and the pure logic over them.
+//! Not here: presets UI or store writes.
 use base64::Engine as _;
 use serde_json::Value;
 

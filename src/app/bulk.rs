@@ -1,3 +1,6 @@
+//! Bulk actions over the checked set: bar rendering and start/copy/delete commits.
+//! Belongs: multi-row actions and the bar that exposes them.
+//! Not here: selection or single-row inspector actions.
 use crate::*;
 
 /// K4/A3-2: one menu row for the bulk bar's overflow. The row carries its own

@@ -1,3 +1,6 @@
+//! `AppView` itself: construction, restore, shared state and post-Root deferral.
+//! Belongs: fields and lifecycle methods every other `impl AppView` block uses.
+//! Not here: one feature's dialogs or render — those get their own `app/` file.
 use crate::*;
 
 use gpui_kit::component::list::ListState;

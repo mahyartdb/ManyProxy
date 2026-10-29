@@ -1,3 +1,6 @@
+//! Dialog commit handlers: add, edit, remove, duplicate and endpoint writes.
+//! Belongs: taking form state and finishing the store write plus UI follow-up.
+//! Not here: opening the dialog or rendering its fields.
 use crate::*;
 
 impl AppView {

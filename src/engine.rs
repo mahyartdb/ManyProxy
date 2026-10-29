@@ -1,3 +1,6 @@
+//! Engine control: binary resolution, child processes, ports, log readers, reap.
+//! Belongs: everything that starts, watches or stops an engine process.
+//! Not here: store writes, dialogs, UI state.
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};

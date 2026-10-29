@@ -1,3 +1,6 @@
+//! The whole test suite: pure-logic tests and gpui test-app paints.
+//! Belongs: every `#[test]`/`#[gpui_kit::test]` and its local fixtures.
+//! Not here: production helpers — a test that needs one promotes it to a module.
 use std::cell::RefCell;
 use std::rc::Rc;
 

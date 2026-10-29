@@ -1,3 +1,6 @@
+//! Probes, outcomes, traffic deltas, log buffers and redaction.
+//! Belongs: executing one probe and modelling what it observed.
+//! Not here: scheduling or painting — ticks and views call in.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
