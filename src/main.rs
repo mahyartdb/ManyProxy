@@ -16,6 +16,7 @@ mod library;
 mod models;
 mod pickers;
 mod preset;
+mod single_instance;
 mod store;
 mod text;
 mod tray;
@@ -374,9 +375,12 @@ fn main() {
     install_crash_hook();
     let _ = crate::tray::clear_dead_autostart_target();
 
-    let launch_intake = std::env::args()
-        .skip(1)
-        .find_map(|arg| classify_open_with(&arg));
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if crate::single_instance::forward_to_running(&argv) {
+        return;
+    }
+    let instance_rx = crate::single_instance::listen();
+    let launch_intake = argv.iter().find_map(|arg| classify_open_with(arg));
     let startup_geometry = stored_window_geometry();
     // F13: with no asset source every kit icon renders as an empty box, which
     // is what made the sheet header close unreadable.
@@ -409,6 +413,34 @@ fn main() {
                         view.handle_launch_intake(intake, window, cx);
                     }
                 });
+
+                if let Some(rx) = instance_rx {
+                    let forward_view = view.clone();
+                    let forward_handle = window.window_handle();
+                    cx.spawn(async move |cx| loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(INSTANCE_POLL_MILLIS))
+                            .await;
+                        while let Ok(argv) = rx.try_recv() {
+                            // A plain relaunch has no intake; it still raises
+                            // the window, including from the tray.
+                            let intake = argv.iter().find_map(|arg| classify_open_with(arg));
+                            let forward_view = forward_view.clone();
+                            let opened = cx.update_window(forward_handle, move |_, window, cx| {
+                                forward_view.update(cx, |view, cx| {
+                                    view.show_window_from_tray(window, cx);
+                                    if let Some(intake) = intake {
+                                        view.handle_launch_intake(intake, window, cx);
+                                    }
+                                });
+                            });
+                            if opened.is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .detach();
+                }
 
                 let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
                 if has_tray {

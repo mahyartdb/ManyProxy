@@ -16,6 +16,7 @@ getrandom = "0.4"
 zeroize = "1.9"
 regex = "1"
 qrcodegen = "1.8.0"
+interprocess = "2.4"
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }

@@ -34428,3 +34428,22 @@ fn b19_palette_hint_fits_the_status_bar_row(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// B4: the second instance's argv crosses the pipe as one JSON line; whatever
+/// the forwarder writes must decode back to the same argument list.
+#[test]
+fn single_instance_argv_line_round_trips() {
+    use crate::single_instance::{decode_argv, encode_argv};
+    let argv = vec![
+        r#""C:\Program Files\ManyProxy\manyproxy.exe""#.to_string(),
+        "--import".to_string(),
+        "vless://one@example.com:443?type=tcp#node".to_string(),
+        "line\nbreak".to_string(),
+        "unicode ✓".to_string(),
+    ];
+    let line = encode_argv(&argv);
+    assert_eq!(line.last(), Some(&b'\n'), "the listener frames on newline");
+    assert_eq!(decode_argv(line.trim_ascii_end()), Some(argv));
+    assert_eq!(decode_argv(b"not json"), None);
+    assert_eq!(decode_argv(b"{}"), None);
+}

@@ -4,6 +4,7 @@ pub(crate) const REPROBE_TICK_SECS: u64 = 60;
 pub(crate) const TRAFFIC_TICK_SECS: u64 = 5;
 pub(crate) const TRAFFIC_FAST_TICK_SECS: u64 = 1;
 pub(crate) const TRAY_PUMP_MILLIS: u64 = 500;
+pub(crate) const INSTANCE_POLL_MILLIS: u64 = 200;
 pub(crate) const STARTUP_REFRESH_DEFER_SECS: u64 = 3;
 pub(crate) const APP_TITLE: &str = "ManyProxy";
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
