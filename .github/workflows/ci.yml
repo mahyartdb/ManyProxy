@@ -20,6 +20,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Doc paths
+        shell: pwsh
+        run: |
+          $missing = Select-String -Path AGENTS.md,README.md -Pattern '`([^`]+\.md)`' -AllMatches |
+            ForEach-Object { $_.Matches.Groups[1].Value } |
+            Sort-Object -Unique |
+            Where-Object { -not (Test-Path $_) }
+          if ($missing) { Write-Error "Missing doc paths: $missing"; exit 1 }
       - name: Format
         run: cargo fmt --check
       - name: Clippy
