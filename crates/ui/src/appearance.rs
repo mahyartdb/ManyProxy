@@ -54,3 +54,91 @@ pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx
     // so the toast park rides along on every re-appearance.
     crate::configure_notification_toasts(cx);
 }
+
+#[cfg(test)]
+mod tokens {
+    use gpui_kit::component::{Theme, ThemeMode};
+
+    fn theme_for(mode: ThemeMode, cx: &mut gpui_kit::TestAppContext) -> Theme {
+        cx.update(|cx| {
+            Theme::change(mode, None, cx);
+            Theme::global(cx).clone()
+        })
+    }
+
+    /// The palette claim DESIGN.md makes: the monochrome ramps invert between
+    /// modes while the signal hues stay put. A theme swap that flips a signal
+    /// color would make green mean nothing.
+    #[gpui_kit::test]
+    fn ramps_invert_and_signal_hues_hold(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dark = theme_for(ThemeMode::Dark, cx);
+        let light = theme_for(ThemeMode::Light, cx);
+
+        for (name, dark_l, light_l) in [
+            ("ink", dark.foreground.l, light.foreground.l),
+            (
+                "muted ink",
+                dark.muted_foreground.l,
+                light.muted_foreground.l,
+            ),
+        ] {
+            assert!(
+                dark_l > light_l,
+                "{name} must be lighter on dark than on light ({dark_l} vs {light_l})"
+            );
+        }
+        for (name, dark_l, light_l) in [
+            ("paper", dark.background.l, light.background.l),
+            ("quiet surface", dark.group_box.l, light.group_box.l),
+            ("hairline", dark.border.l, light.border.l),
+        ] {
+            assert!(
+                dark_l < light_l,
+                "{name} must be darker on dark than on light ({dark_l} vs {light_l})"
+            );
+        }
+
+        for (name, dark_color, light_color) in [
+            ("serving green", dark.success, light.success),
+            ("alarm red", dark.danger, light.danger),
+            ("warning amber", dark.warning, light.warning),
+        ] {
+            assert!(
+                (dark_color.h - light_color.h).abs() < 0.02,
+                "{name} keeps its hue across modes ({} vs {})",
+                dark_color.h,
+                light_color.h
+            );
+            assert!(
+                (dark_color.l - light_color.l).abs() > 0.05,
+                "{name} retunes its lightness for the other ground"
+            );
+        }
+
+        // Selection is the kit's blue list tokens, not `accent`: the kit's
+        // accent is a neutral surface (saturation 0) in both modes.
+        for (name, wash, rim) in [
+            ("dark", dark.list_active, dark.list_active_border),
+            ("light", light.list_active, light.list_active_border),
+        ] {
+            assert!(
+                (0.55..0.70).contains(&wash.h) && wash.s > 0.5,
+                "{name} selection wash is blue, got {wash:?}"
+            );
+            assert!(
+                (0.55..0.70).contains(&rim.h) && rim.s > 0.5,
+                "{name} selection rim is blue, got {rim:?}"
+            );
+            assert!(wash.a < 1.0, "{name} selection is a wash, not a fill");
+        }
+        for (name, accent) in [("dark", dark.accent), ("light", light.accent)] {
+            assert!(
+                accent.s < 0.01,
+                "{name} accent is a neutral surface, not a signal color: {accent:?}"
+            );
+        }
+
+        assert_eq!(dark.radius, light.radius, "one radius across modes");
+    }
+}

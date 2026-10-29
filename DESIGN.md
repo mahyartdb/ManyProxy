@@ -1,35 +1,27 @@
 ---
 name: ManyProxy
 description: Local-only proxy library for Windows — a railway signal-box instrument panel.
-colors:
-  dark:
-    primary-ink: "#fafafa"
-    primary-ink-foreground: "#171717"
-    primary-ink-hover: "#e5e5e5"
-    paper: "#101010"
-    ink: "#fafafa"
-    quiet-surface: "#1e1e1e"
-    hairline: "#333333"
-    muted-ink: "#a3a3a3"
-    selection-wash: "#bfdbfe33"
-    selection-rim: "#60a5fa"
-    signal-go: "#22c55e"
-    signal-stop: "#ef4444"
-    chrome-band: "#171717"
-  light:
-    primary-ink: "#171717"
-    primary-ink-foreground: "#fafafa"
-    primary-ink-hover: "#262626"
-    paper: "#ffffff"
-    ink: "#0a0a0a"
-    quiet-surface: "#f5f5f5"
-    hairline: "#e5e5e5"
-    muted-ink: "#737373"
-    selection-wash: "#bfdbfe33"
-    selection-rim: "#60a5fa"
-    signal-go: "#22c55e"
-    signal-stop: "#ef4444"
-    chrome-band: "#F8F8F8"
+# Every role below names a gpui-kit `Theme` field. The app never carries a
+# color literal: it reads these tokens from the active theme, so Dark, Light
+# and System all restyle from one place. Values live in the kit, not here —
+# run the token test in `crates/ui/src/appearance.rs` for the live values.
+tokens:
+  ink: foreground
+  paper: background
+  quiet-surface: group_box
+  plate: secondary
+  hairline: border
+  muted-ink: muted_foreground
+  quiet-label: description_list_label_foreground
+  selection-wash: list_active
+  selection-rim: list_active_border
+  row-hover: list_hover
+  signal-go: success
+  signal-stop: danger
+  signal-warn: warning
+  chrome-band: title_bar
+  overlay-surface: popover
+  focus-ring: ring
 typography:
   body:
     fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif"
@@ -47,25 +39,25 @@ spacing:
   md: "8px"
 components:
   button-primary:
-    backgroundColor: "{colors.primary-ink}"
-    textColor: "{colors.primary-ink-foreground}"
+    backgroundColor: "{tokens.ink}"
+    textColor: "{tokens.paper}"
     rounded: "{rounded.md}"
   button-primary-hover:
-    backgroundColor: "{colors.primary-ink-hover}"
+    backgroundColor: "{tokens.row-hover}"
   button-danger:
-    backgroundColor: "{colors.signal-stop}"
-    textColor: "{colors.paper}"
+    backgroundColor: "{tokens.signal-stop}"
+    textColor: "{tokens.paper}"
   row-card:
-    backgroundColor: "{colors.quiet-surface}"
+    backgroundColor: "{tokens.quiet-surface}"
     rounded: "{rounded.md}"
   row-endpoint-field:
-    backgroundColor: "{colors.paper}"
-    textColor: "{colors.ink}"
+    backgroundColor: "{tokens.paper}"
+    textColor: "{tokens.ink}"
     rounded: "{rounded.md}"
   row-selected:
-    backgroundColor: "{colors.selection-wash}"
+    backgroundColor: "{tokens.selection-wash}"
   row-checked:
-    leadingBarColor: "{colors.selection-rim}"
+    leadingBarColor: "{tokens.selection-rim}"
     leadingBarWidth: "3px"
 ---
 
@@ -77,7 +69,7 @@ components:
 
 ManyProxy looks like the instrument it is: a railway signal-box panel for a personal proxy pool. Library rows are track circuits — an occupancy lamp, a nameplate, and the row's numbers on a paper-white ground. The toolbar is a menu bar with one labeled master throw (Start-all / Stop-all) at the trailing end. The detail pane is a right-hand inspector of ruled instruments (endpoints, health, usage, history), never stacked toolbars. Dialogs are ruled train orders: guided first, JSON only as Advanced.
 
-Color is signal-only and rides gpui-kit theme tokens everywhere — app code carries zero hardcoded colors. Selection is a wash plus rim on one row only; the checked bulk set is a 3px accent bar on the row's leading edge plus a filled checkbox chip. Green means serving, red means dead or destructive, blue means selected-or-checked, black means primary action. Everything else is ink, paper, gray, or hairline.
+Color is signal-only and rides gpui-kit theme tokens everywhere — app code carries zero hardcoded colors, with one named exception (`dialog/qr.rs`, which must stay true black on true white). Selection is a wash plus rim on one row only; the checked bulk set is a 3px accent bar on the row's leading edge plus a filled checkbox chip. Green means serving, red means dead or destructive, blue means selected-or-checked, black means primary action. Everything else is ink, paper, gray, or hairline.
 
 A keyboard shortcut never appears as text inside a label. The accessible name of a control is the action it performs — `Start the selected endpoint`, never `Start (F5)`. The key lives in the control's tooltip and in the Settings Shortcuts section, where it is written out in full. Kbd chips remain legal on dropdown menu rows, inspector tab suffixes, and the operate row: a chip is a separate element, not label text.
 
@@ -91,38 +83,41 @@ A keyboard shortcut never appears as text inside a label. The accessible name of
 
 ## Colors
 
-Ink, paper, signal: a monochrome working surface where color is information, never ornament. Every value below rides the kit theme — `group_box`, `border`, `radius`, `accent`, `list_hover`, `list_active`, `success`, `danger`, `secondary`, `muted_foreground`, `description_list_label_foreground` — so a future theme propagates without touching app code.
+Ink, paper, signal: a monochrome working surface where color is information, never ornament. Every color below is a gpui-kit `Theme` field read at paint time — `foreground`, `background`, `group_box`, `secondary`, `border`, `muted_foreground`, `description_list_label_foreground`, `list_active`, `list_active_border`, `list_hover`, `success`, `danger`, `warning`, `title_bar`, `popover`, `ring`, plus the theme `radius` — so a future theme propagates without touching app code. `crates/ui/src/appearance.rs` pins the palette claims in a test; `library/metrics.rs::RowMetrics` is the one geometry spec for row pitch, card height and column widths.
 
-**Dual palettes.** `{colors.X}` anywhere in this file means the active palette's `X` (`colors.dark.X` when Appearance is Dark, `colors.light.X` when Light). Dark is the default; System follows the Windows app-theme flag (`AppsUseLightTheme`) and resolves to one of the two. The monochrome ramps invert between palettes while the signal hues stay byte-identical — green is serving, red is dead-or-destructive, blue is selected-or-checked in both.
+**Dual palettes.** `{tokens.X}` anywhere in this file names a role from the front matter, which maps to the kit token of the same meaning. Dark is the default; System follows the Windows app-theme flag (`AppsUseLightTheme`) and resolves to one of the two. The monochrome ramps invert between palettes. The signal hues do not move — green stays green, red stays red, the selection blue stays blue — but their lightness retunes per ground, because the same green that reads on near-black is too light on near-white. Hue identifies the signal; lightness belongs to the theme.
+
+**The one literal.** `dialog/qr.rs` paints the QR quiet zone and modules in pure black on pure white, because a scanner needs real contrast and a themed QR is a broken QR. That is the only color literal in app code, and it is exempt from the guard below by name.
 
 ### Primary
 
-- **Switchboard Ink** ({colors.primary-ink}): primary actions (Add, Start) and primary text on light surfaces (near-black on light, near-white on dark). Hover deepens to ({colors.primary-ink-hover}).
-- **Paper** ({colors.paper}): app background, list background, dialog and popover surfaces (white on light, near-black on dark).
+- **Switchboard Ink** ({tokens.ink}): primary actions (Add, Start) and primary text on light surfaces (near-black on light, near-white on dark). Hover deepens to ({tokens.row-hover}).
+- **Paper** ({tokens.paper}): app background and list background. Dialog and popover surfaces sit one step off it ({tokens.overlay-surface}).
 
 ### Neutral
 
-- **Working Ink** ({colors.ink}): body foreground on paper (near-black on light, near-white on dark).
-- **Quiet Surface** ({colors.quiet-surface}): row cards and lever-frame plate (`group_box`), list hover ground (`list_hover`), tab bar background.
-- **Hairline** ({colors.hairline}): every 1px separator (`border`) — toolbar base, facet-bar base, card rims, plate rim, title/status bar edges.
-- **Muted Ink** ({colors.muted-ink}): secondary text (`muted_foreground`, `description_list_label_foreground`) — row metadata, stopped badges, endpoint labels, search context, the `Acting on:` echo.
-- **Chrome Band** ({colors.chrome-band}): title bar and status bar bands, edged with hairlines.
+- **Working Ink** ({tokens.ink}): body foreground on paper (near-black on light, near-white on dark).
+- **Quiet Surface** ({tokens.quiet-surface}): row cards and tab bar background. The lever-frame plate and neutral fills take the kit's `secondary` ({tokens.plate}); the hover ground is `list_hover` ({tokens.row-hover}).
+- **Hairline** ({tokens.hairline}): every 1px separator (`border`) — toolbar base, facet-bar base, card rims, plate rim, title/status bar edges.
+- **Muted Ink** ({tokens.muted-ink}): row metadata, stopped badges, search context, the `Acting on:` echo. Endpoint labels take the kit's quieter description-list label token ({tokens.quiet-label}).
+- **Chrome Band** ({tokens.chrome-band}): title bar and status bar bands, edged with hairlines.
 
 ### Selection and signal
 
 Signal meanings are identical in both palettes: the wash and rim stay blue, serving stays green, dead-or-destructive stays red, stopped stays gray. Only the monochrome ground inverts.
 
-- **Selection Wash** ({colors.selection-wash}): the selected row's card fill (`list_active` when the theme highlights, else `accent`) — selection only, never the checked set.
-- **Checked Bar** ({colors.selection-rim}): a 3px accent bar on the checked row's leading edge (`row-check-bar-<id>`) plus the kit checkbox in its filled state — shape and fill, never hue alone. The bar belongs to the checked set; the 2px rim stays selection-only.
-- **Serving Green** ({colors.signal-go}): running lamp, running badge text, healthy state (`success`).
-- **Alarm Red** ({colors.signal-stop}): dead-row lamp and badge text, failure alerts (`danger`), Delete confirms.
-- **Stopped Gray** ({colors.muted-ink}): dark lamp and `○ Stopped` badge on stopped rows (`secondary` on the detail Badge, `muted_foreground` in the list).
+- **Selection Wash** ({tokens.selection-wash}): the selected row's card fill (`list_active` when the theme highlights, else `accent`) — selection only, never the checked set.
+- **Checked Bar** ({tokens.selection-rim}): a 3px accent bar on the checked row's leading edge (`row-check-bar-<id>`) plus the kit checkbox in its filled state — shape and fill, never hue alone. The bar belongs to the checked set; the 2px rim stays selection-only.
+- **Serving Green** ({tokens.signal-go}): running lamp, running badge text, healthy state (`success`).
+- **Alarm Red** ({tokens.signal-stop}): dead-row lamp and badge text, failure alerts (`danger`), Delete confirms.
+- **Stopped Gray** ({tokens.muted-ink}): dark lamp and `○ Stopped` badge on stopped rows (`{tokens.plate}` on the detail Badge, `{tokens.muted-ink}` in the list).
+- **Warning Amber** ({tokens.signal-warn}): advisory text that is neither serving nor fatal — a draft colliding with another row, a port claimed by the clash range. Never a commit's color.
 
 ### Named Rules
 
 **The Signal-Only Rule.** Color marks primary actions, current selection, the checked set, and serving state — never decoration. If an element is neither actionable-primary, selected, checked, nor state-bearing, it is ink, paper, gray, or hairline.
 
-**The Theme-Token Rule.** No hardcoded colors in app UI code — every surface, rim, and state color resolves through kit theme tokens. Restyle by re-pointing tokens, never by inventing fills.
+**The Theme-Token Rule.** No hardcoded colors in app UI code — every surface, rim, and state color resolves through kit theme tokens. Restyle by re-pointing tokens, never by inventing fills. CI enforces this: the `Color literals` step fails on any `#rrggbb` / `0xrrggbb` outside `dialog/qr.rs`, and `crates/ui/src/appearance.rs` pins the palette claims (ramps invert, signal hues hold, selection is the blue list tokens, `accent` is neutral).
 
 ## Typography
 
@@ -178,9 +173,9 @@ Restrained and consistent: one button voice, one field voice, one chip voice per
 ### Buttons
 
 - **Shape:** theme-radius corners ({rounded.md}).
-- **Primary:** switchboard-ink fill ({colors.primary-ink}) with contrasting text ({colors.primary-ink-foreground}); hover deepens ({colors.primary-ink-hover}). Used for Add and Start — the two constructive commitments.
+- **Primary:** switchboard-ink fill ({tokens.ink}) with contrasting text ({tokens.paper}); hover deepens ({tokens.row-hover}). Used for Add and Start — the two constructive commitments.
 - **Hover / Focus:** kit hover tints plus visible keyboard focus. A key never appears inside a label or an accessible name: the accessible name is the action alone, and the key rides in the control's tooltip and in Settings → Shortcuts. Kbd chips stay on menu rows, tab suffixes, and the operate row. Destructive commits (remove, bulk delete, clear-checked) return focus to the shell, since the control they acted from unmounts. The inspector header carries the status role so selection changes announce.
-- **Danger:** alarm-red fill ({colors.signal-stop}) with paper text (destructive confirms; the row-menu Delete gates through a naming confirm instead of carrying danger styling).
+- **Danger:** alarm-red fill ({tokens.signal-stop}) with paper text (destructive confirms; the row-menu Delete gates through a naming confirm instead of carrying danger styling).
 - **Small density:** `.small()` variant across toolbar, facet, bulk, detail operate row, and endpoint rows so the full control set fits without scrolling (the five menus plus the labeled master throw ride small so the strip fits the 880px minimum on one row).
 - **Loading:** `Starting…` label plus inline spinner (`engine-start-spinner`) while a start is in flight; probe buttons spinner while testing or pinging. Tooltips name every action.
 - **Enabled-with-honest-toast:** no control renders kit `.disabled()` — every action stays enabled and explains itself on press (`Nothing to start — the library is empty`, `"<name>" is already stopped`). Loading covers in-flight inertness.
@@ -197,9 +192,9 @@ Five menus in fixed order — Program (`program-menu`: intake + lifecycle), Sett
 ### Cards / Containers
 
 - **Corner Style:** theme radius ({rounded.md}).
-- **Background:** quiet surface (`group_box`, {colors.quiet-surface}) on paper; selected rows take the selection wash ({colors.selection-wash}) with its rim so rim and card read as one highlight; checked rows keep the card's hairline and take the 3px leading accent bar (`row-check-bar-<id>`) plus a filled checkbox.
+- **Background:** quiet surface (`group_box`, {tokens.quiet-surface}) on paper; selected rows take the selection wash ({tokens.selection-wash}) with its rim so rim and card read as one highlight; checked rows keep the card's hairline and take the 3px leading accent bar (`row-check-bar-<id>`) plus a filled checkbox.
 - **Shadow Strategy:** none — see Elevation & Depth.
-- **Border:** 1px hairline ({colors.hairline}) everywhere; checked rows signal through the 3px leading bar, never a heavier border. The 2px accent rim belongs to selection alone.
+- **Border:** 1px hairline ({tokens.hairline}) everywhere; checked rows signal through the 3px leading bar, never a heavier border. The 2px accent rim belongs to selection alone.
 - **Internal Padding:** 8px horizontal, 4px vertical ({spacing.md} / {spacing.sm}) on row cards; 8px ({spacing.md}) pane padding in toolbar, inspector, and dialogs.
 
 ### Inputs / Fields
@@ -207,7 +202,7 @@ Five menus in fixed order — Program (`program-menu`: intake + lifecycle), Sett
 - **Style:** hairline stroke, paper fill, theme radius; stacked label-over-field at 4px gaps. Params box fixed at 96px, import box at 160px. The Port field carries a live auto-port budget readout (`port-budget`: used of 499 across `10801–10999` plus spill `18081–18380`) on Add and Edit.
 - **Row editors:** the library's bind/port fields are small kit inputs at fixed widths (bind 118px, port 76px) in the system face — the same hairline/paper/radius voice as dialog fields, with the kit focus ring. Placeholders read `127.0.0.1` / `auto`; blank port still means auto-assign.
 - **Guided-first:** Add and Edit are 560px wide (the kit's 448px default clipped the Server placeholder and crowded the hint/Advanced row); Add opens on Server / Server-port / Identity mini-fields with a one-clause hint (`vless needs uuid.`); JSON is an Advanced disclosure toggled from the hint row (collapsed) or the Params header (expanded). Guided and JSON swap, never stack; expanding merges guided values into JSON, collapsing echoes JSON into blank guided inputs only. Edit opens expanded to preserve existing JSON.
-- **Focus:** kit focus ring — the kit's own ring, never a hand-rolled rim or a second colour. A custom control that paints focus without a real focus handle is not focusable, and the selected library row is the case in point: the keyboard lands on the list, so the row wears the ring while that list holds focus. Dismissing an overlay returns keyboard focus to the shell — but only when no overlay is open and nothing already holds focus, checked at the END of the dismiss path, because a handler that closes one overlay and opens the next would otherwise steal the keystroke it just handed back. **Esc peels exactly one layer**: Advanced over Add closes Advanced first, then Add, and never "every modal at once". A shortcut that cannot run because an overlay owns the keyboard says `Close the open dialog first` — a refused key that does nothing is indistinguishable from a broken key. Validation keeps dialogs open with an inline error notification rather than closing; params errors auto-expand Advanced. After any overlay is dismissed, the shell reclaims keyboard focus only when no overlay is open and no element holds focus — a reclaim that fires while the user has already clicked elsewhere, or while a second overlay has just opened, steals the keystroke they were aiming. `Esc` dismisses exactly one overlay layer. Every focusable control paints a visible focus ring.
+- **Focus:** kit focus ring ({tokens.focus-ring}) — the kit's own ring, never a hand-rolled rim or a second colour. A custom control that paints focus without a real focus handle is not focusable, and the selected library row is the case in point: the keyboard lands on the list, so the row wears the ring while that list holds focus. Dismissing an overlay returns keyboard focus to the shell — but only when no overlay is open and nothing already holds focus, checked at the END of the dismiss path, because a handler that closes one overlay and opens the next would otherwise steal the keystroke it just handed back. **Esc peels exactly one layer**: Advanced over Add closes Advanced first, then Add, and never "every modal at once". A shortcut that cannot run because an overlay owns the keyboard says `Close the open dialog first` — a refused key that does nothing is indistinguishable from a broken key. Validation keeps dialogs open with an inline error notification rather than closing; params errors auto-expand Advanced. After any overlay is dismissed, the shell reclaims keyboard focus only when no overlay is open and no element holds focus — a reclaim that fires while the user has already clicked elsewhere, or while a second overlay has just opened, steals the keystroke they were aiming. `Esc` dismisses exactly one overlay layer. Every focusable control paints a visible focus ring.
 - **Error / Disabled:** inline error lines and collision warnings inside the form; `lan-hint` names the loopback guard in plain words (`Leaving loopback exposes this machine — …`); disabled rows read `disabled` in their muted meta line. No disabled-control styling exists — see honest-toast above.
 
 ### Navigation
@@ -249,7 +244,7 @@ Concrete guardrails grounded in the implementation. Every `Button::new` id, pinn
 
 ### Do:
 
-- **Do** build new rows, bars, and panes from theme tokens (`group_box`, `border`, `radius`, `accent`, `list_hover`, `list_active`, `success`, `danger`, `secondary`, `muted_foreground`, `description_list_label_foreground`) so light-theme changes propagate.
+- **Do** build new rows, bars, and panes from the theme roles in the front matter (`{tokens.ink}`, `{tokens.paper}`, `{tokens.quiet-surface}`, `{tokens.plate}`, `{tokens.hairline}`, `{tokens.muted-ink}`, `{tokens.quiet-label}`, `{tokens.selection-wash}`, `{tokens.selection-rim}`, `{tokens.row-hover}`, `{tokens.signal-go}`, `{tokens.signal-stop}`, `{tokens.signal-warn}`, `{tokens.chrome-band}`, `{tokens.overlay-surface}`, `{tokens.focus-ring}`) plus `radius`, so light-theme changes propagate.
 - **Do** keep a key out of every label and out of every accessible name — the accessible name is the action alone (`Start the selected endpoint`); the key rides in the control's tooltip and in Settings → Shortcuts. Kbd chips stay on menu rows, tab suffixes, and the operate row.
 - **Do** name affected rows in confirms, failures, and toasts — honesty is the brand voice.
 - **Do** keep the serving lamp, badge, and detail Badge in agreement: green serving, red dead/failed, dark stopped.
@@ -263,6 +258,7 @@ Concrete guardrails grounded in the implementation. Every `Button::new` id, pinn
 ### Don't:
 
 - **Don't** introduce display type, gradient text, glass, emoji icons, glow, or shadows — the world is plain, flat, and unadorned by decision.
+- **Don't** write a color literal. A new color is a new role in the front matter mapped to an existing kit token; `rgb(0x…)` and `#rrggbb` fail CI. Deriving a shade from a token is fine (`blend`, `opacity`), but the base hue always comes from the theme.
 - **Don't** spend color on decoration; blue is selection-or-checked-only, green/red are state-only, black is primary-action-only.
 - **Don't** add a third text size or a second corner radius without replacing the system, not extending it.
 - **Don't** turn confirm dialogs into silent actions or collapse per-item import failures into a single toast.
