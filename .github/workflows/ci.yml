@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, ui-audit-fixes]
   pull_request:
+    branches: [master]
 
+# Windows only: the app links winreg/tray-icon and build.rs embeds Windows
+# resources. A Linux runner would need the full GPUI system dependency set
+# (x11/wayland/vulkan) before it could compile anything, so the matrix stays
+# cheap instead of pretending to cover it.
 jobs:
   check:
     runs-on: windows-latest
