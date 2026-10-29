@@ -12198,6 +12198,37 @@ fn t01_checked_positions_and_selection_stay_distinct() {
     );
 }
 
+/// B2: the render path borrows rows so a frame does not clone a config per
+/// visible row; `row_at` stays the owning accessor for callers that need it.
+#[test]
+fn library_row_ref_borrows_while_row_at_clones() {
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![ProxyConfig {
+        id: "1".to_string(),
+        name: "Alpha".to_string(),
+        protocol: "vless".to_string(),
+        params: r#"{"server":"a.example.com"}"#.to_string(),
+        group: "g".to_string(),
+        enabled: true,
+        bind_ip: "127.0.0.1".to_string(),
+        port: 10801,
+        subscription_id: None,
+        identity_key: None,
+        preset_id: None,
+    }]);
+    let borrowed = delegate.row_ref(IndexPath::new(0)).expect("row is visible");
+    assert!(
+        std::ptr::eq(borrowed, &delegate.rows[0]),
+        "render reads the stored row, not a copy"
+    );
+    assert_eq!(delegate.rows[0].name, "Alpha");
+    assert_eq!(
+        delegate.row_at(IndexPath::new(0)).map(|row| row.id),
+        Some("1".to_string()),
+        "the owning accessor still returns an independent config"
+    );
+}
+
 /// F3: the checkbox is a bulk-set edit, not a selection gesture. A real
 /// pointer click on another row's checkbox must check that row without
 /// moving the selection, and the second click must leave both alone.

@@ -708,11 +708,16 @@ impl LibraryDelegate {
             .collect()
     }
 
-    pub(crate) fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
+    /// Borrowed row for per-frame rendering: `render_item` copies only the
+    /// fields it needs instead of cloning a whole config every frame.
+    pub(crate) fn row_ref(&self, index: IndexPath) -> Option<&ProxyConfig> {
         self.visible
             .get(index.row)
             .and_then(|&row| self.rows.get(row))
-            .cloned()
+    }
+
+    pub(crate) fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
+        self.row_ref(index).cloned()
     }
 
     pub(crate) fn selected_row(&self) -> Option<ProxyConfig> {
@@ -897,7 +902,13 @@ impl ListDelegate for LibraryDelegate {
         window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
-        let row = self.row_at(index)?;
+        let row = self.row_ref(index)?;
+        let row_id = row.id.clone();
+        let row_name = row.name.clone();
+        let row_protocol = row.protocol.clone();
+        let row_bind_ip = row.bind_ip.clone();
+        let row_port = row.port;
+        let port_stored = row_port.to_string();
         let selected = self
             .selected
             .map(|current| current.section == index.section && current.row == index.row)
@@ -905,18 +916,28 @@ impl ListDelegate for LibraryDelegate {
 
         let health = self
             .health
-            .get(&row.id)
+            .get(&row_id)
             .filter(|summary| !summary.is_empty())
             .cloned();
-        let is_running = self.running.contains(&row.id);
+        let is_running = self.running.contains(&row_id);
 
-        let traffic = self.traffic.get(&row.id).copied();
+        let traffic = self.traffic.get(&row_id).copied();
         let upstream = self
-            .upstream_for(&row.id)
+            .upstream_for(&row_id)
             .unwrap_or("no upstream")
             .to_string();
+        // Everything below the helpers mutates the delegate, so the row borrow
+        // ends here; the copies above are the fields the frame actually paints.
+        let full_route = library_row_full_route(row, &upstream);
+        let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
+            row,
+            &upstream,
+            health.as_deref(),
+            is_running,
+            traffic,
+            self.show_security,
+        );
 
-        let row_id = row.id.clone();
         let list_view = cx.entity();
         // The checkbox's and the lamp's handlers are separate closures; both
         // update this list state, so both need their own handle.
@@ -928,9 +949,9 @@ impl ListDelegate for LibraryDelegate {
             .small()
             .checked(is_checked)
             .accessibility_label(if is_checked {
-                format!("Checked {} (bulk action target)", row.name)
+                format!("Checked {} (bulk action target)", row_name)
             } else {
-                format!("Check {} for bulk actions", row.name)
+                format!("Check {} for bulk actions", row_name)
             })
             .on_change(move |_, _, cx| {
                 let toggle_id = toggle_id.clone();
@@ -952,9 +973,8 @@ impl ListDelegate for LibraryDelegate {
             .flex()
             .child(checkbox);
 
-        let port_stored = row.port.to_string();
-        self.ensure_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
-        self.sync_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
+        self.ensure_row_inputs(&row_id, &row_bind_ip, &port_stored, window, cx);
+        self.sync_row_inputs(&row_id, &row_bind_ip, &port_stored, window, cx);
 
         if self.pending_endpoint_commits.contains(&row_id) {
             self.pending_endpoint_commits.retain(|id| id != &row_id);
@@ -968,7 +988,7 @@ impl ListDelegate for LibraryDelegate {
             }
         }
 
-        let item = ListItem::new(format!("library-row-{}", row.id))
+        let item = ListItem::new(format!("library-row-{}", row_id))
             .selected(selected)
             .px_1()
             // T-03: the row carries a definite height and the card leaves a
@@ -1033,11 +1053,11 @@ impl ListDelegate for LibraryDelegate {
         let tone = serving_tone(
             is_running,
             health.as_deref(),
-            self.crashed.contains(&row.id),
+            self.crashed.contains(&row_id),
         );
         let probe_tone = self
             .health_tone
-            .get(&row.id)
+            .get(&row_id)
             .copied()
             .unwrap_or(LatencyTone::Unknown);
         let health_text_color = health_tone_color(probe_tone, cx);
@@ -1046,7 +1066,7 @@ impl ListDelegate for LibraryDelegate {
             ServingTone::Serving => cx.theme().success,
             ServingTone::Stopped => cx.theme().muted_foreground,
         };
-        let lamp_label = lamp_access_label(tone, &row.name);
+        let lamp_label = lamp_access_label(tone, &row_name);
         // K11/A2-1: the occupancy lamp doubles as the health filter's toggle —
         // its tone names the verdict a click filters by.
         let lamp_status = match tone {
@@ -1063,17 +1083,8 @@ impl ListDelegate for LibraryDelegate {
                 lamp_status.label().to_lowercase()
             )
         };
-        let full_route = library_row_full_route(&row, &upstream);
-        let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
-            &row,
-            &upstream,
-            health.as_deref(),
-            is_running,
-            traffic,
-            self.show_security,
-        );
         {
-            let name = row.name.clone();
+            let name = row_name.clone();
             let metrics = self.row_metrics;
             let mut cells: Vec<AnyElement> = Vec::new();
             if metrics.show_group {
@@ -1100,7 +1111,7 @@ impl ListDelegate for LibraryDelegate {
                         .truncate()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(row.protocol.clone())
+                        .child(row_protocol)
                         .into_any_element(),
                 );
             }
@@ -1146,10 +1157,10 @@ impl ListDelegate for LibraryDelegate {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .tooltip({
-                                let tip = format!("Serve bind address {}", row.bind_ip);
+                                let tip = format!("Serve bind address {}", row_bind_ip);
                                 move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                             })
-                            .child(row.bind_ip.clone()),
+                            .child(row_bind_ip.clone()),
                     )
                     .child(
                         div()
@@ -1161,12 +1172,12 @@ impl ListDelegate for LibraryDelegate {
                             .tooltip({
                                 let tip = format!(
                                     "Local endpoint {}:{} — edit it in the inspector",
-                                    row.bind_ip, row.port
+                                    row_bind_ip, row_port
                                 );
                                 move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                             })
-                            .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
-                            .child(format!(":{}", row.port)),
+                            .aria_label(format!("Local port {} on {}", row_port, row_bind_ip))
+                            .child(format!(":{}", row_port)),
                     )
                     .into_any_element(),
             );
@@ -1207,9 +1218,9 @@ impl ListDelegate for LibraryDelegate {
             // header strip reserves the same width, so the columns line up.
             let copy_view = self.app_view.clone();
             let copy_id = row_id.clone();
-            let copy_name = row.name.clone();
-            let copy_bind = row.bind_ip.clone();
-            let copy_port = row.port;
+            let copy_name = row_name;
+            let copy_bind = row_bind_ip;
+            let copy_port = row_port;
             cells.push(
                 div()
                     .id(format!("row-copy-cell-{row_id}"))
