@@ -3,19 +3,20 @@
 //! Not here: dialog chrome or unrelated feature panels.
 use crate::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use std::cell::Cell;
 
-// ---- T-04: the Settings dialog ------------------------------------------
+// ---- T-04/B17: the Settings dialog --------------------------------------
 //
-// Six named sections in a left rail; the body shows exactly one at a time.
-// Every setting is one row: the label on the left, the control on the right,
-// and at most one muted help line beneath. Toggles and radios save on change;
-// text fields save on Enter or on the dialog's one footer `Save` — never on
-// blur. K9: the footer is the only commit row: `Cancel` (secondary) beside
-// `Save` (primary), bottom-right, with the Esc note on its left. The body
-// hugs its content (capped, then it scrolls) instead of holding a fixed
-// black frame.
+// One column, six sections in fixed order, each under a caps header with a
+// hairline under it. Every setting is one row: the label on the left, the
+// control on the right, and at most one muted help line beneath. A filter
+// field at the top narrows the column by row label, so a setting is one
+// scroll or one query away. Toggles and radios save on change; text fields
+// save on Enter or on the dialog's one footer `Save` — never on blur. K9: the
+// footer is the only commit row: `Cancel` (secondary) beside `Save`
+// (primary), bottom-right, with the Esc note on its left.
 
-/// T-04: the six named sections, in rail order.
+/// T-04/B17: the six named sections, in spine order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SettingsSection {
     General,
@@ -36,7 +37,7 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
     ];
 
-    /// The section's name — the rail entry and the body's heading.
+    /// The section's name — the column header.
     pub(crate) fn title(self) -> &'static str {
         match self {
             SettingsSection::General => "General",
@@ -48,27 +49,15 @@ impl SettingsSection {
         }
     }
 
-    /// The rail entry's element id.
-    pub(crate) fn rail_id(self) -> &'static str {
+    /// The column header's element id.
+    pub(crate) fn header_id(self) -> &'static str {
         match self {
-            SettingsSection::General => "settings-rail-general",
-            SettingsSection::Probing => "settings-rail-probing",
-            SettingsSection::Updates => "settings-rail-updates",
-            SettingsSection::Engine => "settings-rail-engine",
-            SettingsSection::Maintenance => "settings-rail-maintenance",
-            SettingsSection::Shortcuts => "settings-rail-shortcuts",
-        }
-    }
-
-    /// The rail entry's button id — the click target inside the rail row.
-    pub(crate) fn rail_button_id(self) -> &'static str {
-        match self {
-            SettingsSection::General => "settings-rail-button-general",
-            SettingsSection::Probing => "settings-rail-button-probing",
-            SettingsSection::Updates => "settings-rail-button-updates",
-            SettingsSection::Engine => "settings-rail-button-engine",
-            SettingsSection::Maintenance => "settings-rail-button-maintenance",
-            SettingsSection::Shortcuts => "settings-rail-button-shortcuts",
+            SettingsSection::General => "settings-section-general",
+            SettingsSection::Probing => "settings-section-probing",
+            SettingsSection::Updates => "settings-section-updates",
+            SettingsSection::Engine => "settings-section-engine",
+            SettingsSection::Maintenance => "settings-section-maintenance",
+            SettingsSection::Shortcuts => "settings-section-shortcuts",
         }
     }
 
@@ -92,12 +81,11 @@ impl SettingsSection {
 /// room after the padding) and the kit's 16 px padding on each side.
 const SETTINGS_DIALOG_WIDTH: f32 = 820.;
 
-/// T-04: the left rail's width.
-const SETTINGS_RAIL_WIDTH: f32 = 168.;
-
-/// T-04: the label column's width. Every row's label starts here, so the
-/// labels read as one column and the controls as another.
-const SETTINGS_LABEL_WIDTH: f32 = 200.;
+/// T-04/B17: the label column's width. Every row's label starts here, so the
+/// labels read as one column and the controls as another — and it is wide
+/// enough for the longest label to stay on one line, because a label that wraps
+/// reads as two columns of label text beside the controls.
+pub(crate) const SETTINGS_LABEL_WIDTH: f32 = 300.;
 
 /// T-04: the width a text field's control column takes.
 const SETTINGS_CONTROL_WIDTH: f32 = 320.;
@@ -117,16 +105,19 @@ fn settings_body_max_height(window: &Window) -> f32 {
     (max_height - SETTINGS_CHROME_HEIGHT).max(0.0)
 }
 
-/// T-04: one setting row — the label on the left, the control on the right,
-/// and at most one muted help line beneath. The control sizes to its content
-/// and sits against the right edge.
+/// T-04/B17: one setting row — the label on the left, the control on the
+/// right, and at most one muted help line beneath. A row the filter misses is
+/// hidden but still counted, so the badge can say how many of how many showed.
 fn settings_row(
+    state: &SettingsState,
+    cx: &App,
     id: &'static str,
     label: &'static str,
     help: Option<String>,
     muted: Hsla,
     control: impl IntoElement,
 ) -> impl IntoElement {
+    let shown = state.note_row(cx, id, label);
     div()
         .id(id)
         .flex()
@@ -141,6 +132,8 @@ fn settings_row(
                 .min_w_0()
                 .child(
                     div()
+                        .id(format!("{id}-label"))
+                        .test_support()
                         .w(px(SETTINGS_LABEL_WIDTH))
                         .flex_shrink_0()
                         .child(label),
@@ -157,19 +150,23 @@ fn settings_row(
                     .child(text),
             )
         })
+        .when(!shown, |this| this.hidden())
         .test_support()
 }
 
 /// T-04: the one deliberate full-width field. The label sits above the
-/// control and the control takes the whole body, because the update-feed URL
+/// control and the control takes the whole column, because the update-feed URL
 /// is longer than the label column plus a right-hand control column can hold.
 fn settings_field_row(
+    state: &SettingsState,
+    cx: &App,
     id: &'static str,
     label: &'static str,
     help: Option<String>,
     muted: Hsla,
     control: impl IntoElement,
 ) -> impl IntoElement {
+    let shown = state.note_row(cx, id, label);
     div()
         .id(id)
         .flex()
@@ -181,7 +178,7 @@ fn settings_field_row(
                 .flex_col()
                 .gap_1()
                 .min_w_0()
-                .child(div().child(label))
+                .child(div().id(format!("{id}-label")).test_support().child(label))
                 .child(div().w_full().min_w_0().child(control)),
         )
         .when_some(help, |this, text| {
@@ -194,6 +191,7 @@ fn settings_field_row(
                     .child(text),
             )
         })
+        .when(!shown, |this| this.hidden())
         .test_support()
 }
 
@@ -202,7 +200,6 @@ fn settings_field_row(
 /// travels through one of these cells.
 struct SettingsState {
     view: Entity<AppView>,
-    section: Rc<RefCell<SettingsSection>>,
     appearance: Rc<RefCell<String>>,
     autostart: Rc<RefCell<bool>>,
     restore: Rc<RefCell<bool>>,
@@ -217,82 +214,147 @@ struct SettingsState {
     timeout_input: Entity<InputState>,
     bind_host_input: Entity<InputState>,
     log_cap_input: Entity<InputState>,
+    filter: Entity<InputState>,
+    /// `(shown, total)` — written while the column is built, read by the
+    /// filter badge. The column is rebuilt every frame, so it resets there.
+    counted: Rc<Cell<(usize, usize)>>,
 }
 
 impl SettingsState {
-    /// T-04: the left rail. The selected entry carries the selection wash and
-    /// its rim; the others stay quiet.
-    fn render_rail(&self, cx: &mut App) -> AnyElement {
-        let current = *self.section.borrow();
-        let selected_bg = if cx.theme().list.active_highlight {
-            cx.theme().list_active
-        } else {
-            cx.theme().accent
-        };
-        let mut rail = div()
-            .id("settings-rail")
-            .test_support()
-            .w(px(SETTINGS_RAIL_WIDTH))
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .gap_1();
-        for section in SettingsSection::ORDER {
-            let selected = section == current;
-            let cell = self.section.clone();
-            let view = self.view.clone();
-            rail = rail.child(
-                div()
-                    .id(section.rail_id())
-                    .test_support()
-                    .w_full()
-                    .rounded(cx.theme().radius)
-                    .bg(if selected {
-                        selected_bg
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .border_1()
-                    .border_color(if selected {
-                        cx.theme().accent
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .child(
-                        Button::new(section.rail_button_id())
-                            .w_full()
-                            .ghost()
-                            .label(section.title())
-                            // K9/A7-6-pending: no tooltip here. `"{title}
-                            // settings"` restated the label and, on hover,
-                            // painted as a stray `Updates settings` chip over
-                            // the rail — the label already names the target.
-                            .on_click(move |_, _, cx| {
-                                *cell.borrow_mut() = section;
-                                view.update(cx, |_, cx| cx.notify());
-                            }),
-                    ),
-            );
-        }
-        rail.into_any_element()
+    /// B17: the filter query, trimmed and lowercased.
+    fn query(&self, cx: &App) -> String {
+        self.filter.read(cx).value().trim().to_lowercase()
     }
 
-    /// T-04: the body shows exactly one section.
-    fn render_body(
-        &self,
-        section: SettingsSection,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> AnyElement {
-        match section {
-            SettingsSection::General => self.render_general(cx),
-            SettingsSection::Probing => self.render_probing(cx),
-            SettingsSection::Updates => self.render_updates(cx),
-            SettingsSection::Engine => self.render_engine(cx),
-            SettingsSection::Maintenance => self.render_maintenance(cx),
-            SettingsSection::Shortcuts => self.render_shortcuts(cx),
+    /// B17: does this row match? Every whitespace-separated token must appear
+    /// in the row's label or its id, so two tokens narrow instead of widen, and
+    /// a row's id (`settings-row-autostart`) is searchable when the label is not
+    /// the word the user reached for.
+    fn row_matches(query: &str, id: &str, label: &str) -> bool {
+        if query.is_empty() {
+            return true;
         }
-        .into_any_element()
+        let haystack = format!("{label} {id}").to_lowercase();
+        query
+            .split_whitespace()
+            .all(|token| haystack.contains(token))
+    }
+
+    /// B17: count one row and report whether it shows.
+    fn note_row(&self, cx: &App, id: &str, label: &str) -> bool {
+        let shown = Self::row_matches(&self.query(cx), id, label);
+        let (mut shown_count, mut total) = self.counted.get();
+        total += 1;
+        if shown {
+            shown_count += 1;
+        }
+        self.counted.set((shown_count, total));
+        shown
+    }
+
+    /// B17: a row that is not built by `settings_row` still has to be counted
+    /// and hidden, or its section would vanish under a filter that matches it.
+    fn filtered(&self, cx: &App, id: &str, label: &str, element: impl IntoElement) -> AnyElement {
+        let shown = self.note_row(cx, id, label);
+        div()
+            .id(format!("{id}-slot"))
+            .when(!shown, |this| this.hidden())
+            .child(element)
+            .into_any_element()
+    }
+
+    /// B17: one caps section header over a hairline.
+    fn section_header(&self, section: SettingsSection, cx: &App) -> AnyElement {
+        div()
+            .id(section.header_id())
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(section.title().to_uppercase()),
+            )
+            .child(Separator::horizontal())
+            .into_any_element()
+    }
+
+    /// B17: the filter field. The kit's own cleanable affordance clears it — no
+    /// hand-rolled Clear button — and the count reads `N of M` exactly like the
+    /// library's search count.
+    fn render_filter_band(&self, cx: &mut App) -> AnyElement {
+        let (shown, total) = self.counted.get();
+        div()
+            .id("settings-filter-band")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.filter)
+                        .id("settings-filter")
+                        .appearance(false)
+                        .cleanable(true),
+                ),
+            )
+            .child(
+                div()
+                    .id("settings-filter-count")
+                    .test_support()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(search_count_text(shown, total)),
+            )
+            .into_any_element()
+    }
+
+    /// T-04/B17: every section in one column, in fixed order. A section whose
+    /// rows all miss the filter takes its header with it, so the column reads as
+    /// the filter's result and not as a mostly empty spine.
+    fn render_body(&self, _window: &mut Window, cx: &mut App) -> AnyElement {
+        self.counted.set((0, 0));
+        let mut column = div()
+            .id("settings-body")
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_6();
+        for section in SettingsSection::ORDER {
+            let before = self.counted.get().0;
+            let body = match section {
+                SettingsSection::General => self.render_general(cx),
+                SettingsSection::Probing => self.render_probing(cx),
+                SettingsSection::Updates => self.render_updates(cx),
+                SettingsSection::Engine => self.render_engine(cx),
+                SettingsSection::Maintenance => self.render_maintenance(cx),
+                SettingsSection::Shortcuts => self.render_shortcuts(cx),
+            };
+            if self.counted.get().0 == before {
+                continue;
+            }
+            column = column.child(self.section_header(section, cx)).child(body);
+        }
+        if self.counted.get().0 == 0 {
+            column = column.child(
+                div()
+                    .id("settings-filter-empty")
+                    .test_support()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No setting matches that — clear the filter to see them all."),
+            );
+        }
+        column.into_any_element()
     }
 
     /// T-04: General — appearance, startup, window behaviour.
@@ -336,6 +398,8 @@ impl SettingsState {
             group = group.child(Radio::new(*label).label(label.to_string()).tooltip(tip));
         }
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-appearance",
             "Appearance",
             Some(
@@ -354,6 +418,8 @@ impl SettingsState {
         let autostart_view = self.view.clone();
         let autostart_on = *autostart_cell.borrow();
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-autostart",
             "Launch at login",
             Some(
@@ -376,18 +442,20 @@ impl SettingsState {
                 }),
         ));
 
-        // Start the previous set on launch.
+        // Restore on launch.
         let restore_cell = self.restore.clone();
         let restore_view = self.view.clone();
         let restore_on = *restore_cell.borrow();
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-restore",
-            "Start the previous set on launch",
+            "Restore on launch",
             Some("Relauch the rows that were running when ManyProxy last exited.".to_string()),
             muted,
             Switch::new("settings-restore-switch")
                 .checked(restore_on)
-                .accessibility_label("Start the previous set on launch")
+                .accessibility_label("Restore on launch")
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = restore_cell.clone();
@@ -431,6 +499,8 @@ impl SettingsState {
             );
         }
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-window-behaviour",
             "Window behaviour",
             Some(close_action.explanation().to_string()),
@@ -456,6 +526,8 @@ impl SettingsState {
             .gap_4();
 
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-test-url",
             "Test URL",
             Some(format!(
@@ -470,6 +542,8 @@ impl SettingsState {
         ));
 
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-probe-timeout",
             "Timeout",
             Some(format!(
@@ -513,6 +587,8 @@ impl SettingsState {
             );
         }
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-test-all-scope",
             "Test all scope",
             Some("The rows a Test all run covers.".to_string()),
@@ -533,7 +609,7 @@ impl SettingsState {
             .flex_col()
             .gap_4();
 
-        body = body.child(settings_field_row(
+        body = body.child(settings_field_row(self, cx,
             "settings-row-feed-url",
             "Update feed URL",
             Some(format!(
@@ -556,6 +632,8 @@ impl SettingsState {
         // timestamp so the section keeps one commit row: the dialog footer.
         let check_view = self.view.clone();
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-last-check",
             "Last checked",
             None,
@@ -614,37 +692,42 @@ impl SettingsState {
             };
             let status_color = if ready { muted } else { cx.theme().danger };
             body = body.child(
-                div()
-                    .id(id)
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .id(format!("settings-engine-summary-{name}"))
-                            .test_support()
-                            .text_sm()
-                            .text_color(status_color)
-                            .child(engine_summary(name, ready)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new(format!("settings-engine-details-{name}"))
-                            .small()
-                            .ghost()
-                            .label("Details")
-                            .tooltip(engine_details_tooltip(name, path.as_deref())),
-                    ),
+                self.filtered(
+                    cx,
+                    id,
+                    name,
+                    div()
+                        .id(id)
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .id(format!("settings-engine-summary-{name}"))
+                                .test_support()
+                                .text_sm()
+                                .text_color(status_color)
+                                .child(engine_summary(name, ready)),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(format!("settings-engine-details-{name}"))
+                                .small()
+                                .ghost()
+                                .label("Details")
+                                .tooltip(engine_details_tooltip(name, path.as_deref())),
+                        ),
+                ),
             );
         }
 
         // F4: the durable "where do I get cores" entry point — the status line
         // names the missing core, this names the source.
         let cores_view = self.view.clone();
-        body = body.child(
+        body = body.child(self.filtered(cx, "settings-engine-cores-help-row", "Where do I get cores?",
             div()
                 .id("settings-engine-cores-help-row")
                 .test_support()
@@ -664,12 +747,12 @@ impl SettingsState {
                                 .update(cx, |view, cx| view.open_cores_help_dialog(window, cx));
                         }),
                 ),
-        );
+        ));
 
         let auto_restart_cell = self.auto_restart.clone();
         let auto_restart_view = self.view.clone();
         let auto_restart_on = *auto_restart_cell.borrow();
-        body = body.child(settings_row(
+        body = body.child(settings_row(self, cx,
             "settings-row-auto-restart",
             "Restart crashed engines",
             Some(
@@ -808,7 +891,12 @@ impl SettingsState {
                         }),
                 );
             }
-            list = list.child(host_row);
+            list = list.child(self.filtered(
+                cx,
+                &format!("settings-bind-host-{host}"),
+                &format!("Bind address {host}"),
+                host_row,
+            ));
         }
         list.into_any_element()
     }
@@ -858,6 +946,8 @@ impl SettingsState {
         let view = self.view.clone();
         let folder = data_folder_text();
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-data-folder",
             "Data folder",
             Some("Where the library and the logs live.".to_string()),
@@ -874,6 +964,8 @@ impl SettingsState {
         let view = self.view.clone();
         let logs_path = logs_save_path_text();
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-save-logs",
             "Visible logs",
             Some("Write the session log to a file.".to_string()),
@@ -888,6 +980,8 @@ impl SettingsState {
         ));
 
         body = body.child(settings_row(
+            self,
+            cx,
             "settings-row-log-cap",
             "Maximum kept log lines",
             Some("500–50,000 lines; saving rebuilds the ring.".to_string()),
@@ -955,7 +1049,12 @@ impl SettingsState {
                     view.update(cx, |view, cx| view.open_reset_library_confirm(window, cx));
                 }),
         );
-        body = body.child(grid);
+        body = body.child(self.filtered(
+            cx,
+            "settings-maintenance-grid",
+            "Clear traffic counters, clear health snapshots, clear sessions, reset library",
+            grid,
+        ));
 
         body.into_any_element()
     }
@@ -985,20 +1084,17 @@ impl SettingsState {
             .flex_col()
             .gap_1();
         for (action, keys) in SHORTCUT_LINES.iter() {
-            list = list.child(
-                div()
-                    .id(format!(
-                        "settings-shortcut-{}",
-                        keys.to_lowercase().replace('.', "")
-                    ))
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .gap_4()
-                    .child(div().child(*action))
-                    .child(div().text_sm().text_color(muted).child(*keys)),
-            );
+            let id = format!("settings-shortcut-{}", keys.to_lowercase().replace('.', ""));
+            let row = div()
+                .id(id.clone())
+                .test_support()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap_4()
+                .child(div().child(*action))
+                .child(div().text_sm().text_color(muted).child(*keys));
+            list = list.child(self.filtered(cx, &id, &format!("{action} {keys}"), row));
         }
         body.child(list).into_any_element()
     }
@@ -1521,7 +1617,6 @@ impl AppView {
 
     pub(crate) fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        let section = Rc::new(RefCell::new(SettingsSection::General));
 
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
@@ -1560,6 +1655,9 @@ impl AppView {
         self.logs.cap_input = Some(cap_state.clone());
         let bind_host_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20 or fd00::7"));
+        // B17: the spine's filter. It commits nothing — it narrows the column
+        // while it is typed and leaves every stored value alone.
+        let filter_state = cx.new(|cx| InputState::new(window, cx).placeholder("Filter settings"));
 
         // T-04/K9: Enter commits a text field; the dialog's one footer `Save`
         // commits the same value. A field never commits on blur.
@@ -1640,6 +1738,18 @@ impl AppView {
                 },
             ));
         }
+        {
+            // B17: the column narrows as the filter is typed, so the dialog
+            // has to rebuild on a text change — the input repaints itself, the
+            // column does not.
+            let weak = weak.clone();
+            subscriptions.push(window.subscribe(&filter_state, cx, move |_, event, _, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let _ = weak.update(cx, |_, cx| cx.notify());
+            }));
+        }
         self.settings_subscriptions = subscriptions;
         self.settings_last_check = Some(last_check_state.clone());
 
@@ -1655,7 +1765,6 @@ impl AppView {
 
         let state = SettingsState {
             view: view.clone(),
-            section: section.clone(),
             appearance: appearance_state.clone(),
             autostart: autostart_state.clone(),
             restore: restore_state.clone(),
@@ -1670,14 +1779,15 @@ impl AppView {
             timeout_input: timeout_state.clone(),
             bind_host_input: bind_host_input.clone(),
             log_cap_input: cap_state.clone(),
+            filter: filter_state.clone(),
+            counted: Rc::new(Cell::new((0, 0))),
         };
 
         open_app_dialog(window, cx, move |dialog: Dialog, window, cx| {
-            let current = *section.borrow();
-            let rail = state.render_rail(cx);
-            let body = state.render_body(current, window, cx);
-            // K9: auto-height up to the cap. A short section hugs its rows;
-            // only a long one (Engine/Shortcuts) grows and then scrolls.
+            // B17: the column is built first — it counts what the filter kept —
+            // and the band reads that count to paint `N of M`.
+            let body = state.render_body(window, cx);
+            let band = state.render_filter_band(cx);
             let body_max_height = settings_body_max_height(window);
             dialog
                 .title("Settings")
@@ -1687,24 +1797,11 @@ impl AppView {
                         .id("settings-shell")
                         .test_support()
                         .flex()
-                        .flex_row()
+                        .flex_col()
                         .gap_4()
                         .max_h(px(body_max_height))
-                        .child(rail)
-                        .child(Separator::vertical())
-                        .child(
-                            div()
-                                .id("settings-body")
-                                .test_support()
-                                .flex_1()
-                                .min_w_0()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .gap_4()
-                                .child(body),
-                        ),
+                        .child(band)
+                        .child(body),
                 )
                 // K9/A7-2: ONE footer. `Cancel` is secondary, `Save` primary,
                 // both bottom-right; the Esc note keeps the keyboard route

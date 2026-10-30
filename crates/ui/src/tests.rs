@@ -11099,39 +11099,25 @@ fn ticket43_chrome_paints(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    // T-04: one modal, six sections, one visible at a time.
-    assert_painted(cx, "settings-rail-general");
+    // T-04/B17: one modal, six sections in one column.
+    assert_painted(cx, "settings-section-general");
     assert_painted(cx, "settings-body-general");
     assert_painted(cx, "settings-row-appearance");
     // K9: one footer pair, bottom-right; the old `Done` is gone.
     assert_painted(cx, "settings-dialog-cancel");
     assert_painted(cx, "settings-dialog-save");
     assert_absent(cx, "settings-dialog-done".to_string());
-    assert_absent(cx, "settings-body-probing".to_string());
-    cx.update(|window, cx| {
-        window.click("settings-rail-probing", cx);
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "field-settings-test-url");
     assert_painted(cx, "field-settings-test-url");
     // K9: no mid-body Save; the one footer Save commits this section too.
     assert_absent(cx, "settings-save-test-url".to_string());
     assert_absent(cx, "settings-footer-probing".to_string());
-    assert_absent(cx, "settings-body-general".to_string());
-    cx.update(|window, cx| {
-        window.click("settings-rail-engine", cx);
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-engine-sing-box");
     // K9/A7-5: lean engine rows + Details; no timer jargon.
     assert_painted(cx, "settings-engine-details-sing-box");
     assert_absent(cx, "settings-ticks".to_string());
     assert_painted(cx, "settings-section-addresses");
-    cx.update(|window, cx| {
-        window.click("settings-rail-maintenance", cx);
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-clear-traffic");
     for id in [
         "settings-clear-traffic",
         "settings-clear-health",
@@ -24056,54 +24042,148 @@ fn appearance_mapping_and_summaries() {
     );
 }
 
+/// B17: the one settings column is taller than the dialog, so a section below
+/// the fold has to be scrolled to before it can be painted or clicked. Rewind,
+/// then walk down until the target's top sits inside the body.
+fn scroll_settings_into_view(cx: &mut VisualTestContext, id: &str) {
+    fn wheel(cx: &mut VisualTestContext, delta: f32) {
+        cx.update(|window, cx| {
+            window.scroll(
+                "settings-body",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(delta))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+    }
+    wheel(cx, 100_000.);
+    for _ in 0..40 {
+        let (top, body_top, body_bottom) = cx.update(|window, _| {
+            (
+                window
+                    .try_find(id.to_string())
+                    .map(|snapshot| snapshot.bounds().origin.y),
+                window.find("settings-body").bounds().origin.y,
+                window.find("settings-body").bounds().bottom(),
+            )
+        });
+        match top {
+            Some(top) if top >= body_top && top <= body_bottom - px(48.) => return,
+            Some(_) => wheel(cx, -120.),
+            None => return,
+        }
+    }
+    panic!("{id} never scrolled into the settings column's viewport");
+}
+
+/// B17: the six spine headers, top to bottom. A settings section below the
+/// scroll viewport is not painted, so a test walks the column and unions what
+/// each step shows.
+const SETTINGS_HEADERS: [&str; 6] = [
+    "settings-section-general",
+    "settings-section-probing",
+    "settings-section-updates",
+    "settings-section-engine",
+    "settings-section-maintenance",
+    "settings-section-shortcuts",
+];
+
+/// B17: the headers painted right now, in the column's order.
+fn settings_headers_painted(cx: &mut VisualTestContext) -> Vec<&'static str> {
+    SETTINGS_HEADERS
+        .into_iter()
+        .filter(|id| cx.update(|window, _| window.try_find(id.to_string()).is_some()))
+        .collect()
+}
+
+/// B17: scroll the one settings column from top to bottom, returning the
+/// headers seen at each step. Every step is in the column's order.
+fn settings_spine_walk(cx: &mut VisualTestContext) -> Vec<Vec<&'static str>> {
+    let mut steps = Vec::new();
+    let mut seen: Vec<&'static str> = Vec::new();
+    for step in 0..12 {
+        if step > 0 {
+            cx.update(|window, cx| {
+                window.scroll(
+                    "settings-body",
+                    gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-320.))),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            paint_dialog_open(cx);
+        }
+        let painted = settings_headers_painted(cx);
+        let first_new = painted.iter().find(|id| !seen.contains(id)).copied();
+        let fresh: Vec<&'static str> = painted
+            .iter()
+            .copied()
+            .filter(|id| !seen.contains(id))
+            .collect();
+        seen.extend(fresh);
+        steps.push(painted);
+        // Stop once the column has nothing new to show and the tail is up.
+        if first_new.is_none()
+            && cx.update(|window, _| {
+                window
+                    .try_find("settings-section-shortcuts".to_string())
+                    .is_some()
+            })
+        {
+            break;
+        }
+    }
+    steps
+}
+
 #[gpui_kit::test]
-fn settings_dialog_has_six_sections_and_appearance(cx: &mut TestAppContext) {
+fn settings_spine_lists_one_column_and_filters_it(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
     assert_eq!(store.appearance(), "dark", "fresh store reads dark");
     let (view, cx) = mount_view(store, cx);
+    cx.simulate_resize(size(px(1000.), px(700.)));
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-    // T-04: six named sections in the left rail.
-    let rail = [
-        "settings-rail-general",
-        "settings-rail-probing",
-        "settings-rail-updates",
-        "settings-rail-engine",
-        "settings-rail-maintenance",
-        "settings-rail-shortcuts",
-    ];
-    for id in rail {
-        assert!(
-            cx.update(|window, _| window.try_find(id).is_some()),
-            "{id} renders"
+
+    // B17: six caps section headers in fixed order, in ONE column. A section
+    // below the viewport is not painted, so the walk scrolls the column and
+    // checks the order at every step.
+    let steps = settings_spine_walk(cx);
+    for step in &steps {
+        let mut sorted = step.clone();
+        sorted.sort_by_key(|id| SETTINGS_HEADERS.iter().position(|h| h == id));
+        assert_eq!(
+            step, &sorted,
+            "each painted set keeps the column's order: {step:?}"
         );
     }
-    let tops: Vec<f32> = rail
-        .iter()
-        .map(|id| cx.update(|window, _| window.find(*id).bounds().origin.y.as_f32()))
-        .collect();
-    assert!(
-        tops.windows(2).all(|pair| pair[0] < pair[1]),
-        "the rail reads General | Probing | Updates | Engine | Maintenance | Shortcuts top to bottom: {tops:?}"
-    );
-    // T-04: the body shows ONE section at a time.
-    assert!(
-        cx.update(|window, _| window.try_find("settings-body-general").is_some()),
-        "General is the section that opens"
-    );
-    for id in [
-        "settings-body-probing",
-        "settings-body-updates",
-        "settings-body-engine",
-        "settings-body-maintenance",
-        "settings-body-shortcuts",
-    ] {
-        assert_absent(cx, id.to_string());
+    let seen: Vec<&'static str> = steps.iter().flatten().copied().collect();
+    for id in SETTINGS_HEADERS {
+        assert!(
+            seen.contains(&id),
+            "{id} is reachable by scrolling the one column; saw {seen:?}"
+        );
     }
+    // Back to the top for the rest of the test.
+    cx.update(|window, cx| {
+        window.scroll(
+            "settings-body",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(100_000.))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+
+    // B17: every section renders in that one column — no rail, no hidden panes.
+    assert_painted(cx, "settings-body-general");
+    assert_painted(cx, "settings-body-probing");
     for id in [
         "settings-row-appearance",
         "settings-appearance-group",
@@ -24111,10 +24191,7 @@ fn settings_dialog_has_six_sections_and_appearance(cx: &mut TestAppContext) {
         "settings-row-autostart",
         "settings-row-restore",
     ] {
-        assert!(
-            cx.update(|window, _| window.try_find(id).is_some()),
-            "{id} renders"
-        );
+        assert_painted(cx, id);
     }
     // T-04: the Routing and Preset summaries left Settings; the presets
     // manager is reached from the Routing menu and the inspector pane.
@@ -24126,35 +24203,100 @@ fn settings_dialog_has_six_sections_and_appearance(cx: &mut TestAppContext) {
     ] {
         assert_absent(cx, id.to_string());
     }
-    // T-04: each rail entry opens its own section.
-    for (rail_id, body_id) in [
-        ("settings-rail-probing", "settings-body-probing"),
-        ("settings-rail-updates", "settings-body-updates"),
-        ("settings-rail-engine", "settings-body-engine"),
-        ("settings-rail-maintenance", "settings-body-maintenance"),
-        ("settings-rail-shortcuts", "settings-body-shortcuts"),
-    ] {
-        cx.update(|window, cx| {
-            window.click(rail_id, cx);
-        });
-        cx.run_until_parked();
-        paint_dialog_open(cx);
-        assert!(
-            cx.update(|window, _| window.try_find(body_id).is_some()),
-            "{rail_id} opens {body_id}"
-        );
-        assert_absent(cx, "settings-body-general".to_string());
+    // B17: the rail is gone — the column replaced it.
+    for id in ["settings-rail", "settings-rail-general"] {
+        assert_absent(cx, id.to_string());
     }
-    // T-04: the Shortcuts section reads the one reference list.
+
+    // B17: the filter field sits above the column with its `N of M` badge.
+    assert_painted(cx, "settings-filter");
+    assert_painted(cx, "settings-filter-count");
+    let (filter_bottom, general_top) = cx.update(|window, _| {
+        (
+            window.find("settings-filter-band").bounds().bottom(),
+            window.find("settings-section-general").bounds().origin.y,
+        )
+    });
     assert!(
-        cx.update(|window, _| window.try_find("settings-shortcuts-list").is_some()),
-        "the Shortcuts section renders its list"
+        filter_bottom <= general_top,
+        "the filter band sits above the column: band {filter_bottom:?} vs column {general_top:?}"
+    );
+
+    // B17: the label column is one width and the longest label fits it — a
+    // label that wraps reads as two columns of label text beside the controls.
+    let longest = "Maximum kept log lines";
+    let shaped = cx.update(|window, _| {
+        let style = window.text_style();
+        let mut font = gpui_kit::font(style.font_family.clone());
+        font.weight = style.font_weight;
+        font.style = style.font_style;
+        let runs = vec![gpui_kit::TextRun {
+            len: longest.len(),
+            font,
+            color: gpui_kit::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        window
+            .text_system()
+            .shape_line(
+                longest.into(),
+                style.font_size.to_pixels(window.rem_size()),
+                &runs,
+                None,
+            )
+            .width
+    });
+    assert!(
+        shaped <= px(crate::app::settings::SETTINGS_LABEL_WIDTH),
+        "the longest label fits the label column: text {shaped:?} vs column {:?}",
+        px(crate::app::settings::SETTINGS_LABEL_WIDTH)
+    );
+
+    // B17: the filter narrows by label, and a section with nothing left takes
+    // its header with it.
+    cx.update(|window, cx| {
+        window.click("settings-filter", cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.input("cores", cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.scroll(
+            "settings-body",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(100_000.))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_eq!(
+        settings_headers_painted(cx),
+        vec!["settings-section-engine"],
+        "only the section holding the match keeps its header"
+    );
+    assert_painted(cx, "settings-engine-cores-help");
+    assert!(
+        cx.update(|window, _| window.try_find("settings-row-autostart").is_none()),
+        "the filtered-out rows leave the column"
     );
     assert_eq!(
-        crate::SHORTCUT_LINES.len(),
-        20,
-        "the reference lists every binding the app installs"
+        view.read_with(cx, |view, _| view.store.appearance()),
+        "dark",
+        "filtering writes nothing"
     );
+
+    // B17: a query that matches nothing says so instead of showing an empty
+    // column with no explanation.
+    cx.update(|window, cx| {
+        window.input("zzzz", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_painted(cx, "settings-filter-empty");
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
 }
@@ -24280,9 +24422,7 @@ fn k9_maintenance_grid_is_two_by_two(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    cx.update(|window, cx| window.click("settings-rail-maintenance", cx));
-    cx.run_until_parked();
-    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-maintenance-grid");
 
     assert_painted(cx, "settings-maintenance-grid");
     let ids = [
@@ -24347,9 +24487,7 @@ fn k9_engine_rows_are_lean_summaries(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    cx.update(|window, cx| window.click("settings-rail-engine", cx));
-    cx.run_until_parked();
-    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-engine-sing-box");
 
     for (row, name) in [
         ("settings-row-engine-sing-box", "sing-box"),
@@ -24411,8 +24549,9 @@ fn k9_settings_nav_labels_are_stable() {
     );
 }
 
-/// K9/A7-3: the body hugs its content instead of holding a fixed 514 px frame,
-/// so a short section is short and a long one grows (then scrolls).
+/// K9/A7-3 + B17: the column caps at the viewport and scrolls past it, and it
+/// hugs a short result instead of holding a fixed frame. The body never paints
+/// under the footer either way.
 #[gpui_kit::test]
 fn k9_settings_body_auto_heights(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
@@ -24424,29 +24563,45 @@ fn k9_settings_body_auto_heights(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    let general = cx.update(|window, _| window.find("settings-shell").bounds().size.height);
-    cx.update(|window, cx| window.click("settings-rail-probing", cx));
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    let probing = cx.update(|window, _| window.find("settings-shell").bounds().size.height);
+
+    // The whole spine is longer than the viewport, so the body stops at the
+    // cap instead of growing the dialog off screen.
+    let capped = cx.update(|window, _| window.find("settings-shell").bounds().size.height);
     assert!(
-        probing < px(400.),
-        "Probing no longer holds the old fixed 514 px frame: {probing:?}"
+        capped < px(520.),
+        "the column caps at the viewport instead of growing: {capped:?}"
+    );
+    let (last_header_bottom, body_bottom, footer_top) = cx.update(|window, _| {
+        (
+            window
+                .try_find("settings-section-shortcuts".to_string())
+                .map(|snapshot| snapshot.bounds().bottom())
+                .unwrap_or(px(0.)),
+            window.find("settings-body").bounds().bottom(),
+            window.find("settings-dialog-save").bounds().origin.y,
+        )
+    });
+    assert!(
+        last_header_bottom > body_bottom,
+        "the long column scrolls past the body's edge: shortcuts {last_header_bottom:?} vs body {body_bottom:?}"
     );
     assert!(
-        probing < general,
-        "a short section is shorter than General: Probing {probing:?} vs General {general:?}"
+        body_bottom <= footer_top,
+        "the body never paints under the footer: body {body_bottom:?} vs footer {footer_top:?}"
     );
 
-    cx.update(|window, cx| window.click("settings-rail-shortcuts", cx));
+    // A filter that leaves one row shrinks the dialog instead of holding the
+    // capped frame — the body hugs its content.
+    cx.update(|window, cx| window.click("settings-filter", cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.input("log cap", cx));
     cx.run_until_parked();
     paint_dialog_open(cx);
-    let shortcuts = cx.update(|window, _| window.find("settings-shell").bounds().size.height);
+    let short = cx.update(|window, _| window.find("settings-shell").bounds().size.height);
     assert!(
-        probing < shortcuts,
-        "the body grows with its content: Probing {probing:?} vs Shortcuts {shortcuts:?}"
+        short < capped,
+        "a filtered column hugs its content: {short:?} vs capped {capped:?}"
     );
-
     let (body_bottom, footer_top) = cx.update(|window, _| {
         (
             window.find("settings-body").bounds().bottom(),
@@ -24455,7 +24610,7 @@ fn k9_settings_body_auto_heights(cx: &mut TestAppContext) {
     });
     assert!(
         body_bottom <= footer_top,
-        "the body never paints under the footer: body {body_bottom:?} vs footer {footer_top:?}"
+        "the short body still clears the footer: body {body_bottom:?} vs footer {footer_top:?}"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
 }
@@ -24519,8 +24674,8 @@ fn routing_menu_links_into_the_presets_manager(cx: &mut TestAppContext) {
         "Routing settings opens the Settings dialog"
     );
     assert!(
-        cx.update(|window, _| window.try_find("settings-rail-general").is_some()),
-        "the dialog carries the section rail"
+        cx.update(|window, _| window.try_find("settings-section-general").is_some()),
+        "the dialog carries the settings spine"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -26795,14 +26950,7 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
             "settings dialog renders {id}"
         );
     }
-    cx.update(|window, cx| {
-        window.click("settings-rail-engine", cx);
-    });
-    cx.run_until_parked();
-    cx.update(|window, cx| {
-        window.draw(cx).clear(cx);
-        window.render_frame(cx);
-    });
+    // B17: one column — the Engine rows are in the same tree as General's.
     for id in [
         "settings-row-auto-restart",
         "settings-auto-restart-switch",
@@ -28723,11 +28871,9 @@ fn f04_settings_offer_the_core_guide(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    cx.update(|window, cx| {
-        window.click("settings-rail-engine", cx);
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
+    // B17: the Engine section sits below the fold of the one column, so the
+    // test scrolls to it exactly as a reader would.
+    scroll_settings_into_view(cx, "settings-engine-cores-help");
     assert_painted(cx, "settings-engine-cores-help");
     cx.update(|window, cx| {
         window.click("settings-engine-cores-help", cx);
@@ -30335,26 +30481,32 @@ fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
         });
         paint_dialog_open(cx);
 
-        // T-04: the rail reads top to bottom and the body carries one section.
-        let (general_top, probing_top) = cx.update(|window, _| {
-            (
+        // B17: one column — the section headers read top to bottom in the
+        // fixed order, and every section is present in that one column.
+        let tops: Vec<f32> = cx.update(|window, _| {
+            [
+                "settings-section-general",
+                "settings-section-probing",
+                "settings-section-updates",
+                "settings-section-engine",
+                "settings-section-maintenance",
+                "settings-section-shortcuts",
+            ]
+            .iter()
+            .map(|id| {
                 window
-                    .try_find("settings-rail-general".to_string())
-                    .expect("general renders")
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
                     .bounds()
                     .origin
-                    .y,
-                window
-                    .try_find("settings-rail-probing".to_string())
-                    .expect("probing renders")
-                    .bounds()
-                    .origin
-                    .y,
-            )
+                    .y
+                    .as_f32()
+            })
+            .collect()
         });
         assert!(
-            general_top < probing_top,
-            "General keeps its slot above Probing"
+            tops.windows(2).all(|pair| pair[0] < pair[1]),
+            "the spine keeps its order: {tops:?}"
         );
         assert!(
             cx.update(|window, _| window.try_find("settings-ticks".to_string()).is_none()),
@@ -30362,14 +30514,7 @@ fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
         );
 
         // Maintenance is the longest section; its last row must clear the
-        // footer button in every frame.
-        cx.update(|window, cx| {
-            window.click("settings-rail-maintenance", cx);
-        });
-        cx.run_until_parked();
-        paint_dialog_open(cx);
-        // Maintenance is the longest section; its tail scrolls into view and
-        // must still clear the footer in every frame.
+        // footer button in every frame, reached by scrolling the one column.
         cx.update(|window, cx| {
             window.scroll(
                 "settings-body",
@@ -30379,11 +30524,13 @@ fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
         });
         cx.run_until_parked();
         paint_dialog_open(cx);
-        assert_painted(cx, "settings-reset-library");
+        // B17: the column's tail is the shortcuts list — the last thing the one
+        // scroll reaches.
+        assert_painted(cx, "settings-shortcuts-list");
         let (tail_bottom, body_bottom, footer_top) = cx.update(|window, _| {
             (
                 window
-                    .try_find("settings-reset-library".to_string())
+                    .try_find("settings-shortcuts-list".to_string())
                     .expect("tail renders")
                     .bounds()
                     .bottom(),
@@ -32784,10 +32931,6 @@ fn t04_settings_dialog_geometry_holds_the_feed_url(cx: &mut TestAppContext) {
     });
     assert!(shaped > px(400.), "the feed URL really is long: {shaped:?}");
 
-    cx.update(|window, cx| {
-        window.click("settings-rail-updates", cx);
-    });
-    cx.run_until_parked();
     paint_dialog_open(cx);
 
     let dialog_width = cx
@@ -33021,11 +33164,8 @@ fn t83_hostname_rejected_in_list_editor(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    // T-04: the address list lives in the Engine section.
-    cx.update(|window, cx| {
-        window.click("settings-rail-engine", cx);
-    });
-    cx.run_until_parked();
+    // T-04/B17: the address list lives in the Engine section, in the one
+    // column.
     paint_dialog_open(cx);
     for id in [
         "settings-addresses-note",
