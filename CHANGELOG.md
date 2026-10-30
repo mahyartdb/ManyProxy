@@ -20,9 +20,10 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - The Add/Edit dialog follows Throne grammar: Common fields, one collapsed Advanced Settings expander, then the protocol-specific section. The raw JSON editor is gone.
 - Routing presets have one creation path: three grammar boxes with inline placeholders plus an `Add remote ruleset…` row. The Rules JSON textarea is gone.
 - The Tools menu is 11 grouped rows and the row context menu is 7 core actions plus `More ▾`. The unreachable speedtest and resolve cluster is deleted end to end. Settings opens straight from the toolbar.
-- The settings modal reads as six named sections with one Cancel/Save footer, an auto-height body, 2×2 maintenance buttons, and a click-time confirm for Reset library. The shortcuts reference lists every binding.
+- The settings modal is one column: a filter field with an `N of M` badge, then six sections in fixed order, each under a caps header with a hairline under it. The filter matches a row's label or id and hides a section whose rows all miss. One Cancel/Save footer, an auto-height body that scrolls past the viewport, 2×2 maintenance buttons, and a click-time confirm for Reset library. The shortcuts reference lists every binding.
 - App dialogs no longer ship an invisible close hit-target. Every dialog keeps a named footer and Esc.
-- The `main.rs` monolith is split across `app/`, `forms/`, `pickers/`, and `library/` modules. The boot-path scan pins nine functions.
+- The `main.rs` monolith is split across `app/`, `forms/`, `pickers/`, and `library/` modules. The boot-path scan pins nine functions. The crate is a workspace: `manyproxy-core` holds the logic with no gpui dependency, `manyproxy-ui` holds the UI, and the root binary is a thin shell around `manyproxy_ui::run()`.
+- `DESIGN.md` describes the theme that is in effect — every color is a named gpui-kit token, and CI fails on a color literal outside the QR dialog's deliberate black on white.
 
 ### Fixed
 
