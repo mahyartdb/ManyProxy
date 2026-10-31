@@ -130,7 +130,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let close_view = cx.entity();
-        div()
+        let drawer = div()
             .id("inspector-drawer")
             .occlude()
             .test_support()
@@ -167,8 +167,11 @@ impl AppView {
                                 });
                             }),
                     ),
-            )
-            .into_any_element()
+            );
+        // B18: the panel eases in where it stands. The fade rides the drawer's
+        // own element, so the overlay keeps `.absolute()` and the list's
+        // reserved gutter never re-measures.
+        Self::motion_fade(drawer, "inspector-drawer-enter", cx).into_any_element()
     }
 
     /// F19: picking a row opens the inspector again — it is the only way back

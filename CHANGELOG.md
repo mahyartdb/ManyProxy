@@ -6,6 +6,7 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Added
 
+- The row you just started or stopped shows a 150 ms accent on its leading edge, then settles. Nothing moves: the row height, the pitch, and the painted row count are unchanged.
 - One-line library rows with a right-hand inspector drawer: one 5-tab switcher (Details, Health, Logs, Connections, Traffic), a single-scroll Details tab with merged endpoints and one copy action, and a Start/Stop/Test kebab. The tab bar sizes to its labels at the default window width.
 - Filter row `Search · Group · N of M`. Clicking a row's status lamp filters by that endpoint state. The eight-way status dropdown is gone; Enabled and Disabled live under the Group menu.
 - Checked-set bulk bar: `N checked (of M)` with Start, Stop, and `More ▾`. Checked rows carry a 3px accent bar and a filled chip. `Copy proxies` copies the running endpoints as one sheet, and bulk verbs route through the batch engine ops.
@@ -16,6 +17,8 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - A standing not-writable banner when the data folder refuses a write, with re-probes on the tick and after a failed save.
 
 ### Changed
+
+- Motion is one vocabulary: panels fade in over 150 ms with an ease-out curve instead of appearing flat, and one duration, one easing, and the reduced-motion switch govern all of it.
 
 - The Add/Edit dialog follows Throne grammar: Common fields, one collapsed Advanced Settings expander, then the protocol-specific section. The raw JSON editor is gone.
 - Routing presets have one creation path: three grammar boxes with inline placeholders plus an `Add remote ruleset…` row. The Rules JSON textarea is gone.

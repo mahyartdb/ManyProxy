@@ -18251,7 +18251,16 @@ fn t09_motion_fast_budget_capped() {
             AppView::MOTION_FAST_MS <= 200,
             "Ticket 09 enter fades stay within the 200ms budget"
         );
+        assert!(
+            AppView::motion_accent_halves_ms() * 2 <= 200,
+            "B18: the row accent's two halves stay inside the same budget"
+        );
     }
+    assert_eq!(
+        2 * AppView::motion_accent_halves_ms(),
+        AppView::MOTION_FAST_MS,
+        "one budget: the accent spends it, it does not add to it"
+    );
 }
 
 #[gpui_kit::test]
@@ -18296,6 +18305,158 @@ fn t09_start_busy_copy_names_starting() {
         start_busy_message(),
         "Starting… already in progress",
         "second Start explains itself with the Starting copy"
+    );
+}
+
+/// B18: a running set that gains exactly one id is a single-row start, and that
+/// row wears the accent. Under reduced motion the strip is not painted at all —
+/// not just handed a zero duration that would paint its end state.
+#[gpui_kit::test]
+fn b18_row_accent_is_off_under_reduce_motion(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let started = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let settled_quiet = store
+        .add(row19_seed("Home", "b.example.com", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    let running = |cx: &mut VisualTestContext, ids: Vec<String>| {
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().set_running(ids);
+                    list_cx.notify();
+                });
+            });
+        });
+    };
+    let finds = |cx: &mut VisualTestContext, id: String| {
+        cx.update(|window, _| window.try_find(id).is_some())
+    };
+
+    running(cx, vec![started.id.clone()]);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        finds(cx, format!("row-accent-{}", started.id)),
+        "the settled row carries the accent with motion on"
+    );
+
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    running(cx, vec![started.id.clone(), settled_quiet.id.clone()]);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        finds(cx, format!("row-card-{}", settled_quiet.id)),
+        "the row itself still paints"
+    );
+    assert!(
+        !finds(cx, format!("row-accent-{}", settled_quiet.id)),
+        "reduced motion paints no accent strip at all"
+    );
+}
+
+/// B18: the accent is decoration on the card's own leading edge, so it may
+/// never move the geometry: every row keeps CARD_HEIGHT, the pitch stays
+/// ROW_PITCH, and the list paints the same rows before and after it fires.
+#[gpui_kit::test]
+fn b18_row_accent_keeps_row_pitch_and_count(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let rows: Vec<String> = (0..3)
+        .map(|i| {
+            store
+                .add(row19_seed(
+                    &format!("node-{i}"),
+                    &format!("h{i}.example.com"),
+                    &format!("{}", 11_000 + i),
+                ))
+                .expect("seed works")
+                .id
+        })
+        .collect();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // (origin.y, height) per painted card, in row order.
+    let cards = |cx: &mut VisualTestContext, rows: &[String]| {
+        cx.update(|window, _| {
+            rows.iter()
+                .filter_map(|id| window.try_find(format!("row-card-{id}")))
+                .map(|snapshot| {
+                    let bounds = snapshot.bounds();
+                    (bounds.origin.y.as_f32(), bounds.size.height.as_f32())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let quiet = cards(cx, &rows);
+    assert_eq!(
+        quiet.len(),
+        rows.len(),
+        "every row paints before the accent"
+    );
+    assert!(
+        quiet
+            .iter()
+            .all(|(_, height)| *height == crate::RowMetrics::CARD_HEIGHT),
+        "quiet rows keep their card height: {quiet:?}"
+    );
+
+    // The engine reports one new running id: the single-row start settles.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().set_running(vec![rows[1].clone()]);
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let accented = cards(cx, &rows);
+    assert_eq!(
+        accented, quiet,
+        "the accent moves no row: same count, same origins, same heights"
+    );
+    assert!(
+        accented
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 == crate::RowMetrics::ROW_PITCH),
+        "the pitch is untouched: {accented:?}"
+    );
+    let (card, accent) = cx.update(|window, _| {
+        (
+            window
+                .try_find(format!("row-card-{}", rows[1]))
+                .expect("the settled row paints")
+                .bounds(),
+            window
+                .try_find(format!("row-accent-{}", rows[1]))
+                .expect("the settled row wears the accent")
+                .bounds(),
+        )
+    });
+    assert_eq!(
+        accent.size.width,
+        px(3.),
+        "the accent is the card's own leading edge"
+    );
+    assert_eq!(
+        accent.origin.x - card.origin.x,
+        px(1.),
+        "the strip rides the card's inside edge, past its hairline"
+    );
+    assert_eq!(
+        card.size.height - accent.size.height,
+        px(2.),
+        "the strip fills the card inside its hairline, not the row"
     );
 }
 

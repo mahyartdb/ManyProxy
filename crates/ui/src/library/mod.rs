@@ -95,6 +95,13 @@ pub(crate) struct LibraryDelegate {
     /// first, then the persisted extras. Pushed from the store on reload, so a
     /// Settings edit reaches every picker on the next paint.
     pub(crate) bind_hosts: Vec<String>,
+
+    /// B18: the one row whose engine state just settled, with a nonce that
+    /// makes a second settle run the accent again instead of reusing the
+    /// finished one. Only a single-id change sets it — bulk ops and the boot
+    /// restore move several rows at once and stay still.
+    pub(crate) settled: Option<(String, u64)>,
+    settle_seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +202,8 @@ impl LibraryDelegate {
                 .iter()
                 .map(|host| host.to_string())
                 .collect(),
+            settled: None,
+            settle_seq: 0,
         }
     }
 
@@ -728,9 +737,43 @@ impl LibraryDelegate {
     }
 
     pub(crate) fn set_running(&mut self, ids: Vec<String>) {
-        self.running = ids.into_iter().collect();
+        let next: HashSet<String> = ids.into_iter().collect();
+        // B18: one id gained or lost is a single-row start or stop — the row
+        // the user just acted on, and the only row the accent marks. Any other
+        // shape (a tick that changes nothing, or a bulk op that moves several)
+        // retires the marker instead of re-running it.
+        let changed: Vec<String> = next.symmetric_difference(&self.running).cloned().collect();
+        self.settled = match changed.as_slice() {
+            [id] => {
+                self.settle_seq = self.settle_seq.wrapping_add(1);
+                Some((id.clone(), self.settle_seq))
+            }
+            _ => None,
+        };
+        self.running = next;
         self.refresh_search_words();
         self.apply_filter();
+    }
+
+    /// B18: the accent strip for the row the engine just started or stopped —
+    /// the same 3px leading edge the checked set uses, so it costs the row no
+    /// geometry at all. `None` for every other row, and for every row under
+    /// reduced motion.
+    fn row_accent(&self, row_id: &str, cx: &App) -> Option<impl IntoElement> {
+        let (_, seq) = self.settled.as_ref().filter(|(id, _)| id == row_id)?;
+        AppView::motion_accent(
+            div()
+                .id(format!("row-accent-{row_id}"))
+                .test_support()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(3.))
+                .bg(cx.theme().accent),
+            ("row-accent", *seq as usize),
+            cx,
+        )
     }
 
     pub(crate) fn set_crashed(&mut self, ids: Vec<String>) {
@@ -1028,6 +1071,10 @@ impl ListDelegate for LibraryDelegate {
                     .w(px(3.))
                     .bg(cx.theme().list_active_border),
             );
+        } else if let Some(accent) = self.row_accent(&row_id, cx) {
+            // B18: one accent blink on the row whose engine state just settled.
+            // Checked wins the edge — one grammar per row.
+            card = card.child(accent);
         }
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));

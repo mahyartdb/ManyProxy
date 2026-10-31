@@ -2225,6 +2225,10 @@ impl AppView {
             .into_any_element()
     }
 
+    // B18: the whole motion vocabulary lives below this line — one duration,
+    // one easing, two primitives. Nothing loops, nothing exceeds the budget,
+    // and reduced motion turns all of it off.
+
     pub(crate) const MOTION_FAST_MS: u64 = 150;
 
     /// How long a `Copied!` transient marker stays painted after a cell click.
@@ -2238,18 +2242,64 @@ impl AppView {
         }
     }
 
+    /// Quick off the mark, soft landing. No overshoot: nothing here bounces.
+    pub(crate) fn motion_ease_out() -> impl Fn(f32) -> f32 + 'static {
+        ease_out_quint()
+    }
+
+    /// The entry fade, applied to an element where it stands. The element keeps
+    /// its own layout, so an absolutely positioned surface (the inspector
+    /// drawer) does not reflow the list behind it and a padded bar keeps its
+    /// padding.
+    pub(crate) fn motion_fade<E>(element: E, id: impl Into<ElementId>, cx: &App) -> impl IntoElement
+    where
+        E: Styled + IntoElement + 'static,
+    {
+        element.with_animation(
+            id,
+            Animation::new(Self::motion_fast_duration(cx)).with_easing(Self::motion_ease_out()),
+            |this, delta| this.opacity(delta),
+        )
+    }
+
     pub(crate) fn motion_enter(
         child: impl IntoElement + 'static,
         id: impl Into<ElementId>,
         cx: &App,
     ) -> impl IntoElement {
-        div()
-            .with_animation(
-                id,
-                Animation::new(Self::motion_fast_duration(cx)),
-                |this, delta| this.opacity(delta),
-            )
-            .child(child)
+        Self::motion_fade(div().child(child), id, cx)
+    }
+
+    /// The accent spends half the budget going up and half coming back down —
+    /// one blink, never a loop, and never longer than the entry fade.
+    pub(crate) const fn motion_accent_halves_ms() -> u64 {
+        Self::MOTION_FAST_MS / 2
+    }
+
+    /// The accent that marks the one row whose engine state just settled.
+    /// Reduced motion returns `None`, so the caller paints neither the strip
+    /// nor its animation state.
+    pub(crate) fn motion_accent<E>(
+        accent: E,
+        id: impl Into<ElementId>,
+        cx: &App,
+    ) -> Option<impl IntoElement>
+    where
+        E: Styled + IntoElement + 'static,
+    {
+        let duration = Self::motion_fast_duration(cx);
+        if duration.is_zero() {
+            return None;
+        }
+        let half = Duration::from_millis(Self::motion_accent_halves_ms());
+        Some(accent.with_animations(
+            id,
+            vec![
+                Animation::new(half).with_easing(Self::motion_ease_out()),
+                Animation::new(half),
+            ],
+            |this, phase, delta| this.opacity(if phase == 0 { delta } else { 1. - delta }),
+        ))
     }
 
     /// F19: picking a tab is a way in — the shortcut and the tab strip both
