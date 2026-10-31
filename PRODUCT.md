@@ -65,7 +65,7 @@ Name and window title: ManyProxy (single branding seam, `APP_TITLE`). Voice: hon
 ## Evidence on Hand
 
 - `README.md`, including the claim → code map table (audit anchor for toolbar, defaults, formats, toasts, subscriptions, endpoints, health, export, missing-binary/LAN/no-mutation behavior).
-- Release-gate scenarios (live egress, snapshot diff, no residue) pinned by hermetic tests such as `session_fingerprint_roundtrip_proves_no_residue` in `src/tests.rs`.
+- Release-gate scenarios (live egress, snapshot diff, no residue) pinned by hermetic tests such as `session_fingerprint_roundtrip_proves_no_residue` in `crates/ui/src/tests.rs`.
 - Hermetic test suite including `assert_no_system_mutation` scans and import-grammar coverage.
 - Absences future work must not fabricate: no testimonials, customers, benchmarks, pricing, or licensing claims exist.
 

@@ -86,6 +86,12 @@ Architecture and its constraints: `docs/internals/overview.md`. Glossary: `docs/
 
 ## Where code lives
 
+- `crates/core/src/` — `manyproxy-core`: store, engine, health, import, secret,
+  preset, update, and the pure row logic. No GUI dependency, enforced by Cargo.
+- `crates/ui/src/` — `manyproxy-ui`: everything a user sees, `AppView`, the
+  list delegate, and the test suite.
+- `src/main.rs` — the bin: crash hook, single-instance claim, `manyproxy_ui::run()`.
+
 ## Taste
 
 - Complexity belongs at the adapter boundary. Orchestration stays pure, UI stays dumb.

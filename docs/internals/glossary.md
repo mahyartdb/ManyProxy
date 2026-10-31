@@ -18,7 +18,8 @@ spelunking the source.
   `EngineController`; the app never links one.
 - **intake** — the open-with argv of a launch (`OpenWithKind::BareHttp` or
   `Batch`), handled by `AppView::handle_launch_intake`.
-- **preset** — a bundled multi-config template or rule set under `src/preset/`.
+- **preset** — a bundled multi-config template or rule set under
+  `crates/core/src/preset/`.
 - **subscription** — a remote config source that refreshes into rows.
 - **probe / health** — one test outcome for a row (kind and latency) shown by
   the status lamp and the health column.
