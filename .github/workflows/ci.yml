@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, ui-audit-fixes]
   pull_request:
+    branches: [master]
 
+# Windows only: the app links winreg/tray-icon and build.rs embeds Windows
+# resources. A Linux runner would need the full GPUI system dependency set
+# (x11/wayland/vulkan) before it could compile anything, so the matrix stays
+# cheap instead of pretending to cover it.
 jobs:
   check:
     runs-on: windows-latest
@@ -15,6 +20,29 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Doc paths
+        shell: pwsh
+        run: |
+          $missing = Select-String -Path AGENTS.md,README.md -Pattern '`([^`]+\.md)`' -AllMatches |
+            ForEach-Object { $_.Matches.Groups[1].Value } |
+            Sort-Object -Unique |
+            Where-Object { -not (Test-Path $_) }
+          if ($missing) { Write-Error "Missing doc paths: $missing"; exit 1 }
+      # DESIGN.md promises app code carries no color literals: every surface,
+      # rim and state color reads a gpui-kit theme token. dialog/qr.rs is the
+      # documented exception (a scanner needs real black on real white).
+      - name: Color literals
+        shell: pwsh
+        run: |
+          $pattern = '#[0-9A-Fa-f]{6}\b|\b0x[0-9A-Fa-f]{6}\b|\b0x[0-9A-Fa-f]{8}\b'
+          $hits = Get-ChildItem crates/ui/src,src -Recurse -Filter *.rs |
+            Where-Object { $_.Name -ne 'tests.rs' -and ($_.FullName -replace '\\', '/') -notmatch 'dialog/qr\.rs$' } |
+            Select-String -Pattern $pattern
+          if ($hits) {
+            $hits | ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            Write-Error 'Color literals belong in the theme; use a gpui-kit token.'
+            exit 1
+          }
       - name: Format
         run: cargo fmt --check
       - name: Clippy

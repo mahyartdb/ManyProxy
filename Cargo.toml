@@ -3,23 +3,13 @@ name = "manyproxy"
 version = "0.0.1"
 edition = "2021"
 
-[dependencies]
-gpui-kit = "0.6"
-rusqlite = { version = "0.40", features = ["bundled"] }
-base64 = "0.22"
-serde_json = "1"
-futures = "0.3"
-tray-icon = "0.25"
-winreg = "0.55"
-raw-window-handle = "0.6"
-getrandom = "0.4"
-zeroize = "1.9"
-regex = "1"
-qrcodegen = "1.8.0"
+[workspace]
+members = ["crates/core", "crates/ui"]
+default-members = [".", "crates/core", "crates/ui"]
 
-[dev-dependencies]
-gpui-kit = { version = "0.6", features = ["test-support"] }
+[dependencies]
+manyproxy-core = { path = "crates/core" }
+manyproxy-ui = { path = "crates/ui" }
 
 [build-dependencies]
 embed-resource = "3"
-png = "0.18"

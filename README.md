@@ -14,10 +14,10 @@ changed.
 ## Supported platform
 
 - **Windows 10/11, x64 (windows-amd64)** — the only supported target today.
-- `windows-arm64` is drafted behind a gated release row (ticket T-04); it is not
-  supported yet.
-- Linux and macOS are tracked as an aspiration only (`EPIC-linux-macos-port.md`),
-  not supported.
+- `windows-arm64` is drafted behind a gated release row (see
+  `.github/workflows/release.yml`); it is not supported yet.
+- Linux and macOS are tracked as an aspiration only (issue
+  [#6](https://github.com/mahyartdb/ManyProxy/issues/6)), not supported.
 
 There is no web, mobile, or CLI edition — only the native desktop app.
 
@@ -74,10 +74,12 @@ folder is never read or migrated. The `MANYPROXY_DB`, `MANYPROXY_EXPORT` and
    file dropped on the window, clipboard text, or a WireGuard `.conf`.
 2. Leave **Port** blank to auto-assign from the primary range `10801–10999`
    (spillover `18081–18380`), or type a port.
-3. Select the row and press **Start** (`F5`), or **Start all** for every enabled
+3. Select the row and press **Start** (`F5`), or **Start all** to start every
    row. Starting regenerates one combined engine config, runs the engine's own
    `check`, then (re)starts the sidecar. Stop with **Stop** (`Shift-F5`) or
-   **Stop all**; stopping clears the enabled flag.
+   **Stop all**; stopping clears the row's restore-on-launch flag. That flag
+   (row menu → **Restore on launch**) decides which rows the next launch
+   reopens — Start all ignores it and starts every row.
 4. **Copy URLs** (`Ctrl-U`) copies both forms for the row:
    `socks5://127.0.0.1:<port>` and `http://127.0.0.1:<port>`. Point one app at
    one endpoint — apps with separate SOCKS5/HTTP fields take the matching line.
@@ -106,12 +108,16 @@ Start all / Stop all / Show / Quit.
 | Focus search | `Ctrl-F` |
 | Inspector details | `Ctrl-1` |
 | Inspector health | `Ctrl-2` |
-| Inspector presets | `Ctrl-3` |
+| Inspector details | `Ctrl-3` |
+| Inspector logs | `Ctrl-4` |
+| Inspector links | `Ctrl-5` |
+| Inspector traffic | `Ctrl-6` |
 | Uncheck all | `Esc` |
 | Copy URLs | `Ctrl-U` |
 | Command palette | `Ctrl-K` |
+| Update the group in focus | `Ctrl-R` |
 
-The same list appears in the About dialog and Settings → Hotkey, and these
+The same list appears in the About dialog and Settings → Shortcuts, and these
 key-bound actions also have toolbar or menu entries and `Ctrl-K` palette twins.
 
 ## What ManyProxy does not do
@@ -212,12 +218,12 @@ them from `.github/workflows/live.yml` only.
 
 | README claim                         | Proved by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Toolbar buttons + dialogs + footers  | `Button::new("add-config"/"import-config"/"import-clipboard"/"export-library"/"subscriptions"/"engine-start-all"/"engine-stop-all"/"health-test-all"/"about-dialog"/"edit-config"/"delete-config"/"copy-urls"/"engine-start"/"engine-stop"/"health-test"/"health-ping"/"logs-open")` with shortcut-hint labels (`Add (Ctrl-N)`, `Import (Ctrl-O)`, `Start selected (F5)`, `Stop selected (Shift-F5)`, `Test selected (Ctrl-T)`, ticket 33), `open_add_dialog` / `open_edit_dialog` / `open_import_dialog` / `open_export_dialog` / `open_logs_dialog` / `open_about_dialog` / `subscription_row`, `dialog_footer` (`src/main.rs`); `dialog_footers_audit_every_plain_dialog` (ticket 18) |
-| Defaults + auto port                 | `DEFAULT_BIND/PROTOCOL/GROUP` (`src/store.rs:6/8/10`), `AUTO_PORT_START/END = 10801–10999` + spillover `AUTO_PORT_SPILL_START/END = 18081–18380` (`src/store.rs:42-46`), `parse_port_field("")` = auto, `auto_ports_are_unique`                                                                                                                                                                                                                                                                                                                                             |
-| Accepted formats                     | `src/import.rs` parsers + tickets 03/07/08/15 tests (239+ passing incl. `paste_and_drop_agree`, `conf_holding_json_or_links_sniffed`, `pasted_clash_yaml_imports`, `bom_prefixed_json_parses`)                                                                                                                                                                                                                                                                                                                 |
-| Toasts honest                        | `config_added/updated/removed_message`, `start_all/stop_all/already_stopped_message`, `export_count_message`, `coalesced_refresh_message` (`src/main.rs:1533/1543/1680/1705/1715/1790`); ticket 17 UI tests                                                                                                                                                                                                                                                                                                                              |
+| Toolbar buttons + dialogs + footers  | `Button::new("add-config"/"import-config"/"import-clipboard"/"export-library"/"subscriptions"/"engine-start-all"/"engine-stop-all"/"health-test-all"/"about-dialog"/"edit-config"/"delete-config"/"copy-urls"/"engine-start"/"engine-stop"/"health-test"/"health-ping"/"logs-open")` keys live in the control's tooltip and in Settings → Shortcuts, never inside the label (`toolbar_*_tooltip` tests, ticket 33), `open_add_dialog` / `open_edit_dialog` / `open_import_dialog` / `open_export_dialog` / `open_logs_dialog` / `open_about_dialog` / `subscription_row`, `dialog_footer`; `dialog_footers_audit_every_plain_dialog` (ticket 18) |
+| Defaults + auto port                 | `DEFAULT_BIND/PROTOCOL/GROUP` and `AUTO_PORT_START/END = 10801–10999` + spillover `AUTO_PORT_SPILL_START/END = 18081–18380` (`crates/core/src/store.rs`), `parse_port_field("")` = auto, `auto_ports_are_unique`                                                                                                                                                                                                                                                                                                                                             |
+| Accepted formats                     | `crates/core/src/import.rs` parsers + tickets 03/07/08/15 tests (239+ passing incl. `paste_and_drop_agree`, `conf_file_holding_json_or_links_is_sniffed`, `pasted_clash_yaml_imports`, `bom_prefixed_json_parses`)                                                                                                                                                                                                                                                                                                                 |
+| Toasts honest                        | `row_action_message("Added"/"Updated")`, `removed_message`, `start_all_message` / `stop_all_message` / `already_stopped_message`, `export_count_message`, `coalesced_refresh_message` (`crates/ui/src/text.rs`); ticket 17 UI tests                                                                                                                                                                                                                                                                                                                              |
 | Subscriptions/auto-refresh           | `fetch_subscription_body`, `redact_subscription_url`, `due_for_refresh` + `DEFAULT_AUTO_REFRESH_SECS`, `DUE_SUBSCRIPTION_TICK_SECS`, `refresh_with_body` tests                                                                                                                                                                                                                                                                                                                                                 |
-| Endpoints/copy URLs                  | `proxy_urls` (`src/store.rs:468`), `copy_selected_urls` + `copy_urls_carry_binds_not_secrets`                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Health/search                        | `DEFAULT_TEST_URL`, `test_all_health` / `test_selected_health` / `ping_selected`, `library_row_matches`, `health_status_text`                                                                                                                                                                                                                                                                                                                                                                                  |
+| Endpoints/copy URLs                  | `proxy_urls` (`crates/core/src/store.rs`), `copy_selected_urls` + `copy_urls_carry_binds_not_secrets`                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Health/search                        | `DEFAULT_TEST_URL`, `test_all_health` / `test_selected_health` / `ping_row`, `library_row_matches`, `health_status_text`                                                                                                                                                                                                                                                                                                                                                                                  |
 | Export                               | `export_warning_text` verbatim + `export_warning_names_secret_classes`, `default_export_path`, `commit_export`, `export_preview_description`                                                                                                                                                                                                                                                                                                                                                                   |
 | Missing binaries / LAN / no-mutation | `EngineError::MissingBinary` + `missing_binaries_state_never_downloads`, `requires_lan_confirm` + `LAN_CONFIRM_TITLE` + `lan_hint_for_bind`, `assert_no_system_mutation` + `session_fingerprint_roundtrip_proves_no_residue`                                                                                                                                                                                                                                                                                   |
