@@ -19,12 +19,13 @@ use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
 };
+use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
         protocol: "vless".to_string(),
-        params: String::new(),
+        params: Secret::default(),
         group: String::new(),
         bind_ip: String::new(),
         port: String::new(),
@@ -1224,7 +1225,8 @@ fn t02_ws_to_tcp_hides_and_restores(cx: &mut TestAppContext) {
             params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"network\":\"ws\",\
                     \"path\":\"/w\",\"host\":\"h.example.com\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -1359,7 +1361,11 @@ fn t02_reality_vision_prefill_round_trips(cx: &mut TestAppContext) {
     assert!(!pbk.is_empty(), "pbk prefills");
     assert_eq!(sni, "a.example.com", "sni prefills");
     assert_eq!(fp, "chrome", "fp prefills");
-    assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
+    assert_eq!(
+        folded,
+        parsed.params.expose(),
+        "untouched refold is byte-identical"
+    );
 }
 
 #[gpui_kit::test]
@@ -1515,7 +1521,7 @@ fn t03_vmess_page_paints(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "VmessRow".to_string(),
             protocol: "vmess".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -1588,7 +1594,7 @@ fn t03_vmess_page_paints(cx: &mut TestAppContext) {
         id: "t03-v".to_string(),
         name: "V".to_string(),
         protocol: "vmess".to_string(),
-        params: params.to_string(),
+        params: params.to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -1644,7 +1650,8 @@ fn t03_trojan_page_paints(cx: &mut TestAppContext) {
             params: "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
                     \"password\":\"secret\",\"security\":\"tls\",\"sni\":\"a.example.com\",\
                     \"network\":\"ws\",\"path\":\"/w\",\"mux\":\"on\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -1704,7 +1711,7 @@ fn t03_ss_page_paints_mux_only(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "SsRow".to_string(),
             protocol: "shadowsocks".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -1791,7 +1798,7 @@ fn t03_ss_page_paints_mux_only(cx: &mut TestAppContext) {
         id: "t03-s".to_string(),
         name: "S".to_string(),
         protocol: "shadowsocks".to_string(),
-        params: params.to_string(),
+        params: params.to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -1846,7 +1853,8 @@ fn t03_ss_plugin_note_paints_on_pick(cx: &mut TestAppContext) {
             protocol: "shadowsocks".to_string(),
             params: "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
                     \"method\":\"aes-128-gcm\",\"password\":\"pw\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -1957,7 +1965,11 @@ fn t03_legacy_vmess_prefill_round_trips(cx: &mut TestAppContext) {
     assert_eq!(cipher, "auto", "legacy cipher prefills");
     assert!(enable, "legacy boolean enables TLS");
     assert_eq!(sni, "a.example.com", "sni prefills");
-    assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
+    assert_eq!(
+        folded,
+        parsed.params.expose(),
+        "untouched refold is byte-identical"
+    );
 }
 
 #[gpui_kit::test]
@@ -1982,7 +1994,7 @@ fn t03_trojan_ss_prefill_round_trips(cx: &mut TestAppContext) {
             id: id.to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -2124,7 +2136,7 @@ fn t04_wireguard_page_paints(cx: &mut TestAppContext) {
                 protocol: "wireguard".to_string(),
                 params: "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
                     \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"address\":\"10.0.0.2/32\"}"
-                    .to_string(),
+                    .to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -2222,7 +2234,7 @@ fn t04_amneziawg_page_paints_and_version_gates(cx: &mut TestAppContext) {
                 params: "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
                     \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\
                     \"awg_version\":\"2.0\",\"jc\":\"5\",\"s1\":\"20\",\"h1\":\"1-100\",\"i1\":\"x\"}"
-                    .to_string(),
+                    .to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -2337,7 +2349,7 @@ fn t04_amneziawg_page_paints_and_version_gates(cx: &mut TestAppContext) {
         id: "t04-a".to_string(),
         name: "A".to_string(),
         protocol: "amneziawg".to_string(),
-        params: "{\"type\":\"amneziawg\"}".to_string(),
+        params: "{\"type\":\"amneziawg\"}".to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -2384,7 +2396,7 @@ fn t04_awg_version_toggle_hide_preserves(cx: &mut TestAppContext) {
         id: "t04-h".to_string(),
         name: "H".to_string(),
         protocol: "amneziawg".to_string(),
-        params: params.to_string(),
+        params: params.to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -2500,7 +2512,8 @@ fn t04_conf_prefill_round_trips(cx: &mut TestAppContext) {
             })
         });
         assert_eq!(
-            folded, params,
+            folded,
+            params.expose(),
             "{protocol} untouched refold is byte-identical"
         );
         if protocol == "wireguard" {
@@ -2824,7 +2837,7 @@ fn t05_hysteria_toggle_hide_preserves(cx: &mut TestAppContext) {
         id: "t05-h".to_string(),
         name: "H".to_string(),
         protocol: "hysteria".to_string(),
-        params: params.to_string(),
+        params: params.to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -2950,7 +2963,7 @@ fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "TuicRow".to_string(),
             protocol: "tuic".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -3024,7 +3037,7 @@ fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
         id: "t05-t".to_string(),
         name: "T".to_string(),
         protocol: "tuic".to_string(),
-        params: params.to_string(),
+        params: params.to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -3301,7 +3314,9 @@ fn t06_socks_page_paints(cx: &mut TestAppContext) {
         id: "t06-s".to_string(),
         name: "S".to_string(),
         protocol: "socks".to_string(),
-        params: "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080}".to_string(),
+        params: "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080}"
+            .to_string()
+            .into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -3565,7 +3580,8 @@ fn t06_anytls_edit_regroups_single_password(cx: &mut TestAppContext) {
             protocol: "anytls".to_string(),
             params: "{\"type\":\"anytls\",\"server\":\"a.example.com\",\"server_port\":443,\
                     \"password\":\"secret\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -3624,7 +3640,8 @@ fn t06_anytls_edit_regroups_single_password(cx: &mut TestAppContext) {
         })
     });
     assert_eq!(
-        folded, seeded.params,
+        folded,
+        seeded.params.expose(),
         "untouched anytls edit refolds byte-identical"
     );
 }
@@ -3751,7 +3768,9 @@ fn t06_naive_page_paints(cx: &mut TestAppContext) {
         id: "t06-n".to_string(),
         name: "N".to_string(),
         protocol: "naive".to_string(),
-        params: "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443}".to_string(),
+        params: "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443}"
+            .to_string()
+            .into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -3802,7 +3821,7 @@ fn t06_ssh_edit_round_trips_and_key_pick(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "SshRow".to_string(),
             protocol: "ssh".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -3861,7 +3880,7 @@ fn t06_ssh_edit_round_trips_and_key_pick(cx: &mut TestAppContext) {
         id: "t06-k".to_string(),
         name: "K".to_string(),
         protocol: "ssh".to_string(),
-        params: params.to_string(),
+        params: params.to_string().into(),
         group: "default".to_string(),
         enabled: false,
         bind_ip: "127.0.0.1".to_string(),
@@ -3956,7 +3975,7 @@ fn t06_small_pages_round_trip(cx: &mut TestAppContext) {
             id: format!("t06-{protocol}"),
             name: protocol.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -4316,7 +4335,7 @@ fn t07_small_pages_round_trip(cx: &mut TestAppContext) {
             id: format!("t07-{protocol}"),
             name: protocol.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -4825,7 +4844,8 @@ fn tick12_seed(name: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: String::new(),
         bind_ip: String::new(),
         port: port.to_string(),
@@ -5288,7 +5308,7 @@ fn bug18_custom_global_test_url_excluded_from_traffic(cx: &mut TestAppContext) {
             engine.set_clash_targets(vec![ClashTarget {
                 core: "stock".to_string(),
                 port,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             }]);
             view.engine = engine;
         });
@@ -5339,7 +5359,7 @@ fn bug18_row_override_test_url_excluded_from_traffic(cx: &mut TestAppContext) {
             view.engine.set_clash_targets(vec![ClashTarget {
                 core: "stock".to_string(),
                 port,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             }]);
         });
     });
@@ -5399,7 +5419,7 @@ fn tick_traffic_poll_persists_deltas_and_mirrors(cx: &mut TestAppContext) {
             engine.set_clash_targets(vec![ClashTarget {
                 core: "stock".to_string(),
                 port,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             }]);
             view.engine = engine;
         });
@@ -5478,7 +5498,7 @@ fn traffic_delta_rx_up_tx_down_no_underflow(cx: &mut TestAppContext) {
             engine.set_clash_targets(vec![ClashTarget {
                 core: "stock".to_string(),
                 port,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             }]);
             view.engine = engine;
         });
@@ -5529,7 +5549,7 @@ fn t47_spawn_traffic_poll_off_ui_and_skips_in_flight(cx: &mut TestAppContext) {
             engine.set_clash_targets(vec![ClashTarget {
                 core: "stock".to_string(),
                 port,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             }]);
             view.engine = engine;
         });
@@ -5627,7 +5647,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
             engine.set_clash_targets(vec![ClashTarget {
                 core: "stock".to_string(),
                 port,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             }]);
             view.engine = engine;
         });
@@ -6031,7 +6051,7 @@ fn t75_status_bar_keeps_connections_in_the_inspector(cx: &mut TestAppContext) {
             ClashTarget {
                 core: "stock".to_string(),
                 port: 19090,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             },
             Ok(vec![conn("a", "tcp"), conn("b", "udp")]),
         ),
@@ -6039,7 +6059,7 @@ fn t75_status_bar_keeps_connections_in_the_inspector(cx: &mut TestAppContext) {
             ClashTarget {
                 core: "fork".to_string(),
                 port: 19091,
-                secret: "s3cret".to_string(),
+                secret: "s3cret".to_string().into(),
             },
             Ok(vec![conn("c", "tcp"), conn("d", "")]),
         ),
@@ -6602,7 +6622,8 @@ fn engine_start_all_and_stop_all_via_fake(cx: &mut TestAppContext) {
             params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                     \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: port.to_string(),
@@ -6709,7 +6730,8 @@ fn health_test_all_via_fake_flags_dead(cx: &mut TestAppContext) {
             params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                     \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: port.to_string(),
@@ -6878,7 +6900,7 @@ fn seed_lan_input(name: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
         protocol: "vless".to_string(),
-        params: String::new(),
+        params: Secret::default(),
         group: String::new(),
         bind_ip: "0.0.0.0".to_string(),
         port: String::new(),
@@ -7286,7 +7308,7 @@ fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "R".to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -8570,7 +8592,8 @@ fn ticket43_search_covers_sub_preset_state() {
             name: "Work".to_string(),
             protocol: "vless".to_string(),
             params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: "default".to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -8682,7 +8705,7 @@ fn ticket43_export_logs_subs_copy() {
             id: format!("id-{name}"),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: "g".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -8713,7 +8736,8 @@ fn ticket43_seed(name: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: String::new(),
         bind_ip: String::new(),
         port: port.to_string(),
@@ -11247,7 +11271,8 @@ fn library_search_matches_host_bind_port() {
             id: format!("id-{name}"),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: format!("{{\"type\":\"vless\",\"server\":\"{server}\",\"server_port\":443}}"),
+            params: format!("{{\"type\":\"vless\",\"server\":\"{server}\",\"server_port\":443}}")
+                .into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: bind.to_string(),
@@ -11304,7 +11329,7 @@ fn t47_search_index_matches_scan_parity() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: group.to_string(),
             enabled: true,
             bind_ip: bind.to_string(),
@@ -11420,7 +11445,7 @@ fn t47_search_index_matches_full_with_context() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com","server_port":443}"#.to_string(),
+            params: r#"{"server":"a.example.com","server_port":443}"#.to_string().into(),
             group: "g".to_string(),
             enabled,
             bind_ip: "127.0.0.1".to_string(),
@@ -11486,7 +11511,7 @@ fn t73_port_row(
         id: id.to_string(),
         name: name.to_string(),
         protocol: protocol.to_string(),
-        params: r#"{"server":"t73.example.com","server_port":443}"#.to_string(),
+        params: r#"{"server":"t73.example.com","server_port":443}"#.to_string().into(),
         group: group.to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -11900,7 +11925,7 @@ fn t44_facets_and_with_text_query() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: r#"{"server":"a.example.com","server_port":443}"#.to_string(),
+            params: r#"{"server":"a.example.com","server_port":443}"#.to_string().into(),
             group: group.to_string(),
             enabled,
             bind_ip: "127.0.0.1".to_string(),
@@ -12010,7 +12035,7 @@ fn t44_checked_set_honest_label_and_prune() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com"}"#.to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
             group: group.to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -12068,7 +12093,7 @@ fn t09_show_security_and_type_security_sort() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: "g".to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -12143,7 +12168,7 @@ fn t01_checked_positions_and_selection_stay_distinct() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com"}"#.to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
             group: "g".to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -12201,7 +12226,7 @@ fn library_row_ref_borrows_while_row_at_clones() {
         id: "1".to_string(),
         name: "Alpha".to_string(),
         protocol: "vless".to_string(),
-        params: r#"{"server":"a.example.com"}"#.to_string(),
+        params: r#"{"server":"a.example.com"}"#.to_string().into(),
         group: "g".to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -12299,7 +12324,7 @@ fn t01_detail_header_names_acting_row() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com"}"#.to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
             group: "g".to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -12331,7 +12356,7 @@ fn t44_facet_options_inventory_rows() {
             id: id.to_string(),
             name: format!("n{id}"),
             protocol: protocol.to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: group.to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -13237,7 +13262,7 @@ fn t01_row_cells_carry_one_fact_each() {
         id: "7".to_string(),
         name: "Work".to_string(),
         protocol: "vless".to_string(),
-        params: "{}".to_string(),
+        params: "{}".to_string().into(),
         group: "travel".to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -13753,7 +13778,7 @@ fn w1_search_never_matches_credentials() {
             id: "1".to_string(),
             name: "Work".to_string(),
             protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com","server_port":443,"password":"hunter2","uuid":"SECRET-UUID","token":"abc123"}"#.to_string(),
+            params: r#"{"server":"a.example.com","server_port":443,"password":"hunter2","uuid":"SECRET-UUID","token":"abc123"}"#.to_string().into(),
             group: "travel".to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -13892,7 +13917,7 @@ fn t47_delegate_caches_survive_params_poison() {
         id: "1".to_string(),
         name: "Alpha".to_string(),
         protocol: "vless".to_string(),
-        params: r#"{"server":"a.example.com","server_port":443}"#.to_string(),
+        params: r#"{"server":"a.example.com","server_port":443}"#.to_string().into(),
         group: "g".to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -13906,7 +13931,7 @@ fn t47_delegate_caches_survive_params_poison() {
     let before = delegate.upstream_for("1").map(str::to_string);
     assert_eq!(before.as_deref(), Some("a.example.com:443"));
 
-    delegate.rows[0].params = "not json{{{".to_string();
+    delegate.rows[0].params = "not json{{{".to_string().into();
     delegate.query = "a.example.com".to_string();
     delegate.apply_filter();
     assert_eq!(
@@ -13943,7 +13968,7 @@ fn add_dialog_shows_lan_hint_only_for_lan_bind(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "Lan".to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: "0.0.0.0".to_string(),
             port: String::new(),
@@ -15402,7 +15427,8 @@ fn t05_edit_prefills_guided_and_collapses_advanced(cx: &mut TestAppContext) {
             protocol: "vless".to_string(),
             params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -15583,7 +15609,8 @@ fn row19_seed(name: &str, host: &str, port: &str) -> NewConfig {
         params: format!(
             "{{\"type\":\"vless\",\"server\":\"{host}\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\"}}"
-        ),
+        )
+        .into(),
         group: "travel".to_string(),
         bind_ip: "127.0.0.1".to_string(),
         port: port.to_string(),
@@ -15884,7 +15911,8 @@ fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig 
         params: format!(
             "{{\"type\":\"{protocol}\",\"server\":\"seed.example.com\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\"}}"
-        ),
+        )
+        .into(),
         group: group.to_string(),
         bind_ip: "127.0.0.1".to_string(),
         port: port.to_string(),
@@ -18820,7 +18848,7 @@ fn library_row_lines_show_complete_content() {
             id: "7".to_string(),
             name: "Work".to_string(),
             protocol: "vless".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: "travel".to_string(),
             enabled,
             bind_ip: "127.0.0.1".to_string(),
@@ -18885,7 +18913,8 @@ fn library_row_cells_split_state_route_and_accounting() {
         name: "Work".to_string(),
         protocol: "vless".to_string(),
         params: "{\"server\":\"a.example.com\",\"server_port\":443,\"password\":\"s3cret\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: "travel".to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -18948,7 +18977,7 @@ fn upstream_host_port_reads_only_host_keys() {
             id: "7".to_string(),
             name: "Work".to_string(),
             protocol: "vless".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -19002,7 +19031,8 @@ fn t26_engine_seed(name: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: String::new(),
         bind_ip: String::new(),
         port: port.to_string(),
@@ -19018,7 +19048,7 @@ fn filter_selection_follows_id_never_wrong_row() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -19152,7 +19182,7 @@ fn edit_commit_writes_only_user_changed_fields(cx: &mut TestAppContext) {
                 .update(
                     &seeded.id,
                     ConfigPatch {
-                        params: Some("{\"type\":\"vless\",\"server\":\"9.9.9.9\"}".to_string()),
+                        params: Some(Secret::new("{\"type\":\"vless\",\"server\":\"9.9.9.9\"}")),
                         ..Default::default()
                     },
                 )
@@ -19469,7 +19499,7 @@ fn t08_group_rows_kind_quota_skip() {
         .add(NewConfig {
             name: "Hand".to_string(),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: "basic".to_string(),
             bind_ip: String::new(),
             port: String::new(),
@@ -20740,7 +20770,9 @@ fn row_lines_badge_follows_serving_not_flag() {
             id: "7".to_string(),
             name: "Work".to_string(),
             protocol: "vless".to_string(),
-            params: "{\"server\":\"a.example.com\",\"server_port\":443}".to_string(),
+            params: "{\"server\":\"a.example.com\",\"server_port\":443}"
+                .to_string()
+                .into(),
             group: "travel".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -22034,7 +22066,8 @@ fn t30_engine_seed(name: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: String::new(),
         bind_ip: String::new(),
         port: port.to_string(),
@@ -22059,7 +22092,7 @@ fn start_all_partial_names_failed_row_and_serves_rest(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "Broken".to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: "10925".to_string(),
@@ -22413,7 +22446,7 @@ fn search_no_hits_vs_empty_counts() {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: "default".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
@@ -23413,7 +23446,7 @@ fn field_error_targets_name_the_owning_field() {
         .add(NewConfig {
             name: "   ".to_string(),
             protocol: "bogus".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -23428,7 +23461,7 @@ fn field_error_targets_name_the_owning_field() {
         .add(NewConfig {
             name: "Work".to_string(),
             protocol: "bogus".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -23441,7 +23474,7 @@ fn field_error_targets_name_the_owning_field() {
         .add(NewConfig {
             name: "Work".to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: "99999".to_string(),
@@ -23467,7 +23500,7 @@ fn bind_port_collision_warning_names_colliding_row() {
         .add(NewConfig {
             name: "One".to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: "127.0.0.1".to_string(),
             port: "12001".to_string(),
@@ -24738,7 +24771,8 @@ fn attached_start_serves_preset_rules_first(cx: &mut TestAppContext) {
             params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                     \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -25259,7 +25293,8 @@ fn t64_seed_in_group(name: &str, group: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: group.to_string(),
         bind_ip: String::new(),
         port: port.to_string(),
@@ -25406,7 +25441,7 @@ fn t64_dialog_monitor_hidden_for_empty_group(cx: &mut TestAppContext) {
         id: "nobody".to_string(),
         name: "Ghost".to_string(),
         protocol: "vless".to_string(),
-        params: "{}".to_string(),
+        params: "{}".to_string().into(),
         group: "Nobody".to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -26149,7 +26184,8 @@ fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: String::new(),
         bind_ip: bind.to_string(),
         port: port.to_string(),
@@ -29684,7 +29720,8 @@ fn t19_auto_clear_seed(name: &str, port: &str, group: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: group.to_string(),
         bind_ip: String::new(),
         port: port.to_string(),
@@ -30215,7 +30252,8 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
                     \"uuid\":\"SECRET-UUID-08\",\"encryption\":\"none\",\
                     \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\",\
                     \"password\":\"hunter2\",\"token\":\"tok-abc123-08\"}"
-                .to_string(),
+                .to_string()
+                .into(),
             group: "travel".to_string(),
             bind_ip: "127.0.0.1".to_string(),
             port: port.to_string(),
@@ -31119,7 +31157,8 @@ fn t65_seed(name: &str, port: &str) -> NewConfig {
         params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                 \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                 \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-            .to_string(),
+            .to_string()
+            .into(),
         group: "travel".to_string(),
         bind_ip: "127.0.0.1".to_string(),
         port: port.to_string(),
@@ -31394,7 +31433,7 @@ fn t77_row(id: &str, name: &str, protocol: &str, group: &str, port: u16) -> Prox
         id: id.to_string(),
         name: name.to_string(),
         protocol: protocol.to_string(),
-        params: "{}".to_string(),
+        params: "{}".to_string().into(),
         group: group.to_string(),
         enabled: true,
         bind_ip: "127.0.0.1".to_string(),
@@ -31627,8 +31666,8 @@ fn t77_type_security_key_matches_old_toggle() {
         t77_row("6", "Plain", "shadowsocks", "g", 10806),
     ];
     let mut with_security = rows.clone();
-    with_security[1].params = r#"{"security":"tls"}"#.to_string();
-    with_security[2].params = r#"{"security":"reality"}"#.to_string();
+    with_security[1].params = r#"{"security":"tls"}"#.to_string().into();
+    with_security[2].params = r#"{"security":"reality"}"#.to_string().into();
 
     let mut sorted_rows = with_security.clone();
     sorted_rows.sort_by(compare_old);
@@ -31942,7 +31981,7 @@ fn t78_row(bind_ip: &str, port: u16) -> ProxyConfig {
         id: format!("t78-{port}"),
         name: "Lan".to_string(),
         protocol: "vless".to_string(),
-        params: "{}".to_string(),
+        params: "{}".to_string().into(),
         group: String::new(),
         enabled: true,
         bind_ip: bind_ip.to_string(),
@@ -33346,7 +33385,7 @@ fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
         .add(NewConfig {
             name: "Custom".to_string(),
             protocol: "custom-config".to_string(),
-            params: params.to_string(),
+            params: params.to_string().into(),
             group: String::new(),
             bind_ip: String::new(),
             port: "10970".to_string(),

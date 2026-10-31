@@ -365,7 +365,7 @@ mod tests {
             id: id.to_string(),
             name: format!("row-{id}"),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: "default".to_string(),
             enabled: true,
             bind_ip: bind.to_string(),

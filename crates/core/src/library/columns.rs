@@ -193,7 +193,7 @@ mod tests {
             id: id.to_string(),
             name: format!("row {id}"),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: Secret::new("{}"),
             group: String::new(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),

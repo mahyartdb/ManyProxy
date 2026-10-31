@@ -2823,7 +2823,7 @@ impl AppView {
         let url_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("https://…")
-                .default_value(sub.url.clone())
+                .default_value(sub.url.expose().to_string())
         });
         let group_state = cx.new(|cx| {
             InputState::new(window, cx)

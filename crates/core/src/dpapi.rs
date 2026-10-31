@@ -4,8 +4,6 @@ use std::ffi::c_void;
 #[cfg(windows)]
 const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
 
-pub const MARKER: &str = "dpapi1:";
-
 #[cfg(windows)]
 #[repr(C)]
 struct DataBlob {
@@ -102,6 +100,7 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(windows)]
 fn unprotect_platform(blob: &[u8]) -> Result<Vec<u8>, String> {
+    use zeroize::Zeroize as _;
     unsafe {
         let input = DataBlob {
             cb_data: blob.len() as u32,
@@ -127,7 +126,11 @@ fn unprotect_platform(blob: &[u8]) -> Result<Vec<u8>, String> {
         if !_descr.is_null() {
             LocalFree(_descr as *mut c_void);
         }
-        let bytes = std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec();
+        // DPAPI hands back its own copy of the plaintext; wipe it before the
+        // freed page can sit in the process with a readable secret in it.
+        let raw = std::slice::from_raw_parts_mut(output.pb_data, output.cb_data as usize);
+        let bytes = raw.to_vec();
+        raw.zeroize();
         LocalFree(output.pb_data as *mut c_void);
         Ok(bytes)
     }
@@ -139,44 +142,6 @@ fn unprotect_platform(_blob: &[u8]) -> Result<Vec<u8>, String> {
         "dpapi unprotect unavailable: secrets at rest need Windows DPAPI (Windows-only build)"
             .to_string(),
     )
-}
-
-pub fn seal_params(plaintext: &str) -> Result<String, String> {
-    if fail_for_test() {
-        return Err("dpapi protect failed (injected for test)".to_string());
-    }
-    use base64::Engine as _;
-    protect(plaintext.as_bytes()).map(|bytes| {
-        format!(
-            "{MARKER}{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        )
-    })
-}
-
-pub fn unseal_params(stored: &str) -> Result<String, String> {
-    use base64::Engine as _;
-
-    let trimmed = stored.trim();
-    if let Some(rest) = trimmed.strip_prefix(MARKER) {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(rest.trim())
-            .map_err(|_| "dpapi params are not valid base64".to_string())?;
-        let plain = unprotect(&bytes)?;
-        return String::from_utf8(plain)
-            .map_err(|_| "dpapi params are not valid utf-8".to_string());
-    }
-
-    if trimmed.starts_with('{') {
-        let is_object = serde_json::from_str::<serde_json::Value>(trimmed)
-            .map(|value| value.is_object())
-            .unwrap_or(false);
-        if is_object {
-            return Ok(stored.to_string());
-        }
-        return Err("legacy params are not valid JSON (refusing to guess)".to_string());
-    }
-    Err("unknown params storage marker (refusing to guess)".to_string())
 }
 
 thread_local! {
@@ -227,93 +192,11 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn t48_seal_roundtrip() {
-        let sealed = seal_params("{\"a\":1}").expect("seal works");
-        assert!(sealed.starts_with(MARKER), "marker shape, got {sealed}");
-        assert_eq!(unseal_params(&sealed).expect("unseal works"), "{\"a\":1}");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn t48_unseal_rejection_table() {
-        let sealed = seal_params("{\"a\":1}").expect("seal works");
-        let mut tampered = sealed.clone();
-        let at = tampered.len() - 8;
-        tampered.replace_range(
-            at..at + 1,
-            if &tampered[at..at + 1] == "A" {
-                "B"
-            } else {
-                "A"
-            },
-        );
-        assert!(
-            unseal_params(&tampered).is_err(),
-            "tampered blob fails loudly"
-        );
-
-        {
-            use base64::Engine as _;
-            let foreign = format!(
-                "{MARKER}{}",
-                base64::engine::general_purpose::STANDARD.encode([0xabu8; 64])
-            );
-            assert!(
-                unseal_params(&foreign).is_err(),
-                "foreign blob fails loudly"
-            );
-        }
-
-        for (stored, needle) in [
-            (format!("{MARKER}!!!"), "base64"),
-            (MARKER.to_string(), "dpapi"),
-            ("v2:abc".to_string(), "unknown params storage marker"),
-            ("plaintext".to_string(), "unknown params storage marker"),
-            ("".to_string(), "unknown params storage marker"),
-        ] {
-            let error = unseal_params(&stored).expect_err(&format!("{stored:?} must fail"));
-            assert!(
-                error.contains(needle),
-                "named cause ({needle}), got {error}"
-            );
-        }
-
-        for legacy in ["{\"a\":1}", "   {\"a\":1}  "] {
-            assert_eq!(
-                unseal_params(legacy).expect("legacy passes through"),
-                legacy
-            );
-        }
-    }
-
     #[test]
     fn t48_fail_seam_aborts_writes_loudly() {
         let _guard = FailGuard::on();
-        for error in [
-            protect(b"x").expect_err("protect aborts"),
-            seal_params("{\"a\":1}").expect_err("seal aborts"),
-        ] {
-            assert!(error.contains("dpapi"), "loud dpapi cause, got {error}");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn unseal_tolerates_trailing_whitespace() {
-        let sealed = seal_params("{\"a\":1}").expect("seal works");
-        assert!(sealed.starts_with(MARKER));
-        for padded in [
-            format!("{sealed} "),
-            format!("{sealed}\n"),
-            format!("{sealed}  \r\n"),
-        ] {
-            assert_eq!(
-                unseal_params(&padded).expect("trailing whitespace tolerated"),
-                "{\"a\":1}"
-            );
-        }
+        let error = protect(b"x").expect_err("protect aborts");
+        assert!(error.contains("dpapi"), "loud dpapi cause, got {error}");
     }
 
     #[test]
@@ -326,39 +209,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unseal_rejects_brace_led_non_json() {
-        for bad in ["{garbage", "{", "[1,2]", "\"str\"", "   {oops"] {
-            let error = unseal_params(bad).expect_err(&format!("{bad:?} must fail"));
-            assert!(
-                error.contains("JSON") || error.contains("unknown params storage marker"),
-                "named cause, got {error}"
-            );
-        }
-        assert_eq!(
-            unseal_params("  {\"a\":1}").expect("legacy object passes"),
-            "  {\"a\":1}"
-        );
-    }
-
     #[cfg(not(windows))]
     #[test]
     fn t48_non_windows_dpapi_is_a_loud_stub() {
         for error in [
             protect(b"x").expect_err("protect is a stub"),
-            seal_params("{\"a\":1}").expect_err("seal is a stub"),
             unprotect(b"blob").expect_err("unprotect is a stub"),
-            unseal_params(&format!("{MARKER}QUJD")).expect_err("sealed open is a stub"),
         ] {
             assert!(error.contains("Windows"), "Windows-only cause, got {error}");
         }
-        assert_eq!(
-            unseal_params("{\"a\":1}").expect("legacy passes through"),
-            "{\"a\":1}"
-        );
-        assert!(
-            unseal_params("v2:abc").is_err(),
-            "unknown markers still refused"
-        );
     }
 }

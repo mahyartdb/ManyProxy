@@ -4284,6 +4284,7 @@ dependencies = [
  "interprocess",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "zeroize",
 ]

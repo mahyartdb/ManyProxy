@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 
+use crate::secret::Secret;
 use crate::store::{NewConfig, Store, StoreError, DEFAULT_GROUP};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +14,7 @@ pub struct ImportedConfig {
 
     pub protocol: String,
 
-    pub params: String,
+    pub params: Secret,
 
     pub host: String,
 
@@ -545,8 +546,8 @@ fn insert_extras(params: &mut Params, query: &HashMap<String, String>, consumed:
     }
 }
 
-fn finish(params: Params) -> String {
-    serde_json::Value::Object(params).to_string()
+fn finish(params: Params) -> Secret {
+    Secret::new(serde_json::Value::Object(params).to_string())
 }
 
 fn normalize_network(raw: Option<&String>) -> String {
@@ -6452,7 +6453,8 @@ mod tests {
         let mut leaky = row_of(config, 10899);
         leaky.params =
             r#"{"type":"vless","server":"1.2.3.4","server_port":443,"uuid":"<UUID>","ws-opts":""}"#
-                .replace("<UUID>", UUID);
+                .replace("<UUID>", UUID)
+                .into();
         let error = crate::engine::generate(std::slice::from_ref(&leaky))
             .expect_err("an unmapped parent key is a named error, not a silent leak");
         assert!(

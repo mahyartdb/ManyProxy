@@ -1,6 +1,7 @@
 //! The SQLite store: schema, queries, DPAPI-sealed secrets and the data dir.
 //! Belongs: every row/subscription/settings read and write plus their error types.
 //! Not here: UI state, engine processes, dialog strings.
+use crate::secret::Secret;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -429,7 +430,7 @@ pub struct ProxyConfig {
     pub name: String,
     pub protocol: String,
 
-    pub params: String,
+    pub params: Secret,
     pub group: String,
     pub enabled: bool,
     pub bind_ip: String,
@@ -446,7 +447,7 @@ pub struct ProxyConfig {
 pub struct NewConfig {
     pub name: String,
     pub protocol: String,
-    pub params: String,
+    pub params: Secret,
     pub group: String,
     pub bind_ip: String,
 
@@ -457,7 +458,7 @@ pub struct NewConfig {
 pub struct ConfigPatch {
     pub name: Option<String>,
     pub protocol: Option<String>,
-    pub params: Option<String>,
+    pub params: Option<Secret>,
     pub group: Option<String>,
     pub bind_ip: Option<String>,
     pub port: Option<String>,
@@ -1104,13 +1105,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
 
         params: {
             let stored: String = row.get(3)?;
-            crate::dpapi::unseal_params(&stored).map_err(|message| {
+            crate::secret::Secret::open(&stored).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     3,
                     rusqlite::types::Type::Text,
                     Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        message,
+                        error.to_string(),
                     )),
                 )
             })?
@@ -1242,7 +1243,7 @@ fn map_health_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthHis
 struct ValidatedConfig {
     name: String,
     protocol: String,
-    params: String,
+    params: Secret,
     group: String,
     bind_ip: String,
     port: u16,
@@ -3264,7 +3265,7 @@ fn validate_protocol_params(
     protocol_raw: &str,
     params_raw: &str,
     errors: &mut Vec<FieldError>,
-) -> Option<(String, String)> {
+) -> Option<(String, Secret)> {
     let protocol_trimmed = protocol_raw.trim();
     let canonical = if protocol_trimmed.is_empty() {
         DEFAULT_PROTOCOL.to_string()
@@ -3426,14 +3427,14 @@ fn validate_protocol_params(
             return None;
         }
     }
-    Some((canonical, params_text))
+    Some((canonical, Secret::new(params_text)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
     pub id: String,
     pub label: String,
-    pub url: String,
+    pub url: Secret,
     pub group: String,
     pub auto_refresh: bool,
 
@@ -3580,19 +3581,19 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
 
         url: {
             let stored: String = row.get(2)?;
-            if stored.trim_start().starts_with(crate::dpapi::MARKER) {
-                crate::dpapi::unseal_params(&stored).map_err(|message| {
+            if stored.trim_start().starts_with(crate::secret::MARKER) {
+                crate::secret::Secret::open(&stored).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         2,
                         rusqlite::types::Type::Text,
                         Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            message,
+                            error.to_string(),
                         )),
                     )
                 })?
             } else {
-                stored
+                Secret::new(stored)
             }
         },
         group: row.get(3)?,
@@ -4417,15 +4418,19 @@ impl Store {
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
     fn seal_or_fail(plaintext: &str) -> Result<String, StoreError> {
-        crate::dpapi::seal_params(plaintext).map_err(|message| StoreError::Crypto {
-            message: format!("dpapi seal failed: {message}"),
-        })
+        crate::secret::Secret::new(plaintext)
+            .seal()
+            .map_err(|error| StoreError::Crypto {
+                message: format!("dpapi seal failed: {error}"),
+            })
     }
 
     fn unseal_or_fail(stored: &str) -> Result<String, StoreError> {
-        crate::dpapi::unseal_params(stored).map_err(|message| StoreError::Crypto {
-            message: format!("dpapi open failed: {message}"),
-        })
+        crate::secret::Secret::open(stored)
+            .map(|secret| secret.into_plaintext())
+            .map_err(|error| StoreError::Crypto {
+                message: format!("dpapi open failed: {error}"),
+            })
     }
 
     fn schema_error(message: String) -> StoreError {
@@ -4641,7 +4646,7 @@ impl Store {
                     )
                     .ok();
                 let url = match stored {
-                    Some(stored) if stored.trim_start().starts_with(crate::dpapi::MARKER) => {
+                    Some(stored) if stored.trim_start().starts_with(crate::secret::MARKER) => {
                         // A URL sealed for another user/machine must not abort
                         // schema setup: skip this tombstone's backfill (leave
                         // subscription_url NULL) instead of failing the open.
@@ -4675,7 +4680,7 @@ impl Store {
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
                 for (id, value) in rows {
-                    if value.starts_with(crate::dpapi::MARKER) {
+                    if value.starts_with(crate::secret::MARKER) {
                         continue;
                     }
                     let sealed = Self::seal_or_fail(&value)?;
@@ -4698,7 +4703,7 @@ impl Store {
                 mapped.collect::<Result<Vec<_>, _>>()?
             };
             for (id, url) in rows {
-                if url.trim_start().starts_with(crate::dpapi::MARKER) {
+                if url.trim_start().starts_with(crate::secret::MARKER) {
                     continue;
                 }
                 let sealed = Self::seal_or_fail(&url)?;
@@ -4763,7 +4768,7 @@ impl Store {
         struct Fields {
             name: String,
             protocol: String,
-            params: String,
+            params: Secret,
             group: String,
             bind_ip: String,
             port: Option<u16>,
@@ -4787,7 +4792,7 @@ impl Store {
                 return Err(StoreError::Invalid(errors));
             }
             let (protocol, params) =
-                proto_params.unwrap_or((DEFAULT_PROTOCOL.to_string(), "{}".to_string()));
+                proto_params.unwrap_or((DEFAULT_PROTOCOL.to_string(), Secret::new("{}")));
             fields.push(Fields {
                 name: name.unwrap_or_default(),
                 protocol,
@@ -4992,7 +4997,9 @@ impl Store {
 
         let owner_url: Option<String> = match &current {
             Some(row) => match &row.subscription_id {
-                Some(sub_id) => self.get_subscription(sub_id)?.map(|s| s.url),
+                Some(sub_id) => self
+                    .get_subscription(sub_id)?
+                    .map(|s| s.url.into_plaintext()),
                 None => None,
             },
             None => None,
@@ -5005,6 +5012,11 @@ impl Store {
                     .identity_key
                     .unwrap_or_else(|| widened_identity(&row.protocol, &row.params));
                 if let Some(subscription_id) = row.subscription_id {
+                    // shortcut: the tombstone's url stays a plaintext column —
+                    // it is an equality key and DPAPI seals are not
+                    // deterministic, so matching would mean opening every row.
+                    // Upgrade when a sealed column plus a migration is worth the
+                    // cost, or when the url becomes a token-bearing secret.
                     let core = rotation_core_from_identity_key(&key)
                         .or_else(|| rotation_core(&row.params));
                     tx.execute(
@@ -6264,9 +6276,10 @@ impl Store {
                 "SELECT identity_key, rotation_core FROM subscription_tombstones
                  WHERE subscription_id = ?1 OR subscription_url = ?2",
             )?;
-            let entries = stmt.query_map(params![subscription.id, subscription.url], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?;
+            let entries = stmt
+                .query_map(params![subscription.id, subscription.url.expose()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
             for entry in entries {
                 let (key, core) = entry?;
                 tombstones.insert(key.clone());
@@ -6352,7 +6365,7 @@ impl Store {
             UpstreamUpdate {
                 id: String,
                 protocol: String,
-                params: String,
+                params: Secret,
                 key: String,
             },
             GroupFollow {
@@ -6361,7 +6374,7 @@ impl Store {
             Adopt {
                 id: String,
                 key: String,
-                params: String,
+                params: Secret,
             },
             Delete {
                 id: String,
@@ -7407,7 +7420,7 @@ impl Store {
 
         let mut sealed_sub_urls: Vec<String> = Vec::with_capacity(sub_rows.len());
         for sub in &sub_rows {
-            if sub.url.trim_start().starts_with(crate::dpapi::MARKER) {
+            if sub.url.trim_start().starts_with(crate::secret::MARKER) {
                 Self::unseal_or_fail(&sub.url).map_err(|error| {
                     let what = if sub.label.trim().is_empty() {
                         format!("subscription {}", sub.id)
@@ -8621,8 +8634,10 @@ impl Store {
         if !errors.is_empty() {
             return Err(StoreError::Invalid(errors));
         }
-        let (protocol, params) =
-            proto_params.unwrap_or((current.protocol.clone(), current.params.clone()));
+        let (protocol, params) = proto_params.unwrap_or((
+            current.protocol.clone(),
+            Secret::new(current.params.expose()),
+        ));
         Ok(ValidatedConfig {
             name: name.unwrap_or_else(|| current.name.clone()),
             protocol,
@@ -8642,7 +8657,7 @@ mod tests {
         NewConfig {
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -9045,7 +9060,9 @@ mod tests {
     fn bug23_restore_rejects_unsealable_sealed_subscription_url() {
         use base64::Engine as _;
         let mut store = Store::open_in_memory().expect("in-memory store opens");
-        let sealed = crate::dpapi::seal_params("https://example.com/feed.txt").expect("seal works");
+        let sealed = crate::secret::Secret::new("https://example.com/feed.txt")
+            .seal()
+            .expect("seal works");
         let good = format!(
             r#"{{"outbounds":[],"library":[],"subscriptions":[{{"id":"1","label":"Good","url":"{sealed}"}}],"tombstones":[],"route_presets":[],"meta":{{}}}}"#
         );
@@ -9093,7 +9110,7 @@ mod tests {
             )
             .expect("stored url reads");
         assert!(
-            stored.trim_start().starts_with(crate::dpapi::MARKER),
+            stored.trim_start().starts_with(crate::secret::MARKER),
             "v6 stores the url sealed"
         );
 
@@ -9126,7 +9143,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM subscription_tombstones
                  WHERE subscription_id = ?1 OR subscription_url = ?2",
-                rusqlite::params!["99999", sub.url],
+                rusqlite::params!["99999", sub.url.expose()],
                 |r| r.get(0),
             )
             .expect("match query runs");
@@ -9198,7 +9215,7 @@ mod tests {
             .add(NewConfig {
                 name: "   ".to_string(),
                 protocol: String::new(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: "not-an-ip".to_string(),
                 port: "99999".to_string(),
@@ -9867,7 +9884,7 @@ mod tests {
             .add(NewConfig {
                 name: "Hand made".to_string(),
                 protocol: "vless".to_string(),
-                params: "{}".to_string(),
+                params: Secret::new("{}"),
                 group: "travel".to_string(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -9925,7 +9942,7 @@ mod tests {
             .add(NewConfig {
                 name: "Hand made".to_string(),
                 protocol: "vless".to_string(),
-                params: "{}".to_string(),
+                params: Secret::new("{}"),
                 group: "travel".to_string(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -10166,7 +10183,7 @@ mod tests {
                 name: "Mine".to_string(),
                 protocol: "trojan".to_string(),
                 params: "{\"password\":\"pw\",\"server\":\"b.example.com\",\"server_port\":443,\"type\":\"trojan\",\"sni\":\"b.example.com\"}"
-                    .to_string(),
+                    .to_string().into(),
                 group: "other".to_string(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -10404,7 +10421,7 @@ mod tests {
         let scheduled = Subscription {
             id: "1".to_string(),
             label: "Nightly".to_string(),
-            url: "https://example.com/sub.txt".to_string(),
+            url: Secret::new("https://example.com/sub.txt"),
             group: "travel".to_string(),
             auto_refresh: true,
             last_refresh_at: None,
@@ -10516,7 +10533,7 @@ mod tests {
             .add(NewConfig {
                 name: "Hand made".to_string(),
                 protocol: "vless".to_string(),
-                params: "{}".to_string(),
+                params: Secret::new("{}"),
                 group: "travel".to_string(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -10624,7 +10641,7 @@ mod tests {
         NewConfig {
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: params.to_string(),
+            params: Secret::new(params),
             group: group.to_string(),
             bind_ip: String::new(),
             port: String::new(),
@@ -10833,7 +10850,7 @@ mod tests {
             id: "0".to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: Secret::new(params),
             group: "g".to_string(),
             enabled: true,
             bind_ip: "127.0.0.1".to_string(),
@@ -10960,7 +10977,7 @@ mod tests {
             .add(NewConfig {
                 name: "Bad proto".to_string(),
                 protocol: "bogus".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -10974,7 +10991,7 @@ mod tests {
             .add(NewConfig {
                 name: "Bad params".to_string(),
                 protocol: "vless".to_string(),
-                params: "not-json".to_string(),
+                params: Secret::new("not-json"),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -10998,7 +11015,8 @@ mod tests {
                 name: "No uuid".to_string(),
                 protocol: "vless".to_string(),
                 params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}"
-                    .to_string(),
+                    .to_string()
+                    .into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -11022,7 +11040,7 @@ mod tests {
             .add(NewConfig {
                 name: "Opaque".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -11050,7 +11068,7 @@ mod tests {
             .update(
                 &created.id,
                 ConfigPatch {
-                    params: Some("not-json".to_string()),
+                    params: Some(Secret::new("not-json")),
                     ..Default::default()
                 },
             )
@@ -11067,7 +11085,7 @@ mod tests {
             .add(NewConfig {
                 name: "Keep".to_string(),
                 protocol: "trojan".to_string(),
-                params: "{\"type\":\"trojan\",\"server\":\"b.example.com\",\"server_port\":443,\"password\":\"pw\",\"sni\":\"b.example.com\"}".to_string(),
+                params: "{\"type\":\"trojan\",\"server\":\"b.example.com\",\"server_port\":443,\"password\":\"pw\",\"sni\":\"b.example.com\"}".to_string().into(),
                 group: "travel".to_string(),
                 bind_ip: "127.0.0.2".to_string(),
                 port: "10821".to_string(),
@@ -11078,7 +11096,7 @@ mod tests {
                 &created.id,
                 ConfigPatch {
                     protocol: Some("   ".to_string()),
-                    params: Some(String::new()),
+                    params: Some(Secret::default()),
                     group: Some("  ".to_string()),
                     bind_ip: Some(String::new()),
                     ..Default::default()
@@ -11121,7 +11139,7 @@ mod tests {
                 id: "1".to_string(),
                 name: "A".to_string(),
                 protocol: "vless".to_string(),
-                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"u\"}".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"u\"}".to_string().into(),
                 group: "g".to_string(),
                 enabled: false,
                 bind_ip: DEFAULT_BIND.to_string(),
@@ -11134,7 +11152,7 @@ mod tests {
                 id: "2".to_string(),
                 name: "B".to_string(),
                 protocol: "vless".to_string(),
-                params: "{}".to_string(),
+                params: Secret::new("{}"),
                 group: "g".to_string(),
                 enabled: false,
                 bind_ip: DEFAULT_BIND.to_string(),
@@ -11147,7 +11165,7 @@ mod tests {
         assert_eq!(count_importable(&rows), 1);
     }
 
-    fn vless_params_with(server: &str, extra: &[(&str, &str)]) -> String {
+    fn vless_params_with(server: &str, extra: &[(&str, &str)]) -> Secret {
         let mut map = serde_json::Map::new();
         map.insert(
             "type".to_string(),
@@ -11171,7 +11189,7 @@ mod tests {
                 serde_json::Value::String(value.to_string()),
             );
         }
-        serde_json::Value::Object(map).to_string()
+        Secret::new(serde_json::Value::Object(map).to_string())
     }
 
     #[test]
@@ -11254,7 +11272,7 @@ mod tests {
 
         let mut value: serde_json::Value = serde_json::from_str(&row.params).expect("params parse");
         value["mux"] = serde_json::Value::String("on".to_string());
-        let fixed = value.to_string();
+        let fixed = Secret::new(value.to_string());
         store
             .update(
                 &row.id,
@@ -11960,7 +11978,7 @@ mod tests {
         bad.push(NewConfig {
             name: "   ".to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -12158,14 +12176,14 @@ mod tests {
                 crate::import::ImportedConfig {
                     name: "AwgFive".to_string(),
                     protocol: "amneziawg".to_string(),
-                    params: first,
+                    params: first.into(),
                     host: "192.0.2.90".to_string(),
                     port: 51820,
                 },
                 crate::import::ImportedConfig {
                     name: "AwgNine".to_string(),
                     protocol: "amneziawg".to_string(),
-                    params: second,
+                    params: second.into(),
                     host: "192.0.2.90".to_string(),
                     port: 51820,
                 },
@@ -12542,7 +12560,7 @@ mod tests {
             .add(NewConfig {
                 name: "Ssh".to_string(),
                 protocol: "ssh".to_string(),
-                params: "{\"type\":\"ssh\",\"server\":\"a.example.com\",\"server_port\":22,\"username\":\"u\",\"password\":\"p\"}".to_string(),
+                params: "{\"type\":\"ssh\",\"server\":\"a.example.com\",\"server_port\":22,\"username\":\"u\",\"password\":\"p\"}".to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -12552,7 +12570,7 @@ mod tests {
             .add(NewConfig {
                 name: "Noise".to_string(),
                 protocol: "noise".to_string(),
-                params: "{\"type\":\"noise\",\"server\":\"a.example.com\",\"server_port\":51820,\"key\":\"k\"}".to_string(),
+                params: "{\"type\":\"noise\",\"server\":\"a.example.com\",\"server_port\":51820,\"key\":\"k\"}".to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -12572,7 +12590,7 @@ mod tests {
                 .add(NewConfig {
                     name: "Bad".to_string(),
                     protocol: protocol.to_string(),
-                    params: params.to_string(),
+                    params: Secret::new(params),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -12606,7 +12624,7 @@ mod tests {
                 .add(NewConfig {
                     name: format!("{protocol} row"),
                     protocol: protocol.to_string(),
-                    params: params.to_string(),
+                    params: Secret::new(params),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -12634,7 +12652,7 @@ mod tests {
                 .add(NewConfig {
                     name: "Bad".to_string(),
                     protocol: protocol.to_string(),
-                    params: params.to_string(),
+                    params: Secret::new(params),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -12673,7 +12691,7 @@ mod tests {
             .add(NewConfig {
                 name: "Sealed".to_string(),
                 protocol: "shadowsocks".to_string(),
-                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"SECRET-PASSWORD"}"#.to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"SECRET-PASSWORD"}"#.to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -12765,7 +12783,7 @@ mod tests {
                 .add(NewConfig {
                     name: "Legacy".to_string(),
                     protocol: "shadowsocks".to_string(),
-                    params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"LEGACY-SECRET"}"#.to_string(),
+                    params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"LEGACY-SECRET"}"#.to_string().into(),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -12817,7 +12835,7 @@ mod tests {
             .add(NewConfig {
                 name: "Flow".to_string(),
                 protocol: "shadowsocks".to_string(),
-                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -12838,7 +12856,7 @@ mod tests {
             .add(NewConfig {
                 name: "Typo".to_string(),
                 protocol: "vles".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -12883,8 +12901,10 @@ mod tests {
         }
 
         let mut store = Store::open_in_memory().expect("in-memory store opens");
-        let params = protocol_params_template("vless")
-            .replace("\"server\":\"\"", "\"server\":\"a.example.com\"");
+        let params = Secret::new(
+            protocol_params_template("vless")
+                .replace("\"server\":\"\"", "\"server\":\"a.example.com\""),
+        );
         let error = store
             .add(NewConfig {
                 name: "Half".to_string(),
@@ -12932,7 +12952,7 @@ mod tests {
                 .add(NewConfig {
                     name: format!("{virtual_proto} row"),
                     protocol: virtual_proto.to_string(),
-                    params: protocol_params_template(virtual_proto),
+                    params: protocol_params_template(virtual_proto).into(),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -12947,7 +12967,7 @@ mod tests {
             .add(NewConfig {
                 name: "Bad brutal".to_string(),
                 protocol: "vless".to_string(),
-                params: bad.to_string(),
+                params: Secret::new(bad),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -12962,7 +12982,7 @@ mod tests {
             .add(NewConfig {
                 name: "Numeric brutal".to_string(),
                 protocol: "vless".to_string(),
-                params: numeric,
+                params: numeric.into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -13051,7 +13071,7 @@ mod tests {
             .add(NewConfig {
                 name: "Direct".to_string(),
                 protocol: "direct".to_string(),
-                params: protocol_params_template("direct"),
+                params: protocol_params_template("direct").into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -13843,7 +13863,7 @@ mod tests {
                 .add(NewConfig {
                     name: name.to_string(),
                     protocol: protocol.to_string(),
-                    params: params.to_string(),
+                    params: Secret::new(params),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -14760,7 +14780,7 @@ mod tests {
             .add(NewConfig {
                 name: "One".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: "127.0.0.1".to_string(),
                 port: "12001".to_string(),
@@ -14770,7 +14790,7 @@ mod tests {
             .add(NewConfig {
                 name: "Two".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: "127.0.0.1".to_string(),
                 port: "12001".to_string(),
@@ -14785,7 +14805,7 @@ mod tests {
             .add(NewConfig {
                 name: name.to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15059,7 +15079,7 @@ mod tests {
         let add_result = store.add(NewConfig {
             name: "Doomed".to_string(),
             protocol: "vless".to_string(),
-            params: "{\"a\":1}".to_string(),
+            params: "{\"a\":1}".to_string().into(),
             group: String::new(),
             bind_ip: String::new(),
             port: String::new(),
@@ -15112,7 +15132,7 @@ mod tests {
             .add(NewConfig {
                 name: "Good".to_string(),
                 protocol: "vless".to_string(),
-                params: "{\"a\":1}".to_string(),
+                params: "{\"a\":1}".to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15185,7 +15205,8 @@ mod tests {
                 params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                     \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
                     \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
-                    .to_string(),
+                    .to_string()
+                    .into(),
                 group: String::new(),
                 bind_ip: "127.0.0.1".to_string(),
                 port: "10801".to_string(),
@@ -15393,7 +15414,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15477,9 +15498,10 @@ mod tests {
             )
             .expect("v4 ddl works");
 
-            let sealed = crate::dpapi::seal_params(
+            let sealed = crate::secret::Secret::new(
                 r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#,
             )
+            .seal()
             .expect("seal works");
             conn.execute(
                 "INSERT INTO proxy_configs (name, protocol, params, grp, enabled, bind_ip, port, traffic_rx, traffic_tx)
@@ -15579,7 +15601,7 @@ mod tests {
             .add(NewConfig {
                 name: "Good".to_string(),
                 protocol: "shadowsocks".to_string(),
-                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15624,7 +15646,7 @@ mod tests {
             .add(NewConfig {
                 name: "A".to_string(),
                 protocol: "shadowsocks".to_string(),
-                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15634,7 +15656,7 @@ mod tests {
             .add(NewConfig {
                 name: "B".to_string(),
                 protocol: "shadowsocks".to_string(),
-                params: r#"{"server":"198.51.100.10","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                params: r#"{"server":"198.51.100.10","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15715,7 +15737,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15753,7 +15775,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15780,7 +15802,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15907,7 +15929,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -15932,7 +15954,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "vless".to_string(),
-                params: String::new(),
+                params: Secret::default(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -16000,7 +16022,7 @@ mod tests {
             .add(NewConfig {
                 name: "R".to_string(),
                 protocol: "shadowsocks".to_string(),
-                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string().into(),
                 group: String::new(),
                 bind_ip: String::new(),
                 port: String::new(),
@@ -16127,7 +16149,7 @@ mod tests {
                 .add(NewConfig {
                     name: "Live".to_string(),
                     protocol: "vless".to_string(),
-                    params: String::new(),
+                    params: Secret::default(),
                     group: String::new(),
                     bind_ip: String::new(),
                     port: String::new(),
@@ -17460,7 +17482,7 @@ mod tests {
         NewConfig {
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: String::new(),
+            params: Secret::default(),
             group: String::new(),
             bind_ip: bind_ip.to_string(),
             port: port.to_string(),

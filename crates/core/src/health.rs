@@ -1315,7 +1315,7 @@ pub fn poll_clash_targets(
         let port = target.port;
         let secret = target.secret.clone();
         std::thread::spawn(move || {
-            let result = poll_clash_entries(port, &secret, per_core);
+            let result = poll_clash_entries(port, secret.expose(), per_core);
             let _ = done_tx.send((index, result));
         });
     }
@@ -2490,7 +2490,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: "default".to_string(),
             enabled: true,
             bind_ip: bind.to_string(),
@@ -2866,7 +2866,7 @@ mod tests {
 
     fn mux_fixture(id: &str, name: &str, bind: &str, port: u16) -> ProxyConfig {
         let mut config = fixture(id, name, "vless", bind, port);
-        config.params = r#"{"mux": "on"}"#.to_string();
+        config.params = r#"{"mux": "on"}"#.to_string().into();
         config
     }
 
@@ -2987,11 +2987,11 @@ mod tests {
     #[test]
     fn t68_non_mux_single_probe_unchanged() {
         let mut off = fixture("off", "MuxOff", "vless", "127.0.0.1", 10801);
-        off.params = r#"{"mux": "off"}"#.to_string();
+        off.params = r#"{"mux": "off"}"#.to_string().into();
         let mut blank = fixture("blank", "MuxBlank", "vless", "127.0.0.1", 10802);
-        blank.params = r#"{"mux": "   "}"#.to_string();
+        blank.params = r#"{"mux": "   "}"#.to_string().into();
         let mut plain = fixture("plain", "Plain", "vmess", "127.0.0.1", 10803);
-        plain.params = r#"{}"#.to_string();
+        plain.params = r#"{}"#.to_string().into();
 
         let (prober, handle) = FakeHealthProber::shared();
         handle.script_latency("plain", 55);
@@ -4459,17 +4459,17 @@ mod tests {
             crate::engine::ClashTarget {
                 core: "a".to_string(),
                 port: fast1,
-                secret: "s".to_string(),
+                secret: "s".to_string().into(),
             },
             crate::engine::ClashTarget {
                 core: "b".to_string(),
                 port: fast2,
-                secret: "s".to_string(),
+                secret: "s".to_string().into(),
             },
             crate::engine::ClashTarget {
                 core: "slow".to_string(),
                 port: slow,
-                secret: "s".to_string(),
+                secret: "s".to_string().into(),
             },
         ];
         let started = Instant::now();
@@ -4515,12 +4515,12 @@ mod tests {
             crate::engine::ClashTarget {
                 core: "s1".to_string(),
                 port,
-                secret: "s".to_string(),
+                secret: "s".to_string().into(),
             },
             crate::engine::ClashTarget {
                 core: "s2".to_string(),
                 port,
-                secret: "s".to_string(),
+                secret: "s".to_string().into(),
             },
         ];
         let started = Instant::now();
@@ -4549,7 +4549,7 @@ mod tests {
         let refused = vec![crate::engine::ClashTarget {
             core: "down".to_string(),
             port: 1,
-            secret: SECRET.to_string(),
+            secret: SECRET.to_string().into(),
         }];
         for (_, result) in
             poll_clash_targets(&refused, Duration::from_secs(2), Duration::from_secs(5))
@@ -4574,7 +4574,7 @@ mod tests {
         let wrong = vec![crate::engine::ClashTarget {
             core: "auth".to_string(),
             port,
-            secret: SECRET.to_string(),
+            secret: SECRET.to_string().into(),
         }];
         for (_, result) in
             poll_clash_targets(&wrong, Duration::from_secs(5), Duration::from_secs(10))

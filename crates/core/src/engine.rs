@@ -13,6 +13,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::secret::Secret;
 use crate::store::ProxyConfig;
 
 pub const ENGINE_BINARY_BASE: &str = "sing-box";
@@ -43,10 +44,12 @@ pub fn reserved_range_of(port: u16) -> Option<&'static str> {
 pub struct ClashTarget {
     pub core: String,
     pub port: u16,
-    pub secret: String,
+    /// The clash controller's bearer token. It rides in the sidecar's config
+    /// file and in the poll's `Authorization` header, never on a command line.
+    pub secret: Secret,
 }
 
-fn clash_secret(core: &str) -> String {
+fn clash_secret(core: &str) -> Secret {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
         use std::collections::hash_map::DefaultHasher;
@@ -68,7 +71,7 @@ fn clash_secret(core: &str) -> String {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    out
+    Secret::new(out)
 }
 
 fn reserve_clash_port(holds: &mut Vec<std::net::TcpListener>) -> Option<u16> {
@@ -175,7 +178,7 @@ fn clash_target_from_served(core: &str, json: &str) -> Option<ClashTarget> {
     if !controller.starts_with("127.0.0.1:") && !controller.starts_with("localhost:") {
         return None;
     }
-    let secret = api.get("secret")?.as_str()?.to_string();
+    let secret = Secret::new(api.get("secret")?.as_str()?);
     if secret.is_empty() {
         return None;
     }
@@ -6471,11 +6474,9 @@ impl EngineController {
         }
     }
 
+    /// `Secret` wipes the plaintext when the target is dropped, so clearing
+    /// the list is the whole job.
     fn clear_clash_secrets(&mut self) {
-        use zeroize::Zeroize as _;
-        for target in self.clash.iter_mut() {
-            target.secret.zeroize();
-        }
         self.clash.clear();
     }
 
@@ -7168,7 +7169,7 @@ impl EngineController {
                 error
             })?;
             let secret = clash_secret(core);
-            *json = inject_clash_api(json, port, &secret).inspect_err(|error| {
+            *json = inject_clash_api(json, port, secret.expose()).inspect_err(|error| {
                 self.last_error = Some(error.to_string());
             })?;
             clash.push(ClashTarget {
@@ -7876,6 +7877,7 @@ fn fnv1a_64(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::Secret;
     use serde_json::json;
 
     fn fixture(
@@ -7890,7 +7892,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             protocol: protocol.to_string(),
-            params: params.to_string(),
+            params: Secret::new(params.to_string()),
             group: "default".to_string(),
             enabled: true,
             bind_ip: bind.to_string(),
@@ -8652,7 +8654,7 @@ mod tests {
             10808,
         )];
         let mut tampered = broken;
-        tampered[0].params = "{not json".to_string();
+        tampered[0].params = "{not json".to_string().into();
         let error = generate(&tampered).expect_err("invalid JSON rejected");
         assert!(!error.to_string().contains("not json"));
     }
@@ -11065,7 +11067,8 @@ mod tests {
         let mut bad = ssh_fixture("2", "NoUser", 10802);
         bad.params = json!({"type": "ssh", "server": "198.51.100.7",
             "server_port": 22, "password": "hunter2"})
-        .to_string();
+        .to_string()
+        .into();
         let error = generate(std::slice::from_ref(&bad)).expect_err("user required");
         assert!(
             matches!(error, EngineError::BadParams { .. }),
@@ -11092,8 +11095,9 @@ mod tests {
         assert_eq!(node["type"], json!("anytls"));
 
         let mut bad = anytls_fixture("9", "NoPass", 10809);
-        bad.params =
-            json!({"type": "anytls", "server": "198.51.100.9", "server_port": 443}).to_string();
+        bad.params = json!({"type": "anytls", "server": "198.51.100.9", "server_port": 443})
+            .to_string()
+            .into();
         let error = generate(std::slice::from_ref(&bad)).expect_err("password required");
         assert!(
             matches!(error, EngineError::BadParams { .. }),
@@ -11156,7 +11160,8 @@ mod tests {
         let mut awg_on_noise = noise_fixture("4", "Confused", 10804);
         awg_on_noise.params = json!({"type": "noise", "server": "192.0.2.44",
             "server_port": 51820, "password": "k", "jc": "4"})
-        .to_string();
+        .to_string()
+        .into();
         let error = generate(std::slice::from_ref(&awg_on_noise)).expect_err("AWG on Noise fails");
         assert!(
             matches!(error, EngineError::WrongLayer { .. }),
@@ -14839,6 +14844,22 @@ Active Connections\r
                 .iter()
                 .all(|(_, pid)| pid.is_none()),
             "stopping every shard clears the whole cohort"
+        );
+    }
+
+    #[test]
+    fn b5_clash_target_debug_redacts_the_controller_secret() {
+        let target = ClashTarget {
+            core: "stock".to_string(),
+            port: 19090,
+            secret: Secret::new("s3cret"),
+        };
+        let printed = format!("{target:?}");
+        assert!(!printed.contains("s3cret"), "debug redacts: {printed}");
+        assert_eq!(
+            target.secret.expose(),
+            "s3cret",
+            "the poll still gets the token it needs"
         );
     }
 }

@@ -35,6 +35,10 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - Log tones stay legible in the light theme, with contrast asserted in tests.
 - The inspector tab bar no longer clips Connections and Traffic at the default drawer width. A paint test pins this.
 
+### Security
+
+- Secrets live in one `Secret` type: the plaintext buffer is wiped when the value is dropped, `Debug` and `Display` print `***`, and storage keeps the same `dpapi1:` DPAPI marker, so an existing database opens unchanged and a copied database file does not. Proxy params, subscription URLs, and the clash controller token all go through it, and the token never reaches a command line. Export is still plaintext, because the user asked for a portable file and the dialog says so first.
+
 ## [0.0.1-beta.1] - 2026-10-21
 
 ### Added

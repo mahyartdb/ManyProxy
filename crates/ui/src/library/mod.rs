@@ -1432,7 +1432,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             protocol: "vless".to_string(),
-            params: "{}".to_string(),
+            params: "{}".to_string().into(),
             group: group.to_string(),
             enabled,
             bind_ip: "127.0.0.1".to_string(),

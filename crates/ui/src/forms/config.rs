@@ -4363,7 +4363,7 @@ impl ConfigForm {
         NewConfig {
             name: self.name.read(cx).value().to_string(),
             protocol: self.protocol_text(cx),
-            params: self.effective_params(cx),
+            params: Secret::new(self.effective_params(cx)),
             group: self.group.read(cx).value().to_string(),
             bind_ip: self.bind.read(cx).value().to_string(),
             port: self.port.read(cx).value().to_string(),
@@ -4813,11 +4813,18 @@ impl ConfigForm {
                 Some(current)
             }
         }
+        fn changed_secret(current: Secret, baseline: &Secret) -> Option<Secret> {
+            if current.expose() == baseline.expose() {
+                None
+            } else {
+                Some(current)
+            }
+        }
         let current = self.as_new(cx);
         ConfigPatch {
             name: changed(current.name, &baseline.name),
             protocol: changed(current.protocol, &baseline.protocol),
-            params: changed(current.params, &baseline.params),
+            params: changed_secret(current.params, &baseline.params),
             group: changed(current.group, &baseline.group),
             bind_ip: changed(current.bind_ip, &baseline.bind_ip),
             port: changed(current.port, &baseline.port.to_string()),
