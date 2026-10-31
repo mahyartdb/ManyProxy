@@ -3,6 +3,7 @@
 //! Not here: one feature's dialogs or render — those get their own `app/` file.
 use crate::*;
 
+use gpui_kit::base::VirtualListScrollHandle;
 use gpui_kit::component::list::ListState;
 
 /// F16: the refresh batch's progress counters and the in-flight set, together
@@ -50,6 +51,46 @@ pub(crate) struct LogsState {
     /// survives the swap, then is consumed once on the next open.
     pub(crate) reopen_draft: Option<(String, String, String)>,
     pub(crate) list: Option<Entity<ListState<LogLinesDelegate>>>,
+}
+
+/// B3: one row-listing inspector pane's scroll window. `sizes` is the list's
+/// caller-owned height cache: rows are uniform, so it only changes when the row
+/// count does, and the list never needs a measure-then-correct pass beyond the
+/// frame that infers its width. `scroll` is the memory that makes coming back
+/// to a pane land where the user left it instead of at the top.
+pub(crate) struct PaneWindow {
+    sizes: Rc<Vec<Size<Pixels>>>,
+    rows: usize,
+    row_h: f32,
+    pub(crate) scroll: VirtualListScrollHandle,
+}
+
+impl PaneWindow {
+    pub(crate) fn new() -> Self {
+        Self {
+            sizes: Rc::new(Vec::new()),
+            rows: 0,
+            row_h: 0.,
+            scroll: VirtualListScrollHandle::new(),
+        }
+    }
+
+    pub(crate) fn sizes_for(&mut self, rows: usize, row_h: f32) -> Rc<Vec<Size<Pixels>>> {
+        if self.rows != rows || self.row_h != row_h {
+            self.rows = rows;
+            self.row_h = row_h;
+            // Only the row height matters on a vertical list; the width is
+            // inferred from one measured row inside the element.
+            self.sizes = Rc::new(vec![
+                Size {
+                    width: px(0.),
+                    height: px(row_h)
+                };
+                rows
+            ]);
+        }
+        self.sizes.clone()
+    }
 }
 
 /// F16: the Traffic sheet's snapshot and its view state, replaced in place on
@@ -209,6 +250,9 @@ impl AppView {
             detail_scroll: ScrollHandle::new(),
             split_state,
             inspector_visible: false,
+            pane_logs: PaneWindow::new(),
+            pane_links: PaneWindow::new(),
+            pane_traffic: PaneWindow::new(),
             store,
             write_blocked,
             write_blocked_folder,

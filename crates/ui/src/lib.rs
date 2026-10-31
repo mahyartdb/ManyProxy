@@ -126,7 +126,7 @@ use app::bits::*;
 use app::focus::*;
 use app::kit_bits::*;
 use app::open::*;
-use app::state::{ConnectionState, LogsState, RefreshBatch};
+use app::state::{ConnectionState, LogsState, PaneWindow, RefreshBatch};
 use app::window::*;
 use appearance::*;
 use chain::*;
@@ -283,6 +283,12 @@ struct AppView {
     /// picking a row or an inspector shortcut opens it, Esc or the close
     /// button shuts it. Esc hands focus back to the list.
     inspector_visible: bool,
+
+    /// B3: one scroll window per row-listing pane, so an open inspector builds
+    /// only the rows it can show and a return to a pane keeps its position.
+    pane_logs: PaneWindow,
+    pane_links: PaneWindow,
+    pane_traffic: PaneWindow,
 
     conn: ConnectionState,
 

@@ -16965,8 +16965,6 @@ fn t08_refresh_batch_progress_and_streaming_rows(cx: &mut TestAppContext) {
 fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
     use gpui_kit::component::IndexPath;
-    use gpui_kit::point;
-    use gpui_kit::test::TestWindowExt;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -17167,8 +17165,6 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
 #[gpui_kit::test]
 fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
-    use gpui_kit::point;
-    use gpui_kit::test::TestWindowExt;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -17263,8 +17259,6 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
-    use gpui_kit::point;
-    use gpui_kit::test::TestWindowExt;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -34598,4 +34592,234 @@ fn single_instance_argv_line_round_trips() {
     assert_eq!(decode_argv(line.trim_ascii_end()), Some(argv));
     assert_eq!(decode_argv(b"not json"), None);
     assert_eq!(decode_argv(b"{}"), None);
+}
+
+/// B3: the whole point of the pane window — an open inspector builds the rows
+/// the panel can show, not every row the pane owns. The counter is the proof;
+/// the same frame also pins that a pane that is not on screen builds nothing.
+#[gpui_kit::test]
+fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
+    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let seeded = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    view.update(cx, |view, cx| {
+        view.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().selected = Some(IndexPath::new(0));
+            list_cx.notify();
+        });
+        view.inspector_tab = crate::InspectorTab::Logs;
+        view.open_inspector();
+        let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
+        let tag = crate::inbound_tag(&seeded.id);
+        for ix in 0..200 {
+            view.logs
+                .store
+                .push_raw(&format!("{tag} info line {ix} of the pane window"), &tags);
+        }
+        view.logs.tail = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let rows = view.read_with(cx, |view, cx| view.visible_log_lines(cx).len());
+    assert_eq!(rows, 200, "the pane owns 200 rows");
+
+    reset_pane_rows_built();
+    paint_frame(cx);
+    let built = pane_rows_built(PaneRows::Logs);
+    assert!(built > 0, "the visible log rows build, got {built}");
+    // A frame lays the list out more than once, so pin the shape of the cost
+    // rather than an exact count: a window's worth stays a small fraction of
+    // the page.
+    assert!(
+        built * 3 < rows,
+        "a 200-row pane builds a window's worth, not the page: {built}"
+    );
+    assert_eq!(
+        pane_rows_built(PaneRows::Links),
+        0,
+        "a pane that is not on screen builds nothing"
+    );
+    assert_eq!(pane_rows_built(PaneRows::Traffic), 0);
+
+    view.update(cx, |view, cx| {
+        view.inspector_tab = crate::InspectorTab::Details;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    reset_pane_rows_built();
+    paint_frame(cx);
+    for pane in [PaneRows::Logs, PaneRows::Links, PaneRows::Traffic] {
+        assert_eq!(
+            pane_rows_built(pane),
+            0,
+            "{pane:?} stays unbuilt when another tab is on screen"
+        );
+    }
+}
+
+/// B3: the closed inspector builds no pane at all.
+#[gpui_kit::test]
+fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
+    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let seeded = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    view.update(cx, |view, cx| {
+        view.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().selected = Some(IndexPath::new(0));
+            list_cx.notify();
+        });
+        view.inspector_tab = crate::InspectorTab::Logs;
+        let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
+        let tag = crate::inbound_tag(&seeded.id);
+        for ix in 0..200 {
+            view.logs
+                .store
+                .push_raw(&format!("{tag} info line {ix}"), &tags);
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.inspector_visible),
+        "the inspector starts closed"
+    );
+    reset_pane_rows_built();
+    paint_frame(cx);
+    for pane in [PaneRows::Logs, PaneRows::Links, PaneRows::Traffic] {
+        assert_eq!(
+            pane_rows_built(pane),
+            0,
+            "{pane:?} builds nothing while the inspector is closed"
+        );
+    }
+}
+
+/// B3: coming back to a pane lands where the user left it, and the rows that
+/// scrolled away were never built.
+#[gpui_kit::test]
+fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
+    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let seeded = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    view.update(cx, |view, cx| {
+        view.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().selected = Some(IndexPath::new(0));
+            list_cx.notify();
+        });
+        view.inspector_tab = crate::InspectorTab::Logs;
+        view.open_inspector();
+        let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
+        let tag = crate::inbound_tag(&seeded.id);
+        for ix in 0..200 {
+            view.logs
+                .store
+                .push_raw(&format!("{tag} info line {ix} of the pane window"), &tags);
+        }
+        view.logs.tail = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // The pane's own handle is the state a wheel would move; the list reads it
+    // back when it lays out.
+    view.update(cx, |view, cx| {
+        view.pane_logs
+            .scroll
+            .scroll_to_item(120, gpui_kit::ScrollStrategy::Top);
+        cx.notify();
+    });
+    paint_frame(cx);
+    let scrolled = view.read_with(cx, |view, _| view.pane_logs.scroll.offset().y);
+    assert!(
+        scrolled < px(0.),
+        "the pane list scrolls on its own: {scrolled:?}"
+    );
+    reset_pane_rows_built();
+    paint_frame(cx);
+    let built_while_scrolled = pane_rows_built(PaneRows::Logs);
+    assert!(
+        built_while_scrolled > 0 && built_while_scrolled * 3 < 200,
+        "a scrolled pane still builds a window, not the page: {built_while_scrolled}"
+    );
+
+    for tab in [crate::InspectorTab::Details, crate::InspectorTab::Logs] {
+        view.update(cx, |view, cx| {
+            view.inspector_tab = tab;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
+    assert_eq!(
+        view.read_with(cx, |view, _| view.pane_logs.scroll.offset().y),
+        scrolled,
+        "the pane returns to the same row instead of jumping to the top"
+    );
+}
+
+/// B3: the traffic pane lists one row per exit, so a large library is exactly
+/// the case that used to build every row on every frame.
+#[gpui_kit::test]
+fn b3_traffic_pane_windows_a_large_library(cx: &mut TestAppContext) {
+    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    for ix in 0..150 {
+        let row = store
+            .add(row19_seed(
+                &format!("Row {ix}"),
+                "a.example.com",
+                &format!("{}", 10800 + ix),
+            ))
+            .expect("seed works");
+        store.add_traffic(&row.id, 10, 20).expect("traffic seeds");
+    }
+    let (view, cx) = mount_view(store, cx);
+    view.update(cx, |view, cx| {
+        view.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().selected = Some(IndexPath::new(0));
+            list_cx.notify();
+        });
+        view.inspector_tab = crate::InspectorTab::Traffic;
+        view.open_inspector();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    reset_pane_rows_built();
+    paint_frame(cx);
+    let built = pane_rows_built(PaneRows::Traffic);
+    assert!(built > 0, "the visible exits build, got {built}");
+    assert!(
+        built < 150,
+        "a 150-exit library builds a window: {built} of 150"
+    );
+    assert_eq!(pane_rows_built(PaneRows::Logs), 0, "other panes stay cold");
 }

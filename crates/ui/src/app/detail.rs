@@ -2,6 +2,7 @@
 //! Belongs: everything rendered in the right-hand inspector.
 //! Not here: library rows or dialog bodies.
 use crate::*;
+use gpui_kit::base::{v_virtual_list, Scrollbar, ScrollbarAxis};
 use gpui_kit::component::scroll::ScrollableElement as _;
 
 /// T-02: a key never rides inside a label or an accessible name. The operate
@@ -18,13 +19,112 @@ const TAB_LABEL_REM: f32 = 0.6875;
 const TAB_LABEL_PAD_X: f32 = 2.;
 const TAB_LABEL_GAP: f32 = 1.;
 
+/// B3: the panes that list rows build a virtual window instead of a full
+/// subtree. Uniform row heights keep the size cache exact: a declared height
+/// that is too small clips a row, so each row is pinned to one line (log and
+/// traffic text truncates, the link card is a fixed two-line block).
+const PANE_LOG_ROW_H: f32 = 20.;
+const PANE_LINK_ROW_H: f32 = 48.;
+const PANE_TRAFFIC_ROW_H: f32 = 20.;
+/// A row list never eats the whole pane: header, endpoints and the operate row
+/// share the same scroll, so the list is capped to a share of what the panel
+/// can show and scrolls itself past it. A short list keeps its natural height.
+const PANE_LIST_SHARE: f32 = 0.6;
+/// The panel's own height is only known after the first layout; until then the
+/// list falls back to this so the pane is never blank on its first frame.
+const PANE_LIST_FALLBACK_H: f32 = 320.;
+
+/// B3 acceptance probe: counts the rows a pane actually builds. Debug-only —
+/// release builds compile the counter away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneRows {
+    Logs = 0,
+    Links = 1,
+    Traffic = 2,
+}
+
+// Per-thread, because a frame runs on the thread that draws it and the suite
+// mounts views in parallel.
+#[cfg(any(debug_assertions, test))]
+thread_local! {
+    static PANE_ROWS_BUILT: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+fn note_pane_row(pane: PaneRows) {
+    #[cfg(any(debug_assertions, test))]
+    PANE_ROWS_BUILT.with(|built| {
+        let mut counts = built.get();
+        counts[pane as usize] += 1;
+        built.set(counts);
+    });
+    #[cfg(not(any(debug_assertions, test)))]
+    let _ = pane;
+}
+
+#[cfg(test)]
+pub(crate) fn pane_rows_built(pane: PaneRows) -> usize {
+    PANE_ROWS_BUILT.with(|built| built.get()[pane as usize])
+}
+
+#[cfg(test)]
+pub(crate) fn reset_pane_rows_built() {
+    PANE_ROWS_BUILT.with(|built| built.set([0; 3]));
+}
+
+/// B3: the pane's row area. The list is handed the visible range only, so rows
+/// outside the window are never built; the paired handle remembers the offset
+/// and the scrollbar makes the extra scroll range visible in a narrow panel.
+fn pane_rows(
+    cx: &mut Context<AppView>,
+    pane: &mut PaneWindow,
+    id: &'static str,
+    height: f32,
+    rows: usize,
+    row_h: f32,
+    build: impl 'static + Fn(&mut AppView, usize, &mut Context<AppView>) -> AnyElement,
+) -> AnyElement {
+    let sizes = pane.sizes_for(rows, row_h);
+    let scroll = pane.scroll.clone();
+    let bar = scroll.clone();
+    let entity = cx.entity();
+    div()
+        .relative()
+        .w_full()
+        .h(px(height))
+        .min_h_0()
+        .child(
+            v_virtual_list(
+                entity,
+                id,
+                sizes,
+                move |view: &mut AppView, range, _window, cx| {
+                    range.map(|ix| build(view, ix, cx)).collect::<Vec<_>>()
+                },
+            )
+            .track_scroll(&scroll),
+        )
+        .child(
+            div()
+                .id(format!("{id}-scrollbar-layer"))
+                .absolute()
+                .inset_0()
+                .child(
+                    Scrollbar::new(&bar)
+                        .id(format!("{id}-scrollbar"))
+                        .axis(ScrollbarAxis::Vertical)
+                        .viewport_from_layout(),
+                ),
+        )
+        .into_any_element()
+}
+
 impl AppView {
     /// T-03: below the breakpoint the inspector slides OVER the table as a
     /// drawer. It is an overlay: the table keeps its own pane beside it, so
     /// the list is never squeezed under its floor. The root occludes input,
     /// or a blank click reaches the rows behind it and retargets the inspector.
     pub(crate) fn render_inspector_drawer(
-        &self,
+        &mut self,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -92,7 +192,7 @@ impl AppView {
     }
 
     pub(crate) fn render_detail(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -137,7 +237,7 @@ impl AppView {
     }
 
     pub(crate) fn render_detail_selected(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -206,7 +306,23 @@ impl AppView {
             .into_any_element()
     }
 
-    pub(crate) fn render_inspector_logs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// B3: how tall the pane's row area is. A short list keeps its natural
+    /// height; past its share of the panel the list scrolls itself, because the
+    /// panel's own scroll cannot tell which rows are on screen.
+    fn pane_list_height(&self, rows: usize, row_h: f32) -> f32 {
+        if rows == 0 {
+            return 0.;
+        }
+        let viewport = self.detail_scroll.bounds().size.height.as_f32();
+        let viewport = if viewport > 0. {
+            viewport
+        } else {
+            PANE_LIST_FALLBACK_H
+        };
+        (rows as f32 * row_h).min((viewport * PANE_LIST_SHARE).max(row_h * 3.))
+    }
+
+    pub(crate) fn render_inspector_logs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let lines = self.visible_log_lines(cx);
 
         const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
@@ -328,16 +444,36 @@ impl AppView {
             }
             pane = pane.child(empty);
         } else {
-            let mut list = div().id("log-pane-lines").test_support().w_full();
-            for line in &lines {
-                list = list.child(line.clone());
-            }
-            pane = pane.child(list);
+            let rows = lines.len();
+            let height = self.pane_list_height(rows, PANE_LOG_ROW_H);
+            pane = pane.child(pane_rows(
+                cx,
+                &mut self.pane_logs,
+                "log-pane-list",
+                height,
+                rows,
+                PANE_LOG_ROW_H,
+                move |_view, ix, _cx| {
+                    let line = lines.get(ix).cloned().unwrap_or_default();
+                    note_pane_row(PaneRows::Logs);
+                    div()
+                        .id(("log-line", ix))
+                        .w_full()
+                        .h(px(PANE_LOG_ROW_H))
+                        .text_sm()
+                        .truncate()
+                        .child(line)
+                        .into_any_element()
+                },
+            ));
         }
         pane
     }
 
-    pub(crate) fn render_inspector_connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_inspector_connections(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let selected = self.selected_config(cx).map(|config| config.id);
         let rows = build_conn_rows(
             &self.conn.snapshot,
@@ -436,104 +572,130 @@ impl AppView {
                     .child("No live connections yet — start an exit to see flows here. Health probes never appear."),
             );
         } else {
-            for (ix, row) in rows.iter().enumerate() {
-                let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
-                let dest = row.dest.clone();
-                let dest_display = if dest.is_empty() {
-                    "(no destination)".to_string()
-                } else {
-                    redact_secrets(&dest)
-                };
-                // Copy the displayed string; an empty dest has no hostname to copy.
-                let dest_value = if dest.is_empty() {
-                    String::new()
-                } else {
-                    dest_display.clone()
-                };
-                let mut dest_cell = div()
-                    .id(format!("conn-col-dest-{ix}"))
-                    .test_support()
-                    .w(px(dest_width_px))
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        Button::new(format!("conn-copy-{ix}"))
-                            .small()
-                            .label(dest_display)
-                            .tooltip("Copy destination")
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.copy_conn_cell(
-                                    ConnCopyTarget::Dest(ix),
-                                    &dest_value,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    );
-                if self.conn.copied == Some(ConnCopyTarget::Dest(ix)) {
-                    dest_cell = dest_cell.child(
-                        div()
-                            .id(format!("conn-copied-dest-{ix}"))
-                            .test_support()
-                            .text_sm()
-                            .child("Copied!"),
-                    );
-                }
+            let count = rows.len();
+            let height = self.pane_list_height(count, PANE_LINK_ROW_H);
+            let library = Rc::new(library);
+            pane = pane.child(pane_rows(
+                cx,
+                &mut self.pane_links,
+                "config-link-list",
+                height,
+                count,
+                PANE_LINK_ROW_H,
+                move |view, ix, cx| {
+                    let Some(row) = rows.get(ix) else {
+                        return div().into_any_element();
+                    };
+                    let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
+                    let dest = row.dest.clone();
+                    let dest_display = if dest.is_empty() {
+                        "(no destination)".to_string()
+                    } else {
+                        redact_secrets(&dest)
+                    };
+                    // Copy the displayed string; an empty dest has no hostname to copy.
+                    let dest_value = if dest.is_empty() {
+                        String::new()
+                    } else {
+                        dest_display.clone()
+                    };
+                    let mut dest_cell = div()
+                        .id(format!("conn-col-dest-{ix}"))
+                        .test_support()
+                        .w(px(dest_width_px))
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            Button::new(format!("conn-copy-{ix}"))
+                                .small()
+                                .label(dest_display)
+                                .tooltip("Copy destination")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.copy_conn_cell(
+                                        ConnCopyTarget::Dest(ix),
+                                        &dest_value,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        );
+                    if view.conn.copied == Some(ConnCopyTarget::Dest(ix)) {
+                        dest_cell = dest_cell.child(
+                            div()
+                                .id(format!("conn-copied-dest-{ix}"))
+                                .test_support()
+                                .text_sm()
+                                .child("Copied!"),
+                        );
+                    }
 
-                // The endpoint cell copies the row's active `bind:port` contact
-                // verbatim; unclaimed rows (no exit) stay non-copyable.
-                let endpoint_value = bind.clone();
-                let endpoint_claimed = row.row_id.is_some();
-                let mut endpoint_button = Button::new(format!("conn-endpoint-{ix}"))
-                    .small()
-                    .label(bind);
-                if endpoint_claimed {
-                    endpoint_button =
-                        endpoint_button
-                            .tooltip("Copy endpoint")
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.copy_conn_cell(
-                                    ConnCopyTarget::Endpoint(ix),
-                                    &endpoint_value,
-                                    window,
-                                    cx,
-                                );
-                            }));
-                }
-                let mut meta = div()
-                    .id(format!("conn-meta-{ix}"))
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .text_sm()
-                    .child(name)
-                    .child("·")
-                    .child(endpoint_button);
-                if self.conn.copied == Some(ConnCopyTarget::Endpoint(ix)) {
-                    meta = meta.child(
-                        div()
-                            .id(format!("conn-copied-endpoint-{ix}"))
-                            .test_support()
-                            .child("Copied!"),
-                    );
-                }
-                meta = meta.child(format!(
-                    "· {protocol} · ↓{} ↑{} · Δ{}",
-                    format_bytes(row.rx_bytes),
-                    format_bytes(row.tx_bytes),
-                    format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
-                ));
+                    // The endpoint cell copies the row's active `bind:port` contact
+                    // verbatim; unclaimed rows (no exit) stay non-copyable.
+                    let endpoint_value = bind.clone();
+                    let endpoint_claimed = row.row_id.is_some();
+                    let mut endpoint_button = Button::new(format!("conn-endpoint-{ix}"))
+                        .small()
+                        .label(bind);
+                    if endpoint_claimed {
+                        endpoint_button =
+                            endpoint_button
+                                .tooltip("Copy endpoint")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.copy_conn_cell(
+                                        ConnCopyTarget::Endpoint(ix),
+                                        &endpoint_value,
+                                        window,
+                                        cx,
+                                    );
+                                }));
+                    }
+                    let mut meta = div()
+                        .id(format!("conn-meta-{ix}"))
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .flex_nowrap()
+                        .items_center()
+                        .gap_1()
+                        .text_sm()
+                        .overflow_hidden()
+                        .child(name)
+                        .child("·")
+                        .child(endpoint_button);
+                    if view.conn.copied == Some(ConnCopyTarget::Endpoint(ix)) {
+                        meta = meta.child(
+                            div()
+                                .id(format!("conn-copied-endpoint-{ix}"))
+                                .test_support()
+                                .child("Copied!"),
+                        );
+                    }
+                    meta = meta.child(format!(
+                        "· {protocol} · ↓{} ↑{} · Δ{}",
+                        format_bytes(row.rx_bytes),
+                        format_bytes(row.tx_bytes),
+                        format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
+                    ));
 
-                pane = pane.child(div().flex().flex_col().child(dest_cell).child(meta));
-            }
+                    note_pane_row(PaneRows::Links);
+                    div()
+                        .id(("conn-row", ix))
+                        .h(px(PANE_LINK_ROW_H))
+                        .w_full()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(dest_cell)
+                        .child(meta)
+                        .into_any_element()
+                },
+            ));
         }
         pane
     }
 
-    pub(crate) fn render_inspector_traffic(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_inspector_traffic(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
         let totals = self.store.traffic_totals().unwrap_or_default();
         let exits = aggregate_exit_traffic(&library, &totals);
@@ -570,18 +732,33 @@ impl AppView {
                     .child("No traffic recorded yet — start an exit and pass data."),
             );
         } else {
-            for exit in &exits {
-                let filled = ((exit.total() as f64 / max as f64) * 12.0).round() as usize;
-                let bar = format!(
-                    "{}{}",
-                    "█".repeat(filled.min(12)),
-                    "░".repeat(12usize.saturating_sub(filled.min(12)))
-                );
-                pane = pane.child(
+            let count = exits.len();
+            let height = self.pane_list_height(count, PANE_TRAFFIC_ROW_H);
+            pane = pane.child(pane_rows(
+                cx,
+                &mut self.pane_traffic,
+                "config-traffic-list",
+                height,
+                count,
+                PANE_TRAFFIC_ROW_H,
+                move |_view, ix, _cx| {
+                    let Some(exit) = exits.get(ix) else {
+                        return div().into_any_element();
+                    };
+                    let filled = ((exit.total() as f64 / max as f64) * 12.0).round() as usize;
+                    let bar = format!(
+                        "{}{}",
+                        "█".repeat(filled.min(12)),
+                        "░".repeat(12usize.saturating_sub(filled.min(12)))
+                    );
+                    note_pane_row(PaneRows::Traffic);
                     div()
                         .id(format!("traffic-exit-{}", exit.row_id))
                         .test_support()
+                        .w_full()
+                        .h(px(PANE_TRAFFIC_ROW_H))
                         .text_sm()
+                        .truncate()
                         .child(format!(
                             "{} {} · {} ↓{} ↑{}",
                             bar,
@@ -589,9 +766,10 @@ impl AppView {
                             exit.bind,
                             format_bytes(exit.rx_bytes),
                             format_bytes(exit.tx_bytes),
-                        )),
-                );
-            }
+                        ))
+                        .into_any_element()
+                },
+            ));
         }
         pane
     }
