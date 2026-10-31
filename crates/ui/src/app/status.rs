@@ -170,11 +170,15 @@ impl AppView {
     }
 
     pub(crate) fn render_search_count(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (visible, total, query) = self
+        // B16: the count line names the wait instead of "0 of 0" while the
+        // first rows are still on the wire.
+        let count_label = self.libraries.read(cx).delegate().count_label();
+        let query = self
             .libraries
             .read(cx)
             .delegate()
-            .delegate_counts_for_search();
+            .delegate_counts_for_search()
+            .2;
         let has_query = !query.trim().is_empty();
         let clear_view = cx.entity();
         div()
@@ -186,7 +190,7 @@ impl AppView {
             .gap_2()
             .px_2()
             .py_1()
-            .child(search_count_text(visible, total))
+            .child(count_label)
             .child(if has_query {
                 Button::new("clear-search")
                     .small()

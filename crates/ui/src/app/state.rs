@@ -30,6 +30,9 @@ pub(crate) struct RefreshBatch {
     /// report — set for manual origins only, so due-tick refreshes finish
     /// count-only.
     pub(crate) inflight_named: HashSet<String>,
+    /// B16: the last fetch/store failure, held until the in-flight set drains
+    /// so the list can report it when it has no rows to fall back on.
+    pub(crate) last_error: Option<String>,
 }
 
 /// F16: everything the Logs sheet owns — the record store plus the filters,
@@ -1672,6 +1675,49 @@ impl AppView {
 
     pub(crate) fn note_refresh_started(&mut self, sub_id: &str) -> bool {
         self.refresh.inflight.insert(sub_id.to_string())
+    }
+
+    /// B16: every refresh origin funnels through `start_subscription_refresh`,
+    /// so the list learns it is waiting from one place and never has to read
+    /// the app's in-flight set while a frame is borrowing it.
+    pub(crate) fn mark_library_loading(&mut self, cx: &mut App) {
+        let load = LibraryLoad::Loading("Fetching subscriptions…".to_string());
+        self.libraries.update(cx, |state, cx| {
+            if state.delegate_mut().set_load(load) {
+                cx.notify();
+            }
+        });
+    }
+
+    /// B16: settle once nothing is in flight. A failure with no rows left is
+    /// the list's state to report; with rows on screen the toast already said
+    /// it and the list stays out of the way.
+    pub(crate) fn settle_library_load(&mut self, cx: &mut App) {
+        if !self.refresh.inflight.is_empty() {
+            return;
+        }
+        let failed = self.refresh.last_error.take();
+        self.libraries.update(cx, |state, cx| {
+            let load = match failed {
+                Some(message) if state.delegate().rows.is_empty() => LibraryLoad::Failed(message),
+                _ => LibraryLoad::Ready,
+            };
+            if state.delegate_mut().set_load(load) {
+                cx.notify();
+            }
+        });
+    }
+
+    /// B16: the failed state's way back. Retry means "fetch my subscriptions
+    /// again", which is the only thing that can fill an empty list.
+    pub(crate) fn retry_library_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let subs = self.store.list_subscriptions().unwrap_or_default();
+        if subs.is_empty() {
+            self.settle_library_load(cx);
+            return;
+        }
+        self.refresh.last_error = None;
+        self.start_explicit_refresh(subs, window, cx);
     }
 
     pub(crate) fn sync_presets_to_engine(&mut self) -> Result<(), String> {

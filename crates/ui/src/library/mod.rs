@@ -16,7 +16,22 @@ pub(crate) use host::*;
 pub(crate) use shard::*;
 pub(crate) use tone::*;
 
+/// B16: what the list paints when it has no rows to show. A fetch that has not
+/// landed is never "empty" — the list holds skeleton rows at the row pitch so
+/// the first real row does not appear from nowhere — and a failed one names the
+/// reason and carries the way back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LibraryLoad {
+    #[default]
+    Ready,
+    Loading(String),
+    Failed(String),
+}
+
 pub(crate) struct LibraryDelegate {
+    /// B16: pushed by every refresh origin; the list never reads the app's
+    /// in-flight set itself, because a frame is already borrowing that entity.
+    pub(crate) load: LibraryLoad,
     pub(crate) rows: Vec<ProxyConfig>,
     pub(crate) search_index: Vec<RowSearchIndex>,
     pub(crate) upstream_cache: HashMap<String, String>,
@@ -148,6 +163,7 @@ impl FacetStatus {
 impl LibraryDelegate {
     pub(crate) fn new() -> Self {
         Self {
+            load: LibraryLoad::Ready,
             rows: Vec::new(),
             search_index: Vec::new(),
             upstream_cache: HashMap::new(),
@@ -184,6 +200,25 @@ impl LibraryDelegate {
 
     pub(crate) fn set_bind_hosts(&mut self, hosts: Vec<String>) {
         self.bind_hosts = hosts;
+    }
+
+    /// B16: returns whether the state actually changed, so a caller can skip a
+    /// notify when nothing on screen moves.
+    pub(crate) fn set_load(&mut self, load: LibraryLoad) -> bool {
+        if self.load == load {
+            return false;
+        }
+        self.load = load;
+        true
+    }
+
+    /// B16: `0 of 0` reads as "your library is empty" while the rows are still
+    /// on the wire, so the count line names the wait instead.
+    pub(crate) fn count_label(&self) -> String {
+        match &self.load {
+            LibraryLoad::Loading(_) if self.rows.is_empty() => "Loading…".to_string(),
+            _ => search_count_text(self.visible.len(), self.rows.len()),
+        }
     }
 
     pub(crate) fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
@@ -1324,6 +1359,89 @@ impl ListDelegate for LibraryDelegate {
         cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
         let list_view = cx.entity();
+        // B16: with no rows at all, the list is either waiting or it failed —
+        // neither may wear the "no configurations yet" or "no matches" copy.
+        if self.rows.is_empty() {
+            match self.load.clone() {
+                LibraryLoad::Loading(label) => {
+                    let mut column = div()
+                        .id("library-loading")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(
+                            div()
+                                .id("library-loading-label")
+                                .test_support()
+                                .px_3()
+                                .py_2()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(label),
+                        );
+                    // The bars keep `ROW_PITCH`, so the first real row lands
+                    // where the skeleton was instead of shoving the list down.
+                    const BAR_W: [f32; 6] = [190., 250., 150., 300., 220., 170.];
+                    for (ix, width) in BAR_W.into_iter().enumerate() {
+                        column = column.child(
+                            div()
+                                .id(format!("skeleton-row-{ix}"))
+                                .test_support()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .h(px(RowMetrics::ROW_PITCH))
+                                .px_3()
+                                .child(
+                                    div()
+                                        .w(px(width))
+                                        .h(px(10.))
+                                        .rounded(px(3.))
+                                        .bg(cx.theme().muted),
+                                ),
+                        );
+                    }
+                    return column;
+                }
+                LibraryLoad::Failed(message) => {
+                    let retry = self.app_view.clone();
+                    return div()
+                        .id("library-load-failed")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(
+                            Empty::new()
+                                .header(
+                                    EmptyHeader::new()
+                                        .title(
+                                            EmptyTitle::new()
+                                                .child("Could not load configurations"),
+                                        )
+                                        .description(EmptyDescription::new().child(message)),
+                                )
+                                .content(
+                                    EmptyContent::new().child(
+                                        Button::new("library-retry")
+                                            .small()
+                                            .label("Retry")
+                                            .tooltip("Fetch the subscriptions again")
+                                            .on_click(move |_, window, cx| {
+                                                if let Some(view) = retry.clone() {
+                                                    view.update(cx, |view, cx| {
+                                                        view.retry_library_load(window, cx);
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                                ),
+                        );
+                }
+                LibraryLoad::Ready => {}
+            }
+        }
         if !self.rows.is_empty() && self.visible.is_empty() {
             let (visible, total) = (self.visible.len(), self.rows.len());
             let mut description = search_count_text(visible, total);

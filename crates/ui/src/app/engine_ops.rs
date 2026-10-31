@@ -542,6 +542,7 @@ impl AppView {
         if !self.note_refresh_started(&sub.id) {
             return false;
         }
+        self.mark_library_loading(cx);
         if named {
             self.refresh.inflight_named.insert(sub.id.clone());
         }

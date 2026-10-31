@@ -208,11 +208,13 @@ impl AppView {
             Ok(None) => {
                 self.reload(window, cx);
 
+                self.settle_library_load(cx);
                 self.close_batch_slot(sub_id, window, cx);
                 self.reopen_subscriptions_if_open(window, cx);
                 return;
             }
             Err(error) => {
+                self.settle_library_load(cx);
                 self.push_refresh_log(&format!(
                     "error cannot refresh subscription \"{label}\": {error}"
                 ));
@@ -247,6 +249,7 @@ impl AppView {
                     Ok(outcome) => {
                         self.reload(window, cx);
                         if let Some(error) = outcome.error {
+                            self.refresh.last_error = Some(format!("{label}: {error}"));
                             self.push_refresh_log(&format!(
                                 "error subscription refresh \"{label}\": refresh failed ({error})"
                             ));
@@ -358,6 +361,11 @@ impl AppView {
             Err(error) => match self.store.record_subscription_error(sub_id, &error) {
                 Ok(_) => {
                     self.reload(window, cx);
+                    // B16: the toast is transient; the list needs a reason that
+                    // is still there once the toast is gone. A subscription row
+                    // that no longer exists is not a load failure — the empty
+                    // copy tells the truth for that one.
+                    self.refresh.last_error = Some(format!("{label}: {error}"));
                     self.push_refresh_log(&format!(
                         "error subscription refresh \"{label}\": {error}"
                     ));
@@ -405,6 +413,7 @@ impl AppView {
                 }
             },
         }
+        self.settle_library_load(cx);
         self.reopen_subscriptions_if_open(window, cx);
     }
 
@@ -438,6 +447,7 @@ impl AppView {
                             .unwrap_or_else(|| sub_id.to_string());
                         let failed = outcome.failures.len();
                         if let Some(error) = outcome.error {
+                            self.refresh.last_error = Some(format!("{label}: {error}"));
                             self.push_refresh_log(&format!(
                                 "error subscription refresh \"{label}\": refresh failed ({error})"
                             ));
@@ -511,12 +521,14 @@ impl AppView {
             }
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
+                self.refresh.last_error = Some(format!("{sub_id}: {error}"));
                 self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
             }
         }
         if self.refresh.members.is_empty() {
             self.take_batch_counts();
         }
+        self.settle_library_load(cx);
         self.reload_quiet(cx);
     }
 

@@ -34862,3 +34862,144 @@ fn b3_traffic_pane_windows_a_large_library(cx: &mut TestAppContext) {
     );
     assert_eq!(pane_rows_built(PaneRows::Logs), 0, "other panes stay cold");
 }
+
+/// B16: a fetch in flight is not an empty library. The load state is set the
+/// instant a refresh starts, before its task is ever scheduled, so the frame
+/// between start and completion is the whole delay a slow subscription buys —
+/// and that frame must show skeleton rows at the row pitch, never "no
+/// configurations yet" and never a `0 of 0` count.
+#[gpui_kit::test]
+fn b16_fetch_in_flight_paints_skeletons_not_the_empty_canvas(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let sub = store
+        .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+        .expect("seed works");
+    let sub_id = sub.id.clone();
+    let label = sub.label.clone();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    paint_frame(cx);
+    assert_painted(cx, "library-empty");
+
+    cx.update(|_, cx| view.update(cx, |view, cx| view.mark_library_loading(cx)));
+    paint_frame(cx);
+    assert_painted(cx, "library-loading");
+    assert_painted(cx, "skeleton-row-0");
+    assert_absent(cx, "library-empty".to_string());
+    assert_absent(cx, "empty-add".to_string());
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .count_label()),
+        "Loading…".to_string(),
+        "the count line names the wait instead of 0 of 0"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_subscription_refresh(
+                &sub_id,
+                &label,
+                Ok(crate::FetchedSubscription {
+                    body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#solo"
+                        .to_string(),
+                    userinfo: None,
+                }),
+                999,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_absent(cx, "library-loading".to_string());
+    assert_absent(cx, "skeleton-row-0".to_string());
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().rows.len()),
+        1,
+        "the fetched row landed and the skeleton gave way"
+    );
+}
+
+/// B16: a failed first fetch is a state, not just a toast. With no rows behind
+/// it the list names what failed and carries the way back; once the toast is
+/// gone, this is the only place the reason still lives.
+#[gpui_kit::test]
+fn b16_failed_fetch_names_the_reason_and_offers_retry(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let sub = store
+        .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+        .expect("seed works");
+    let sub_id = sub.id.clone();
+    let label = sub.label.clone();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    paint_frame(cx);
+
+    cx.update(|_, cx| view.update(cx, |view, cx| view.mark_library_loading(cx)));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_subscription_refresh(
+                &sub_id,
+                &label,
+                Err("subscription fetch failed: connection refused".to_string()),
+                999,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "library-load-failed");
+    assert_painted(cx, "library-retry");
+    assert_absent(cx, "library-loading".to_string());
+    assert_absent(cx, "library-empty".to_string());
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            match &view.libraries.read(cx).delegate().load {
+                crate::library::LibraryLoad::Failed(message) => message.clone(),
+                other => format!("not a failure: {other:?}"),
+            }
+        }),
+        "Nightly: subscription fetch failed: connection refused".to_string(),
+        "the list carries the reason the fetch gave"
+    );
+}
+
+/// B16: with rows on screen the skeleton is never the answer — a search that
+/// matches nothing still says so while a refresh runs in the background, so a
+/// background refresh cannot hang the search's own empty copy.
+#[gpui_kit::test]
+fn b16_search_no_matches_keeps_its_copy_while_a_refresh_is_in_flight(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.mark_library_loading(cx);
+            view.libraries.update(cx, |state, list_cx| {
+                state.set_query("zzz-no-hit", window, list_cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "library-empty");
+    assert_painted(cx, "clear-search-hint");
+    assert_absent(cx, "library-loading".to_string());
+    assert_absent(cx, "skeleton-row-0".to_string());
+}
