@@ -54,6 +54,8 @@ Ratified never-builds. Do not ticket them, do not build them, and do not present
 
 Parked candidates, each needs its own decision before work starts: a Download Profiles country menu, remote-preset auto-update with per-preset `last_update` stamps, a traffic hour-bucket history database, a beta-channel update setting, and a QR share-link variant behind the Share confirm.
 
+Parked with a written decision (B10): a signed in-app update download. An honest version is a detached Ed25519 signature over the artifact with the public key compiled in, verified before the published hash, refusing a tampered file with the signer's fingerprint in the message, and rotating keys without a new binary. It cannot land as written: it overturns two ratified rules on this page — "no auto-update replacing binaries" and "Installers. ZIP only" — and the rotation requirement forces a user-visible trust root that does not exist yet (a data-folder trusted-keys file, a Settings row for it, and a refuse-an-unknown-signer flow), which is a policy decision, not a dependency choice. Reviving it needs the owner to overturn those two rules and ratify the trust root first; the shape to build is recorded here so the analysis is not lost. The updater stays check-only: a JSON feed read, a newer release opened in the user's own browser, no asset fetched and nothing executed.
+
 Future epics live as outlines on the GitHub tracker and need a grilling session each: #5 (a user-owned single Go core from the ThroneCore lineage, retiring the three-sidecar packing) and #6 (the linux/macOS port, earning per-OS release rows with real keyring backends).
 
 ## Brand Commitments
