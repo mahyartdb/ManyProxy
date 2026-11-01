@@ -103,6 +103,7 @@ pub fn library_row_cells(
     upstream: &str,
     health: Option<&str>,
     is_running: bool,
+    crashed: bool,
     traffic: Option<(u64, u64)>,
     show_security: bool,
 ) -> [String; 4] {
@@ -110,10 +111,20 @@ pub fn library_row_cells(
     if show_security {
         apply_show_security(&mut upstream_cell, row);
     }
-    let health_cell = if is_running {
-        serving_badge(true, &row.bind_ip, row.port, health)
-    } else {
+    // The health cell is its own 110px column, so it carries the state and the
+    // probe only. The full badge (endpoint included) belongs to the inspector;
+    // repeating the endpoint here pushed the latency past the cell's edge.
+    let health_cell = if crashed {
+        "● Failed".to_string()
+    } else if !is_running {
         String::new()
+    } else if health.is_some_and(|summary| summary.trim() == "dead") {
+        "● Failed".to_string()
+    } else {
+        match health.map(str::trim).filter(|summary| !summary.is_empty()) {
+            Some(summary) => format!("● Running · {summary}"),
+            None => "● Running".to_string(),
+        }
     };
     let traffic_cell = if is_running {
         traffic

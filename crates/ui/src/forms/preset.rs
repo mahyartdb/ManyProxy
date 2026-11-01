@@ -36,11 +36,7 @@ impl PresetForm {
         boxes: &SimpleRuleBoxes,
     ) -> Self {
         Self {
-            name: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Preset name")
-                    .default_value(name.to_string())
-            }),
+            name: cx.new(|cx| InputState::new(window, cx).default_value(name.to_string())),
             rules: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("Optional rules JSON (preset object or rules array)")

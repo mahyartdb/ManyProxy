@@ -11,6 +11,35 @@ pub(crate) enum FacetMenu {
 /// sentinel choice can never collide with a real group row.
 const STATE_ENABLED_VALUE: &str = "\u{1}state:enabled";
 const STATE_DISABLED_VALUE: &str = "\u{1}state:disabled";
+const STATE_RUNNING_VALUE: &str = "\u{1}state:running";
+const STATE_DEAD_VALUE: &str = "\u{1}state:dead";
+const STATE_STOPPED_VALUE: &str = "\u{1}state:stopped";
+
+/// K11: the lamp's three states are facet values too. The lamp click writes
+/// `facet_status` directly, so the dropdown has to be able to name and release
+/// that filter; otherwise its collapsed label says `Group: All` while the list
+/// shows only running rows.
+fn status_value(status: FacetStatus) -> String {
+    match status {
+        FacetStatus::Enabled => STATE_ENABLED_VALUE,
+        FacetStatus::Disabled => STATE_DISABLED_VALUE,
+        FacetStatus::Running => STATE_RUNNING_VALUE,
+        FacetStatus::Dead => STATE_DEAD_VALUE,
+        FacetStatus::Stopped => STATE_STOPPED_VALUE,
+    }
+    .to_string()
+}
+
+fn status_from_value(value: &str) -> Option<FacetStatus> {
+    match value {
+        STATE_ENABLED_VALUE => Some(FacetStatus::Enabled),
+        STATE_DISABLED_VALUE => Some(FacetStatus::Disabled),
+        STATE_RUNNING_VALUE => Some(FacetStatus::Running),
+        STATE_DEAD_VALUE => Some(FacetStatus::Dead),
+        STATE_STOPPED_VALUE => Some(FacetStatus::Stopped),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FacetChoice {
@@ -125,22 +154,43 @@ impl FacetMenu {
         );
         let enabled_count = delegate.rows.iter().filter(|row| row.enabled).count();
         let disabled_count = delegate.rows.len() - enabled_count;
-        choices.push(FacetChoice {
-            id: "facet-status-enabled".to_string(),
-            title: format!("Enabled ({enabled_count})"),
-            display: "Enabled".to_string(),
-            value: Some(STATE_ENABLED_VALUE.to_string()),
-        });
-        choices.push(FacetChoice {
-            id: "facet-status-disabled".to_string(),
-            title: format!("Disabled ({disabled_count})"),
-            display: "Disabled".to_string(),
-            value: Some(STATE_DISABLED_VALUE.to_string()),
-        });
+        for (status, id, count) in [
+            (FacetStatus::Enabled, "facet-status-enabled", enabled_count),
+            (
+                FacetStatus::Disabled,
+                "facet-status-disabled",
+                disabled_count,
+            ),
+        ] {
+            choices.push(FacetChoice {
+                id: id.to_string(),
+                title: format!("{} ({count})", status.label()),
+                display: format!("Status: {}", status.label()),
+                value: Some(status_value(status)),
+            });
+        }
+        for (status, id) in [
+            (FacetStatus::Running, "facet-status-running"),
+            (FacetStatus::Dead, "facet-status-dead"),
+            (FacetStatus::Stopped, "facet-status-stopped"),
+        ] {
+            let count = delegate
+                .rows
+                .iter()
+                .filter(|row| {
+                    status.matches(row, &delegate.running, &delegate.health, &delegate.crashed)
+                })
+                .count();
+            choices.push(FacetChoice {
+                id: id.to_string(),
+                title: format!("{} ({count})", status.label()),
+                display: format!("Status: {}", status.label()),
+                value: Some(status_value(status)),
+            });
+        }
         let current = match delegate.facet_status {
-            Some(FacetStatus::Enabled) => Some(STATE_ENABLED_VALUE.to_string()),
-            Some(FacetStatus::Disabled) => Some(STATE_DISABLED_VALUE.to_string()),
-            _ => delegate.facet_group.clone(),
+            Some(status) => Some(status_value(status)),
+            None => delegate.facet_group.clone(),
         };
         (choices, current)
     }
@@ -165,10 +215,9 @@ impl FacetMenu {
             // K11/A2-1: the dropdown shows one selected item, so a pick writes
             // the two slots disjointly — a state sentinel releases the group
             // choice and any group pick releases the sentinel.
-            let (group, status) = match value.as_deref() {
-                Some(STATE_ENABLED_VALUE) => (None, Some(FacetStatus::Enabled)),
-                Some(STATE_DISABLED_VALUE) => (None, Some(FacetStatus::Disabled)),
-                _ => (value, None),
+            let (group, status) = match value.as_deref().and_then(status_from_value) {
+                Some(status) => (None, Some(status)),
+                None => (value, None),
             };
             delegate.set_facet_menu(group, status);
             list_cx.notify();

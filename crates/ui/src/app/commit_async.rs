@@ -113,7 +113,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.import_parse_in_flight = false;
+        self.set_import_parse_in_flight(false);
         if self.import_parse_cancelled(epoch) {
             return;
         }
@@ -130,7 +130,7 @@ impl AppView {
         group: String,
         cx: &mut Context<Self>,
     ) {
-        self.import_parse_in_flight = false;
+        self.set_import_parse_in_flight(false);
         if self.import_parse_cancelled(epoch) {
             return;
         }

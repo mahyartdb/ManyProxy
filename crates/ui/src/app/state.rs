@@ -1511,6 +1511,14 @@ impl AppView {
         .detach();
     }
 
+    /// Keeps the dialog footer's mirror in step with the parse state.
+    pub(crate) fn set_import_parse_in_flight(&mut self, in_flight: bool) {
+        self.import_parse_in_flight = in_flight;
+        if let Some(form) = &self.import_form {
+            form.in_flight.set(in_flight);
+        }
+    }
+
     /// Marks the running (or just-finished) import parse as cancelled so its
     /// batch is dropped instead of landing after the dialog was dismissed.
     pub(crate) fn cancel_import_parse(&mut self, cx: &mut Context<Self>) {

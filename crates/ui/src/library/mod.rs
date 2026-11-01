@@ -117,8 +117,6 @@ pub(crate) enum FacetStatus {
 }
 
 impl FacetStatus {
-    // K11: the menus no longer round-trip status labels; these survive for the
-    // tests that pin the label vocabulary.
     #[cfg(test)]
     pub(crate) const ALL: [FacetStatus; 5] = [
         FacetStatus::Enabled,
@@ -590,11 +588,7 @@ impl LibraryDelegate {
         }
         // F3: M is the visible row count, so it must read as the current
         // scope of the bar, never as the library total.
-        format!(
-            "{} checked · {} shown",
-            self.checked.len(),
-            self.visible.len()
-        )
+        format!("{} checked (of {})", self.checked.len(), self.visible.len())
     }
 
     pub(crate) fn checked_rows(&self) -> Vec<ProxyConfig> {
@@ -956,6 +950,7 @@ impl ListDelegate for LibraryDelegate {
             .filter(|summary| !summary.is_empty())
             .cloned();
         let is_running = self.running.contains(&row_id);
+        let crashed = self.crashed.contains(&row_id);
 
         let traffic = self.traffic.get(&row_id).copied();
         let upstream = self
@@ -970,6 +965,7 @@ impl ListDelegate for LibraryDelegate {
             &upstream,
             health.as_deref(),
             is_running,
+            crashed,
             traffic,
             self.show_security,
         );
@@ -1058,7 +1054,12 @@ impl ListDelegate for LibraryDelegate {
         // its hairline and carries a 3px signal-blue bar on the leading edge;
         // the kit checkbox fills when checked. Selection alone keeps its 2px
         // rim, so the two grammars never collide.
-        card = card.relative().border_1().border_color(cx.theme().border);
+        card = card.relative();
+        if selected {
+            card = card.border_2().border_color(cx.theme().list_active_border);
+        } else {
+            card = card.border_1().border_color(cx.theme().border);
+        }
         if is_checked {
             card = card.child(
                 div()
@@ -1090,17 +1091,19 @@ impl ListDelegate for LibraryDelegate {
         {
             card = card.focus_ring_style(window, cx);
         }
-        let tone = serving_tone(
-            is_running,
-            health.as_deref(),
-            self.crashed.contains(&row_id),
-        );
+        let tone = serving_tone(is_running, health.as_deref(), crashed);
         let probe_tone = self
             .health_tone
             .get(&row_id)
             .copied()
             .unwrap_or(LatencyTone::Unknown);
-        let health_text_color = health_tone_color(probe_tone, cx);
+        // The cell text and the color carry the same verdict: a crashed row
+        // never probed still reads `● Failed` in the failure tone.
+        let health_text_color = if crashed || tone == ServingTone::Failed {
+            health_tone_color(LatencyTone::Failed, cx)
+        } else {
+            health_tone_color(probe_tone, cx)
+        };
         let lamp_color = match tone {
             ServingTone::Failed => cx.theme().danger,
             ServingTone::Serving => cx.theme().success,
@@ -1222,23 +1225,22 @@ impl ListDelegate for LibraryDelegate {
                     .into_any_element(),
             );
             if metrics.show_health {
-                let tip = health_text.clone();
-                cells.push(
-                    div()
-                        .id(format!("row-health-{row_id}"))
-                        .test_support()
-                        .w(px(metrics.health))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(health_text_color)
-                        .tooltip({
-                            let tip = tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .child(health_text.clone())
-                        .into_any_element(),
-                );
+                let mut cell = div()
+                    .id(format!("row-health-{row_id}"))
+                    .test_support()
+                    .w(px(metrics.health))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(health_text_color)
+                    .child(health_text.clone());
+                // A stopped row's cell is empty by design; an empty tooltip is
+                // a popover that names nothing.
+                if !health_text.is_empty() {
+                    let tip = health_text.clone();
+                    cell = cell.tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into());
+                }
+                cells.push(cell.into_any_element());
             }
             if metrics.show_traffic {
                 cells.push(
@@ -1270,9 +1272,9 @@ impl ListDelegate for LibraryDelegate {
                     .child(
                         Button::new(format!("row-copy-{row_id}"))
                             .small()
-                            // Pinned row test: 72px cell. The default small
-                            // padding clipped the label; compact keeps the
-                            // full "Copy SOCKS" inside the cell.
+                            // Pinned row test: the fixed cell holds the full
+                            // "Copy SOCKS" label; the default small padding
+                            // clipped it at the old 72px width.
                             .compact()
                             .label("Copy SOCKS")
                             .accessibility_label(format!("Copy SOCKS URL for {copy_name}"))
@@ -1421,10 +1423,20 @@ impl ListDelegate for LibraryDelegate {
                             div()
                                 .id("library-loading-label")
                                 .test_support()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
                                 .px_3()
                                 .py_2()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    div()
+                                        .id("library-loading-spinner")
+                                        .test_support()
+                                        .child(Spinner::new().small()),
+                                )
                                 .child(label),
                         );
                     // The bars keep `ROW_PITCH`, so the first real row lands
@@ -1647,8 +1659,8 @@ mod tests {
         delegate.check_ids(&["1".to_string(), "2".to_string()]);
         assert_eq!(
             delegate.bulk_label(),
-            "2 checked · 2 shown",
-            "checked counts the whole set, shown counts the visible scope"
+            "2 checked (of 2)",
+            "checked counts the whole set, of M is the visible scope"
         );
         assert_eq!(
             delegate.checked_position("1"),

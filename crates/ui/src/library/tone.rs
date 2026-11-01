@@ -1,19 +1,29 @@
 use crate::*;
 
+/// T-31: theme *background* tokens (amber, danger red) are legible behind white
+/// text on a dark surface, but well under WCAG AA as text on the light theme's
+/// white — so in light mode both back off toward black along their own hue (the
+/// T-30 `danger.blend(...)` precedent). Dark mode keeps the raw tokens.
+pub(crate) fn warning_text_color(theme: &Theme) -> Hsla {
+    match theme.mode {
+        ThemeMode::Light => theme.warning.blend(hsla(0., 0., 0., 0.45)),
+        ThemeMode::Dark => theme.warning,
+    }
+}
+
+pub(crate) fn danger_text_color(theme: &Theme) -> Hsla {
+    match theme.mode {
+        ThemeMode::Light => theme.danger.blend(hsla(0., 0., 0., 0.35)),
+        ThemeMode::Dark => theme.danger,
+    }
+}
+
 /// T-31: the tone each level paints in, from the active theme. `Info` keeps the
-/// default text color, `Debug` recedes to muted. `Warn`/`Error` are theme
-/// *background* tokens (amber, danger red): legible behind white text on a dark
-/// surface, but well under WCAG AA as text on the light theme's white — so in
-/// light mode both are backed off toward black along their own hue (the T-30
-/// `danger.blend(...)` precedent). Dark mode keeps the raw tokens.
+/// default text color, `Debug` recedes to muted.
 pub(crate) fn log_level_text_color(level: LogLevel, theme: &Theme) -> Hsla {
-    let text_safe = |color: Hsla, darken: f32| match theme.mode {
-        ThemeMode::Light => color.blend(hsla(0., 0., 0., darken)),
-        ThemeMode::Dark => color,
-    };
     match level {
-        LogLevel::Error => text_safe(theme.danger, 0.35),
-        LogLevel::Warn => text_safe(theme.warning, 0.45),
+        LogLevel::Error => danger_text_color(theme),
+        LogLevel::Warn => warning_text_color(theme),
         LogLevel::Info => theme.foreground,
         LogLevel::Debug => theme.muted_foreground,
     }

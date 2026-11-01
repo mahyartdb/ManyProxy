@@ -57,7 +57,10 @@ impl RowMetrics {
     pub const ENDPOINT: f32 = 120.;
     pub const HEALTH: f32 = 110.;
     pub const TRAFFIC: f32 = 120.;
-    pub const COPY: f32 = 72.;
+    /// The `Copy SOCKS` label at the small text step needs more than the old
+    /// 72px cell; the extra 24px still fits the 640px table once the optional
+    /// upstream column yields.
+    pub const COPY: f32 = 96.;
 
     /// The table never falls under this width: below the drawer's window
     /// width the inspector stops taking space from the list.

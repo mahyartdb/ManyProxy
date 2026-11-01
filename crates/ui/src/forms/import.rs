@@ -7,6 +7,10 @@ pub(crate) struct ImportForm {
     pub(crate) file_hint: Option<String>,
     pub(crate) original_text: String,
     pub(crate) multi_files: Option<Vec<(String, String)>>,
+    /// Mirrors `AppView::import_parse_in_flight` for the dialog footer: the
+    /// builder cannot read `AppView` mid-update, but a cell it owns lets the
+    /// footer repaint when the parse starts or finishes.
+    pub(crate) in_flight: Rc<Cell<bool>>,
 }
 
 impl ImportForm {
@@ -24,14 +28,12 @@ impl ImportForm {
                     .placeholder("One share link per line, JSON, or a WireGuard conf")
                     .default_value(prefill_text.to_string())
             }),
-            group: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Group")
-                    .default_value(prefill_group.to_string())
-            }),
+            group: cx
+                .new(|cx| InputState::new(window, cx).default_value(prefill_group.to_string())),
             file_hint,
             original_text: prefill_text.to_string(),
             multi_files: multi,
+            in_flight: Rc::new(Cell::new(false)),
         }
     }
 

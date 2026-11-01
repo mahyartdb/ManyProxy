@@ -107,7 +107,7 @@ pub(crate) fn footer_commit_label(dialog: &str) -> &'static str {
         "presets" | "add" => "OK",
         "edit" => "OK",
         "subscriptions" => "Add",
-        "preset-edit" | "subscription-edit" => "Save",
+        "preset-edit" | "subscription-edit" | "group-edit" => "Save",
         "import" => "Import",
         "export" => "Export",
         "bulk-move" => "Move",

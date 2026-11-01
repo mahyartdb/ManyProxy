@@ -860,7 +860,7 @@ impl AppView {
                         .test_support()
                         .size(px(6.))
                         .rounded_full()
-                        .bg(cx.theme().list_active_border)
+                        .bg(warning_text_color(cx.theme()))
                         .tooltip({
                             let tip = dirty_tip.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
@@ -1419,25 +1419,18 @@ impl AppView {
             );
         }
 
-        let mut stop = Button::new("engine-stop")
+        // DESIGN: an enabled control answers with an honest toast; it never
+        // fakes its own unavailability. Stop and Test stay live on a stopped
+        // row and the commit path says there is nothing to do.
+        let stop = Button::new("engine-stop")
             .small()
             .label("Stop")
             .accessibility_label("Stop")
             .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
             .tooltip(OPERATE_STOP_TOOLTIP)
-            .disabled(!is_running)
-            .loading(self.start_in_flight)
             .on_click(cx.listener(|view, _, window, cx| {
                 view.stop_selected_engine(window, cx);
             }));
-        if self.start_in_flight {
-            stop = stop.child(
-                div()
-                    .id("engine-stop-spinner")
-                    .test_support()
-                    .child(Spinner::new().small()),
-            );
-        }
 
         let mut test = Button::new("health-test")
             .small()
@@ -1445,7 +1438,6 @@ impl AppView {
             .accessibility_label("Test")
             .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
             .tooltip(OPERATE_TEST_TOOLTIP)
-            .disabled(!is_running)
             .loading(self.probe_kind_in_flight(false))
             .on_click(cx.listener(|view, _, window, cx| {
                 view.test_selected_health(window, cx);

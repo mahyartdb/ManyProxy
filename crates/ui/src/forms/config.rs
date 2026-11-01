@@ -135,6 +135,7 @@ fn local_field_error(
     id: &'static str,
     form_error: Option<&(String, String)>,
     field: &str,
+    cx: &App,
 ) -> Option<AnyElement> {
     let (name, message) = form_error?;
     (name == field).then(|| {
@@ -142,6 +143,7 @@ fn local_field_error(
             .id(id)
             .test_support()
             .text_sm()
+            .text_color(danger_text_color(cx.theme()))
             .child(message.clone())
             .into_any_element()
     })
@@ -3900,7 +3902,7 @@ impl ConfigForm {
         // K2: the protocol-specific rows render directly. The stream-transport
         // / TLS / mux / camouflage / dial panels left this match and moved into
         // the single `Advanced Settings` disclosure further down.
-        let uuid_error = local_field_error("uuid-field-error", form_error.as_ref(), "uuid");
+        let uuid_error = local_field_error("uuid-field-error", form_error.as_ref(), "uuid", cx);
         let protocol_section = match protocol_text.as_str() {
             "vless" => Some(
                 self.vless_block(&view, &repaint, uuid_error, cx)
@@ -4105,6 +4107,7 @@ impl ConfigForm {
                                                 "field-guided-server-error",
                                                 form_error.as_ref(),
                                                 "guided_server",
+                                                cx,
                                             )),
                                     ),
                             ),
@@ -4129,6 +4132,7 @@ impl ConfigForm {
                                                 "field-guided-port-error",
                                                 form_error.as_ref(),
                                                 "guided_port",
+                                                cx,
                                             )),
                                     ),
                             ),
@@ -4302,13 +4306,17 @@ impl ConfigForm {
                     div()
                         .id("bind-collision-warning")
                         .test_support()
+                        .text_sm()
+                        .text_color(warning_text_color(cx.theme()))
                         .child(warning),
                 ),
             );
         }
         if let Some((field_name, message)) = form_error {
             // Guided fields carry their error beside themselves; the foot line
-            // stays for everything else (params, port, test_url).
+            // stays for everything else (params, port, test_url). The message
+            // already says what is wrong, so the raw field key stays out of
+            // the user's sentence.
             if !matches!(
                 field_name.as_str(),
                 "uuid" | "guided_server" | "guided_port"
@@ -4318,7 +4326,9 @@ impl ConfigForm {
                         div()
                             .id("form-field-error")
                             .test_support()
-                            .child(format!("{field_name}: {message}")),
+                            .text_sm()
+                            .text_color(danger_text_color(cx.theme()))
+                            .child(message),
                     ),
                 );
             }

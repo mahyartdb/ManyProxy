@@ -14,8 +14,15 @@ impl AppView {
     pub(crate) fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let libraries = self.libraries.read(cx);
         let delegate = libraries.delegate();
-        let (total, enabled) = delegate.counts();
-        let count_text = status_count_text(total, enabled);
+        // A broken read has no honest count: `0 of 0` beside "Could not load
+        // configurations" is a lying zero, so the segment stays absent.
+        let count_text = match (&delegate.load, delegate.rows.is_empty()) {
+            (LibraryLoad::Failed(_), true) => None,
+            _ => {
+                let (total, enabled) = delegate.counts();
+                Some(status_count_text(total, enabled))
+            }
+        };
         let filter_text = delegate.active_filter_text();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
@@ -37,9 +44,10 @@ impl AppView {
             .gap_2()
             // Wide enough for the longest count ("2 configurations · 1 set
             // for launch") so a plural never shifts the neighbouring slots.
-            .min_w(px(260.))
-            .child({
-                let tip = count_text.clone();
+            .min_w(px(260.));
+        if let Some(count_text) = count_text {
+            let tip = count_text.clone();
+            left = left.child(
                 div()
                     .id("status-count")
                     .test_support()
@@ -47,8 +55,9 @@ impl AppView {
                     .truncate()
                     .aria_label(count_text.clone())
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(count_text)
-            });
+                    .child(count_text),
+            );
+        }
 
         if !filter_text.is_empty() {
             let tip = filter_text.clone();
@@ -190,6 +199,9 @@ impl AppView {
             .gap_2()
             .px_2()
             .py_1()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .aria_label(count_label.clone())
             .child(count_label)
             .child(if has_query {
                 Button::new("clear-search")

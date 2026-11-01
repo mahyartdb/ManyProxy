@@ -12056,12 +12056,12 @@ fn t44_checked_set_honest_label_and_prune() {
     delegate.toggle_checked("3");
     delegate.toggle_checked("ghost");
     assert_eq!(delegate.checked.len(), 2, "unknown ids never check");
-    assert_eq!(delegate.bulk_label(), "2 checked · 3 shown");
+    assert_eq!(delegate.bulk_label(), "2 checked (of 3)");
 
     delegate.query = "alpha".to_string();
     delegate.apply_filter();
     assert_eq!(delegate.checked.len(), 2);
-    assert_eq!(delegate.bulk_label(), "2 checked · 1 shown");
+    assert_eq!(delegate.bulk_label(), "2 checked (of 1)");
     let checked: Vec<String> = delegate
         .checked_rows()
         .iter()
@@ -12071,12 +12071,12 @@ fn t44_checked_set_honest_label_and_prune() {
 
     delegate.query = String::new();
     delegate.set_facet_group(Some("nope".to_string()));
-    assert_eq!(delegate.bulk_label(), "2 checked · 0 shown");
+    assert_eq!(delegate.bulk_label(), "2 checked (of 0)");
     delegate.clear_facets();
 
     delegate.set_rows(vec![row("1", "Alpha", "g"), row("2", "Beta", "g")]);
     assert_eq!(delegate.checked.len(), 1);
-    assert_eq!(delegate.bulk_label(), "1 checked · 2 shown");
+    assert_eq!(delegate.bulk_label(), "1 checked (of 2)");
     delegate.toggle_checked("1");
     assert_eq!(delegate.bulk_label(), "");
     delegate.clear_checked();
@@ -12190,7 +12190,7 @@ fn t01_checked_positions_and_selection_stay_distinct() {
         None,
         "the selected-only row carries no chip"
     );
-    assert_eq!(delegate.bulk_label(), "2 checked · 3 shown");
+    assert_eq!(delegate.bulk_label(), "2 checked (of 3)");
     assert_eq!(
         delegate.selected_row().map(|row| row.name),
         Some("Gamma".to_string()),
@@ -12208,7 +12208,7 @@ fn t01_checked_positions_and_selection_stay_distinct() {
 
     delegate.toggle_checked("1");
     assert_eq!(delegate.checked_position("3"), Some(1));
-    assert_eq!(delegate.bulk_label(), "1 checked · 3 shown");
+    assert_eq!(delegate.bulk_label(), "1 checked (of 3)");
     delegate.selected = None;
     assert_eq!(
         delegate.checked.len(),
@@ -12412,6 +12412,28 @@ fn t44_facet_options_inventory_rows() {
             .map(|choice| choice.title.as_str()),
         Some("Disabled (0)")
     );
+    // K11: the lamp's three states ride the same menu, counts included.
+    for (id, title) in [
+        ("facet-status-running", "Running (0)"),
+        ("facet-status-dead", "Dead (0)"),
+        ("facet-status-stopped", "Stopped (3)"),
+    ] {
+        assert_eq!(
+            group_choices
+                .iter()
+                .find(|choice| choice.id == id)
+                .map(|choice| choice.title.as_str()),
+            Some(title),
+            "{id} carries its own count"
+        );
+    }
+    assert!(
+        !group_choices
+            .iter()
+            .find(|choice| choice.id == "facet-status-stopped")
+            .is_some_and(|choice| choice.display == "Group: All"),
+        "a status choice never collapses to the group-all label"
+    );
 }
 
 #[gpui_kit::test]
@@ -12503,7 +12525,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "1 checked · 2 shown");
+    assert_eq!(label, "1 checked (of 2)");
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -12518,7 +12540,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "1 checked · 1 shown");
+    assert_eq!(label, "1 checked (of 1)");
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.select_visible_checked(window, cx));
@@ -12526,7 +12548,7 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "2 checked · 1 shown");
+    assert_eq!(label, "2 checked (of 1)");
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.clear_checked(window, cx));
     });
@@ -12774,7 +12796,7 @@ fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
     let label = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().bulk_label()
     });
-    assert_eq!(label, "2 checked · 3 shown");
+    assert_eq!(label, "2 checked (of 3)");
 }
 
 #[gpui_kit::test]
@@ -13271,7 +13293,15 @@ fn t01_row_cells_carry_one_fact_each() {
         identity_key: None,
         preset_id: None,
     };
-    let cells = library_row_cells(&row, "a.example.com:443", Some("87ms"), true, None, false);
+    let cells = library_row_cells(
+        &row,
+        "a.example.com:443",
+        Some("87ms"),
+        true,
+        false,
+        None,
+        false,
+    );
     assert_eq!(
         cells[0], "a.example.com:443",
         "upstream cell carries upstream"
@@ -13288,6 +13318,7 @@ fn t01_row_cells_carry_one_fact_each() {
         "a.example.com:443",
         Some("87ms"),
         true,
+        false,
         Some((1_048_782, 88)),
         false,
     );
@@ -13301,12 +13332,12 @@ fn t01_row_cells_carry_one_fact_each() {
         "health cell stays state-only:\n{}",
         busy[1]
     );
-    let idle = library_row_cells(&row, "a.example.com:443", None, false, None, false);
+    let idle = library_row_cells(&row, "a.example.com:443", None, false, false, None, false);
     assert_eq!(
         idle[1], "",
         "stopped health cell stays empty — the gray lamp carries stopped"
     );
-    let secured = library_row_cells(&row, "a.example.com:443", None, true, None, true);
+    let secured = library_row_cells(&row, "a.example.com:443", None, true, false, None, true);
     assert_eq!(
         secured[0], "a.example.com:443 · none",
         "security posture splices onto upstream:\n{}",
@@ -13365,7 +13396,7 @@ fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
         (delegate.checked_position(&only.id), delegate.bulk_label())
     });
     assert_eq!(position, Some(1), "the checked set keeps its order");
-    assert_eq!(label, "1 checked · 1 shown");
+    assert_eq!(label, "1 checked (of 1)");
 }
 
 #[gpui_kit::test]
@@ -13447,7 +13478,7 @@ fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
         view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         }),
-        "1 checked · 1 shown"
+        "1 checked (of 1)"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
 }
@@ -15783,7 +15814,7 @@ fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
         (&stopped, "b.example.com:443", None, false),
         (&dead, "c.example.com:443", Some("dead"), true),
     ] {
-        let cells = library_row_cells(row, upstream, health, serving, None, false);
+        let cells = library_row_cells(row, upstream, health, serving, false, None, false);
         assert_eq!(cells[0], upstream, "upstream cell in row");
         assert_painted(cx, &format!("row-upstream-{}", row.id));
         if serving {
@@ -15804,6 +15835,7 @@ fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
         "a.example.com:443",
         Some("87ms"),
         true,
+        false,
         None,
         false,
     );
@@ -16075,6 +16107,19 @@ fn lamp_click_toggles_endpoint_state_filter(cx: &mut TestAppContext) {
         view.libraries.read(cx).delegate().facet_status
     });
     assert_eq!(status, Some(FacetStatus::Stopped));
+    // The dropdown can name the filter the lamp wrote; otherwise its collapsed
+    // label would lie while the list shows only one state.
+    let (display, picked) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        let (choices, current) = crate::FacetMenu::Group.choices(delegate);
+        let picked = choices
+            .into_iter()
+            .find(|choice| choice.value == current)
+            .map(|choice| choice.id);
+        (crate::FacetMenu::Group.current_display(delegate), picked)
+    });
+    assert_eq!(display, "Status: Stopped");
+    assert_eq!(picked.as_deref(), Some("facet-status-stopped"));
     // The clicked row carries that lamp, so the filter cannot hide it.
     assert_painted(cx, &format!("library-row-{}", seeded.id));
 
@@ -17731,7 +17776,7 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
         view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         }),
-        "2 checked · 2 shown"
+        "2 checked (of 2)"
     );
 
     let (bar_bounds, button_height) = cx.update(|window, _| {
@@ -18174,7 +18219,10 @@ fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
         has_spinner(cx, "engine-start-spinner"),
         "start shows loading"
     );
-    assert!(has_spinner(cx, "engine-stop-spinner"), "stop shows loading");
+    assert!(
+        !has_spinner(cx, "engine-stop-spinner"),
+        "stop stays live and unlit during a start"
+    );
     assert!(
         !has_spinner(cx, "health-test-spinner"),
         "no probe running, no test spinner"
@@ -18220,7 +18268,7 @@ fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
     );
     assert!(
         !has_spinner(cx, "engine-start-spinner") && !has_spinner(cx, "engine-stop-spinner"),
-        "a ping lights no operate-row spinner"
+        "a ping lights no operate-row spinner (Stop never lights one)"
     );
 
     cx.update(|_, cx| {
@@ -18463,13 +18511,31 @@ fn b18_row_accent_keeps_row_pitch_and_count(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t09_import_double_commit_ignored(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
-    cx.update(|_, cx| {
-        view.update(cx, |view, _| {
-            view.import_parse_in_flight = true;
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_import_dialog("vless://x", "travel", None, window, cx);
         });
     });
+    paint_dialog_open(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.set_import_parse_in_flight(true);
+        });
+    });
+    paint_dialog_open(cx);
+    // The parse begins after the commit click, while this dialog stays open;
+    // its footer has to show the wait instead of looking idle.
+    assert_painted(cx, "import-dialog-spinner");
+    assert_painted(cx, "import-dialog-ok");
+    let import_label = cx.update(|window, _| {
+        window
+            .try_find("import-dialog-ok")
+            .and_then(|snapshot| snapshot.label().map(str::to_string))
+    });
+    assert_eq!(import_label.as_deref(), Some("Importing…"));
     let before = notification_count(cx);
     let committed = cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -18564,7 +18630,7 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
         view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         }),
-        "1 checked · 1 shown"
+        "1 checked (of 1)"
     );
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.clear_checked(window, cx));
@@ -19089,6 +19155,7 @@ fn library_row_cells_split_state_route_and_accounting() {
         "a.example.com:443",
         Some("87ms"),
         true,
+        false,
         Some((1_048_782, 88)),
         false,
     );
@@ -19122,7 +19189,7 @@ fn library_row_cells_split_state_route_and_accounting() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!shown.contains("s3cret"), "no secrets in row cells");
-    let idle = library_row_cells(&row, "no upstream", None, false, None, false);
+    let idle = library_row_cells(&row, "no upstream", None, false, false, None, false);
     assert_eq!(
         idle[1], "",
         "idle health cell empty — gray lamp carries stopped"
@@ -21437,8 +21504,9 @@ fn f19_inspector_shortcut_toggles_presence(cx: &mut TestAppContext) {
     );
 }
 
-/// F11: Start leads while the endpoint is stopped; Stop and Test only mean
-/// something once it runs, so a stopped row ignores their presses.
+/// F11: Start leads while the endpoint is stopped. Stop and Test stay live
+/// everywhere and answer a stopped row with an honest toast, never by faking
+/// their own unavailability.
 #[gpui_kit::test]
 fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
@@ -21481,8 +21549,8 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
     );
     assert_eq!(
         notification_count(cx),
-        notifications,
-        "the disabled Stop does not toast"
+        notifications + 1,
+        "a stopped Stop answers with the already-stopped toast"
     );
 
     cx.update(|window, cx| {
@@ -21493,6 +21561,11 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
     assert!(
         !has_spinner(cx, "health-test-spinner"),
         "a stopped endpoint has nothing to test"
+    );
+    assert_eq!(
+        notification_count(cx),
+        notifications + 2,
+        "a stopped Test answers with the not-running toast"
     );
 
     cx.update(|window, cx| {
@@ -21549,7 +21622,7 @@ fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppCon
 
 /// F2: upstream is the third budget drop. At 740 the protocol column is gone
 /// but upstream still fits; at the 640 floor it goes too, so the minimum row
-/// (562px) never overflows the table.
+/// (586px) never overflows the table.
 #[test]
 fn t03_row_budget_drops_upstream_after_protocol() {
     use crate::{RowColumns, RowMetrics};
@@ -21574,9 +21647,9 @@ fn t03_row_budget_drops_upstream_after_protocol() {
         + RowMetrics::HEALTH
         + RowMetrics::COPY
         + 5. * RowMetrics::GAP;
-    assert_eq!(min_row, 562.);
+    assert_eq!(min_row, 586.);
     assert!(min_row <= RowMetrics::TABLE_MIN);
-    assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 710.);
+    assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 734.);
 }
 
 /// F2: at the default 1000px frame the table reserves the drawer's 260px, so
@@ -21725,7 +21798,7 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
     assert!(pitch > 0., "the pitch is measurable");
 
     // The row's only framed control besides the checkbox is Copy, and it
-    // holds its 72px cell.
+    // holds its fixed cell with the whole label visible.
     let copy_label = cx.update(|window, _| {
         window
             .try_find(format!("row-copy-{}", ids[0]))
@@ -21743,8 +21816,8 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
             .map(|snapshot| snapshot.bounds().size.width.as_f32())
     });
     assert!(
-        copy_width.is_some_and(|width| width <= 72.),
-        "Copy holds its 72px cell, got {copy_width:?}"
+        copy_width.is_some_and(|width| width <= 96.),
+        "Copy holds its 96px cell, got {copy_width:?}"
     );
 
     // Every header label sits at its column's first character.
@@ -22988,8 +23061,8 @@ fn ticket03_facet_triggers_show_active_choice_with_count(cx: &mut TestAppContext
         .expect("enabled sentinel rides the group menu");
     assert_eq!(enabled.title, "Enabled (1)");
     assert_eq!(
-        enabled.display, "Enabled",
-        "the sentinel selection names itself"
+        enabled.display, "Status: Enabled",
+        "the sentinel selection names its dimension"
     );
 }
 
@@ -23096,14 +23169,14 @@ fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
         let delegate = view.libraries.read(cx).delegate();
         let (visible, total, _) = delegate.delegate_counts_for_search();
         crate::facet_tip_text(
-            "group",
+            "group or status",
             &crate::FacetMenu::Group.current_display(delegate),
             visible,
             total,
         )
     });
     assert_eq!(
-        group_tip, "Filter by group: Group: travel · 1 of 2 shown",
+        group_tip, "Filter by group or status: Group: travel · 1 of 2 shown",
         "K11: the tip names the choice without the retired count chip"
     );
 }
@@ -29842,7 +29915,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
             .read(cx)
             .delegate()
             .bulk_label()),
-        "1 checked · 1 shown"
+        "1 checked (of 1)"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -29869,7 +29942,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
             .read(cx)
             .delegate()
             .bulk_label()),
-        "1 checked · 1 shown",
+        "1 checked (of 1)",
         "arrows keep the checks"
     );
 }
@@ -30451,7 +30524,7 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     let upstream = crate::upstream_host_port(&row).expect("upstream reads");
     assert_eq!(upstream, "198.51.100.9:443");
     assert_no_canaries(&upstream, "upstream");
-    let cells = crate::library_row_cells(&row, &upstream, Some("87ms"), true, None, false);
+    let cells = crate::library_row_cells(&row, &upstream, Some("87ms"), true, false, None, false);
     let route = crate::library_row_full_route(&row, &upstream);
     assert!(
         route.contains("127.0.0.1:10982"),
@@ -30838,8 +30911,14 @@ fn bug16_import_cancel_drops_late_batch(cx: &mut TestAppContext) {
         assert!(!started, "async parse leaves the dialog open");
     });
     assert!(
-        view.read_with(cx, |view, _| view.import_parse_in_flight),
-        "parse is in flight"
+        view.read_with(cx, |view, _| {
+            view.import_parse_in_flight
+                && view
+                    .import_form
+                    .as_ref()
+                    .is_some_and(|form| form.in_flight.get())
+        }),
+        "parse is in flight and the footer mirror follows"
     );
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.cancel_import_parse(cx));
@@ -32040,7 +32119,7 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
             .unwrap_or_default()
     });
     assert!(
-        marked.contains('✓'),
+        marked.contains("current sort"),
         "the persisted key carries the marker: {marked:?}"
     );
 
@@ -32093,7 +32172,7 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
             .try_find("sort-header-health-none".to_string())
             .and_then(|snapshot| snapshot.label().map(str::to_string))
             .unwrap_or_default()
-            .contains('✓')),
+            .contains("current sort")),
         "a key owned by the other column is not marked here"
     );
     let direction = cx.update(|window, _| {
@@ -35047,6 +35126,7 @@ fn b16_fetch_in_flight_paints_skeletons_not_the_empty_canvas(cx: &mut TestAppCon
     cx.update(|_, cx| view.update(cx, |view, cx| view.mark_library_loading(cx)));
     paint_frame(cx);
     assert_painted(cx, "library-loading");
+    assert_painted(cx, "library-loading-spinner");
     assert_painted(cx, "skeleton-row-0");
     assert_absent(cx, "library-empty".to_string());
     assert_absent(cx, "empty-add".to_string());

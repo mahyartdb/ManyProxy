@@ -18,6 +18,7 @@ impl AppView {
         id_suffix: &'static str,
         label: String,
         tip: String,
+        checked: bool,
         action: SortMenuAction,
         view: &Entity<AppView>,
     ) -> PopupMenuItem {
@@ -26,11 +27,19 @@ impl AppView {
         PopupMenuItem::element(move |_, _| {
             let text = label.clone();
             let tip = tip.clone();
+            // The check mark is the menu's own state, not a glyph in the label:
+            // the visual row gets the check slot and screen readers hear the
+            // same fact as words.
+            let aria = if checked {
+                format!("{text} — current sort")
+            } else {
+                text.clone()
+            };
             div()
                 .id(id.clone())
                 .test_support()
                 .role(Role::MenuItem)
-                .aria_label(text.clone())
+                .aria_label(aria)
                 .flex()
                 .flex_row()
                 .items_center()
@@ -38,6 +47,7 @@ impl AppView {
                 .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                 .child(text)
         })
+        .checked(checked)
         .on_click(move |_, window, cx| {
             view.update(cx, |view, cx| match action {
                 SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
@@ -126,7 +136,7 @@ impl AppView {
             let delegate = libraries.delegate();
             let (visible, total, _) = delegate.delegate_counts_for_search();
             facet_tip_text(
-                "group",
+                "group or status",
                 &FacetMenu::Group.current_display(delegate),
                 visible,
                 total,
@@ -159,7 +169,7 @@ impl AppView {
                         Select::new(&self.facet_group.state)
                             .id("facet-group")
                             .small()
-                            .accessibility_label("Filter by group"),
+                            .accessibility_label("Filter by group or status"),
                     ),
             )
             .child(
@@ -373,21 +383,12 @@ impl AppView {
         let mut menu = menu;
         for key in sort_header_keys(column) {
             let current = *key == sort.key;
-            let label = if current {
-                format!("{} ✓", key.label())
-            } else {
-                key.label().to_string()
-            };
-            let tip = if current {
-                format!("{} — current sort", key.label())
-            } else {
-                format!("Sort by {}", key.label())
-            };
             menu = menu.item(Self::sort_menu_item(
                 column,
                 key.token(),
-                label,
-                tip,
+                key.label().to_string(),
+                format!("Sort by {}", key.label()),
+                current,
                 SortMenuAction::Key(*key),
                 view,
             ));
@@ -398,6 +399,7 @@ impl AppView {
             "direction",
             format!("Direction: {} → {}", sort.direction.label(), next.label()),
             "Reverse the active key (Type | Security keeps its fixed order)".to_string(),
+            false,
             SortMenuAction::Direction,
             view,
         ))

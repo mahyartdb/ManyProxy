@@ -756,7 +756,7 @@ impl AppView {
                             .w_full()
                             .px_2()
                             .pt_2()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .aria_label(PALETTE_FOOTER_HINT)
                             .child(PALETTE_FOOTER_HINT)
@@ -1604,6 +1604,9 @@ impl AppView {
                         .child(
                             Button::new("edit-dialog-ok")
                                 .small()
+                                // The named commit is a primary action, like
+                                // every other dialog footer's.
+                                .primary()
                                 .label(footer_commit_label("edit"))
                                 .on_click(move |_, window, cx| {
                                     if commit_click(window, cx) {
@@ -1693,9 +1696,11 @@ impl AppView {
             }
             None => ImportForm::new(window, cx, prefill_text, prefill_group, file_hint, None),
         };
+        form.in_flight.set(self.import_parse_in_flight);
         // F7: the open form is the drop target, and a stale marker must never
         // outlive its dialog — every close below clears it.
         self.import_form = Some(form.clone());
+        let form_for_footer = form.clone();
         let view = cx.entity();
         let reader = form.clone();
 
@@ -1717,10 +1722,10 @@ impl AppView {
         let ok_view = view.clone();
         let drop_view = view.clone();
         focus_shell_before_overlay(window, cx);
-        // Snapshot before the builder runs: reading `AppView` inside the
-        // dialog-builder closure re-enters the entity mid-update and panics.
-        let in_flight = self.import_parse_in_flight;
+        // The builder runs every frame, so the footer reads the live in-flight
+        // flag from the form itself; `AppView` cannot be read from here.
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+            let in_flight = form_for_footer.in_flight.get();
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let cancel_view = cancel_view.clone();
@@ -1741,8 +1746,8 @@ impl AppView {
                             reclaim_shell_focus(window, cx);
                         }),
                 )
-                .child(
-                    Button::new("import-dialog-ok")
+                .child({
+                    let mut import_ok = Button::new("import-dialog-ok")
                         .small()
                         // K17/A7-10: the named commit is a primary action —
                         // accent-filled like the other dialog footers.
@@ -1752,15 +1757,27 @@ impl AppView {
                         } else {
                             footer_commit_label("import")
                         })
-                        .disabled(in_flight)
+                        // A working commit keeps its primary face and spinner
+                        // instead of graying out; loading blocks the second
+                        // click, and the commit handler holds the same guard.
+                        .loading(in_flight)
                         .on_click(move |_, window, cx| {
                             if commit_click(window, cx) {
                                 drop_view.update(cx, |view, _| view.import_form = None);
                                 window.close_all_dialogs(cx);
                                 reclaim_shell_focus(window, cx);
                             }
-                        }),
-                );
+                        });
+                    if in_flight {
+                        import_ok = import_ok.child(
+                            div()
+                                .id("import-dialog-spinner")
+                                .test_support()
+                                .child(Spinner::new().small()),
+                        );
+                    }
+                    import_ok
+                });
             dialog
                 .title("Import proxy configurations")
                 .close_button(false)
@@ -2056,7 +2073,7 @@ impl AppView {
     }
 
     pub(crate) fn open_rule_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Rule set name"));
+        let name_state = cx.new(|cx| InputState::new(window, cx));
         let url_state =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://host.example/set.srs"));
         let view = cx.entity();
@@ -2067,7 +2084,8 @@ impl AppView {
             let name = name_reader.read(cx).value().to_string();
             let url = url_reader.read(cx).value().to_string();
             if name.trim().is_empty() && url.trim().is_empty() {
-                return true;
+                window.push_notification(Notification::warning("Enter a rule set name or URL"), cx);
+                return false;
             }
             commit_view.update(cx, |view, cx| {
                 view.begin_rule_set_download(name, url, window, cx)
@@ -2320,7 +2338,11 @@ impl AppView {
                 && boxes.is_empty()
                 && remote_url.is_empty()
             {
-                return true;
+                window.push_notification(
+                    Notification::warning("Enter a name, rules, or a remote URL"),
+                    cx,
+                );
+                return false;
             }
             commit_view.update(cx, |view, cx| {
                 view.commit_preset_create_with_boxes(name, rules, boxes, window, cx)
@@ -2684,7 +2706,8 @@ impl AppView {
             let auto = *reader.auto_refresh.borrow();
             let interval = *reader.interval_secs.borrow();
             if label.trim().is_empty() && url.trim().is_empty() {
-                return true;
+                window.push_notification(Notification::warning("Enter a subscription URL"), cx);
+                return false;
             }
             commit_view.update(cx, |view, cx| {
                 view.commit_subscription_add(label, url, group, auto, interval, window, cx)
@@ -2815,21 +2838,13 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let label_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Label")
-                .default_value(sub.label.clone())
-        });
+        let label_state = cx.new(|cx| InputState::new(window, cx).default_value(sub.label.clone()));
         let url_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("https://…")
                 .default_value(sub.url.expose().to_string())
         });
-        let group_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Group")
-                .default_value(sub.group.clone())
-        });
+        let group_state = cx.new(|cx| InputState::new(window, cx).default_value(sub.group.clone()));
         let view = cx.entity();
         let id = sub.id.clone();
         let title = format!("Edit {}", sub.label);

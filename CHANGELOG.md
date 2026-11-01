@@ -7,7 +7,7 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 ### Added
 
 - The row you just started or stopped shows a 150 ms accent on its leading edge, then settles. Nothing moves: the row height, the pitch, and the painted row count are unchanged.
-- One-line library rows with a right-hand inspector drawer: one 5-tab switcher (Details, Health, Logs, Connections, Traffic), a single-scroll Details tab with merged endpoints and one copy action, and a Start/Stop/Test kebab. The tab bar sizes to its labels at the default window width.
+- One-line library rows with a right-hand inspector drawer: one 5-tab switcher (Details, Health, Logs, Links, Traffic), a single-scroll Details tab with merged endpoints and one copy action, and a Start/Stop/Test kebab. The tab bar sizes to its labels at the default window width.
 - Filter row `Search · Group · N of M`. Clicking a row's status lamp filters by that endpoint state. The eight-way status dropdown is gone; Enabled and Disabled live under the Group menu.
 - Checked-set bulk bar: `N checked (of M)` with Start, Stop, and `More ▾`. Checked rows carry a 3px accent bar and a filled chip. `Copy proxies` copies the running endpoints as one sheet, and bulk verbs route through the batch engine ops.
 - Toasts, bottom-right above the status bar, at most two at a time: batched test sweeps (`Testing N…` then one `Tested N: X live · Y dead`), single-row test results, and delete with Undo. Deletion is immediate. An 8-second stash restores the rows and their group assignments, and expiry is permanent.
@@ -39,7 +39,14 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - Overlays created during boot no longer precede the Root layer, which had panicked at startup.
 - Engine batches survive individual row failures: a dead active row, a bad port on one row, or a failed batch no longer stalls the rest or restores a stale Running status.
 - Log tones stay legible in the light theme, with contrast asserted in tests.
-- The inspector tab bar no longer clips Connections and Traffic at the default drawer width. A paint test pins this.
+- The inspector tab bar no longer clips Links and Traffic at the default drawer width. A paint test pins this.
+- Stop and Test stay live on a stopped endpoint and answer with an honest toast; the operate row no longer fakes unavailability or lights a Stop spinner during a start. Import keeps its `Importing…` label and spinner while it works.
+- The Group filter round-trips the status lamp's Running, Dead, and Stopped choices, so its collapsed label and tooltip always name the filter the list is actually showing.
+- The row health cell reads `● Running`, `● Running · <probe>`, or `● Failed` without repeating the endpoint, so the latency fits its 110px column. `Copy SOCKS` fits its 96px cell whole.
+- Selected rows paint the 2px selection rim; the dirty-dot and collision warnings use the amber warning tone instead of selection blue and danger red. Inline form errors and warnings stay legible in the light theme.
+- A failed library read no longer adds a lying `0 of 0` to the status bar. Sort menus mark the current key with a real check state, not a `✓` glued into the label.
+- Committing an empty Add rule set, Add subscription, or new preset keeps the dialog open with an explicit prompt instead of closing silently. Subscription, import, group, rule-set, and preset fields drop placeholders that only repeated their label.
+- The Group edit footer says `Save` instead of `Close`, and the Edit dialog's commit is primary like every other footer.
 
 ### Security
 

@@ -1180,7 +1180,7 @@ impl AppView {
         if self.import_parse_in_flight {
             return false;
         }
-        self.import_parse_in_flight = true;
+        self.set_import_parse_in_flight(true);
         self.import_parse_epoch = self.import_parse_epoch.wrapping_add(1);
         let epoch = self.import_parse_epoch;
         self.import_cancel_epoch = None;

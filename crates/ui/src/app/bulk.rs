@@ -68,6 +68,8 @@ impl AppView {
                         .id("bulk-label")
                         .test_support()
                         .flex_shrink_0()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
                         // B19: the count is the bar's only status text, so it
                         // names itself like every other bar segment does.
                         .aria_label(label.clone())
@@ -599,7 +601,7 @@ impl AppView {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         }
-        let group_state = cx.new(|cx| InputState::new(window, cx).placeholder("Group"));
+        let group_state = cx.new(|cx| InputState::new(window, cx));
         let view = cx.entity();
         let reader = group_state.clone();
         let ids_for_commit = ids.clone();
@@ -650,7 +652,7 @@ impl AppView {
         };
         let ids_for_commit = vec![config.id.clone()];
         let name = config.name.clone();
-        let group_state = cx.new(|cx| InputState::new(window, cx).placeholder("Group"));
+        let group_state = cx.new(|cx| InputState::new(window, cx));
         let view = cx.entity();
         let reader = group_state.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
@@ -929,11 +931,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let old_name = old.to_string();
-        let name_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("New group name")
-                .default_value(old_name.clone())
-        });
+        let name_state = cx.new(|cx| InputState::new(window, cx).default_value(old_name.clone()));
         let view = cx.entity();
         let reader = name_state.clone();
         let old_for_commit = old_name.clone();
@@ -975,11 +973,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let old_name = group.to_string();
-        let name_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Group name")
-                .default_value(old_name.clone())
-        });
+        let name_state = cx.new(|cx| InputState::new(window, cx).default_value(old_name.clone()));
         let skip = Rc::new(RefCell::new(self.store.group_skip_refresh(group)));
         let skip_for_change = skip.clone();
         let skip_for_commit = skip.clone();

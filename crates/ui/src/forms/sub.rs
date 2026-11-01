@@ -21,21 +21,13 @@ impl SubForm {
         interval_secs: i64,
     ) -> Self {
         Self {
-            label: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Label")
-                    .default_value(label.to_string())
-            }),
+            label: cx.new(|cx| InputState::new(window, cx).default_value(label.to_string())),
             url: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("https://…")
                     .default_value(url.to_string())
             }),
-            group: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Group")
-                    .default_value(group.to_string())
-            }),
+            group: cx.new(|cx| InputState::new(window, cx).default_value(group.to_string())),
             auto_refresh: Rc::new(RefCell::new(auto_refresh)),
             interval_secs: Rc::new(RefCell::new(interval_secs)),
         }
