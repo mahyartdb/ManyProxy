@@ -33,6 +33,7 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Fixed
 
+- Opening Settings costs what it paints: the three core binaries, the two data folders, and the theme are read once when the dialog opens instead of on every frame of the entry animation, and a row's filter check no longer allocates.
 - Ships as a GUI binary with no console window. The release workflow stamps the version, gates the tag, bundles licenses, and carries the arm64 row.
 - Export no longer loses the file when Windows strips ACLs from the temp file before rename.
 - Overlays created during boot no longer precede the Root layer, which had panicked at startup.

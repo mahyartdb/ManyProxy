@@ -110,14 +110,13 @@ fn settings_body_max_height(window: &Window) -> f32 {
 /// hidden but still counted, so the badge can say how many of how many showed.
 fn settings_row(
     state: &SettingsState,
-    cx: &App,
     id: &'static str,
     label: &'static str,
     help: Option<String>,
     muted: Hsla,
     control: impl IntoElement,
 ) -> impl IntoElement {
-    let shown = state.note_row(cx, id, label);
+    let shown = state.note_row(id, label);
     div()
         .id(id)
         .flex()
@@ -128,17 +127,16 @@ fn settings_row(
                 .flex()
                 .flex_row()
                 .items_center()
+                .justify_between()
                 .gap_4()
                 .min_w_0()
                 .child(
                     div()
-                        .id(format!("{id}-label"))
-                        .test_support()
                         .w(px(SETTINGS_LABEL_WIDTH))
                         .flex_shrink_0()
                         .child(label),
                 )
-                .child(div().flex_1().min_w_0().justify_end().child(control)),
+                .child(control),
         )
         .when_some(help, |this, text| {
             this.child(
@@ -159,14 +157,13 @@ fn settings_row(
 /// is longer than the label column plus a right-hand control column can hold.
 fn settings_field_row(
     state: &SettingsState,
-    cx: &App,
     id: &'static str,
     label: &'static str,
     help: Option<String>,
     muted: Hsla,
     control: impl IntoElement,
 ) -> impl IntoElement {
-    let shown = state.note_row(cx, id, label);
+    let shown = state.note_row(id, label);
     div()
         .id(id)
         .flex()
@@ -218,14 +215,21 @@ struct SettingsState {
     /// `(shown, total)` — written while the column is built, read by the
     /// filter badge. The column is rebuilt every frame, so it resets there.
     counted: Rc<Cell<(usize, usize)>>,
+    /// B17: this frame's filter query, trimmed and lowercased. Written once at
+    /// the top of `render_body`; every row reads it instead of re-reading the
+    /// field, because the column is rebuilt every frame.
+    query: Rc<RefCell<String>>,
+    /// K9/A7-5: the three cores as `(row id, name, exe)`, resolved once when the
+    /// dialog opens. The dialog is rebuilt every frame and the binaries cannot
+    /// change under it, so resolving them per frame was pure I/O in a paint.
+    engines: Vec<(&'static str, &'static str, Option<std::path::PathBuf>)>,
+    /// T-04: the two folder paths Maintenance shows, resolved at open for the
+    /// same reason: `app_data_dir` asks the OS for the exe path.
+    data_folder: String,
+    logs_path: String,
 }
 
 impl SettingsState {
-    /// B17: the filter query, trimmed and lowercased.
-    fn query(&self, cx: &App) -> String {
-        self.filter.read(cx).value().trim().to_lowercase()
-    }
-
     /// B17: does this row match? Every whitespace-separated token must appear
     /// in the row's label or its id, so two tokens narrow instead of widen, and
     /// a row's id (`settings-row-autostart`) is searchable when the label is not
@@ -241,8 +245,8 @@ impl SettingsState {
     }
 
     /// B17: count one row and report whether it shows.
-    fn note_row(&self, cx: &App, id: &str, label: &str) -> bool {
-        let shown = Self::row_matches(&self.query(cx), id, label);
+    fn note_row(&self, id: &str, label: &str) -> bool {
+        let shown = Self::row_matches(&self.query.borrow(), id, label);
         let (mut shown_count, mut total) = self.counted.get();
         total += 1;
         if shown {
@@ -254,12 +258,12 @@ impl SettingsState {
 
     /// B17: a row that is not built by `settings_row` still has to be counted
     /// and hidden, or its section would vanish under a filter that matches it.
-    fn filtered(&self, cx: &App, id: &str, label: &str, element: impl IntoElement) -> AnyElement {
-        let shown = self.note_row(cx, id, label);
-        div()
-            .id(format!("{id}-slot"))
+    fn filtered(&self, id: &str, label: &str, element: impl Styled + IntoElement) -> AnyElement {
+        let shown = self.note_row(id, label);
+        // Hiding the row itself, not a wrapper around it: the wrapper was one
+        // more element in a column GPUI lays out again on every frame.
+        element
             .when(!shown, |this| this.hidden())
-            .child(element)
             .into_any_element()
     }
 
@@ -319,6 +323,7 @@ impl SettingsState {
     /// the filter's result and not as a mostly empty spine.
     fn render_body(&self, _window: &mut Window, cx: &mut App) -> AnyElement {
         self.counted.set((0, 0));
+        *self.query.borrow_mut() = self.filter.read(cx).value().trim().to_lowercase();
         let mut column = div()
             .id("settings-body")
             .test_support()
@@ -399,7 +404,6 @@ impl SettingsState {
         }
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-appearance",
             "Appearance",
             Some(
@@ -419,7 +423,6 @@ impl SettingsState {
         let autostart_on = *autostart_cell.borrow();
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-autostart",
             "Launch at login",
             Some(
@@ -448,7 +451,6 @@ impl SettingsState {
         let restore_on = *restore_cell.borrow();
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-restore",
             "Restore on launch",
             Some("Relauch the rows that were running when ManyProxy last exited.".to_string()),
@@ -500,7 +502,6 @@ impl SettingsState {
         }
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-window-behaviour",
             "Window behaviour",
             Some(close_action.explanation().to_string()),
@@ -527,7 +528,6 @@ impl SettingsState {
 
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-test-url",
             "Test URL",
             Some(format!(
@@ -543,7 +543,6 @@ impl SettingsState {
 
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-probe-timeout",
             "Timeout",
             Some(format!(
@@ -588,7 +587,6 @@ impl SettingsState {
         }
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-test-all-scope",
             "Test all scope",
             Some("The rows a Test all run covers.".to_string()),
@@ -609,7 +607,7 @@ impl SettingsState {
             .flex_col()
             .gap_4();
 
-        body = body.child(settings_field_row(self, cx,
+        body = body.child(settings_field_row(self,
             "settings-row-feed-url",
             "Update feed URL",
             Some(format!(
@@ -633,7 +631,6 @@ impl SettingsState {
         let check_view = self.view.clone();
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-last-check",
             "Last checked",
             None,
@@ -670,38 +667,23 @@ impl SettingsState {
             .flex_col()
             .gap_4();
 
-        for (id, name, resolved) in [
-            (
-                "settings-row-engine-sing-box",
-                "sing-box",
-                resolve_engine_binary(),
-            ),
-            (
-                "settings-row-engine-sing-box-awg",
-                "sing-box-awg",
-                resolve_fork_binary(),
-            ),
-            ("settings-row-engine-xray", "xray", resolve_xray_binary()),
-        ] {
+        for (id, name, path) in &self.engines {
             // K9/A7-5: the row is the summary (`sing-box · ready`) and the
             // full path lives behind ONE `Details` tooltip. A path is noise at
             // rest and truncates mid-directory in the row.
-            let (ready, path) = match resolved {
-                Ok(path) => (true, Some(path)),
-                Err(_) => (false, None),
-            };
+            let ready = path.is_some();
             let status_color = if ready { muted } else { cx.theme().danger };
             body = body.child(
                 self.filtered(
-                    cx,
                     id,
                     name,
                     div()
-                        .id(id)
+                        .id(*id)
                         .test_support()
                         .flex()
                         .flex_row()
                         .items_center()
+                        .justify_between()
                         .gap_2()
                         .min_w_0()
                         .child(
@@ -712,7 +694,6 @@ impl SettingsState {
                                 .text_color(status_color)
                                 .child(engine_summary(name, ready)),
                         )
-                        .child(div().flex_1())
                         .child(
                             Button::new(format!("settings-engine-details-{name}"))
                                 .small()
@@ -727,7 +708,7 @@ impl SettingsState {
         // F4: the durable "where do I get cores" entry point — the status line
         // names the missing core, this names the source.
         let cores_view = self.view.clone();
-        body = body.child(self.filtered(cx, "settings-engine-cores-help-row", "Where do I get cores?",
+        body = body.child(self.filtered("settings-engine-cores-help-row", "Where do I get cores?",
             div()
                 .id("settings-engine-cores-help-row")
                 .test_support()
@@ -752,7 +733,7 @@ impl SettingsState {
         let auto_restart_cell = self.auto_restart.clone();
         let auto_restart_view = self.view.clone();
         let auto_restart_on = *auto_restart_cell.borrow();
-        body = body.child(settings_row(self, cx,
+        body = body.child(settings_row(self,
             "settings-row-auto-restart",
             "Restart crashed engines",
             Some(
@@ -840,8 +821,9 @@ impl SettingsState {
             .gap_1();
         for host in self.bind_hosts.borrow().clone() {
             let constant = Store::BIND_HOST_CONSTANTS.contains(&host.as_str());
+            let row_id = format!("settings-bind-host-{host}");
             let mut host_row = div()
-                .id(format!("settings-bind-host-{host}"))
+                .id(row_id.clone())
                 .test_support()
                 .flex()
                 .flex_row()
@@ -891,12 +873,7 @@ impl SettingsState {
                         }),
                 );
             }
-            list = list.child(self.filtered(
-                cx,
-                &format!("settings-bind-host-{host}"),
-                &format!("Bind address {host}"),
-                host_row,
-            ));
+            list = list.child(self.filtered(&row_id, &format!("Bind address {host}"), host_row));
         }
         list.into_any_element()
     }
@@ -944,10 +921,9 @@ impl SettingsState {
             .gap_4();
 
         let view = self.view.clone();
-        let folder = data_folder_text();
+        let folder = self.data_folder.clone();
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-data-folder",
             "Data folder",
             Some("Where the library and the logs live.".to_string()),
@@ -962,10 +938,9 @@ impl SettingsState {
         ));
 
         let view = self.view.clone();
-        let logs_path = logs_save_path_text();
+        let logs_path = self.logs_path.clone();
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-save-logs",
             "Visible logs",
             Some("Write the session log to a file.".to_string()),
@@ -981,7 +956,6 @@ impl SettingsState {
 
         body = body.child(settings_row(
             self,
-            cx,
             "settings-row-log-cap",
             "Maximum kept log lines",
             Some("500–50,000 lines; saving rebuilds the ring.".to_string()),
@@ -1050,7 +1024,6 @@ impl SettingsState {
                 }),
         );
         body = body.child(self.filtered(
-            cx,
             "settings-maintenance-grid",
             "Clear traffic counters, clear health snapshots, clear sessions, reset library",
             grid,
@@ -1092,9 +1065,9 @@ impl SettingsState {
                 .flex_row()
                 .justify_between()
                 .gap_4()
-                .child(div().child(*action))
+                .child(*action)
                 .child(div().text_sm().text_color(muted).child(*keys));
-            list = list.child(self.filtered(cx, &id, &format!("{action} {keys}"), row));
+            list = list.child(self.filtered(&id, &format!("{action} {keys}"), row));
         }
         body.child(list).into_any_element()
     }
@@ -1626,7 +1599,28 @@ impl AppView {
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
         let last_check_state = Rc::new(RefCell::new(self.store.last_update_check()));
 
-        apply_appearance(&self.store.appearance(), Some(window), cx);
+        // K9/A7-5 + T-04: the three cores and the two folder paths are read
+        // once, here. The dialog rebuilds its whole column on every frame, and
+        // these are the answers that cannot change while it is open — resolving
+        // them in the paint meant a dozen `current_exe`/`PATH`/`stat` syscalls
+        // per frame.
+        let engines = vec![
+            (
+                "settings-row-engine-sing-box",
+                "sing-box",
+                resolve_engine_binary().ok(),
+            ),
+            (
+                "settings-row-engine-sing-box-awg",
+                "sing-box-awg",
+                resolve_fork_binary().ok(),
+            ),
+            (
+                "settings-row-engine-xray",
+                "xray",
+                resolve_xray_binary().ok(),
+            ),
+        ];
 
         let current_test_url = self.store.test_url().unwrap_or_default();
         let test_url_state = cx.new(|cx| {
@@ -1781,6 +1775,10 @@ impl AppView {
             log_cap_input: cap_state.clone(),
             filter: filter_state.clone(),
             counted: Rc::new(Cell::new((0, 0))),
+            query: Rc::new(RefCell::new(String::new())),
+            engines,
+            data_folder: data_folder_text(),
+            logs_path: logs_save_path_text(),
         };
 
         open_app_dialog(window, cx, move |dialog: Dialog, window, cx| {
