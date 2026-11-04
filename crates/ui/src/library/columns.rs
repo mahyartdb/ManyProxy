@@ -1,26 +1,71 @@
+use crate::app::columns::ColumnDragPreview;
 use crate::*;
 
 use gpui_kit::component::ThemeStyled as _;
 
-/// T-03: one header cell. The wrapper owns the column width so the edge handle
-/// can sit on the boundary; the label fills it, so every existing `header-*`
-/// test id keeps the same first-character position.
+/// T-03/T-04: one header cell. The wrapper owns the column width so the edge
+/// handle can sit on the boundary; it is also the drag source and the drop
+/// target, which keeps the six movable columns as the only draggable set.
 fn resizable_header(
-    id: String,
-    label_id: String,
+    prefix: &'static str,
     column: LibraryColumn,
     width: f32,
+    drop_side: Option<DropSide>,
+    view: Entity<AppView>,
     cx: &mut Context<AppView>,
     label: AnyElement,
 ) -> AnyElement {
+    let column_id = column.id();
+    let wrap_id = format!("{prefix}-{column_id}-cell");
+    let label_id = format!("column-resize-{column_id}");
+    let drag_column = column;
+    let drag_view = view.clone();
+    let indicator = drop_side.map(|side| {
+        let bar = div()
+            .id(format!("column-drop-{}", column.id()))
+            .test_support()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(px(2.))
+            .bg(cx.theme().accent);
+        if side == DropSide::Before {
+            bar.left(px(-4.))
+        } else {
+            bar.right(px(-4.))
+        }
+    });
     div()
-        .id(id)
+        .id(wrap_id)
         .relative()
         .w(px(width))
         .h_full()
         .flex_shrink_0()
+        .on_drag(ColumnDrag { column }, move |drag: &ColumnDrag, _, _, cx| {
+            drag_view.update(cx, |view, cx| view.clear_column_drop(cx));
+            cx.new(|_| ColumnDragPreview {
+                label: drag.column.label(),
+            })
+        })
+        .on_drag_move(
+            cx.listener(move |view, event: &DragMoveEvent<ColumnDrag>, _, cx| {
+                if !event.bounds.contains(&event.event.position) {
+                    return;
+                }
+                let side = if event.event.position.x >= event.bounds.center().x {
+                    DropSide::After
+                } else {
+                    DropSide::Before
+                };
+                view.hover_column_drop(column, side, cx);
+            }),
+        )
+        .on_drop(cx.listener(move |view, drag: &ColumnDrag, window, cx| {
+            view.drop_column(*drag, drag_column, window, cx);
+        }))
         .child(label)
         .child(column_resize_handle(label_id, column, width, cx))
+        .children(indicator)
         .into_any_element()
 }
 
@@ -60,6 +105,7 @@ fn column_resize_handle(
 pub(crate) fn column_header_label(
     column: LibraryColumn,
     width: f32,
+    drop_side: Option<DropSide>,
     view: Entity<AppView>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
@@ -76,14 +122,7 @@ pub(crate) fn column_header_label(
         .child(column.label())
         .context_menu(move |menu, _, _| AppView::width_header_menu(menu, column, &menu_view))
         .into_any_element();
-    resizable_header(
-        format!("header-{column_id}-cell"),
-        format!("column-resize-{column_id}"),
-        column,
-        width,
-        cx,
-        label,
-    )
+    resizable_header("header", column, width, drop_side, view, cx, label)
 }
 
 /// T-27: a sortable column header — a labeled cell in the header strip that
@@ -94,6 +133,7 @@ pub(crate) fn sort_header_cell(
     column: LibraryColumn,
     sort: LibrarySort,
     width: f32,
+    drop_side: Option<DropSide>,
     view: Entity<AppView>,
     window: &mut Window,
     cx: &mut Context<AppView>,
@@ -154,12 +194,5 @@ pub(crate) fn sort_header_cell(
             AppView::sort_header_menu(menu, column_id, sort, &menu_view)
         })
         .into_any_element();
-    resizable_header(
-        format!("sort-header-{column_id}-cell"),
-        format!("column-resize-{column_id}"),
-        column,
-        width,
-        cx,
-        label,
-    )
+    resizable_header("sort-header", column, width, drop_side, view, cx, label)
 }

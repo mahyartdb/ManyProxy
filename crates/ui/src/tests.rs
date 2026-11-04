@@ -21999,6 +21999,119 @@ fn t03_column_width_menu_and_dialog_reset(cx: &mut TestAppContext) {
     assert_eq!(layout.width(LibraryColumn::Health), RowMetrics::HEALTH);
 }
 
+/// T-04: a header drag carries the column and its sort behavior. The drop line
+/// paints before release, the new order persists, and the pinned name/copy
+/// cells stay outside the movable run.
+#[gpui_kit::test]
+fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, LibrarySortKey};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Drag", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    let left = |cx: &mut VisualTestContext, id: &str| -> f32 {
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+                .origin
+                .x
+                .as_f32()
+        })
+    };
+
+    drag_column_header(
+        cx,
+        "sort-header-health",
+        "header-protocol",
+        false,
+        Some("column-drop-protocol"),
+    );
+
+    let (layout, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().layout,
+            view.store.library_column_layout(),
+        )
+    });
+    assert_eq!(layout, saved, "the new order is written on release");
+    assert_eq!(layout.order()[1], LibraryColumn::Health);
+    assert_eq!(layout.order()[2], LibraryColumn::Protocol);
+
+    let health = left(cx, "sort-header-health");
+    assert!(
+        left(cx, "header-name") < health && health < left(cx, "header-protocol"),
+        "Health now paints between the pinned Name and Protocol"
+    );
+    let row_health = left(cx, &format!("row-health-{}", row.id));
+    assert!(
+        left(cx, &format!("row-name-{}", row.id)) < row_health
+            && row_health < left(cx, &format!("row-protocol-{}", row.id)),
+        "the row follows the header order"
+    );
+
+    // The sort gesture belongs to the column, not the slot it used to occupy.
+    cx.update(|window, cx| window.click("sort-header-health".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let sort = view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().sort);
+    assert_eq!(
+        sort.key,
+        LibrarySortKey::Latency,
+        "clicking the moved Health header still sorts by latency"
+    );
+}
+
+/// T-04: the pinned name column is not a drop target, and the indicator never
+/// lingers when the pointer leaves the movable run.
+#[gpui_kit::test]
+fn t04_column_drag_cannot_cross_fixed_columns(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, LibraryColumns};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Fixed", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    begin_column_drag(cx, "header-protocol");
+    move_column_drag(cx, "header-upstream", false);
+    assert_painted(cx, "column-drop-upstream");
+
+    move_column_drag(cx, "header-name", false);
+    assert_absent(cx, "column-drop-upstream".to_string());
+
+    release_column_drag(cx, "header-name", false);
+    let (layout, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().layout,
+            view.store.library_column_layout(),
+        )
+    });
+    assert_eq!(
+        layout.order(),
+        &LibraryColumn::ALL,
+        "dropping on the pinned Name leaves the order untouched"
+    );
+    assert_eq!(saved, LibraryColumns::default(), "nothing was persisted");
+}
+
 /// F2: at the default 1000px frame the table reserves the drawer's 260px, so
 /// the row Copy action paints left of the drawer instead of under it.
 #[gpui_kit::test]
@@ -35975,6 +36088,122 @@ fn double_click_column_edge(cx: &mut VisualTestContext, id: &str) {
     });
     cx.run_until_parked();
     paint_frame(cx);
+}
+
+/// T-04: press a header and cross gpui's drag threshold. A header drag starts
+/// only after the pointer moves; the second move in the tests below is the one
+/// that carries the indicator onto a target.
+fn begin_column_drag(cx: &mut VisualTestContext, source_id: &str) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent};
+    let start = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(source_id.to_string())
+            .unwrap_or_else(|| panic!("{source_id} renders"))
+            .bounds()
+            .center()
+    });
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: point(start.x + px(8.), start.y),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-04: the point inside a header that selects the before/after landing slot.
+fn column_drop_point(
+    cx: &mut VisualTestContext,
+    target_id: &str,
+    after: bool,
+) -> gpui_kit::gpui::Point<gpui_kit::gpui::Pixels> {
+    cx.update(|window, _| {
+        let bounds = window
+            .try_find(target_id.to_string())
+            .unwrap_or_else(|| panic!("{target_id} renders"))
+            .bounds();
+        let x = if after {
+            bounds.right() - px(4.)
+        } else {
+            bounds.left() + px(4.)
+        };
+        point(x, bounds.center().y)
+    })
+}
+
+fn move_column_drag(cx: &mut VisualTestContext, target_id: &str, after: bool) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseMoveEvent};
+    let position = column_drop_point(cx, target_id, after);
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn release_column_drag(cx: &mut VisualTestContext, target_id: &str, after: bool) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseUpEvent};
+    let position = column_drop_point(cx, target_id, after);
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-04: the common one-target gesture: start, hover, assert the indicator,
+/// release.
+fn drag_column_header(
+    cx: &mut VisualTestContext,
+    source_id: &str,
+    target_id: &str,
+    after: bool,
+    indicator: Option<&str>,
+) {
+    begin_column_drag(cx, source_id);
+    move_column_drag(cx, target_id, after);
+    if let Some(indicator) = indicator {
+        assert_painted(cx, indicator);
+    }
+    release_column_drag(cx, target_id, after);
 }
 
 fn selected_ids(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {

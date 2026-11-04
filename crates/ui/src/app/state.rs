@@ -329,6 +329,7 @@ impl AppView {
             facet_group,
             row_columns,
             column_resize: None,
+            column_drop: None,
             inspector_tab: InspectorTab::Details,
             conn: ConnectionState {
                 selected_only: true,

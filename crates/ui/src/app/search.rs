@@ -265,6 +265,7 @@ impl AppView {
         let sort = delegate.sort;
         let has_rows = !delegate.rows.is_empty();
         let view = cx.entity();
+        let column_drop = self.column_drop;
         if !has_rows {
             // An empty library keeps today's empty-state clean: a header strip
             // over nothing is noise.
@@ -282,6 +283,14 @@ impl AppView {
             .flex_nowrap()
             .items_center()
             .gap_2()
+            // A drag move outside any movable header must clear the indicator;
+            // parent listeners register before child listeners, so the headers
+            // below can put it back when the pointer is over one of them.
+            .on_drag_move(
+                cx.listener(move |view, _: &DragMoveEvent<ColumnDrag>, _, cx| {
+                    view.clear_column_drop(cx);
+                }),
+            )
             // The row's content starts after the list item's 4px inset and
             // the card's 8px padding — the strip starts at the same place.
             .px_3()
@@ -315,55 +324,24 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child("Name"),
             );
-        if metrics.show_group {
-            strip = strip.child(column_header_label(
-                LibraryColumn::Group,
-                metrics.group,
-                view.clone(),
-                cx,
-            ));
-        }
-        if metrics.show_protocol {
-            strip = strip.child(column_header_label(
-                LibraryColumn::Protocol,
-                metrics.protocol,
-                view.clone(),
-                cx,
-            ));
-        }
-        if metrics.show_upstream {
-            strip = strip.child(column_header_label(
-                LibraryColumn::Upstream,
-                metrics.upstream,
-                view.clone(),
-                cx,
-            ));
-        }
-        strip = strip.child(column_header_label(
-            LibraryColumn::Endpoint,
-            metrics.endpoint,
-            view.clone(),
-            cx,
-        ));
-        if metrics.show_health {
-            strip = strip.child(sort_header_cell(
-                LibraryColumn::Health,
-                sort,
-                metrics.health,
-                view.clone(),
-                window,
-                cx,
-            ));
-        }
-        if metrics.show_traffic {
-            strip = strip.child(sort_header_cell(
-                LibraryColumn::Traffic,
-                sort,
-                metrics.traffic,
-                view.clone(),
-                window,
-                cx,
-            ));
+        for column in *metrics.layout.order() {
+            if !metrics.column_visible(column) {
+                continue;
+            }
+            let drop_side =
+                column_drop.and_then(|(target, side)| (target == column).then_some(side));
+            let width = metrics.column_width(column);
+            strip = strip.child(match column {
+                LibraryColumn::Group
+                | LibraryColumn::Protocol
+                | LibraryColumn::Upstream
+                | LibraryColumn::Endpoint => {
+                    column_header_label(column, width, drop_side, view.clone(), cx)
+                }
+                LibraryColumn::Health | LibraryColumn::Traffic => {
+                    sort_header_cell(column, sort, width, drop_side, view.clone(), window, cx)
+                }
+            });
         }
         // The row's trailing cell holds the copy action; the strip keeps the
         // same width so the columns stay lined up.
@@ -481,8 +459,20 @@ fn column_drag_canvas(view: Entity<AppView>) -> AnyElement {
             window.on_mouse_event({
                 let view = view.clone();
                 move |event: &MouseUpEvent, _phase, window, cx| {
-                    if event.button == MouseButton::Left && view.read(cx).column_resize.is_some() {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
+                    if view.read(cx).column_resize.is_some() {
                         view.update(cx, |view, cx| view.finish_column_resize(window, cx));
+                    }
+                    // A drag released outside a header has no on_drop to clear
+                    // its indicator; defer so a real drop still sees the
+                    // indicator state during its own dispatch.
+                    if view.read(cx).column_drop.is_some() {
+                        let view = view.clone();
+                        window.defer(cx, move |_, cx| {
+                            view.update(cx, |view, cx| view.clear_column_drop(cx));
+                        });
                     }
                 }
             });

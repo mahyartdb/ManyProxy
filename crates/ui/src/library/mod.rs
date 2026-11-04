@@ -1403,131 +1403,121 @@ impl ListDelegate for LibraryDelegate {
             let name = row_name.clone();
             let metrics = self.row_metrics;
             let mut cells: Vec<AnyElement> = Vec::new();
-            if metrics.show_group {
-                cells.push(
-                    div()
+            for column in *metrics.layout.order() {
+                if !metrics.column_visible(column) {
+                    continue;
+                }
+                let width = metrics.column_width(column);
+                cells.push(match column {
+                    LibraryColumn::Group => div()
                         .id(format!("row-group-{row_id}"))
                         .test_support()
-                        .w(px(metrics.group))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(group_text.clone())
                         .into_any_element(),
-                );
-            }
-            if metrics.show_protocol {
-                cells.push(
-                    div()
+                    LibraryColumn::Protocol => div()
                         .id(format!("row-protocol-{row_id}"))
                         .test_support()
-                        .w(px(metrics.protocol))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(row_protocol)
+                        .child(row_protocol.clone())
                         .into_any_element(),
-                );
-            }
-            if metrics.show_upstream {
-                let tip = upstream_text.clone();
-                cells.push(
-                    div()
+                    LibraryColumn::Upstream => div()
                         .id(format!("row-upstream-{row_id}"))
                         .test_support()
-                        .w(px(metrics.upstream))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .tooltip({
-                            let tip = tip.clone();
+                            let tip = upstream_text.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                         })
                         .child(upstream_text.clone())
                         .into_any_element(),
-                );
-            }
-            // T-03: the endpoint is read, not edited — the bind rides as
-            // muted small text and the port as the quiet `row-port-<id>` pill.
-            cells.push(
-                div()
-                    .id(format!("row-endpoint-{row_id}"))
-                    .test_support()
-                    .w(px(metrics.endpoint))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id(format!("row-bind-text-{row_id}"))
+                    // T-03: the endpoint is read, not edited — the bind rides as
+                    // muted small text and the port as the quiet `row-port-<id>` pill.
+                    LibraryColumn::Endpoint => div()
+                        .id(format!("row-endpoint-{row_id}"))
+                        .test_support()
+                        .w(px(width))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id(format!("row-bind-text-{row_id}"))
+                                .test_support()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .tooltip({
+                                    let tip = format!("Serve bind address {}", row_bind_ip);
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .child(row_bind_ip.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(format!("row-port-{row_id}"))
+                                .test_support()
+                                .flex_shrink_0()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .tooltip({
+                                    let tip = format!(
+                                        "Local endpoint {}:{} — edit it in the inspector",
+                                        row_bind_ip, row_port
+                                    );
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .aria_label(format!("Local port {} on {}", row_port, row_bind_ip))
+                                .child(format!(":{}", row_port)),
+                        )
+                        .into_any_element(),
+                    LibraryColumn::Health => {
+                        let mut cell = div()
+                            .id(format!("row-health-{row_id}"))
                             .test_support()
-                            .flex_1()
-                            .min_w_0()
+                            .w(px(width))
+                            .flex_shrink_0()
                             .truncate()
                             .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .tooltip({
-                                let tip = format!("Serve bind address {}", row_bind_ip);
-                                move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                            })
-                            .child(row_bind_ip.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(format!("row-port-{row_id}"))
-                            .test_support()
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .tooltip({
-                                let tip = format!(
-                                    "Local endpoint {}:{} — edit it in the inspector",
-                                    row_bind_ip, row_port
-                                );
-                                move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                            })
-                            .aria_label(format!("Local port {} on {}", row_port, row_bind_ip))
-                            .child(format!(":{}", row_port)),
-                    )
-                    .into_any_element(),
-            );
-            if metrics.show_health {
-                let mut cell = div()
-                    .id(format!("row-health-{row_id}"))
-                    .test_support()
-                    .w(px(metrics.health))
-                    .flex_shrink_0()
-                    .truncate()
-                    .text_sm()
-                    .text_color(health_text_color)
-                    .child(health_text.clone());
-                // A stopped row's cell is empty by design; an empty tooltip is
-                // a popover that names nothing.
-                if !health_text.is_empty() {
-                    let tip = health_text.clone();
-                    cell = cell.tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into());
-                }
-                cells.push(cell.into_any_element());
-            }
-            if metrics.show_traffic {
-                cells.push(
-                    div()
+                            .text_color(health_text_color)
+                            .child(health_text.clone());
+                        // A stopped row's cell is empty by design; an empty tooltip
+                        // is a popover that names nothing.
+                        if !health_text.is_empty() {
+                            let tip = health_text.clone();
+                            cell = cell
+                                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into());
+                        }
+                        cell.into_any_element()
+                    }
+                    LibraryColumn::Traffic => div()
                         .id(format!("row-traffic-{row_id}"))
                         .test_support()
-                        .w(px(metrics.traffic))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(traffic_text.clone())
                         .into_any_element(),
-                );
+                });
             }
             // T-03: the trailing cell holds the row-scoped copy action; the
             // header strip reserves the same width, so the columns line up.

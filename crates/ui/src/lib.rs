@@ -278,6 +278,10 @@ struct AppView {
     /// the store.
     column_resize: Option<ColumnResize>,
 
+    /// T-04: the header drag's live landing slot. `None` while not dragging (or
+    /// between cells), so the strip paints one indicator at most.
+    column_drop: Option<(LibraryColumn, DropSide)>,
+
     inspector_tab: InspectorTab,
 
     /// T-03: the split's own state. The inspector's width is session-only —
@@ -328,6 +332,20 @@ struct ColumnResize {
     column: LibraryColumn,
     start_x: f32,
     start_width: f32,
+}
+
+/// T-04: where a dragged header would land relative to the hovered column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropSide {
+    Before,
+    After,
+}
+
+/// T-04: the payload carried by a header drag. The movable set is the payload
+/// type, so a drag can never target the pinned lamp/check/name/copy cells.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnDrag {
+    pub(crate) column: LibraryColumn,
 }
 
 /// T-08: why this session is running in memory instead of on disk. The banner

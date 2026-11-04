@@ -157,3 +157,65 @@ impl WidthAction {
         });
     }
 }
+
+/// T-04: the chip under the pointer while a header is dragged. It names the
+/// column being moved so the drop result is obvious before release.
+pub(crate) struct ColumnDragPreview {
+    pub(crate) label: &'static str,
+}
+
+impl Render for ColumnDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(self.label)
+    }
+}
+
+impl AppView {
+    pub(crate) fn hover_column_drop(
+        &mut self,
+        column: LibraryColumn,
+        side: DropSide,
+        cx: &mut Context<Self>,
+    ) {
+        if self.column_drop != Some((column, side)) {
+            self.column_drop = Some((column, side));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_column_drop(&mut self, cx: &mut Context<Self>) {
+        if self.column_drop.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn drop_column(
+        &mut self,
+        drag: ColumnDrag,
+        target: LibraryColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let side = self
+            .column_drop
+            .take()
+            .filter(|(hovered, _)| *hovered == target)
+            .map(|(_, side)| side)
+            .unwrap_or(DropSide::After);
+        let mut layout = self.libraries.read(cx).delegate().layout;
+        if layout.move_column(drag.column, target, side == DropSide::After) {
+            self.commit_column_layout(layout, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+}
