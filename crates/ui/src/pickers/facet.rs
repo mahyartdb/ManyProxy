@@ -3,6 +3,9 @@ use crate::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FacetMenu {
     Group,
+    /// T-05: the latency buckets live in their own picker so they compose with
+    /// the group/status menu instead of replacing it.
+    Latency,
 }
 
 /// K11/A2-1: the enabled/disabled axis rides the group dropdown (one `facet`
@@ -134,6 +137,21 @@ impl FacetMenu {
     /// search box carries the visible count. Enabled/Disabled entries close
     /// the menu over the state axis so the row never grows a second picker.
     pub(crate) fn choices(&self, delegate: &LibraryDelegate) -> (Vec<FacetChoice>, Option<String>) {
+        if *self == FacetMenu::Latency {
+            let choices = LatencyBucket::ALL
+                .into_iter()
+                .map(|bucket| FacetChoice {
+                    id: format!("facet-latency-{}", bucket.token()),
+                    title: bucket.label().to_string(),
+                    display: format!("Latency: {}", bucket.label()),
+                    value: Some(bucket.token().to_string()),
+                })
+                .collect();
+            return (
+                choices,
+                Some(delegate.latency_facet.bucket.token().to_string()),
+            );
+        }
         let total = delegate.rows.len();
         let mut choices = vec![FacetChoice {
             id: "facet-group-all".to_string(),
@@ -210,6 +228,25 @@ impl FacetMenu {
         value: Option<String>,
         cx: &mut Context<AppView>,
     ) {
+        if *self == FacetMenu::Latency {
+            let Some(bucket) = value.as_deref().and_then(LatencyBucket::from_token) else {
+                return;
+            };
+            let include_unprobed = view
+                .libraries
+                .read(cx)
+                .delegate()
+                .latency_facet
+                .include_unprobed;
+            view.set_latency_facet(
+                LatencyFacet {
+                    bucket,
+                    include_unprobed,
+                },
+                cx,
+            );
+            return;
+        }
         view.libraries.update(cx, |state, list_cx| {
             let delegate = state.delegate_mut();
             // K11/A2-1: the dropdown shows one selected item, so a pick writes

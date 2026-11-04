@@ -268,6 +268,10 @@ struct AppView {
 
     facet_group: FacetPicker,
 
+    /// T-05: the latency bucket picker, separate from the group/status menu so
+    /// the two facets compose.
+    facet_latency: FacetPicker,
+
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
 

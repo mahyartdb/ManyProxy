@@ -155,11 +155,17 @@ impl AppView {
         .into_any_element()
     }
 
-    pub(crate) fn clear_facets(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn clear_facets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().clear_facets();
             list_cx.notify();
         });
+        if let Err(error) = self.store.set_latency_facet(LatencyFacet::default()) {
+            window.push_notification(
+                Notification::error(format!("Could not save latency filter: {error}")),
+                cx,
+            );
+        }
         cx.notify();
     }
 

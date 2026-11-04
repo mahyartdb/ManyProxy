@@ -1,7 +1,7 @@
 //! The SQLite store: schema, queries, DPAPI-sealed secrets and the data dir.
 //! Belongs: every row/subscription/settings read and write plus their error types.
 //! Not here: UI state, engine processes, dialog strings.
-use crate::library::LibraryColumns;
+use crate::library::{LatencyFacet, LibraryColumns};
 use crate::secret::Secret;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -8337,6 +8337,21 @@ impl Store {
         self.set_meta(Self::META_LIBRARY_COLUMN_LAYOUT, &layout.to_json())
     }
 
+    /// T-05: the latency facet (bucket + include-unprobed). Missing or corrupt
+    /// reads as the pre-feature view: any latency, unprobed included.
+    pub const META_LATENCY_FACET: &str = "library_latency_facet";
+
+    pub fn latency_facet(&self) -> LatencyFacet {
+        match self.get_meta(Self::META_LATENCY_FACET) {
+            Ok(Some(raw)) => LatencyFacet::from_json(&raw),
+            _ => LatencyFacet::default(),
+        }
+    }
+
+    pub fn set_latency_facet(&mut self, facet: LatencyFacet) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LATENCY_FACET, &facet.to_json())
+    }
+
     pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";
 
     /// T-23: the library search query string of the previous session. A missing
@@ -8739,7 +8754,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library::LibraryColumn;
+    use crate::library::{LatencyBucket, LatencyFacet, LibraryColumn};
 
     fn valid_input(name: &str) -> NewConfig {
         NewConfig {
@@ -15432,6 +15447,30 @@ mod tests {
             store.library_column_layout(),
             LibraryColumns::default(),
             "a corrupt payload resets geometry, never visibility"
+        );
+    }
+
+    #[test]
+    fn library_latency_facet_defaults_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.latency_facet(),
+            LatencyFacet::default(),
+            "an absent facet includes every latency"
+        );
+        let facet = LatencyFacet {
+            bucket: LatencyBucket::Ms300,
+            include_unprobed: false,
+        };
+        store.set_latency_facet(facet).expect("facet writes");
+        assert_eq!(store.latency_facet(), facet);
+        store
+            .set_meta(Store::META_LATENCY_FACET, "not json")
+            .expect("raw write");
+        assert_eq!(
+            store.latency_facet(),
+            LatencyFacet::default(),
+            "a corrupt payload restores the unfiltered view"
         );
     }
 

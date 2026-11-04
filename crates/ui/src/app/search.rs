@@ -90,6 +90,21 @@ impl AppView {
         // K11/A2-1: one facet menu; the enabled/disabled axis rides inside it.
         let (choices, current) = FacetMenu::Group.choices(self.libraries.read(cx).delegate());
         Self::sync_facet_picker(&mut self.facet_group, choices, current, window, cx);
+        let (choices, current) = FacetMenu::Latency.choices(self.libraries.read(cx).delegate());
+        Self::sync_facet_picker(&mut self.facet_latency, choices, current, window, cx);
+    }
+
+    /// T-05: one writer for the latency facet, shared by the picker and the
+    /// unprobed switch. The live filter is the important part; a failed meta
+    /// write only costs the remembered choice, so it does not interrupt the
+    /// user (the remembered query takes the same trade).
+    pub(crate) fn set_latency_facet(&mut self, facet: LatencyFacet, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_latency_facet(facet);
+            list_cx.notify();
+        });
+        let _ = self.store.set_latency_facet(facet);
+        cx.notify();
     }
 
     pub(crate) fn sync_facet_picker(
@@ -123,6 +138,7 @@ impl AppView {
         self.sync_facet_pickers(window, cx);
         let right_pad = 8.;
         let has_facets = self.libraries.read(cx).delegate().facets_active();
+        let latency_now = self.libraries.read(cx).delegate().latency_facet;
         // T-19: the facet area carries the same per-group opt-in switch for
         // the focused group; has no group to protect by design.
         let facet_group_now = self.libraries.read(cx).delegate().facet_group.clone();
@@ -171,6 +187,51 @@ impl AppView {
                             .id("facet-group")
                             .small()
                             .accessibility_label("Filter by group or status"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("facet-latency-tip")
+                    .test_support()
+                    .tooltip(|_, cx| {
+                        cx.new(|_| {
+                            Tooltip::new(
+                                "Latest URL-test latency. Buckets are inclusive: ≤100 ms \
+                                 includes exactly 100 ms.",
+                            )
+                        })
+                        .into()
+                    })
+                    .child(
+                        Select::new(&self.facet_latency.state)
+                            .id("facet-latency")
+                            .small()
+                            .accessibility_label("Filter by probe latency"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("facet-latency-unprobed")
+                    .test_support()
+                    .child(
+                        Switch::new("facet-latency-unprobed-switch")
+                            .checked(latency_now.include_unprobed)
+                            .label("Include unprobed")
+                            .tooltip(
+                                "Keep rows that have not passed a URL test. Off means only \
+                                 measured latencies count.",
+                            )
+                            .accessibility_label("Include rows that have not been probed")
+                            .on_change(cx.listener(|view, next: &bool, _, cx| {
+                                let bucket = view.libraries.read(cx).delegate().latency_facet.bucket;
+                                view.set_latency_facet(
+                                    LatencyFacet {
+                                        bucket,
+                                        include_unprobed: *next,
+                                    },
+                                    cx,
+                                );
+                            })),
                     ),
             )
             .child(
@@ -236,7 +297,7 @@ impl AppView {
                 Button::new("clear-facets")
                     .small()
                     .label("Clear facet filters")
-                    .tooltip("Clear the group and status filters (keeps search and checked)")
+                    .tooltip("Clear the group, status, and latency filters (keeps search and checked)")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.clear_facets(window, cx);
                     }))

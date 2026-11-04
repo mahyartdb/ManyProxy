@@ -84,6 +84,9 @@ pub(crate) struct LibraryDelegate {
 
     pub(crate) facet_group: Option<String>,
     pub(crate) facet_status: Option<FacetStatus>,
+    /// T-05: the latest-probe latency filter. Kept whole so the picker and the
+    /// unprobed switch write the same persisted value.
+    pub(crate) latency_facet: LatencyFacet,
 
     pub(crate) show_security: bool,
 
@@ -217,6 +220,7 @@ impl LibraryDelegate {
             checked: HashSet::new(),
             facet_group: None,
             facet_status: None,
+            latency_facet: LatencyFacet::default(),
             show_security: false,
             sort: LibrarySort::default(),
             latency: HashMap::new(),
@@ -624,11 +628,20 @@ impl LibraryDelegate {
                 return false;
             }
         }
+        if !self
+            .latency_facet
+            .matches(self.latency.get(&row.id).copied())
+        {
+            return false;
+        }
         true
     }
 
     pub(crate) fn facets_active(&self) -> bool {
-        self.facet_group.is_some() || self.facet_status.is_some()
+        self.facet_group.is_some()
+            || self.facet_status.is_some()
+            || self.latency_facet.bucket != LatencyBucket::Any
+            || !self.latency_facet.include_unprobed
     }
 
     pub(crate) fn active_filter_text(&self) -> String {
@@ -638,6 +651,16 @@ impl LibraryDelegate {
         }
         if let Some(status) = &self.facet_status {
             parts.push(format!("status: {}", status.label()));
+        }
+        if self.latency_facet.bucket != LatencyBucket::Any {
+            let bucket = self.latency_facet.bucket.label();
+            if self.latency_facet.include_unprobed {
+                parts.push(format!("latency: {bucket}"));
+            } else {
+                parts.push(format!("latency: {bucket} (probed only)"));
+            }
+        } else if !self.latency_facet.include_unprobed {
+            parts.push("latency: probed only".to_string());
         }
         let query = self.query.trim();
         if !query.is_empty() {
@@ -712,6 +735,11 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
+    pub(crate) fn set_latency_facet(&mut self, facet: LatencyFacet) {
+        self.latency_facet = facet;
+        self.apply_filter();
+    }
+
     pub(crate) fn set_show_security(&mut self, show: bool) {
         self.show_security = show;
     }
@@ -742,6 +770,7 @@ impl LibraryDelegate {
     pub(crate) fn clear_facets(&mut self) {
         self.facet_group = None;
         self.facet_status = None;
+        self.latency_facet = LatencyFacet::default();
         self.apply_filter();
     }
 

@@ -16263,6 +16263,261 @@ fn facet_group_menu_carries_enabled_disabled_and_releases_the_group(cx: &mut Tes
     assert_painted(cx, &format!("library-row-{}", travel.id));
 }
 
+/// T-05: latency buckets are inclusive, compose with group/status/search, and
+/// the unprobed toggle is an independent predicate instead of a no-op under
+/// `Any`.
+#[test]
+fn t05_latency_facet_filters_inclusively_and_composes() {
+    use crate::{FacetStatus, LatencyBucket, LatencyFacet};
+
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![
+        t77_row("fast", "Fast", "vless", "travel", 10801),
+        t77_row("edge", "Edge", "vless", "travel", 10802),
+        t77_row("slow", "Slow", "vmess", "team", 10803),
+        t77_row("unprobed", "Unprobed", "vless", "team", 10804),
+        t77_row("toolow", "TooLow", "vless", "travel", 10805),
+    ]);
+    delegate.set_latency(t77_map_u64(&[
+        ("fast", 100),
+        ("edge", 300),
+        ("slow", 1000),
+        ("toolow", 1001),
+    ]));
+    delegate.rows[3].enabled = false;
+    delegate.apply_filter();
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms100,
+        include_unprobed: true,
+    });
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast", "Unprobed"],
+        "exactly 100 ms is in the bucket and unprobed defaults in"
+    );
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms300,
+        include_unprobed: true,
+    });
+    assert_eq!(t77_names(&delegate), vec!["Fast", "Edge", "Unprobed"]);
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms1000,
+        include_unprobed: true,
+    });
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast", "Edge", "Slow", "Unprobed"],
+        "1000 ms is in; 1001 ms is out"
+    );
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms300,
+        include_unprobed: false,
+    });
+    assert_eq!(t77_names(&delegate), vec!["Fast", "Edge"]);
+
+    delegate.set_facet_group(Some("travel".to_string()));
+    delegate.query = "vmess".to_string();
+    delegate.apply_filter();
+    assert!(
+        delegate.visible.is_empty(),
+        "search AND group AND latency all have to agree"
+    );
+
+    delegate.query = "vless".to_string();
+    delegate.apply_filter();
+    delegate.set_running(vec!["fast".to_string()]);
+    delegate.set_facet_status(Some(FacetStatus::Running));
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast"],
+        "the status facet narrows the latency survivors"
+    );
+    assert_eq!(
+        delegate.active_filter_text(),
+        "group: travel · status: Running · latency: ≤300 ms (probed only) · search: \"vless\""
+    );
+
+    delegate.clear_facets();
+    delegate.query.clear();
+    delegate.apply_filter();
+    assert_eq!(delegate.latency_facet, LatencyFacet::default());
+    assert!(!delegate.facets_active());
+    assert_eq!(t77_names(&delegate).len(), 5, "Clear restores the library");
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Any,
+        include_unprobed: false,
+    });
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast", "Edge", "Slow", "TooLow"],
+        "excluding unprobed filters even without a bucket"
+    );
+    assert!(delegate.facets_active(), "the toggle alone is a live facet");
+    assert_eq!(delegate.active_filter_text(), "latency: probed only");
+}
+
+/// T-05: the picker writes the delegate and the store, the switch releases
+/// unprobed rows, and Clear resets both surfaces.
+#[gpui_kit::test]
+fn t05_latency_picker_filters_persists_and_clears(cx: &mut TestAppContext) {
+    use crate::{LatencyBucket, LatencyFacet};
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let fast = store
+        .add(facet_seed("Fast", "vless", "travel", "10801"))
+        .expect("seed works");
+    let mid = store
+        .add(facet_seed("Mid", "vmess", "travel", "10802"))
+        .expect("seed works");
+    let unprobed = store
+        .add(facet_seed("Unprobed", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    view.update(cx, |view, cx| {
+        view.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_latency(t77_map_u64(&[
+                (fast.id.as_str(), 100),
+                (mid.id.as_str(), 300),
+            ]));
+            list_cx.notify();
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_painted(cx, "facet-latency");
+    assert_painted(cx, "facet-latency-unprobed-switch");
+    assert_eq!(label_of("facet-latency", cx), "Filter by probe latency");
+    assert_eq!(
+        label_of("facet-latency-unprobed-switch", cx),
+        "Include rows that have not been probed"
+    );
+
+    cx.update(|window, cx| {
+        window.click("facet-latency", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in [
+        "facet-latency-any",
+        "facet-latency-100",
+        "facet-latency-300",
+        "facet-latency-1000",
+    ] {
+        assert_painted(cx, id);
+    }
+    cx.update(|window, cx| {
+        window.click("facet-latency-100", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let facet = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().latency_facet
+    });
+    assert_eq!(
+        facet,
+        LatencyFacet {
+            bucket: LatencyBucket::Ms100,
+            include_unprobed: true,
+        },
+        "the picker keeps the default include-unprobed"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.latency_facet()),
+        facet,
+        "the choice is remembered"
+    );
+    assert_painted(cx, &format!("library-row-{}", fast.id));
+    assert_absent(cx, format!("library-row-{}", mid.id));
+    assert_painted(cx, &format!("library-row-{}", unprobed.id));
+    assert_painted(cx, "clear-facets");
+
+    cx.update(|window, cx| {
+        window.click("facet-latency-unprobed-switch", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let facet = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().latency_facet
+    });
+    assert!(!facet.include_unprobed, "the switch narrows the facet");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.latency_facet()),
+        facet
+    );
+    assert_absent(cx, format!("library-row-{}", unprobed.id));
+
+    cx.update(|window, cx| {
+        window.click("clear-facets", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().latency_facet
+        }),
+        LatencyFacet::default()
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.latency_facet()),
+        LatencyFacet::default(),
+        "Clear persists the unfiltered choice"
+    );
+    for row in [&fast, &mid, &unprobed] {
+        assert_painted(cx, &format!("library-row-{}", row.id));
+    }
+}
+
+/// T-05: an earlier latency choice seeds the delegate and the picker label on
+/// the next launch, including the unprobed half of the state.
+#[gpui_kit::test]
+fn t05_latency_facet_restores_from_store(cx: &mut TestAppContext) {
+    use crate::{LatencyBucket, LatencyFacet};
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Fast", "vless", "travel", "10801"))
+        .expect("seed works");
+    let facet = LatencyFacet {
+        bucket: LatencyBucket::Ms300,
+        include_unprobed: false,
+    };
+    store.set_latency_facet(facet).expect("facet writes");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let (restored, display) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        (
+            delegate.latency_facet,
+            crate::FacetMenu::Latency.current_display(delegate),
+        )
+    });
+    assert_eq!(restored, facet);
+    assert_eq!(display, "Latency: ≤300 ms");
+    assert_painted(cx, "facet-latency");
+    assert_painted(cx, "facet-latency-unprobed-switch");
+}
+
 #[gpui_kit::test]
 fn lamp_click_toggles_endpoint_state_filter(cx: &mut TestAppContext) {
     use crate::FacetStatus;

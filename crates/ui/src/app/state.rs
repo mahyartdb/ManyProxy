@@ -201,18 +201,29 @@ impl AppView {
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
         let layout = store.library_column_layout();
         let sort = store.library_sort();
+        let latency_facet = store.latency_facet();
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
             state.delegate_mut().set_layout(layout);
             state.delegate_mut().set_sort(sort);
+            state.delegate_mut().set_latency_facet(latency_facet);
             state.delegate_mut().query = last_query;
             state.delegate_mut().set_bind_hosts(bind_hosts);
             list_cx.notify();
         });
 
-        let empty_delegate = LibraryDelegate::new();
+        let mut empty_delegate = LibraryDelegate::new();
+        empty_delegate.set_latency_facet(latency_facet);
         let (choices, current) = FacetMenu::Group.choices(&empty_delegate);
         let facet_group = FacetPicker::new(FacetMenu::Group, choices, current, window, cx);
+        let (latency_choices, latency_current) = FacetMenu::Latency.choices(&empty_delegate);
+        let facet_latency = FacetPicker::new(
+            FacetMenu::Latency,
+            latency_choices,
+            latency_current,
+            window,
+            cx,
+        );
 
         apply_appearance(&store.appearance(), Some(window), cx);
         apply_text_size(store.text_size(), cx);
@@ -327,6 +338,7 @@ impl AppView {
                 },
             ),
             facet_group,
+            facet_latency,
             row_columns,
             column_resize: None,
             column_drop: None,
