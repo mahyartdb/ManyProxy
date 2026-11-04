@@ -1,3 +1,4 @@
+use crate::app::columns::WidthAction;
 use crate::*;
 
 impl AppView {
@@ -275,6 +276,7 @@ impl AppView {
         let mut strip = div()
             .id("library-column-headers")
             .test_support()
+            .relative()
             .flex()
             .flex_row()
             .flex_nowrap()
@@ -315,40 +317,39 @@ impl AppView {
             );
         if metrics.show_group {
             strip = strip.child(column_header_label(
-                "header-group",
-                "Group",
+                LibraryColumn::Group,
                 metrics.group,
+                view.clone(),
                 cx,
             ));
         }
         if metrics.show_protocol {
             strip = strip.child(column_header_label(
-                "header-protocol",
-                "Protocol",
+                LibraryColumn::Protocol,
                 metrics.protocol,
+                view.clone(),
                 cx,
             ));
         }
         if metrics.show_upstream {
             strip = strip.child(column_header_label(
-                "header-upstream",
-                "Upstream",
+                LibraryColumn::Upstream,
                 metrics.upstream,
+                view.clone(),
                 cx,
             ));
         }
         strip = strip.child(column_header_label(
-            "header-endpoint",
-            "Endpoint",
+            LibraryColumn::Endpoint,
             metrics.endpoint,
+            view.clone(),
             cx,
         ));
         if metrics.show_health {
             strip = strip.child(sort_header_cell(
-                "health",
-                "Health",
-                metrics.health,
+                LibraryColumn::Health,
                 sort,
+                metrics.health,
                 view.clone(),
                 window,
                 cx,
@@ -356,11 +357,10 @@ impl AppView {
         }
         if metrics.show_traffic {
             strip = strip.child(sort_header_cell(
-                "traffic",
-                "Traffic",
-                metrics.traffic,
+                LibraryColumn::Traffic,
                 sort,
-                view,
+                metrics.traffic,
+                view.clone(),
                 window,
                 cx,
             ));
@@ -374,6 +374,7 @@ impl AppView {
                 .w(px(metrics.copy))
                 .flex_shrink_0(),
         );
+        strip = strip.child(column_drag_canvas(view));
         strip.into_any_element()
     }
 
@@ -400,7 +401,7 @@ impl AppView {
             ));
         }
         let next = sort.direction.toggled();
-        menu.item(Self::sort_menu_item(
+        menu = menu.item(Self::sort_menu_item(
             column,
             "direction",
             format!("Direction: {} → {}", sort.direction.label(), next.label()),
@@ -408,6 +409,89 @@ impl AppView {
             false,
             SortMenuAction::Direction,
             view,
-        ))
+        ));
+        match LibraryColumn::from_id(column) {
+            Some(column) => Self::width_menu_items(menu.separator(), column, view),
+            None => menu,
+        }
     }
+
+    /// T-03: the same three verbs every header exposes, minus the sort half for
+    /// the columns that have no sort key.
+    pub(crate) fn width_header_menu(
+        menu: PopupMenu,
+        column: LibraryColumn,
+        view: &Entity<AppView>,
+    ) -> PopupMenu {
+        Self::width_menu_items(menu, column, view)
+    }
+
+    fn width_menu_items(
+        mut menu: PopupMenu,
+        column: LibraryColumn,
+        view: &Entity<AppView>,
+    ) -> PopupMenu {
+        for action in WidthAction::ALL {
+            menu = menu.item(Self::width_menu_item(column, action, view));
+        }
+        menu
+    }
+
+    fn width_menu_item(
+        column: LibraryColumn,
+        action: WidthAction,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let id = format!("column-menu-{}-{}", column.id(), action.id_suffix());
+        let label = action.label();
+        let aria = format!("{} {} column", label, column.label());
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            div()
+                .id(id.clone())
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(aria.clone())
+                .child(label)
+        })
+        .on_click(move |_, window, cx| {
+            action.apply(&view, column, window, cx);
+        })
+    }
+}
+
+/// T-03: window-level pointer tracking for a width drag. A header cell's own
+/// `on_mouse_move` stops at the cell edge, but the user may drag higher or
+/// lower than the 30px strip; the window listener follows until mouse-up. It
+/// has to be registered during paint, hence the zero-visual canvas.
+fn column_drag_canvas(view: Entity<AppView>) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            window.on_mouse_event({
+                let view = view.clone();
+                move |event: &MouseMoveEvent, _phase, _window, cx| {
+                    if view.read(cx).column_resize.is_some() {
+                        view.update(cx, |view, cx| {
+                            view.drag_column_resize(event.position.x.as_f32(), cx)
+                        });
+                    }
+                }
+            });
+            window.on_mouse_event({
+                let view = view.clone();
+                move |event: &MouseUpEvent, _phase, window, cx| {
+                    if event.button == MouseButton::Left && view.read(cx).column_resize.is_some() {
+                        view.update(cx, |view, cx| view.finish_column_resize(window, cx));
+                    }
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .w_full()
+    .h_full()
+    .into_any_element()
 }

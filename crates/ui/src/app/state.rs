@@ -199,9 +199,11 @@ impl AppView {
                 .default_value(last_query.clone())
         });
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
+        let layout = store.library_column_layout();
         let sort = store.library_sort();
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
+            state.delegate_mut().set_layout(layout);
             state.delegate_mut().set_sort(sort);
             state.delegate_mut().query = last_query;
             state.delegate_mut().set_bind_hosts(bind_hosts);
@@ -326,6 +328,7 @@ impl AppView {
             ),
             facet_group,
             row_columns,
+            column_resize: None,
             inspector_tab: InspectorTab::Details,
             conn: ConnectionState {
                 selected_only: true,

@@ -102,6 +102,10 @@ pub(crate) struct LibraryDelegate {
 
     pub(crate) row_columns: RowColumns,
 
+    /// T-03: the user's width/order overrides, loaded from store meta at boot
+    /// and written back when a drag or menu action settles.
+    pub(crate) layout: LibraryColumns,
+
     /// T-03: the geometry the header strip and the row both read. The owner
     /// decides it once per frame (the table's width decides which optional
     /// columns fit) and hands it to both readers.
@@ -219,7 +223,13 @@ impl LibraryDelegate {
             data_traffic: HashMap::new(),
             out_ips: HashMap::new(),
             row_columns: RowColumns::default(),
-            row_metrics: RowMetrics::widths(false, false, RowColumns::default()),
+            layout: LibraryColumns::default(),
+            row_metrics: RowMetrics::widths(
+                false,
+                false,
+                RowColumns::default(),
+                LibraryColumns::default(),
+            ),
             app_view: None,
             endpoint_inputs: HashMap::new(),
             pending_endpoint_commits: Vec::new(),
@@ -479,6 +489,16 @@ impl LibraryDelegate {
 
     pub(crate) fn set_row_columns(&mut self, columns: RowColumns) {
         self.row_columns = columns;
+    }
+
+    pub(crate) fn set_layout(&mut self, layout: LibraryColumns) {
+        self.layout = layout;
+    }
+
+    /// T-03: live resize writes only the delegate; the store write waits for
+    /// mouse-up so one drag is one meta row, not one per frame.
+    pub(crate) fn set_column_width(&mut self, column: LibraryColumn, width: f32) {
+        self.layout.set_width(column, width);
     }
 
     /// T-03: the owner hands both readers the same geometry.

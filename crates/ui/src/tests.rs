@@ -21824,15 +21824,16 @@ fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppCon
 /// (586px) never overflows the table.
 #[test]
 fn t03_row_budget_drops_upstream_after_protocol() {
-    use crate::{RowColumns, RowMetrics};
+    use crate::{LibraryColumns, RowColumns, RowMetrics};
 
     let columns = RowColumns::default();
-    let at_740 = RowMetrics::for_table_width(740., columns);
+    let layout = LibraryColumns::default();
+    let at_740 = RowMetrics::for_table_width(740., columns, layout);
     assert!(!at_740.show_protocol, "protocol drops at 740");
     assert!(at_740.show_upstream, "upstream still fits at 740");
     assert!(at_740.show_health, "health is never budgeted away");
 
-    let at_640 = RowMetrics::for_table_width(640., columns);
+    let at_640 = RowMetrics::for_table_width(640., columns, layout);
     assert!(!at_640.show_protocol, "protocol drops at 640");
     assert!(!at_640.show_upstream, "upstream drops at 640");
     assert!(at_640.show_health, "health is never budgeted away");
@@ -21849,6 +21850,153 @@ fn t03_row_budget_drops_upstream_after_protocol() {
     assert_eq!(min_row, 586.);
     assert!(min_row <= RowMetrics::TABLE_MIN);
     assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 734.);
+}
+
+/// T-03: one gesture from edge to edge: the delegate follows every move, the
+/// store only hears about the final width, and a double-click restores the
+/// computed default.
+#[gpui_kit::test]
+fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, RowMetrics};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Resize", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().row_metrics.health
+        }),
+        RowMetrics::HEALTH,
+        "the persisted default starts at the computed width"
+    );
+
+    drag_column_edge(cx, "column-resize-health", 40.);
+    let (live, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().row_metrics.health,
+            view.store
+                .library_column_layout()
+                .width(LibraryColumn::Health),
+        )
+    });
+    assert_eq!(live, RowMetrics::HEALTH + 40., "the row and header reflow");
+    assert_eq!(saved, live, "mouse-up writes the final width");
+
+    drag_column_edge(cx, "column-resize-endpoint", -500.);
+    let endpoint = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().row_metrics.endpoint
+    });
+    assert_eq!(
+        endpoint,
+        LibraryColumn::Endpoint.min_width(),
+        "a drag past the floor stops at the column minimum"
+    );
+
+    double_click_column_edge(cx, "column-resize-health");
+    let (live, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().row_metrics.health,
+            view.store
+                .library_column_layout()
+                .width(LibraryColumn::Health),
+        )
+    });
+    assert_eq!(
+        live,
+        RowMetrics::HEALTH,
+        "double-click restores the default"
+    );
+    assert_eq!(saved, RowMetrics::HEALTH, "the reset persists");
+}
+
+/// T-03: the keyboard/a11y route. A sortable header's menu carries the sort
+/// keys and the width verbs together; a plain header carries only the verbs;
+/// the dialog's Reset clears every override.
+#[gpui_kit::test]
+fn t03_column_width_menu_and_dialog_reset(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, LibraryColumns, RowMetrics};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Menu", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        window.right_click("sort-header-health".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in [
+        "sort-header-health-latency",
+        "column-menu-health-wider",
+        "column-menu-health-narrower",
+        "column-menu-health-reset",
+    ] {
+        assert_painted(cx, id);
+    }
+    cx.update(|window, cx| window.click("column-menu-health-wider".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().row_metrics.health
+        }),
+        RowMetrics::HEALTH + 16.,
+        "Wider nudges the column by one step"
+    );
+
+    cx.update(|window, cx| {
+        window.right_click("header-endpoint".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "column-menu-endpoint-wider");
+    assert_painted(cx, "column-menu-endpoint-reset");
+    assert_absent(cx, "sort-header-endpoint-none".to_string());
+    cx.update(|window, cx| window.click("column-menu-endpoint-reset".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_row_columns_dialog(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_painted(cx, "columns-dialog-reset");
+    cx.update(|window, cx| window.click("columns-dialog-reset".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let (layout, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().layout,
+            view.store.library_column_layout(),
+        )
+    });
+    assert_eq!(
+        layout,
+        LibraryColumns::default(),
+        "the dialog clears overrides"
+    );
+    assert_eq!(saved, LibraryColumns::default(), "the reset persists");
+    assert_eq!(layout.width(LibraryColumn::Health), RowMetrics::HEALTH);
 }
 
 /// F2: at the default 1000px frame the table reserves the drawer's 260px, so
@@ -35734,6 +35882,91 @@ fn click_row_with(cx: &mut VisualTestContext, id: &str, modifiers: gpui_kit::Mod
                 position,
                 modifiers,
                 click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-03: press on a column edge, move by `dx`, release. The move listener is
+/// registered by the header strip's paint, so the frame must exist first.
+fn drag_column_edge(cx: &mut VisualTestContext, id: &str, dx: f32) {
+    use gpui_kit::gpui::{
+        InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    };
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let start = window
+            .try_find(id.to_string())
+            .unwrap_or_else(|| panic!("{id} renders"))
+            .bounds()
+            .center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: point(start.x + px(dx), start.y),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(start.x + px(dx), start.y),
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn double_click_column_edge(cx: &mut VisualTestContext, id: &str) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseUpEvent};
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let position = window
+            .try_find(id.to_string())
+            .unwrap_or_else(|| panic!("{id} renders"))
+            .bounds()
+            .center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 2,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 2,
             }
             .to_platform_input(),
             cx,

@@ -112,7 +112,8 @@ impl Render for AppView {
                 delegate.app_view = Some(app_entity);
                 cx.notify();
             }
-            let metrics = RowMetrics::for_table_width(layout.table_w, delegate.row_columns);
+            let metrics =
+                RowMetrics::for_table_width(layout.table_w, delegate.row_columns, delegate.layout);
             delegate.set_row_metrics(metrics);
             // T-06: the row cards paint the kit focus ring while the list holds
             // the keyboard; the handle lives on the ListState, the app owns the

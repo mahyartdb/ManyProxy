@@ -1,6 +1,7 @@
 //! The SQLite store: schema, queries, DPAPI-sealed secrets and the data dir.
 //! Belongs: every row/subscription/settings read and write plus their error types.
 //! Not here: UI state, engine processes, dialog strings.
+use crate::library::LibraryColumns;
 use crate::secret::Secret;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -8320,6 +8321,22 @@ impl Store {
         self.set_meta(Self::META_LIBRARY_SORT, &sort.to_json())
     }
 
+    /// T-03: the user's column widths and order, stored apart from
+    /// `library_columns` so a corrupt payload can only reset geometry, never
+    /// hide a column. Missing reads as the default geometry.
+    pub const META_LIBRARY_COLUMN_LAYOUT: &str = "library_column_layout";
+
+    pub fn library_column_layout(&self) -> LibraryColumns {
+        match self.get_meta(Self::META_LIBRARY_COLUMN_LAYOUT) {
+            Ok(Some(raw)) => LibraryColumns::from_json(&raw),
+            _ => LibraryColumns::default(),
+        }
+    }
+
+    pub fn set_library_column_layout(&mut self, layout: LibraryColumns) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LIBRARY_COLUMN_LAYOUT, &layout.to_json())
+    }
+
     pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";
 
     /// T-23: the library search query string of the previous session. A missing
@@ -8722,6 +8739,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::LibraryColumn;
 
     fn valid_input(name: &str) -> NewConfig {
         NewConfig {
@@ -15389,6 +15407,31 @@ mod tests {
         assert!(
             store.set_library_columns("  ").is_err(),
             "blank fails loudly"
+        );
+    }
+
+    #[test]
+    fn library_column_layout_defaults_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.library_column_layout(),
+            LibraryColumns::default(),
+            "an absent layout is the computed default"
+        );
+        let mut layout = LibraryColumns::default();
+        layout.set_width(LibraryColumn::Endpoint, 176.);
+        layout.move_column(LibraryColumn::Traffic, LibraryColumn::Group, false);
+        store
+            .set_library_column_layout(layout)
+            .expect("layout writes");
+        assert_eq!(store.library_column_layout(), layout);
+        store
+            .set_meta(Store::META_LIBRARY_COLUMN_LAYOUT, "not json")
+            .expect("raw write");
+        assert_eq!(
+            store.library_column_layout(),
+            LibraryColumns::default(),
+            "a corrupt payload resets geometry, never visibility"
         );
     }
 

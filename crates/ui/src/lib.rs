@@ -273,6 +273,11 @@ struct AppView {
 
     row_columns: RowColumns,
 
+    /// T-03: the width drag in flight. `None` means no pointer is resizing a
+    /// column; the delegate layout updates every move and only mouse-up writes
+    /// the store.
+    column_resize: Option<ColumnResize>,
+
     inspector_tab: InspectorTab,
 
     /// T-03: the split's own state. The inspector's width is session-only —
@@ -313,6 +318,16 @@ struct AppView {
     process_sampler: ProcessSampler,
 
     started_at: std::time::Instant,
+}
+
+/// T-03: the start of one header-edge drag. The delta is measured from the
+/// pointer's start x, so a move that returns to the origin restores the width
+/// without accumulating rounding drift.
+#[derive(Clone, Copy)]
+struct ColumnResize {
+    column: LibraryColumn,
+    start_x: f32,
+    start_width: f32,
 }
 
 /// T-08: why this session is running in memory instead of on disk. The banner
