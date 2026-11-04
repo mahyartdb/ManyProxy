@@ -33,6 +33,10 @@ pub struct RowMetrics {
     pub show_upstream: bool,
     pub show_health: bool,
     pub show_traffic: bool,
+
+    /// The user's width and order overrides; the row and the header both
+    /// iterate this, so a reorder cannot desynchronise their grids.
+    pub layout: LibraryColumns,
 }
 
 impl RowMetrics {
@@ -79,23 +83,29 @@ impl RowMetrics {
 
     /// The geometry both readers share. `show_group` and `show_protocol` are
     /// the width budget's decisions; the rest are the user's column toggles.
-    pub fn widths(show_group: bool, show_protocol: bool, columns: RowColumns) -> RowMetrics {
+    pub fn widths(
+        show_group: bool,
+        show_protocol: bool,
+        columns: RowColumns,
+        layout: LibraryColumns,
+    ) -> RowMetrics {
         RowMetrics {
             lamp_check: RowMetrics::LAMP_CHECK,
             check_slot: RowMetrics::CHECK_SLOT,
             name_min: RowMetrics::NAME_MIN,
-            group: RowMetrics::GROUP,
-            protocol: RowMetrics::PROTOCOL,
-            upstream: RowMetrics::UPSTREAM,
-            endpoint: RowMetrics::ENDPOINT,
-            health: RowMetrics::HEALTH,
-            traffic: RowMetrics::TRAFFIC,
+            group: layout.width(LibraryColumn::Group),
+            protocol: layout.width(LibraryColumn::Protocol),
+            upstream: layout.width(LibraryColumn::Upstream),
+            endpoint: layout.width(LibraryColumn::Endpoint),
+            health: layout.width(LibraryColumn::Health),
+            traffic: layout.width(LibraryColumn::Traffic),
             copy: RowMetrics::COPY,
             show_group,
             show_protocol,
             show_upstream: columns.upstream,
             show_health: columns.health,
             show_traffic: columns.traffic,
+            layout,
         }
     }
 
@@ -104,10 +114,14 @@ impl RowMetrics {
     /// endpoint, health and copy columns never go. An optional column also
     /// honours the user's own toggle — the budget can only take a column
     /// away, never add one.
-    pub fn for_table_width(table_width: f32, columns: RowColumns) -> RowMetrics {
-        let both = RowMetrics::row_width(columns, true, true);
-        let protocol_only = RowMetrics::row_width(columns, false, true);
-        let upstream_only = RowMetrics::row_width(columns, false, false);
+    pub fn for_table_width(
+        table_width: f32,
+        columns: RowColumns,
+        layout: LibraryColumns,
+    ) -> RowMetrics {
+        let both = RowMetrics::row_width(columns, layout, true, true);
+        let protocol_only = RowMetrics::row_width(columns, layout, false, true);
+        let upstream_only = RowMetrics::row_width(columns, layout, false, false);
         let (budget_group, budget_protocol, budget_upstream) = if table_width >= both {
             (true, true, true)
         } else if table_width >= protocol_only {
@@ -117,39 +131,71 @@ impl RowMetrics {
         } else {
             (false, false, false)
         };
-        let mut metrics =
-            RowMetrics::widths(columns.group && budget_group, budget_protocol, columns);
+        let mut metrics = RowMetrics::widths(
+            columns.group && budget_group,
+            budget_protocol,
+            columns,
+            layout,
+        );
         metrics.show_upstream = columns.upstream && budget_upstream;
         metrics
     }
 
+    /// The effective width for one movable column.
+    pub fn column_width(&self, column: LibraryColumn) -> f32 {
+        match column {
+            LibraryColumn::Group => self.group,
+            LibraryColumn::Protocol => self.protocol,
+            LibraryColumn::Upstream => self.upstream,
+            LibraryColumn::Endpoint => self.endpoint,
+            LibraryColumn::Health => self.health,
+            LibraryColumn::Traffic => self.traffic,
+        }
+    }
+
+    /// Whether the budget kept this column visible.
+    pub fn column_visible(&self, column: LibraryColumn) -> bool {
+        match column {
+            LibraryColumn::Group => self.show_group,
+            LibraryColumn::Protocol => self.show_protocol,
+            LibraryColumn::Upstream => self.show_upstream,
+            LibraryColumn::Endpoint | LibraryColumn::Health => true,
+            LibraryColumn::Traffic => self.show_traffic,
+        }
+    }
+
     /// The row's minimum width: every cell at its width, the name at its
     /// minimum, and the gaps between them.
-    fn row_width(columns: RowColumns, show_group: bool, show_protocol: bool) -> f32 {
+    fn row_width(
+        columns: RowColumns,
+        layout: LibraryColumns,
+        show_group: bool,
+        show_protocol: bool,
+    ) -> f32 {
         let mut width = RowMetrics::LAMP_CHECK
             + RowMetrics::CHECK_SLOT
             + RowMetrics::NAME_MIN
-            + RowMetrics::ENDPOINT
+            + layout.width(LibraryColumn::Endpoint)
             + RowMetrics::COPY;
         let mut cells = 5;
         if columns.upstream {
-            width += RowMetrics::UPSTREAM;
+            width += layout.width(LibraryColumn::Upstream);
             cells += 1;
         }
         if columns.health {
-            width += RowMetrics::HEALTH;
+            width += layout.width(LibraryColumn::Health);
             cells += 1;
         }
         if columns.traffic {
-            width += RowMetrics::TRAFFIC;
+            width += layout.width(LibraryColumn::Traffic);
             cells += 1;
         }
         if show_group {
-            width += RowMetrics::GROUP;
+            width += layout.width(LibraryColumn::Group);
             cells += 1;
         }
         if show_protocol {
-            width += RowMetrics::PROTOCOL;
+            width += layout.width(LibraryColumn::Protocol);
             cells += 1;
         }
         width + (cells - 1) as f32 * RowMetrics::GAP

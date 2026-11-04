@@ -117,9 +117,246 @@ pub fn sort_header_keys(column: &str) -> &'static [LibrarySortKey] {
     }
 }
 
+/// The movable columns, in their default order. The lamp/check gutter and the
+/// name stay pinned left; the copy action stays pinned right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryColumn {
+    Group,
+    Protocol,
+    Upstream,
+    Endpoint,
+    Health,
+    Traffic,
+}
+
+impl LibraryColumn {
+    pub const ALL: [LibraryColumn; 6] = [
+        LibraryColumn::Group,
+        LibraryColumn::Protocol,
+        LibraryColumn::Upstream,
+        LibraryColumn::Endpoint,
+        LibraryColumn::Health,
+        LibraryColumn::Traffic,
+    ];
+
+    /// The widest a dragged column may become. Wider than any cell needs and
+    /// narrow enough that one column cannot swallow the whole table alone.
+    pub const MAX_WIDTH: f32 = 480.;
+
+    pub fn id(self) -> &'static str {
+        match self {
+            LibraryColumn::Group => "group",
+            LibraryColumn::Protocol => "protocol",
+            LibraryColumn::Upstream => "upstream",
+            LibraryColumn::Endpoint => "endpoint",
+            LibraryColumn::Health => "health",
+            LibraryColumn::Traffic => "traffic",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibraryColumn::Group => "Group",
+            LibraryColumn::Protocol => "Protocol",
+            LibraryColumn::Upstream => "Upstream",
+            LibraryColumn::Endpoint => "Endpoint",
+            LibraryColumn::Health => "Health",
+            LibraryColumn::Traffic => "Traffic",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|column| column.id() == id)
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            LibraryColumn::Group => 0,
+            LibraryColumn::Protocol => 1,
+            LibraryColumn::Upstream => 2,
+            LibraryColumn::Endpoint => 3,
+            LibraryColumn::Health => 4,
+            LibraryColumn::Traffic => 5,
+        }
+    }
+
+    pub fn default_width(self) -> f32 {
+        match self {
+            LibraryColumn::Group => RowMetrics::GROUP,
+            LibraryColumn::Protocol => RowMetrics::PROTOCOL,
+            LibraryColumn::Upstream => RowMetrics::UPSTREAM,
+            LibraryColumn::Endpoint => RowMetrics::ENDPOINT,
+            LibraryColumn::Health => RowMetrics::HEALTH,
+            LibraryColumn::Traffic => RowMetrics::TRAFFIC,
+        }
+    }
+
+    /// A header must still show its own name at the smallest size.
+    pub fn min_width(self) -> f32 {
+        match self {
+            LibraryColumn::Group => 64.,
+            LibraryColumn::Protocol => 72.,
+            LibraryColumn::Upstream => 90.,
+            LibraryColumn::Endpoint => 96.,
+            LibraryColumn::Health => 84.,
+            LibraryColumn::Traffic => 84.,
+        }
+    }
+}
+
+/// T-03: persisted geometry for the movable columns. Visibility stays in
+/// [`RowColumns`]; this is the user's width and order choice layered over the
+/// computed defaults, stored in its own meta row so a corrupt payload can only
+/// reset geometry, never hide a column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LibraryColumns {
+    widths: [Option<f32>; 6],
+    order: [LibraryColumn; 6],
+}
+
+impl Default for LibraryColumns {
+    fn default() -> Self {
+        Self {
+            widths: [None; 6],
+            order: LibraryColumn::ALL,
+        }
+    }
+}
+
+impl LibraryColumns {
+    pub fn order(&self) -> &[LibraryColumn; 6] {
+        &self.order
+    }
+
+    /// The effective width: the user's override clamped to the column's own
+    /// floor, or the computed default when untouched.
+    pub fn width(&self, column: LibraryColumn) -> f32 {
+        let raw = self.widths[column.index()].unwrap_or(column.default_width());
+        if raw.is_finite() {
+            raw.clamp(column.min_width(), LibraryColumn::MAX_WIDTH)
+        } else {
+            column.default_width()
+        }
+    }
+
+    pub fn is_custom(&self, column: LibraryColumn) -> bool {
+        self.widths[column.index()].is_some()
+    }
+
+    pub fn set_width(&mut self, column: LibraryColumn, width: f32) {
+        if !width.is_finite() {
+            return;
+        }
+        self.widths[column.index()] = Some(
+            width
+                .clamp(column.min_width(), LibraryColumn::MAX_WIDTH)
+                .round(),
+        );
+    }
+
+    pub fn reset_width(&mut self, column: LibraryColumn) {
+        self.widths[column.index()] = None;
+    }
+
+    pub fn reset_widths(&mut self) {
+        self.widths = [None; 6];
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Move `source` next to `target`. The array only ever holds the six
+    /// movable columns, so the fixed name/copy ends can never be crossed.
+    pub fn move_column(
+        &mut self,
+        source: LibraryColumn,
+        target: LibraryColumn,
+        after: bool,
+    ) -> bool {
+        if source == target {
+            return false;
+        }
+        let mut rest: Vec<LibraryColumn> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|column| *column != source)
+            .collect();
+        let Some(target_index) = rest.iter().position(|column| *column == target) else {
+            return false;
+        };
+        rest.insert(
+            if after {
+                target_index + 1
+            } else {
+                target_index
+            },
+            source,
+        );
+        if rest.as_slice() == self.order.as_slice() {
+            return false;
+        }
+        self.order.copy_from_slice(&rest);
+        true
+    }
+
+    /// Canonical meta payload. Widths are keyed by id so a later column
+    /// insertion cannot shift an existing override onto its neighbour.
+    pub fn to_json(&self) -> String {
+        let widths: serde_json::Map<String, serde_json::Value> = LibraryColumn::ALL
+            .iter()
+            .filter_map(|column| {
+                self.widths[column.index()]
+                    .map(|width| (column.id().to_string(), serde_json::json!(width)))
+            })
+            .collect();
+        let order: Vec<&str> = self.order.iter().map(|column| column.id()).collect();
+        serde_json::json!({ "widths": widths, "order": order }).to_string()
+    }
+
+    /// Tolerant read: unknown ids, duplicates, and malformed numbers are
+    /// ignored; any column the payload omits keeps its default position.
+    pub fn from_json(raw: &str) -> Self {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str(raw.trim()) else {
+            return Self::default();
+        };
+        let mut layout = Self::default();
+        if let Some(entries) = map.get("order").and_then(|value| value.as_array()) {
+            let mut seen = [false; 6];
+            let mut order = Vec::with_capacity(6);
+            for entry in entries {
+                let Some(column) = entry.as_str().and_then(LibraryColumn::from_id) else {
+                    continue;
+                };
+                if !seen[column.index()] {
+                    seen[column.index()] = true;
+                    order.push(column);
+                }
+            }
+            for column in LibraryColumn::ALL {
+                if !seen[column.index()] {
+                    order.push(column);
+                }
+            }
+            layout.order.copy_from_slice(&order);
+        }
+        if let Some(widths) = map.get("widths").and_then(|value| value.as_object()) {
+            for (id, value) in widths {
+                let Some(column) = LibraryColumn::from_id(id) else {
+                    continue;
+                };
+                if let Some(width) = value.as_f64() {
+                    layout.set_width(column, width as f32);
+                }
+            }
+        }
+        layout
+    }
+}
+
 /// T-03: a labeled header cell. The id is the column's anchor, so a test can
 /// measure the label against the row cell it names.
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowColumns {
     pub upstream: bool,
@@ -357,5 +594,85 @@ mod tests {
         let none = RowColumns::parse("none");
         assert_eq!(none.display(), "none", "no known token reads as none");
         assert_eq!(RowColumns::parse(&none.display()), none);
+    }
+
+    #[test]
+    fn library_columns_widths_clamp_and_reset() {
+        let mut layout = LibraryColumns::default();
+        assert_eq!(layout.width(LibraryColumn::Health), RowMetrics::HEALTH);
+        assert!(!layout.is_custom(LibraryColumn::Health));
+
+        layout.set_width(LibraryColumn::Health, 1.);
+        assert_eq!(
+            layout.width(LibraryColumn::Health),
+            LibraryColumn::Health.min_width(),
+            "a drag below the floor stops at the column minimum"
+        );
+        assert!(layout.is_custom(LibraryColumn::Health));
+
+        layout.set_width(LibraryColumn::Health, 10_000.);
+        assert_eq!(
+            layout.width(LibraryColumn::Health),
+            LibraryColumn::MAX_WIDTH,
+            "a drag past the ceiling stops at the shared maximum"
+        );
+
+        layout.set_width(LibraryColumn::Health, 132.4);
+        assert_eq!(layout.width(LibraryColumn::Health), 132.);
+        layout.reset_width(LibraryColumn::Health);
+        assert_eq!(layout.width(LibraryColumn::Health), RowMetrics::HEALTH);
+        assert!(!layout.is_custom(LibraryColumn::Health));
+    }
+
+    #[test]
+    fn library_columns_round_trip_and_tolerate_junk() {
+        let mut layout = LibraryColumns::default();
+        layout.set_width(LibraryColumn::Endpoint, 180.);
+        assert!(layout.move_column(LibraryColumn::Traffic, LibraryColumn::Group, false));
+        let parsed = LibraryColumns::from_json(&layout.to_json());
+        assert_eq!(parsed, layout, "widths and order round-trip");
+        assert_eq!(parsed.order()[0], LibraryColumn::Traffic);
+
+        assert_eq!(
+            LibraryColumns::from_json("not json"),
+            LibraryColumns::default()
+        );
+        let partial = LibraryColumns::from_json(
+            r#"{"widths":{"bogus":120,"health":90},"order":["traffic","traffic","bogus"]}"#,
+        );
+        assert_eq!(partial.width(LibraryColumn::Health), 90.);
+        assert_eq!(partial.order()[0], LibraryColumn::Traffic);
+        assert_eq!(
+            partial.order()[1],
+            LibraryColumn::Group,
+            "omitted columns append in canonical order"
+        );
+        assert_eq!(
+            partial.order().len(),
+            LibraryColumn::ALL.len(),
+            "the order always holds every movable column once"
+        );
+    }
+
+    #[test]
+    fn library_columns_reorder_keeps_every_column() {
+        let mut layout = LibraryColumns::default();
+        let original = *layout.order();
+        assert!(layout.move_column(LibraryColumn::Protocol, LibraryColumn::Endpoint, true));
+        assert_eq!(
+            layout.order(),
+            &[
+                LibraryColumn::Group,
+                LibraryColumn::Upstream,
+                LibraryColumn::Endpoint,
+                LibraryColumn::Protocol,
+                LibraryColumn::Health,
+                LibraryColumn::Traffic,
+            ],
+            "move after the target"
+        );
+        assert!(!layout.move_column(LibraryColumn::Protocol, LibraryColumn::Protocol, false));
+        layout.reset();
+        assert_eq!(layout.order(), &original);
     }
 }

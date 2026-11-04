@@ -2,6 +2,7 @@ pub(crate) mod actions;
 pub(crate) mod bits;
 pub(crate) mod bootstrap;
 pub(crate) mod bulk;
+pub(crate) mod columns;
 pub(crate) mod commit_async;
 pub(crate) mod commit_engine;
 pub(crate) mod commit_forms;

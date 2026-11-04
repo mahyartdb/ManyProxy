@@ -6,6 +6,9 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Added
 
+- Rows select like a file list: click, Ctrl+click to toggle, Shift+click or Shift+Up/Down for a range, and Ctrl+A for everything visible. Row menus and Delete act on the whole selection, and the bulk bar shows both counts when they differ.
+- Column headers resize by dragging their edges (double-click resets) and reorder by dragging. Widths and order persist, and Reset columns restores both.
+- A latency filter in the row bar: Any, at most 100, 300, or 1000 ms, plus an Include unprobed switch. It composes with group, status, and search, and Clear facet filters resets it.
 - The row you just started or stopped shows a 150 ms accent on its leading edge, then settles. Nothing moves: the row height, the pitch, and the painted row count are unchanged.
 - One-line library rows with a right-hand inspector drawer: one 5-tab switcher (Details, Health, Logs, Links, Traffic), a single-scroll Details tab with merged endpoints and one copy action, and a Start/Stop/Test kebab. The tab bar sizes to its labels at the default window width.
 - Sort headers are buttons: click, Enter, or Space sorts by that column and reverses on a second press, and the command palette carries every sort key plus Reverse and Clear.

@@ -16,7 +16,7 @@ mod update;
 use manyproxy_core::*;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -151,6 +151,9 @@ actions!(
         ClearChecked,
         EditSelected,
         DeleteSelected,
+        SelectPreviousRow,
+        SelectNextRow,
+        SelectAllRows,
         FocusSearch,
         InspectorDetails,
         InspectorHealth,
@@ -265,10 +268,23 @@ struct AppView {
 
     facet_group: FacetPicker,
 
+    /// T-05: the latency bucket picker, separate from the group/status menu so
+    /// the two facets compose.
+    facet_latency: FacetPicker,
+
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
 
     row_columns: RowColumns,
+
+    /// T-03: the width drag in flight. `None` means no pointer is resizing a
+    /// column; the delegate layout updates every move and only mouse-up writes
+    /// the store.
+    column_resize: Option<ColumnResize>,
+
+    /// T-04: the header drag's live landing slot. `None` while not dragging (or
+    /// between cells), so the strip paints one indicator at most.
+    column_drop: Option<(LibraryColumn, DropSide)>,
 
     inspector_tab: InspectorTab,
 
@@ -310,6 +326,30 @@ struct AppView {
     process_sampler: ProcessSampler,
 
     started_at: std::time::Instant,
+}
+
+/// T-03: the start of one header-edge drag. The delta is measured from the
+/// pointer's start x, so a move that returns to the origin restores the width
+/// without accumulating rounding drift.
+#[derive(Clone, Copy)]
+struct ColumnResize {
+    column: LibraryColumn,
+    start_x: f32,
+    start_width: f32,
+}
+
+/// T-04: where a dragged header would land relative to the hovered column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropSide {
+    Before,
+    After,
+}
+
+/// T-04: the payload carried by a header drag. The movable set is the payload
+/// type, so a drag can never target the pinned lamp/check/name/copy cells.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnDrag {
+    pub(crate) column: LibraryColumn,
 }
 
 /// T-08: why this session is running in memory instead of on disk. The banner

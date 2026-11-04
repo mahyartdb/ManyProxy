@@ -33,6 +33,23 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     bind(&mut keys, "update-current-group", UpdateCurrentGroup);
     bind(&mut keys, "edit", EditSelected);
     bind(&mut keys, "delete", DeleteSelected);
+    // Multi-select growth is app-level: the kit's List owns plain Up/Down, and
+    // these modifiers never reach its bindings.
+    keys.push(KeyBinding::new(
+        "shift-up",
+        SelectPreviousRow,
+        Some(APP_KEY_CONTEXT),
+    ));
+    keys.push(KeyBinding::new(
+        "shift-down",
+        SelectNextRow,
+        Some(APP_KEY_CONTEXT),
+    ));
+    keys.push(KeyBinding::new(
+        "ctrl-a",
+        SelectAllRows,
+        Some(APP_KEY_CONTEXT),
+    ));
     bind(&mut keys, "focus-search", FocusSearch);
     bind(&mut keys, "inspector-details", InspectorDetails);
     bind(&mut keys, "inspector-health", InspectorHealth);

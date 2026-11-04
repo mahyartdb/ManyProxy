@@ -1399,6 +1399,20 @@ impl AppView {
                         }),
                 );
             }
+            let reset_view = view.clone();
+            body = body.child(
+                div().flex().justify_end().pt_1().child(
+                    Button::new("columns-dialog-reset")
+                        .small()
+                        .label("Reset columns")
+                        .tooltip("Restore the default column widths and order")
+                        .on_click(move |_, window, cx| {
+                            reset_view.update(cx, |view, cx| {
+                                view.reset_all_columns(window, cx);
+                            });
+                        }),
+                ),
+            );
             let close: DialogCommit = Rc::new(|_, _| true);
             dialog
                 .title("Row columns")

@@ -16263,6 +16263,261 @@ fn facet_group_menu_carries_enabled_disabled_and_releases_the_group(cx: &mut Tes
     assert_painted(cx, &format!("library-row-{}", travel.id));
 }
 
+/// T-05: latency buckets are inclusive, compose with group/status/search, and
+/// the unprobed toggle is an independent predicate instead of a no-op under
+/// `Any`.
+#[test]
+fn t05_latency_facet_filters_inclusively_and_composes() {
+    use crate::{FacetStatus, LatencyBucket, LatencyFacet};
+
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![
+        t77_row("fast", "Fast", "vless", "travel", 10801),
+        t77_row("edge", "Edge", "vless", "travel", 10802),
+        t77_row("slow", "Slow", "vmess", "team", 10803),
+        t77_row("unprobed", "Unprobed", "vless", "team", 10804),
+        t77_row("toolow", "TooLow", "vless", "travel", 10805),
+    ]);
+    delegate.set_latency(t77_map_u64(&[
+        ("fast", 100),
+        ("edge", 300),
+        ("slow", 1000),
+        ("toolow", 1001),
+    ]));
+    delegate.rows[3].enabled = false;
+    delegate.apply_filter();
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms100,
+        include_unprobed: true,
+    });
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast", "Unprobed"],
+        "exactly 100 ms is in the bucket and unprobed defaults in"
+    );
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms300,
+        include_unprobed: true,
+    });
+    assert_eq!(t77_names(&delegate), vec!["Fast", "Edge", "Unprobed"]);
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms1000,
+        include_unprobed: true,
+    });
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast", "Edge", "Slow", "Unprobed"],
+        "1000 ms is in; 1001 ms is out"
+    );
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Ms300,
+        include_unprobed: false,
+    });
+    assert_eq!(t77_names(&delegate), vec!["Fast", "Edge"]);
+
+    delegate.set_facet_group(Some("travel".to_string()));
+    delegate.query = "vmess".to_string();
+    delegate.apply_filter();
+    assert!(
+        delegate.visible.is_empty(),
+        "search AND group AND latency all have to agree"
+    );
+
+    delegate.query = "vless".to_string();
+    delegate.apply_filter();
+    delegate.set_running(vec!["fast".to_string()]);
+    delegate.set_facet_status(Some(FacetStatus::Running));
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast"],
+        "the status facet narrows the latency survivors"
+    );
+    assert_eq!(
+        delegate.active_filter_text(),
+        "group: travel · status: Running · latency: ≤300 ms (probed only) · search: \"vless\""
+    );
+
+    delegate.clear_facets();
+    delegate.query.clear();
+    delegate.apply_filter();
+    assert_eq!(delegate.latency_facet, LatencyFacet::default());
+    assert!(!delegate.facets_active());
+    assert_eq!(t77_names(&delegate).len(), 5, "Clear restores the library");
+
+    delegate.set_latency_facet(LatencyFacet {
+        bucket: LatencyBucket::Any,
+        include_unprobed: false,
+    });
+    assert_eq!(
+        t77_names(&delegate),
+        vec!["Fast", "Edge", "Slow", "TooLow"],
+        "excluding unprobed filters even without a bucket"
+    );
+    assert!(delegate.facets_active(), "the toggle alone is a live facet");
+    assert_eq!(delegate.active_filter_text(), "latency: probed only");
+}
+
+/// T-05: the picker writes the delegate and the store, the switch releases
+/// unprobed rows, and Clear resets both surfaces.
+#[gpui_kit::test]
+fn t05_latency_picker_filters_persists_and_clears(cx: &mut TestAppContext) {
+    use crate::{LatencyBucket, LatencyFacet};
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let fast = store
+        .add(facet_seed("Fast", "vless", "travel", "10801"))
+        .expect("seed works");
+    let mid = store
+        .add(facet_seed("Mid", "vmess", "travel", "10802"))
+        .expect("seed works");
+    let unprobed = store
+        .add(facet_seed("Unprobed", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    view.update(cx, |view, cx| {
+        view.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_latency(t77_map_u64(&[
+                (fast.id.as_str(), 100),
+                (mid.id.as_str(), 300),
+            ]));
+            list_cx.notify();
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_painted(cx, "facet-latency");
+    assert_painted(cx, "facet-latency-unprobed-switch");
+    assert_eq!(label_of("facet-latency", cx), "Filter by probe latency");
+    assert_eq!(
+        label_of("facet-latency-unprobed-switch", cx),
+        "Include rows that have not been probed"
+    );
+
+    cx.update(|window, cx| {
+        window.click("facet-latency", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in [
+        "facet-latency-any",
+        "facet-latency-100",
+        "facet-latency-300",
+        "facet-latency-1000",
+    ] {
+        assert_painted(cx, id);
+    }
+    cx.update(|window, cx| {
+        window.click("facet-latency-100", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let facet = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().latency_facet
+    });
+    assert_eq!(
+        facet,
+        LatencyFacet {
+            bucket: LatencyBucket::Ms100,
+            include_unprobed: true,
+        },
+        "the picker keeps the default include-unprobed"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.latency_facet()),
+        facet,
+        "the choice is remembered"
+    );
+    assert_painted(cx, &format!("library-row-{}", fast.id));
+    assert_absent(cx, format!("library-row-{}", mid.id));
+    assert_painted(cx, &format!("library-row-{}", unprobed.id));
+    assert_painted(cx, "clear-facets");
+
+    cx.update(|window, cx| {
+        window.click("facet-latency-unprobed-switch", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let facet = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().latency_facet
+    });
+    assert!(!facet.include_unprobed, "the switch narrows the facet");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.latency_facet()),
+        facet
+    );
+    assert_absent(cx, format!("library-row-{}", unprobed.id));
+
+    cx.update(|window, cx| {
+        window.click("clear-facets", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().latency_facet
+        }),
+        LatencyFacet::default()
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.latency_facet()),
+        LatencyFacet::default(),
+        "Clear persists the unfiltered choice"
+    );
+    for row in [&fast, &mid, &unprobed] {
+        assert_painted(cx, &format!("library-row-{}", row.id));
+    }
+}
+
+/// T-05: an earlier latency choice seeds the delegate and the picker label on
+/// the next launch, including the unprobed half of the state.
+#[gpui_kit::test]
+fn t05_latency_facet_restores_from_store(cx: &mut TestAppContext) {
+    use crate::{LatencyBucket, LatencyFacet};
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Fast", "vless", "travel", "10801"))
+        .expect("seed works");
+    let facet = LatencyFacet {
+        bucket: LatencyBucket::Ms300,
+        include_unprobed: false,
+    };
+    store.set_latency_facet(facet).expect("facet writes");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let (restored, display) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        (
+            delegate.latency_facet,
+            crate::FacetMenu::Latency.current_display(delegate),
+        )
+    });
+    assert_eq!(restored, facet);
+    assert_eq!(display, "Latency: ≤300 ms");
+    assert_painted(cx, "facet-latency");
+    assert_painted(cx, "facet-latency-unprobed-switch");
+}
+
 #[gpui_kit::test]
 fn lamp_click_toggles_endpoint_state_filter(cx: &mut TestAppContext) {
     use crate::FacetStatus;
@@ -21824,15 +22079,16 @@ fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppCon
 /// (586px) never overflows the table.
 #[test]
 fn t03_row_budget_drops_upstream_after_protocol() {
-    use crate::{RowColumns, RowMetrics};
+    use crate::{LibraryColumns, RowColumns, RowMetrics};
 
     let columns = RowColumns::default();
-    let at_740 = RowMetrics::for_table_width(740., columns);
+    let layout = LibraryColumns::default();
+    let at_740 = RowMetrics::for_table_width(740., columns, layout);
     assert!(!at_740.show_protocol, "protocol drops at 740");
     assert!(at_740.show_upstream, "upstream still fits at 740");
     assert!(at_740.show_health, "health is never budgeted away");
 
-    let at_640 = RowMetrics::for_table_width(640., columns);
+    let at_640 = RowMetrics::for_table_width(640., columns, layout);
     assert!(!at_640.show_protocol, "protocol drops at 640");
     assert!(!at_640.show_upstream, "upstream drops at 640");
     assert!(at_640.show_health, "health is never budgeted away");
@@ -21849,6 +22105,266 @@ fn t03_row_budget_drops_upstream_after_protocol() {
     assert_eq!(min_row, 586.);
     assert!(min_row <= RowMetrics::TABLE_MIN);
     assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 734.);
+}
+
+/// T-03: one gesture from edge to edge: the delegate follows every move, the
+/// store only hears about the final width, and a double-click restores the
+/// computed default.
+#[gpui_kit::test]
+fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, RowMetrics};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Resize", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().row_metrics.health
+        }),
+        RowMetrics::HEALTH,
+        "the persisted default starts at the computed width"
+    );
+
+    drag_column_edge(cx, "column-resize-health", 40.);
+    let (live, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().row_metrics.health,
+            view.store
+                .library_column_layout()
+                .width(LibraryColumn::Health),
+        )
+    });
+    assert_eq!(live, RowMetrics::HEALTH + 40., "the row and header reflow");
+    assert_eq!(saved, live, "mouse-up writes the final width");
+
+    drag_column_edge(cx, "column-resize-endpoint", -500.);
+    let endpoint = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().row_metrics.endpoint
+    });
+    assert_eq!(
+        endpoint,
+        LibraryColumn::Endpoint.min_width(),
+        "a drag past the floor stops at the column minimum"
+    );
+
+    double_click_column_edge(cx, "column-resize-health");
+    let (live, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().row_metrics.health,
+            view.store
+                .library_column_layout()
+                .width(LibraryColumn::Health),
+        )
+    });
+    assert_eq!(
+        live,
+        RowMetrics::HEALTH,
+        "double-click restores the default"
+    );
+    assert_eq!(saved, RowMetrics::HEALTH, "the reset persists");
+}
+
+/// T-03: the keyboard/a11y route. A sortable header's menu carries the sort
+/// keys and the width verbs together; a plain header carries only the verbs;
+/// the dialog's Reset clears every override.
+#[gpui_kit::test]
+fn t03_column_width_menu_and_dialog_reset(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, LibraryColumns, RowMetrics};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Menu", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        window.right_click("sort-header-health".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in [
+        "sort-header-health-latency",
+        "column-menu-health-wider",
+        "column-menu-health-narrower",
+        "column-menu-health-reset",
+    ] {
+        assert_painted(cx, id);
+    }
+    cx.update(|window, cx| window.click("column-menu-health-wider".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().row_metrics.health
+        }),
+        RowMetrics::HEALTH + 16.,
+        "Wider nudges the column by one step"
+    );
+
+    cx.update(|window, cx| {
+        window.right_click("header-endpoint".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "column-menu-endpoint-wider");
+    assert_painted(cx, "column-menu-endpoint-reset");
+    assert_absent(cx, "sort-header-endpoint-none".to_string());
+    cx.update(|window, cx| window.click("column-menu-endpoint-reset".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_row_columns_dialog(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_painted(cx, "columns-dialog-reset");
+    cx.update(|window, cx| window.click("columns-dialog-reset".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let (layout, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().layout,
+            view.store.library_column_layout(),
+        )
+    });
+    assert_eq!(
+        layout,
+        LibraryColumns::default(),
+        "the dialog clears overrides"
+    );
+    assert_eq!(saved, LibraryColumns::default(), "the reset persists");
+    assert_eq!(layout.width(LibraryColumn::Health), RowMetrics::HEALTH);
+}
+
+/// T-04: a header drag carries the column and its sort behavior. The drop line
+/// paints before release, the new order persists, and the pinned name/copy
+/// cells stay outside the movable run.
+#[gpui_kit::test]
+fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, LibrarySortKey};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Drag", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    let left = |cx: &mut VisualTestContext, id: &str| -> f32 {
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+                .origin
+                .x
+                .as_f32()
+        })
+    };
+
+    drag_column_header(
+        cx,
+        "sort-header-health",
+        "header-protocol",
+        false,
+        Some("column-drop-protocol"),
+    );
+
+    let (layout, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().layout,
+            view.store.library_column_layout(),
+        )
+    });
+    assert_eq!(layout, saved, "the new order is written on release");
+    assert_eq!(layout.order()[1], LibraryColumn::Health);
+    assert_eq!(layout.order()[2], LibraryColumn::Protocol);
+
+    let health = left(cx, "sort-header-health");
+    assert!(
+        left(cx, "header-name") < health && health < left(cx, "header-protocol"),
+        "Health now paints between the pinned Name and Protocol"
+    );
+    let row_health = left(cx, &format!("row-health-{}", row.id));
+    assert!(
+        left(cx, &format!("row-name-{}", row.id)) < row_health
+            && row_health < left(cx, &format!("row-protocol-{}", row.id)),
+        "the row follows the header order"
+    );
+
+    // The sort gesture belongs to the column, not the slot it used to occupy.
+    cx.update(|window, cx| window.click("sort-header-health".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let sort = view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().sort);
+    assert_eq!(
+        sort.key,
+        LibrarySortKey::Latency,
+        "clicking the moved Health header still sorts by latency"
+    );
+}
+
+/// T-04: the pinned name column is not a drop target, and the indicator never
+/// lingers when the pointer leaves the movable run.
+#[gpui_kit::test]
+fn t04_column_drag_cannot_cross_fixed_columns(cx: &mut TestAppContext) {
+    use crate::{LibraryColumn, LibraryColumns};
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Fixed", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    begin_column_drag(cx, "header-protocol");
+    move_column_drag(cx, "header-upstream", false);
+    assert_painted(cx, "column-drop-upstream");
+
+    move_column_drag(cx, "header-name", false);
+    assert_absent(cx, "column-drop-upstream".to_string());
+
+    release_column_drag(cx, "header-name", false);
+    let (layout, saved) = view.read_with(cx, |view, cx| {
+        (
+            view.libraries.read(cx).delegate().layout,
+            view.store.library_column_layout(),
+        )
+    });
+    assert_eq!(
+        layout.order(),
+        &LibraryColumn::ALL,
+        "dropping on the pinned Name leaves the order untouched"
+    );
+    assert_eq!(saved, LibraryColumns::default(), "nothing was persisted");
 }
 
 /// F2: at the default 1000px frame the table reserves the drawer's 260px, so
@@ -29916,6 +30432,7 @@ fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
+    use gpui_kit::Focusable as _;
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -29930,6 +30447,9 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Stop Testing", "Ctrl-."),
         ("Edit selected", "Ctrl-E"),
         ("Delete selected", "Delete"),
+        ("Extend selection up", "Shift-Up"),
+        ("Extend selection down", "Shift-Down"),
+        ("Select all visible", "Ctrl-A"),
         ("Focus search", "Ctrl-F"),
         ("Inspector details", "Ctrl-1"),
         ("Inspector health", "Ctrl-2"),
@@ -30087,8 +30607,8 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     assert_eq!(notification_count(cx), before, "Escape clear is silent");
     assert_eq!(
         view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
-        Some(id.clone()),
-        "Escape never eats the selection"
+        None,
+        "Escape clears the selection with the checks"
     );
 
     cx.update(|_, cx| {
@@ -30119,7 +30639,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
 
-    let focus = view.read_with(cx, |view, _| view.focus.clone());
+    let focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
     cx.update(|window, cx| window.focus(&focus, cx));
     let before = notification_count(cx);
     press(cx, "down");
@@ -35699,5 +36219,821 @@ fn k12_text_size_persists_and_survives_appearance(cx: &mut TestAppContext) {
         view.read_with(cx, |view, _| view.store.text_size()),
         TextSize::Default,
         "the choice persists"
+    );
+}
+
+/// A click on a library row with modifiers held. The kit's own test helpers
+/// click with an empty modifier set, so multi-select needs its own dispatch.
+fn click_row_with(cx: &mut VisualTestContext, id: &str, modifiers: gpui_kit::Modifiers) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseUpEvent};
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let position = window
+            .try_find(id.to_string())
+            .unwrap_or_else(|| panic!("{id} renders"))
+            .bounds()
+            .center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-03: press on a column edge, move by `dx`, release. The move listener is
+/// registered by the header strip's paint, so the frame must exist first.
+fn drag_column_edge(cx: &mut VisualTestContext, id: &str, dx: f32) {
+    use gpui_kit::gpui::{
+        InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    };
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let start = window
+            .try_find(id.to_string())
+            .unwrap_or_else(|| panic!("{id} renders"))
+            .bounds()
+            .center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: point(start.x + px(dx), start.y),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(start.x + px(dx), start.y),
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn double_click_column_edge(cx: &mut VisualTestContext, id: &str) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseUpEvent};
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let position = window
+            .try_find(id.to_string())
+            .unwrap_or_else(|| panic!("{id} renders"))
+            .bounds()
+            .center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 2,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 2,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-04: press a header and cross gpui's drag threshold. A header drag starts
+/// only after the pointer moves; the second move in the tests below is the one
+/// that carries the indicator onto a target.
+fn begin_column_drag(cx: &mut VisualTestContext, source_id: &str) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent};
+    let start = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(source_id.to_string())
+            .unwrap_or_else(|| panic!("{source_id} renders"))
+            .bounds()
+            .center()
+    });
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: start,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: point(start.x + px(8.), start.y),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-04: the point inside a header that selects the before/after landing slot.
+fn column_drop_point(
+    cx: &mut VisualTestContext,
+    target_id: &str,
+    after: bool,
+) -> gpui_kit::gpui::Point<gpui_kit::gpui::Pixels> {
+    cx.update(|window, _| {
+        let bounds = window
+            .try_find(target_id.to_string())
+            .unwrap_or_else(|| panic!("{target_id} renders"))
+            .bounds();
+        let x = if after {
+            bounds.right() - px(4.)
+        } else {
+            bounds.left() + px(4.)
+        };
+        point(x, bounds.center().y)
+    })
+}
+
+fn move_column_drag(cx: &mut VisualTestContext, target_id: &str, after: bool) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseMoveEvent};
+    let position = column_drop_point(cx, target_id, after);
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn release_column_drag(cx: &mut VisualTestContext, target_id: &str, after: bool) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseUpEvent};
+    let position = column_drop_point(cx, target_id, after);
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+/// T-04: the common one-target gesture: start, hover, assert the indicator,
+/// release.
+fn drag_column_header(
+    cx: &mut VisualTestContext,
+    source_id: &str,
+    target_id: &str,
+    after: bool,
+    indicator: Option<&str>,
+) {
+    begin_column_drag(cx, source_id);
+    move_column_drag(cx, target_id, after);
+    if let Some(indicator) = indicator {
+        assert_painted(cx, indicator);
+    }
+    release_column_drag(cx, target_id, after);
+}
+
+fn selected_ids(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
+    view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().selected_ids()
+    })
+}
+
+fn row_aria_selected(cx: &mut VisualTestContext, id: &str) -> bool {
+    cx.update(|window, _| {
+        window
+            .try_find(format!("library-row-{id}"))
+            .unwrap_or_else(|| panic!("row {id} renders"))
+            .selected()
+            .unwrap_or(false)
+    })
+}
+
+/// Task 1: click replaces, Ctrl+click toggles, Shift+click draws from the
+/// anchor, and every row carries its own `aria_selected`.
+#[gpui_kit::test]
+fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let delta = store
+        .add(facet_seed("Delta", "vless", "team", "10804"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let click = |cx: &mut VisualTestContext, id: &str, modifiers: Modifiers| {
+        click_row_with(cx, &format!("library-row-{id}"), modifiers);
+    };
+
+    click(cx, &alpha.id, Modifiers::default());
+    assert_eq!(selected_ids(&view, cx), vec![alpha.id.clone()]);
+    assert!(row_aria_selected(cx, &alpha.id));
+    assert!(!row_aria_selected(cx, &bravo.id));
+    assert!(!row_aria_selected(cx, &charlie.id));
+    assert!(!row_aria_selected(cx, &delta.id));
+
+    click(
+        cx,
+        &charlie.id,
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), charlie.id.clone()],
+        "Ctrl+click adds without dropping the first row"
+    );
+    assert!(row_aria_selected(cx, &alpha.id));
+    assert!(!row_aria_selected(cx, &bravo.id));
+    assert!(row_aria_selected(cx, &charlie.id));
+
+    click(
+        cx,
+        &delta.id,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![charlie.id.clone(), delta.id.clone()],
+        "Shift+click draws from the last-clicked anchor"
+    );
+    assert!(!row_aria_selected(cx, &alpha.id));
+    assert!(row_aria_selected(cx, &charlie.id));
+    assert!(row_aria_selected(cx, &delta.id));
+
+    click(
+        cx,
+        &bravo.id,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![bravo.id.clone(), charlie.id.clone()],
+        "a second Shift+click re-drags the same anchor"
+    );
+
+    click(
+        cx,
+        &bravo.id,
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![charlie.id.clone()],
+        "Ctrl+click removes a row already in the set"
+    );
+
+    click(cx, &alpha.id, Modifiers::default());
+    assert_eq!(selected_ids(&view, cx), vec![alpha.id.clone()]);
+    assert!(row_aria_selected(cx, &alpha.id));
+
+    let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&list_handle, cx));
+    cx.update(|window, cx| {
+        let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+        window.dispatch_keystroke(escape, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        selected_ids(&view, cx).is_empty(),
+        "Esc clears the transient selection"
+    );
+    for id in [&alpha.id, &bravo.id, &charlie.id, &delta.id] {
+        assert!(!row_aria_selected(cx, id), "Esc clears aria_selected too");
+    }
+}
+
+/// Task 1: the anchor outlives a filter that still shows it, and leaves with
+/// it. Hidden rows are never silently acted on by a later Shift range.
+#[test]
+fn multi_select_anchor_survives_filters_and_prunes_hidden_rows() {
+    use crate::store::ProxyConfig;
+    fn row(id: &str, name: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
+            group: "team".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![
+        row("1", "Alpha"),
+        row("2", "Bravo"),
+        row("3", "Charlie"),
+    ]);
+
+    delegate.select_only("2");
+    delegate.extend_selection_to("3");
+    assert_eq!(delegate.selected_ids(), vec!["2", "3"]);
+    assert_eq!(
+        delegate.selection_anchor.as_deref(),
+        Some("2"),
+        "the range keeps its origin"
+    );
+
+    delegate.query = "r".to_string();
+    delegate.apply_filter();
+    assert_eq!(
+        delegate.selected_ids(),
+        vec!["2", "3"],
+        "a filter that keeps the set leaves it alone"
+    );
+    assert_eq!(
+        delegate.selection_anchor.as_deref(),
+        Some("2"),
+        "the anchor survives while its row is visible"
+    );
+
+    delegate.query = "alpha".to_string();
+    delegate.apply_filter();
+    assert!(
+        delegate.selected_ids().is_empty(),
+        "a filter that hides the set empties it"
+    );
+    assert_eq!(delegate.selection_anchor, None, "the hidden anchor leaves");
+
+    delegate.query.clear();
+    delegate.apply_filter();
+    delegate.select_only("2");
+    delegate.extend_selection_to("3");
+    delegate.set_rows(vec![row("1", "Alpha"), row("3", "Charlie")]);
+    assert_eq!(
+        delegate.selected_ids(),
+        vec!["3"],
+        "deleting a selected row prunes only that row"
+    );
+    assert_eq!(
+        delegate.selection_anchor, None,
+        "the deleted anchor does not linger"
+    );
+
+    delegate.set_facet_group(Some("ghost".to_string()));
+    assert!(
+        delegate.selected_ids().is_empty(),
+        "a facet that empties the list clears the set"
+    );
+}
+
+/// Task 1: with several rows selected the context menu names the count and
+/// the verb lands on all of them, not just the row under the pointer.
+#[gpui_kit::test]
+fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    click_row_with(
+        cx,
+        &format!("library-row-{}", alpha.id),
+        Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("library-row-{}", charlie.id),
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()]
+    );
+
+    cx.update(|window, cx| window.right_click(format!("row-card-{}", bravo.id), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    for (verb, want) in [
+        ("start", "Start 3 configurations"),
+        ("stop", "Stop 3 configurations"),
+        ("test", "Test 3 configurations"),
+        ("copy-proxy", "Copy 3 SOCKS URLs"),
+        ("edit", "Edit"),
+        ("delete", "Delete 3 configurations"),
+    ] {
+        assert_eq!(
+            label_of(&format!("rowctx-{verb}-{}", bravo.id), cx),
+            want,
+            "{verb} names the whole selection"
+        );
+    }
+
+    // Copy URLs and Move live behind More ▾, like the single-row menu.
+    cx.update(|window, cx| {
+        let up = gpui_kit::Keystroke::parse("up").expect("test keystroke parses");
+        window.dispatch_keystroke(up, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        label_of(&format!("rowctx-copy-urls-{}", bravo.id), cx),
+        "Copy 3 URLs"
+    );
+    assert_eq!(
+        label_of(&format!("rowctx-move-{}", bravo.id), cx),
+        "Move 3 configurations to group"
+    );
+
+    cx.update(|window, cx| {
+        window.click(format!("rowctx-copy-urls-{}", bravo.id), cx);
+    });
+    cx.run_until_parked();
+    let clip = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+            .to_string()
+    });
+    let lines: Vec<&str> = clip.lines().collect();
+    assert_eq!(lines.len(), 3, "the selection's three URLs were copied");
+    assert!(lines.iter().any(|line| line.starts_with("Alpha\t")));
+    assert!(lines.iter().any(|line| line.starts_with("Bravo\t")));
+    assert!(lines.iter().any(|line| line.starts_with("Charlie\t")));
+}
+
+fn press_key(cx: &mut VisualTestContext, key: &str) {
+    let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn focus_library(view: &Entity<AppView>, cx: &mut VisualTestContext) {
+    use gpui_kit::Focusable as _;
+    let handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&handle, cx));
+}
+
+/// Task 2: Shift+Down/Down grows from the anchor, Shift+Up shrinks the same
+/// range without re-anchoring at the new focus.
+#[gpui_kit::test]
+fn multi_select_shift_arrows_extend_and_collapse(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let delta = store
+        .add(facet_seed("Delta", "vless", "team", "10804"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    click_row_with(
+        cx,
+        &format!("library-row-{}", alpha.id),
+        Modifiers::default(),
+    );
+    focus_library(&view, cx);
+    press_key(cx, "shift-down");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()]
+    );
+    press_key(cx, "shift-down");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()],
+        "each Shift+Down grows the same anchored range"
+    );
+    press_key(cx, "shift-up");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()],
+        "Shift+Up shrinks the range instead of starting a new one"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .selection_anchor
+            .clone()),
+        Some(alpha.id.clone()),
+        "the anchor never moves while the range is redrawn"
+    );
+    assert!(
+        !row_aria_selected(cx, &delta.id),
+        "rows outside the range stay unselected"
+    );
+}
+
+/// Task 2: Ctrl+A takes exactly the rows the filters keep.
+#[gpui_kit::test]
+fn multi_select_ctrl_a_takes_visible_rows_only(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "home", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state
+                    .delegate_mut()
+                    .set_facet_group(Some("team".to_string()));
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    focus_library(&view, cx);
+    press_key(cx, "ctrl-a");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()],
+        "the hidden home row is not selected"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .selection_anchor
+            .clone()),
+        Some(alpha.id.clone()),
+        "the first visible row anchors the set"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().clear_facets();
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    focus_library(&view, cx);
+    press_key(cx, "ctrl-a");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()]
+    );
+}
+
+/// Task 2: Delete on a multi-selection uses the K17 bulk path — immediate
+/// removal with one Undo toast, never a dialog per row.
+#[gpui_kit::test]
+fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("M2 Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("M2 Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("M2 Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    click_row_with(
+        cx,
+        &format!("library-row-{}", alpha.id),
+        Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("library-row-{}", bravo.id),
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()]
+    );
+
+    focus_library(&view, cx);
+    let before = notification_count(cx);
+    press_key(cx, "delete");
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "multi-delete is immediate, not a confirm per row"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        1,
+        "both selected rows are gone"
+    );
+    assert_eq!(notification_count(cx), before + 1, "one batched Undo toast");
+    assert!(
+        selected_ids(&view, cx).is_empty(),
+        "the deleted rows leave the selection"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .visible_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>()),
+        vec![charlie.id.clone()],
+        "the untouched row remains"
+    );
+    assert_eq!(crate::undo_stash_count_named("M2 Alpha"), 1);
+    assert_eq!(crate::undo_stash_count_named("M2 Bravo"), 1);
+}
+
+/// Task 2: the bulk bar shows the selection count only when it disagrees with
+/// the checked count, so one browser of checked rows keeps its compact label.
+#[test]
+fn bulk_label_adds_the_selection_count_when_it_differs() {
+    use crate::store::ProxyConfig;
+    fn row(id: &str, name: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
+            group: "team".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![
+        row("1", "Alpha"),
+        row("2", "Bravo"),
+        row("3", "Charlie"),
+    ]);
+
+    delegate.toggle_checked("1");
+    delegate.select_only("2");
+    delegate.extend_selection_to("3");
+    assert_eq!(
+        delegate.bulk_label(),
+        "1 checked · 2 selected (of 3)",
+        "both sets are named when they disagree"
+    );
+
+    delegate.select_only("1");
+    assert_eq!(
+        delegate.bulk_label(),
+        "1 checked (of 3)",
+        "equal counts collapse back to the checked label"
+    );
+
+    delegate.clear_selection();
+    assert_eq!(
+        delegate.bulk_label(),
+        "1 checked (of 3)",
+        "a checks-only bulk session never shows a zero selection"
     );
 }
