@@ -24,6 +24,66 @@ impl AppView {
         window.push_notification(Notification::success("Copied proxy URLs"), cx);
     }
 
+    pub(crate) fn copy_selected_urls(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.copy_row_urls(id, window, cx);
+            return;
+        }
+        let mut lines = Vec::new();
+        for id in ids {
+            let Some(config) = self.row_config(id) else {
+                continue;
+            };
+            let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+            lines.push(format!("{}\t{socks}\t{http}", config.name));
+        }
+        if lines.is_empty() {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        }
+        let count = lines.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        window.push_notification(
+            Notification::success(format!("Copied URLs for {count} configuration(s)")),
+            cx,
+        );
+    }
+
+    pub(crate) fn copy_selected_socks(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.copy_row_socks(id, window, cx);
+            return;
+        }
+        let mut lines = Vec::new();
+        for id in ids {
+            let Some(config) = self.row_config(id) else {
+                continue;
+            };
+            let (socks, _) = proxy_urls(&config.bind_ip, config.port);
+            lines.push(format!("{}\t{socks}", config.name));
+        }
+        if lines.is_empty() {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        }
+        let count = lines.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        window.push_notification(
+            Notification::success(format!("Copied SOCKS URLs for {count} configuration(s)")),
+            cx,
+        );
+    }
+
     /// T-32: mirrors the window rectangle into meta on the same orderly-exit
     /// paths `snapshot_running_set` already uses. A killed process keeps the
     /// last clean-exit save — the snapshot's own tolerance. Maximized

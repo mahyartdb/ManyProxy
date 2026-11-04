@@ -14,6 +14,7 @@ pub(crate) enum ActionTarget<'a> {
 /// handlers already work off the selection.
 pub(crate) enum Handler {
     Row(fn(&mut AppView, &str, &mut Window, &mut Context<AppView>)),
+    Rows(fn(&mut AppView, &[String], &mut Window, &mut Context<AppView>)),
     Selected(fn(&mut AppView, &mut Window, &mut Context<AppView>)),
 }
 
@@ -292,45 +293,45 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         &[("ctrl-6", "Ctrl+6")],
         show_traffic,
     ),
-    row(
+    rows(
         "start",
         "Start",
         &["start", "serve", "f5"],
         &[("f5", "F5")],
-        "Start this row's endpoint",
-        AppView::start_row,
+        "Start this row or every selected row",
+        AppView::start_selected_rows,
     ),
-    row(
+    rows(
         "stop",
         "Stop",
         &["stop"],
         &[("shift-f5", "Shift+F5")],
-        "Stop this row's endpoint",
-        AppView::stop_row,
+        "Stop this row or every selected row",
+        AppView::stop_selected_rows,
     ),
-    row(
+    rows(
         "test",
         "Test",
         &["test", "probe", "health"],
         &[("ctrl-t", "Ctrl+T")],
-        "URL-test this row's endpoint",
-        AppView::test_row,
+        "URL-test this row or every selected row",
+        AppView::test_selected_rows,
     ),
-    row(
+    rows(
         "copy-urls",
         "Copy URLs",
         &["copy", "clipboard", "url", "endpoint"],
         &[("ctrl-u", "Ctrl+U")],
         "Copy bind endpoints (no secrets)",
-        AppView::copy_row_urls,
+        AppView::copy_selected_urls,
     ),
-    row(
+    rows(
         "copy-proxy",
         "Copy SOCKS",
         &["copy", "socks", "proxy"],
         &[],
-        "Copy this row's SOCKS proxy URL only",
-        AppView::copy_row_socks,
+        "Copy the SOCKS proxy URL for this row or the selection",
+        AppView::copy_selected_socks,
     ),
     row(
         "edit",
@@ -340,21 +341,21 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         "Edit this row",
         AppView::open_edit_for_row,
     ),
-    row(
+    rows(
         "delete",
         "Delete",
         &["delete", "remove"],
         &[("delete", "Delete")],
-        "Delete this row",
-        AppView::open_remove_for_row,
+        "Delete this row or every selected row",
+        AppView::delete_selected_rows,
     ),
-    row(
+    rows(
         "move",
         "Move to group",
         &["move", "group"],
         &[],
-        "Move this row to a group",
-        AppView::open_row_move_dialog,
+        "Move this row or the selection to a group",
+        AppView::move_selected_rows,
     ),
     row(
         "share",
@@ -414,7 +415,14 @@ fn always(_view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
 /// a selection target can be empty, and that refusal is the only place the
 /// palette, the menus and the shortcuts say "select a row first".
 fn needs_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> bool {
-    target_row(view, target, cx).is_some()
+    target_row(view, target, cx).is_some() || !target_rows(view, target, cx).is_empty()
+}
+
+fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String> {
+    match target {
+        ActionTarget::Row(id) => vec![id.to_string()],
+        ActionTarget::Selection => view.libraries.read(cx).delegate().selected_ids(),
+    }
 }
 
 const fn selected(
@@ -451,6 +459,25 @@ const fn row(
         shortcuts,
         enabled: needs_row,
         run: Handler::Row(run),
+    }
+}
+
+const fn rows(
+    id: &'static str,
+    label: &'static str,
+    keywords: &'static [&'static str],
+    shortcuts: &'static [(&'static str, &'static str)],
+    tooltip: &'static str,
+    run: fn(&mut AppView, &[String], &mut Window, &mut Context<AppView>),
+) -> ActionDef {
+    ActionDef {
+        id,
+        label,
+        keywords,
+        tooltip: Some(tooltip),
+        shortcuts,
+        enabled: needs_row,
+        run: Handler::Rows(run),
     }
 }
 
@@ -546,6 +573,14 @@ pub(crate) fn run_action(
                 return;
             };
             run(view, &row_id, window, cx);
+        }
+        Handler::Rows(run) => {
+            let ids = target_rows(view, target, cx);
+            if ids.is_empty() {
+                window.push_notification(Notification::info(no_selection_message()), cx);
+                return;
+            }
+            run(view, &ids, window, cx);
         }
         Handler::Selected(run) => run(view, window, cx),
     }

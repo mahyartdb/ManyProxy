@@ -188,6 +188,12 @@ impl AppView {
             return false;
         }
         self.clear_checked(window, cx);
+        // The kit's index is the last-clicked row; clearing it drops the focus
+        // ring with the wash so Esc leaves no row looking selected.
+        self.libraries.update(cx, |state, list_cx| {
+            state.set_selected_index(None, window, list_cx);
+            list_cx.notify();
+        });
         true
     }
 
@@ -238,6 +244,15 @@ impl AppView {
 
     pub(crate) fn commit_bulk_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.libraries.read(cx).delegate().checked_rows();
+        self.start_rows(rows, window, cx);
+    }
+
+    pub(crate) fn start_rows(
+        &mut self,
+        rows: Vec<ProxyConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if rows.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -282,6 +297,23 @@ impl AppView {
         } else {
             self.spawn_commit_bulk_start_ids(ids, window, cx);
         }
+    }
+
+    /// The Start action for a row menu and for the selection shortcuts. One
+    /// row keeps the single-row path (and its own toasts); several rows share
+    /// the batch apply the bulk bar already uses.
+    pub(crate) fn start_selected_rows(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.start_row(id, window, cx);
+            return;
+        }
+        let rows: Vec<ProxyConfig> = ids.iter().filter_map(|id| self.row_config(id)).collect();
+        self.start_rows(rows, window, cx);
     }
 
     pub(crate) fn commit_bulk_start_ids(
@@ -459,13 +491,30 @@ impl AppView {
             .iter()
             .map(|row| row.id.clone())
             .collect();
+        self.stop_ids(&ids, window, cx);
+    }
+
+    pub(crate) fn stop_selected_rows(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.stop_row(id, window, cx);
+            return;
+        }
+        self.stop_ids(ids, window, cx);
+    }
+
+    pub(crate) fn stop_ids(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         }
         let mut stopped: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        for id in &ids {
+        for id in ids {
             let name = self
                 .row_config(id)
                 .map(|row| row.name)
@@ -536,6 +585,30 @@ impl AppView {
         self.commit_bulk_delete(&targets, window, cx);
     }
 
+    /// Delete from the row menu or the Delete key. One row still asks its own
+    /// confirm; more than one is the bulk path (K17): immediate, one Undo toast.
+    pub(crate) fn delete_selected_rows(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.open_remove_for_row(id, window, cx);
+            return;
+        }
+        let targets: Vec<(String, String)> = ids
+            .iter()
+            .filter_map(|id| self.row_config(id))
+            .map(|row| (row.id, row.name))
+            .collect();
+        if targets.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        self.commit_bulk_delete(&targets, window, cx);
+    }
+
     pub(crate) fn commit_bulk_delete(
         &mut self,
         targets: &[(String, String)],
@@ -597,6 +670,28 @@ impl AppView {
             .iter()
             .map(|row| row.id.clone())
             .collect();
+        self.open_move_ids_dialog(ids, window, cx);
+    }
+
+    pub(crate) fn move_selected_rows(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.open_row_move_dialog(id, window, cx);
+            return;
+        }
+        self.open_move_ids_dialog(ids.to_vec(), window, cx);
+    }
+
+    fn open_move_ids_dialog(
+        &mut self,
+        ids: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;

@@ -1479,10 +1479,25 @@ impl AppView {
 
     /// A context-menu row for one table action. The target row travels by id
     /// and is resolved when the handler runs, never at render.
-    fn context_menu_item(id: &'static str, row_id: &str, view: &Entity<AppView>) -> PopupMenuItem {
+    fn context_menu_item(
+        id: &'static str,
+        row_id: &str,
+        view: &Entity<AppView>,
+        multi: Option<usize>,
+    ) -> PopupMenuItem {
+        Self::context_menu_item_with_label(id, row_id, view, multi, None)
+    }
+
+    fn context_menu_item_with_label(
+        id: &'static str,
+        row_id: &str,
+        view: &Entity<AppView>,
+        multi: Option<usize>,
+        label: Option<String>,
+    ) -> PopupMenuItem {
         let def = action(id);
         let element_id = format!("rowctx-{}-{row_id}", def.id);
-        let label = def.label.to_string();
+        let label = label.unwrap_or_else(|| def.label.to_string());
         let tip = def.tooltip.unwrap_or(def.label).to_string();
         let target = row_id.to_string();
         let view = view.clone();
@@ -1502,9 +1517,49 @@ impl AppView {
         })
         .on_click(move |_, window, cx| {
             view.update(cx, |view, cx| {
-                run_action(view, id, ActionTarget::Row(&target), window, cx);
+                // A menu opened on a row inside a multi-selection acts on the
+                // whole selection; anywhere else it keeps its single subject.
+                let target = match multi {
+                    Some(count) if count > 1 => ActionTarget::Selection,
+                    _ => ActionTarget::Row(&target),
+                };
+                run_action(view, id, target, window, cx);
             });
         })
+    }
+
+    /// The row verbs that widen to the whole set, and the copy they wear when
+    /// they do. Edit / Share / Duplicate stay row-scoped by nature.
+    fn multi_row_label(id: &str, count: usize) -> Option<String> {
+        if count <= 1 {
+            return None;
+        }
+        match id {
+            "start" => Some(format!("Start {count} configurations")),
+            "stop" => Some(format!("Stop {count} configurations")),
+            "test" => Some(format!("Test {count} configurations")),
+            "copy-urls" => Some(format!("Copy {count} URLs")),
+            "copy-proxy" => Some(format!("Copy {count} SOCKS URLs")),
+            "move" => Some(format!("Move {count} configurations to group")),
+            "delete" => Some(format!("Delete {count} configurations")),
+            _ => None,
+        }
+    }
+
+    fn row_context_item(
+        id: &'static str,
+        row_id: &str,
+        view: &Entity<AppView>,
+        multi_count: usize,
+    ) -> PopupMenuItem {
+        let multi = Self::multi_row_label(id, multi_count);
+        let multi = multi.map(|label| (multi_count, label));
+        match multi {
+            Some((count, label)) => {
+                Self::context_menu_item_with_label(id, row_id, view, Some(count), Some(label))
+            }
+            None => Self::context_menu_item(id, row_id, view, None),
+        }
     }
 
     pub(crate) fn row_context_menu(
@@ -1514,13 +1569,31 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        let multi_count = view
+            .read(cx)
+            .libraries
+            .read(cx)
+            .delegate()
+            .selected_ids()
+            .len();
+        let multi_count = if view
+            .read(cx)
+            .libraries
+            .read(cx)
+            .delegate()
+            .is_selected(row_id)
+        {
+            multi_count
+        } else {
+            1
+        };
         // K8/A6-2: 7 core verbs at top level (Reset… is its own submenu) and
         // the demoted row chores behind `More ▾`. Speedtest / Resolve Out-IP /
         // Resolve domain are retired (K8): they appear in no menu at all.
         let menu = ["start", "stop", "test", "copy-proxy", "edit"]
             .into_iter()
             .fold(menu, |menu, id| {
-                menu.item(Self::context_menu_item(id, row_id, view))
+                menu.item(Self::row_context_item(id, row_id, view, multi_count))
             });
         let reset_id = row_id.to_string();
         let reset_view = view.clone();
@@ -1529,17 +1602,22 @@ impl AppView {
                 ["reset-traffic", "reset-usage"]
                     .into_iter()
                     .fold(menu, |menu, id| {
-                        menu.item(Self::context_menu_item(id, &reset_id, &reset_view))
+                        menu.item(Self::context_menu_item(id, &reset_id, &reset_view, None))
                     })
             })
-            .item(Self::context_menu_item("delete", row_id, view));
+            .item(Self::row_context_item("delete", row_id, view, multi_count));
         let more_id = row_id.to_string();
         let more_view = view.clone();
         menu.submenu("More ▾", window, cx, move |menu, _, _| {
             ["move", "copy-urls", "share", "duplicate", "ping"]
                 .into_iter()
                 .fold(menu, |menu, id| {
-                    menu.item(Self::context_menu_item(id, &more_id, &more_view))
+                    menu.item(Self::row_context_item(
+                        id,
+                        &more_id,
+                        &more_view,
+                        multi_count,
+                    ))
                 })
         })
     }

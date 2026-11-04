@@ -29916,6 +29916,7 @@ fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
+    use gpui_kit::Focusable as _;
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -30087,8 +30088,8 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     assert_eq!(notification_count(cx), before, "Escape clear is silent");
     assert_eq!(
         view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
-        Some(id.clone()),
-        "Escape never eats the selection"
+        None,
+        "Escape clears the selection with the checks"
     );
 
     cx.update(|_, cx| {
@@ -30119,7 +30120,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
 
-    let focus = view.read_with(cx, |view, _| view.focus.clone());
+    let focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
     cx.update(|window, cx| window.focus(&focus, cx));
     let before = notification_count(cx);
     press(cx, "down");
@@ -35700,4 +35701,351 @@ fn k12_text_size_persists_and_survives_appearance(cx: &mut TestAppContext) {
         TextSize::Default,
         "the choice persists"
     );
+}
+
+/// A click on a library row with modifiers held. The kit's own test helpers
+/// click with an empty modifier set, so multi-select needs its own dispatch.
+fn click_row_with(cx: &mut VisualTestContext, id: &str, modifiers: gpui_kit::Modifiers) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseUpEvent};
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let position = window
+            .try_find(id.to_string())
+            .unwrap_or_else(|| panic!("{id} renders"))
+            .bounds()
+            .center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn selected_ids(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
+    view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().selected_ids()
+    })
+}
+
+fn row_aria_selected(cx: &mut VisualTestContext, id: &str) -> bool {
+    cx.update(|window, _| {
+        window
+            .try_find(format!("library-row-{id}"))
+            .unwrap_or_else(|| panic!("row {id} renders"))
+            .selected()
+            .unwrap_or(false)
+    })
+}
+
+/// Task 1: click replaces, Ctrl+click toggles, Shift+click draws from the
+/// anchor, and every row carries its own `aria_selected`.
+#[gpui_kit::test]
+fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let delta = store
+        .add(facet_seed("Delta", "vless", "team", "10804"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let click = |cx: &mut VisualTestContext, id: &str, modifiers: Modifiers| {
+        click_row_with(cx, &format!("library-row-{id}"), modifiers);
+    };
+
+    click(cx, &alpha.id, Modifiers::default());
+    assert_eq!(selected_ids(&view, cx), vec![alpha.id.clone()]);
+    assert!(row_aria_selected(cx, &alpha.id));
+    assert!(!row_aria_selected(cx, &bravo.id));
+    assert!(!row_aria_selected(cx, &charlie.id));
+    assert!(!row_aria_selected(cx, &delta.id));
+
+    click(
+        cx,
+        &charlie.id,
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), charlie.id.clone()],
+        "Ctrl+click adds without dropping the first row"
+    );
+    assert!(row_aria_selected(cx, &alpha.id));
+    assert!(!row_aria_selected(cx, &bravo.id));
+    assert!(row_aria_selected(cx, &charlie.id));
+
+    click(
+        cx,
+        &delta.id,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![charlie.id.clone(), delta.id.clone()],
+        "Shift+click draws from the last-clicked anchor"
+    );
+    assert!(!row_aria_selected(cx, &alpha.id));
+    assert!(row_aria_selected(cx, &charlie.id));
+    assert!(row_aria_selected(cx, &delta.id));
+
+    click(
+        cx,
+        &bravo.id,
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![bravo.id.clone(), charlie.id.clone()],
+        "a second Shift+click re-drags the same anchor"
+    );
+
+    click(
+        cx,
+        &bravo.id,
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![charlie.id.clone()],
+        "Ctrl+click removes a row already in the set"
+    );
+
+    click(cx, &alpha.id, Modifiers::default());
+    assert_eq!(selected_ids(&view, cx), vec![alpha.id.clone()]);
+    assert!(row_aria_selected(cx, &alpha.id));
+
+    let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&list_handle, cx));
+    cx.update(|window, cx| {
+        let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+        window.dispatch_keystroke(escape, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        selected_ids(&view, cx).is_empty(),
+        "Esc clears the transient selection"
+    );
+    for id in [&alpha.id, &bravo.id, &charlie.id, &delta.id] {
+        assert!(!row_aria_selected(cx, id), "Esc clears aria_selected too");
+    }
+}
+
+/// Task 1: the anchor outlives a filter that still shows it, and leaves with
+/// it. Hidden rows are never silently acted on by a later Shift range.
+#[test]
+fn multi_select_anchor_survives_filters_and_prunes_hidden_rows() {
+    use crate::store::ProxyConfig;
+    fn row(id: &str, name: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
+            group: "team".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![
+        row("1", "Alpha"),
+        row("2", "Bravo"),
+        row("3", "Charlie"),
+    ]);
+
+    delegate.select_only("2");
+    delegate.extend_selection_to("3");
+    assert_eq!(delegate.selected_ids(), vec!["2", "3"]);
+    assert_eq!(
+        delegate.selection_anchor.as_deref(),
+        Some("2"),
+        "the range keeps its origin"
+    );
+
+    delegate.query = "r".to_string();
+    delegate.apply_filter();
+    assert_eq!(
+        delegate.selected_ids(),
+        vec!["2", "3"],
+        "a filter that keeps the set leaves it alone"
+    );
+    assert_eq!(
+        delegate.selection_anchor.as_deref(),
+        Some("2"),
+        "the anchor survives while its row is visible"
+    );
+
+    delegate.query = "alpha".to_string();
+    delegate.apply_filter();
+    assert!(
+        delegate.selected_ids().is_empty(),
+        "a filter that hides the set empties it"
+    );
+    assert_eq!(delegate.selection_anchor, None, "the hidden anchor leaves");
+
+    delegate.query.clear();
+    delegate.apply_filter();
+    delegate.select_only("2");
+    delegate.extend_selection_to("3");
+    delegate.set_rows(vec![row("1", "Alpha"), row("3", "Charlie")]);
+    assert_eq!(
+        delegate.selected_ids(),
+        vec!["3"],
+        "deleting a selected row prunes only that row"
+    );
+    assert_eq!(
+        delegate.selection_anchor, None,
+        "the deleted anchor does not linger"
+    );
+
+    delegate.set_facet_group(Some("ghost".to_string()));
+    assert!(
+        delegate.selected_ids().is_empty(),
+        "a facet that empties the list clears the set"
+    );
+}
+
+/// Task 1: with several rows selected the context menu names the count and
+/// the verb lands on all of them, not just the row under the pointer.
+#[gpui_kit::test]
+fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    click_row_with(
+        cx,
+        &format!("library-row-{}", alpha.id),
+        Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("library-row-{}", charlie.id),
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()]
+    );
+
+    cx.update(|window, cx| window.right_click(format!("row-card-{}", bravo.id), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    for (verb, want) in [
+        ("start", "Start 3 configurations"),
+        ("stop", "Stop 3 configurations"),
+        ("test", "Test 3 configurations"),
+        ("copy-proxy", "Copy 3 SOCKS URLs"),
+        ("edit", "Edit"),
+        ("delete", "Delete 3 configurations"),
+    ] {
+        assert_eq!(
+            label_of(&format!("rowctx-{verb}-{}", bravo.id), cx),
+            want,
+            "{verb} names the whole selection"
+        );
+    }
+
+    // Copy URLs and Move live behind More ▾, like the single-row menu.
+    cx.update(|window, cx| {
+        let up = gpui_kit::Keystroke::parse("up").expect("test keystroke parses");
+        window.dispatch_keystroke(up, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        label_of(&format!("rowctx-copy-urls-{}", bravo.id), cx),
+        "Copy 3 URLs"
+    );
+    assert_eq!(
+        label_of(&format!("rowctx-move-{}", bravo.id), cx),
+        "Move 3 configurations to group"
+    );
+
+    cx.update(|window, cx| {
+        window.click(format!("rowctx-copy-urls-{}", bravo.id), cx);
+    });
+    cx.run_until_parked();
+    let clip = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+            .to_string()
+    });
+    let lines: Vec<&str> = clip.lines().collect();
+    assert_eq!(lines.len(), 3, "the selection's three URLs were copied");
+    assert!(lines.iter().any(|line| line.starts_with("Alpha\t")));
+    assert!(lines.iter().any(|line| line.starts_with("Bravo\t")));
+    assert!(lines.iter().any(|line| line.starts_with("Charlie\t")));
 }

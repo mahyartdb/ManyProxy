@@ -39,6 +39,28 @@ pub(crate) struct LibraryDelegate {
     pub(crate) query: String,
     pub(crate) selected: Option<IndexPath>,
 
+    /// The transient multi-selection. Checked stays the persistent bulk scope;
+    /// this set only drives the wash, context verbs, and keyboard work.
+    pub(crate) selection: BTreeSet<String>,
+
+    /// `false` until a pointer, keyboard, or kit selection gesture writes the
+    /// set. Direct `selected` writes (tests, boot restore) keep the old
+    /// single-selection behavior; an explicit empty set stays empty.
+    pub(crate) selection_explicit: bool,
+
+    /// Shift ranges grow from this row. It survives filtering while the row
+    /// stays visible, so a facet change never silently re-anchors the range.
+    pub(crate) selection_anchor: Option<String>,
+
+    /// Set by the row's pointer handler immediately before the kit confirms the
+    /// same click. The kit's `set_selected_index` must not fold that click back
+    /// down to one row (Ctrl+click can deselect the row it reports).
+    pub(crate) pending_pointer_sync: Option<String>,
+
+    /// The kit resets its index to row 0 after a search. That is a focus reset,
+    /// not a new selection, so the next index sync leaves the set alone.
+    search_reset_pending: bool,
+
     /// T-06: the list's own focus handle, handed in by the frame that owns the
     /// `ListState`. The selected row wears the kit focus ring while this handle
     /// is focused - the row card is the app's custom control, but the keyboard
@@ -175,6 +197,11 @@ impl LibraryDelegate {
             visible: Vec::new(),
             query: String::new(),
             selected: None,
+            selection: BTreeSet::new(),
+            selection_explicit: false,
+            selection_anchor: None,
+            pending_pointer_sync: None,
+            search_reset_pending: false,
             list_focus: None,
             health: HashMap::new(),
             health_tone: HashMap::new(),
@@ -537,6 +564,30 @@ impl LibraryDelegate {
                 .position(|&index| self.rows[index].id == id)
                 .map(IndexPath::new)
         });
+        self.prune_selection();
+    }
+
+    /// Selection is a view over what the filters kept: a hidden row cannot be
+    /// acted on, so it leaves the set. The anchor only leaves when its own row
+    /// did — otherwise the next Shift+click still extends from the same row.
+    fn prune_selection(&mut self) {
+        let live: HashSet<&str> = self
+            .visible
+            .iter()
+            .filter_map(|&index| self.rows.get(index))
+            .map(|row| row.id.as_str())
+            .collect();
+        self.selection.retain(|id| live.contains(id.as_str()));
+        if self
+            .selection_anchor
+            .as_deref()
+            .is_some_and(|id| !live.contains(id))
+        {
+            self.selection_anchor = None;
+        }
+        if self.selection.is_empty() {
+            self.selection_anchor = None;
+        }
     }
 
     pub(crate) fn row_matches_facets(&self, index: usize) -> bool {
@@ -720,6 +771,82 @@ impl LibraryDelegate {
         self.selected.and_then(|index| self.row_at(index))
     }
 
+    pub(crate) fn is_selected(&self, id: &str) -> bool {
+        if self.selection_explicit {
+            return self.selection.contains(id);
+        }
+        self.selected_row().is_some_and(|row| row.id == id)
+    }
+
+    /// The rows an action targets. A set the pointer built wins; with no set
+    /// (direct `selected` writes in tests and the boot restore) the list's
+    /// single focus row is the selection, preserving every existing caller.
+    pub(crate) fn selected_ids(&self) -> Vec<String> {
+        if !self.selection_explicit {
+            return self
+                .selected_row()
+                .map(|row| vec![row.id])
+                .unwrap_or_default();
+        }
+        self.visible
+            .iter()
+            .filter_map(|&index| self.rows.get(index))
+            .filter(|row| self.selection.contains(&row.id))
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// Plain click: the set is this row, and the next Shift range grows here.
+    pub(crate) fn select_only(&mut self, id: &str) {
+        self.selection_explicit = true;
+        self.selection.clear();
+        if self.rows.iter().any(|row| row.id == id) {
+            self.selection.insert(id.to_string());
+        }
+        self.selection_anchor = Some(id.to_string());
+    }
+
+    /// Ctrl+click: add or remove one row without disturbing the rest.
+    pub(crate) fn toggle_selected(&mut self, id: &str) {
+        self.selection_explicit = true;
+        if !self.selection.remove(id) && self.rows.iter().any(|row| row.id == id) {
+            self.selection.insert(id.to_string());
+        }
+        self.selection_anchor = Some(id.to_string());
+    }
+
+    /// Shift+click: replace the set with the visible range between the anchor
+    /// and the picked row, and keep the anchor so the range can be re-dragged.
+    pub(crate) fn extend_selection_to(&mut self, id: &str) {
+        self.selection_explicit = true;
+        let anchor = self
+            .selection_anchor
+            .clone()
+            .unwrap_or_else(|| id.to_string());
+        let position = |wanted: &str| {
+            self.visible
+                .iter()
+                .position(|&index| self.rows.get(index).is_some_and(|row| row.id == wanted))
+        };
+        let (Some(from), Some(to)) = (position(&anchor), position(id)) else {
+            self.select_only(id);
+            return;
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        self.selection = self.visible[lo..=hi]
+            .iter()
+            .filter_map(|&index| self.rows.get(index))
+            .map(|row| row.id.clone())
+            .collect();
+        self.selection_anchor = Some(anchor);
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection_explicit = true;
+        self.selection.clear();
+        self.selection_anchor = None;
+    }
+
     pub(crate) fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
         self.refresh_search_words();
@@ -898,7 +1025,30 @@ impl ListDelegate for LibraryDelegate {
         window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
+        let preserve_selection = self.search_reset_pending;
+        self.search_reset_pending = false;
         self.selected = index;
+        if let Some(index) = index {
+            let Some(row_id) = self.row_ref(index).map(|row| row.id.clone()) else {
+                return;
+            };
+            let pointer_owned = self.pending_pointer_sync.as_deref() == Some(row_id.as_str());
+            self.pending_pointer_sync = None;
+            // Arrows and the import restore land here too. A row the pointer
+            // already folded into the set (or toggled out of it) must not be
+            // reduced back to a single selection by the kit's confirmation.
+            if !pointer_owned && !preserve_selection {
+                self.selection_explicit = true;
+                self.selection.clear();
+                self.selection.insert(row_id.clone());
+                self.selection_anchor = Some(row_id);
+            }
+        } else {
+            self.pending_pointer_sync = None;
+            if !preserve_selection {
+                self.clear_selection();
+            }
+        }
         // F19: picking a row opens the inspector again — it is the only way
         // back to the row's controls once Esc closed it. The update is
         // deferred: the selection often changes inside the shell's own
@@ -922,6 +1072,10 @@ impl ListDelegate for LibraryDelegate {
     ) -> Task<()> {
         self.query = query.to_string();
         self.apply_filter();
+        // The kit follows this call by resetting its index to row 0. That is a
+        // focus reset: the pointer's selection and its anchor stay put when
+        // the filtered set still holds them.
+        self.search_reset_pending = true;
         cx.notify();
         Task::ready(())
     }
@@ -939,10 +1093,10 @@ impl ListDelegate for LibraryDelegate {
         let row_bind_ip = row.bind_ip.clone();
         let row_port = row.port;
         let port_stored = row_port.to_string();
-        let selected = self
+        let selected = self.is_selected(&row_id);
+        let focused_row = self
             .selected
-            .map(|current| current.section == index.section && current.row == index.row)
-            .unwrap_or(false);
+            .is_some_and(|current| current.section == index.section && current.row == index.row);
 
         let health = self
             .health
@@ -1022,6 +1176,7 @@ impl ListDelegate for LibraryDelegate {
 
         let item = ListItem::new(format!("library-row-{}", row_id))
             .selected(selected)
+            .aria_selected(selected)
             .px_1()
             // T-03: the row carries a definite height and the card leaves a
             // hairline of room above and below it, so the pitch is fixed and
@@ -1084,6 +1239,7 @@ impl ListDelegate for LibraryDelegate {
         // keyboard lands on the list, so the selected row wears the ring while
         // that handle is focused.
         if selected
+            && focused_row
             && self
                 .list_focus
                 .as_ref()
@@ -1396,6 +1552,38 @@ impl ListDelegate for LibraryDelegate {
                 .children(cells);
             card = card.child(header);
         }
+
+        let right_view = cx.entity();
+        let right_id = row_id.clone();
+        let item = item.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+            right_view.update(cx, |state, cx| {
+                let delegate = state.delegate_mut();
+                // Right-clicking outside the set makes that row the subject;
+                // right-clicking inside a multi-selection keeps the set whole.
+                if !delegate.is_selected(&right_id) {
+                    delegate.select_only(&right_id);
+                    cx.notify();
+                }
+            });
+        });
+        let click_view = cx.entity();
+        let click_id = row_id.clone();
+        let item = item.on_click(move |event, _, cx| {
+            let modifiers = event.modifiers();
+            let id = click_id.clone();
+            click_view.update(cx, |state, cx| {
+                let delegate = state.delegate_mut();
+                if modifiers.shift {
+                    delegate.extend_selection_to(&id);
+                } else if modifiers.secondary() {
+                    delegate.toggle_selected(&id);
+                } else {
+                    delegate.select_only(&id);
+                }
+                delegate.pending_pointer_sync = Some(id.clone());
+                cx.notify();
+            });
+        });
 
         let rendered = match self.app_view.clone() {
             Some(app_view) => {

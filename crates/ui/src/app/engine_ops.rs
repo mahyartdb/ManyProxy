@@ -407,6 +407,35 @@ impl AppView {
         self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
     }
 
+    /// URL-test the row menu's subject or the whole selection. One row keeps
+    /// its own not-running copy; several rows test the running subset.
+    pub(crate) fn test_selected_rows(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [id] = ids {
+            self.test_row(id, window, cx);
+            return;
+        }
+        let running = self.engine.running_ids();
+        let rows: Vec<ProxyConfig> = ids
+            .iter()
+            .filter_map(|id| self.row_config(id))
+            .filter(|row| running.contains(&row.id))
+            .collect();
+        if rows.is_empty() {
+            window.push_notification(Notification::warning("No running endpoints to test"), cx);
+            return;
+        }
+        if self.probe_kind_in_flight(false) {
+            window.push_notification(Notification::info("A health test is already running"), cx);
+            return;
+        }
+        self.spawn_probe(rows, false, true, Some(window.window_handle()), cx);
+    }
+
     /// K8 removed the Tools "Test group" row; the group sweep stays wired for
     /// the T-19 auto-clear path and its tests, so the entry point is retained
     /// until a group-test entry gets a new UI home.
