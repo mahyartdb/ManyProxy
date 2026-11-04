@@ -4,7 +4,6 @@ pub const REPROBE_TICK_SECS: u64 = 60;
 pub const TRAFFIC_TICK_SECS: u64 = 5;
 pub const TRAFFIC_FAST_TICK_SECS: u64 = 1;
 pub const TRAY_PUMP_MILLIS: u64 = 500;
-pub const INSTANCE_POLL_MILLIS: u64 = 200;
 pub const STARTUP_REFRESH_DEFER_SECS: u64 = 3;
 pub const APP_TITLE: &str = "ManyProxy";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

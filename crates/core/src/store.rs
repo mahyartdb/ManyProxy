@@ -104,6 +104,61 @@ impl CloseAction {
     }
 }
 
+/// K12: the reading scale for the whole window. Two steps only — the design's
+/// two-size rule governs type roles; this scales the rem those roles resolve
+/// against, so the hierarchy stays intact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TextSize {
+    #[default]
+    Default,
+    Large,
+}
+
+impl TextSize {
+    pub const ALL: [TextSize; 2] = [TextSize::Default, TextSize::Large];
+
+    /// The value written to the store's meta table.
+    pub fn stored(self) -> &'static str {
+        match self {
+            TextSize::Default => "default",
+            TextSize::Large => "large",
+        }
+    }
+
+    /// Reads a stored value back. Anything unknown is `None`, so the caller
+    /// falls back to the default instead of guessing.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "default" => Some(TextSize::Default),
+            "large" => Some(TextSize::Large),
+            _ => None,
+        }
+    }
+
+    /// The label the Settings radio shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            TextSize::Default => "Default",
+            TextSize::Large => "Large",
+        }
+    }
+
+    /// The one-line explanation under the selected radio.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            TextSize::Default => "The standard 100% reading scale.",
+            TextSize::Large => "The window's text scales to 125%.",
+        }
+    }
+
+    pub fn scale(self) -> f32 {
+        match self {
+            TextSize::Default => 1.0,
+            TextSize::Large => 1.125,
+        }
+    }
+}
+
 /// T-04: which rows a "Test all" run covers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TestAllScope {
@@ -8123,6 +8178,21 @@ impl Store {
             )]));
         }
         self.set_meta(Self::META_APPEARANCE, value)
+    }
+
+    pub const META_TEXT_SIZE: &str = "text_size";
+
+    /// K12: the window's reading scale. A missing or corrupt value reads as
+    /// `Default`, so a legacy library opens at the stock size.
+    pub fn text_size(&self) -> TextSize {
+        match self.get_meta(Self::META_TEXT_SIZE) {
+            Ok(Some(raw)) => TextSize::from_stored(&raw).unwrap_or_default(),
+            _ => TextSize::default(),
+        }
+    }
+
+    pub fn set_text_size(&mut self, size: TextSize) -> Result<(), StoreError> {
+        self.set_meta(Self::META_TEXT_SIZE, size.stored())
     }
 
     // K17: the old META_SKIP_DELETE_CONFIRM meta and its accessors are gone.
@@ -17278,6 +17348,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// K12: the reading scale rides the meta family; an absent or corrupt value
+    /// reads as the stock size so a hand-edited database never wedges boot.
+    #[test]
+    fn k12_text_size_meta_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.text_size(),
+            TextSize::Default,
+            "a fresh store reads at the stock scale"
+        );
+        store
+            .set_text_size(TextSize::Large)
+            .expect("text size writes");
+        assert_eq!(store.text_size(), TextSize::Large, "the scale round-trips");
+        store
+            .set_meta(Store::META_TEXT_SIZE, "huge")
+            .expect("corrupt meta writes");
+        assert_eq!(
+            store.text_size(),
+            TextSize::Default,
+            "an unknown scale falls back to the stock size"
+        );
     }
 
     /// T-31: `log_max_lines` rides the meta family with a `500..=50_000` window

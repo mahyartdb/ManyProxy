@@ -26,7 +26,7 @@ fn bulk_menu_item(
             .gap_2()
             .child(label);
         if danger {
-            row.text_color(cx.theme().danger)
+            row.text_color(danger_text_color(cx.theme()))
         } else {
             row
         }
@@ -624,7 +624,7 @@ impl AppView {
                         .flex_col()
                         .gap_1()
                         .child(Label::new("Group"))
-                        .child(Input::new(&group_state)),
+                        .child(labelled_input("Group", &group_state)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -673,7 +673,7 @@ impl AppView {
                         .flex_col()
                         .gap_1()
                         .child(Label::new("Group"))
-                        .child(Input::new(&group_state)),
+                        .child(labelled_input("Group", &group_state)),
                 )
                 .button_props(
                     DialogButtonProps::default()

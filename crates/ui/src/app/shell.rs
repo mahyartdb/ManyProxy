@@ -133,7 +133,7 @@ impl AppView {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_color(cx.theme().danger)
+                        .text_color(danger_text_color(cx.theme()))
                         .aria_label(text.clone())
                         .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                         .child(text),

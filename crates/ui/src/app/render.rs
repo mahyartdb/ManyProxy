@@ -125,7 +125,7 @@ impl Render for AppView {
         let current_title = window_title_text(self.engine.running_count());
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
-        let column_headers = self.render_library_column_headers(cx);
+        let column_headers = self.render_library_column_headers(window, cx);
         let mut list_pane = div()
             .id("config-list")
             .test_support()

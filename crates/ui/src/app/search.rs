@@ -253,7 +253,11 @@ impl AppView {
     /// T-03: the strip reads the same `RowMetrics` the row reads, so every
     /// label sits at its column's first character instead of at a second,
     /// disagreeing set of widths.
-    pub(crate) fn render_library_column_headers(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_library_column_headers(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let libraries = self.libraries.read(cx);
         let delegate = libraries.delegate();
         let metrics = delegate.row_metrics;
@@ -346,6 +350,7 @@ impl AppView {
                 metrics.health,
                 sort,
                 view.clone(),
+                window,
                 cx,
             ));
         }
@@ -356,6 +361,7 @@ impl AppView {
                 metrics.traffic,
                 sort,
                 view,
+                window,
                 cx,
             ));
         }

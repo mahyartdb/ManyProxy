@@ -746,7 +746,7 @@ impl AppView {
         let view = cx.entity();
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let view = view.clone();
-            dialog.title("Command palette").child(
+            let mut command =
                 Command::new(&state)
                     .placeholder("Type a command…")
                     .footer(|_, _, cx| {
@@ -760,21 +760,19 @@ impl AppView {
                             .text_color(cx.theme().muted_foreground)
                             .aria_label(PALETTE_FOOTER_HINT)
                             .child(PALETTE_FOOTER_HINT)
-                    })
-                    .group(
-                        CommandGroup::new()
-                            .label(PALETTE_GROUPS[0].0)
-                            .items(palette_items(0)),
-                    )
-                    .group(
-                        CommandGroup::new()
-                            .label(PALETTE_GROUPS[1].0)
-                            .items(palette_items(1)),
-                    )
-                    .on_confirm(move |index, window, cx| {
-                        view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
-                    }),
-            )
+                    });
+            for (section, (label, _)) in PALETTE_GROUPS.iter().enumerate() {
+                command = command.group(
+                    CommandGroup::new()
+                        .label(*label)
+                        .items(palette_items(section)),
+                );
+            }
+            dialog
+                .title("Command palette")
+                .child(command.on_confirm(move |index, window, cx| {
+                    view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
+                }))
         });
     }
 

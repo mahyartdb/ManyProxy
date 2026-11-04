@@ -275,31 +275,42 @@ pub(crate) fn startup_window_bounds(
         || size(px(1000.), px(700.)),
         |geometry| size(px(geometry.width), px(geometry.height)),
     );
+    // A stored rectangle can outgrow the display it opens on (a laptop panel
+    // at high scaling is the common case): keep the chosen position, but
+    // never open wider or taller than the work area.
+    let desired = visible_bounds.map_or(desired, |visible| desired.min(&visible.size));
     if let Some(geometry) = stored.filter(|geometry| geometry.x != 0. || geometry.y != 0.) {
-        return WindowBounds::Windowed(Bounds::new(
-            point(px(geometry.x), px(geometry.y)),
-            size(px(geometry.width), px(geometry.height)),
-        ));
+        return WindowBounds::Windowed(Bounds::new(point(px(geometry.x), px(geometry.y)), desired));
     }
     let Some(visible) = visible_bounds else {
         return WindowBounds::Windowed(Bounds::new(point(px(0.), px(0.)), desired));
     };
-    WindowBounds::Windowed(Bounds::centered_at(
-        visible.center(),
-        desired.min(&visible.size),
-    ))
+    WindowBounds::Windowed(Bounds::centered_at(visible.center(), desired))
 }
 
-pub(crate) fn app_window_options(bounds: WindowBounds) -> WindowOptions {
+/// The window's design minimum, capped by the display's work area. Logical
+/// points shrink as Windows display scaling rises: a 1080p panel at 200%
+/// leaves roughly 540 points of usable height, well under the 620-point
+/// design floor. A minimum taller than the screen pins the status strip below
+/// the desktop and leaves no drag edge to recover it, so the display wins.
+pub(crate) fn window_min_size(visible_bounds: Option<Bounds<Pixels>>) -> Size<Pixels> {
+    let design = size(
+        px(WindowGeometry::MIN_WIDTH),
+        px(WindowGeometry::MIN_HEIGHT),
+    );
+    visible_bounds.map_or(design, |visible| design.min(&visible.size))
+}
+
+pub(crate) fn app_window_options(
+    bounds: WindowBounds,
+    visible_bounds: Option<Bounds<Pixels>>,
+) -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(APP_TITLE.into());
     }
     options.window_bounds = Some(bounds);
-    options.window_min_size = Some(size(
-        px(WindowGeometry::MIN_WIDTH),
-        px(WindowGeometry::MIN_HEIGHT),
-    ));
+    options.window_min_size = Some(window_min_size(visible_bounds));
     options
 }
 

@@ -198,6 +198,7 @@ fn settings_field_row(
 struct SettingsState {
     view: Entity<AppView>,
     appearance: Rc<RefCell<String>>,
+    text_size: Rc<RefCell<TextSize>>,
     autostart: Rc<RefCell<bool>>,
     restore: Rc<RefCell<bool>>,
     auto_restart: Rc<RefCell<bool>>,
@@ -303,7 +304,8 @@ impl SettingsState {
                     Input::new(&self.filter)
                         .id("settings-filter")
                         .appearance(false)
-                        .cleanable(true),
+                        .cleanable(true)
+                        .aria_label("Filter settings"),
                 ),
             )
             .child(
@@ -413,6 +415,48 @@ impl SettingsState {
             muted,
             div()
                 .id("settings-appearance-group")
+                .test_support()
+                .child(group),
+        ));
+
+        // K12: the reading scale. One preference for the whole window; the
+        // two type roles keep their relationship.
+        let text_size_cell = self.text_size.clone();
+        let text_size_view = self.view.clone();
+        let current_size = *text_size_cell.borrow();
+        let selected = TextSize::ALL.iter().position(|size| *size == current_size);
+        let mut group = RadioGroup::horizontal("settings-text-size-options")
+            .selected_index(selected)
+            .on_change(move |ix, window, cx| {
+                let Some(size) = TextSize::ALL.get(*ix).copied() else {
+                    return;
+                };
+                let cell = text_size_cell.clone();
+                text_size_view.update(cx, |view, cx| {
+                    if view.commit_text_size(size, window, cx) {
+                        *cell.borrow_mut() = size;
+                        cx.notify();
+                    }
+                });
+            });
+        for size in TextSize::ALL {
+            group = group.child(
+                Radio::new(size.label())
+                    .label(size.label().to_string())
+                    .tooltip(size.explanation()),
+            );
+        }
+        body = body.child(settings_row(
+            self,
+            "settings-row-text-size",
+            "Text size",
+            Some(
+                "Scales the window's text; the library row pitch and the minimum window size stay fixed."
+                    .to_string(),
+            ),
+            muted,
+            div()
+                .id("settings-text-size-group")
                 .test_support()
                 .child(group),
         ));
@@ -538,7 +582,7 @@ impl SettingsState {
                 .w(px(SETTINGS_CONTROL_WIDTH))
                 .id("field-settings-test-url")
                 .test_support()
-                .child(Input::new(&self.test_url)),
+                .child(labelled_input("Test URL", &self.test_url)),
         ));
 
         body = body.child(settings_row(
@@ -553,7 +597,7 @@ impl SettingsState {
                 .w(px(SETTINGS_CONTROL_WIDTH))
                 .id("field-settings-probe-timeout")
                 .test_support()
-                .child(Input::new(&self.timeout_input)),
+                .child(labelled_input("Timeout", &self.timeout_input)),
         ));
 
         let scope_cell = self.test_all_scope.clone();
@@ -619,7 +663,7 @@ impl SettingsState {
                 .min_w_0()
                 .id("field-settings-update-feed")
                 .test_support()
-                .child(Input::new(&self.feed_url)),
+                .child(labelled_input("Update feed URL", &self.feed_url)),
         ));
 
         let last = match *self.last_check.borrow() {
@@ -672,7 +716,11 @@ impl SettingsState {
             // full path lives behind ONE `Details` tooltip. A path is noise at
             // rest and truncates mid-directory in the row.
             let ready = path.is_some();
-            let status_color = if ready { muted } else { cx.theme().danger };
+            let status_color = if ready {
+                muted
+            } else {
+                danger_text_color(cx.theme())
+            };
             body = body.child(
                 self.filtered(
                     id,
@@ -789,7 +837,7 @@ impl SettingsState {
                                 .id("field-settings-bind-host")
                                 .test_support()
                                 .w(px(SETTINGS_CONTROL_WIDTH))
-                                .child(Input::new(&self.bind_host_input)),
+                                .child(labelled_input("Bind host", &self.bind_host_input)),
                         )
                         .child(self.render_add_bind_host()),
                 )
@@ -803,7 +851,7 @@ impl SettingsState {
                         .id("settings-bind-host-error")
                         .test_support()
                         .text_sm()
-                        .text_color(cx.theme().danger)
+                        .text_color(danger_text_color(cx.theme()))
                         .child(error_text)
                 }),
         );
@@ -964,7 +1012,10 @@ impl SettingsState {
                 .w(px(SETTINGS_CONTROL_WIDTH))
                 .id("field-log-cap")
                 .test_support()
-                .child(Input::new(&self.log_cap_input)),
+                .child(labelled_input(
+                    "Maximum kept log lines",
+                    &self.log_cap_input,
+                )),
         ));
 
         // K9/A7-4: four upkeep ops as one neutral 2×2 grid. The buttons carry
@@ -1293,6 +1344,7 @@ impl AppView {
         match self.store.set_appearance(value) {
             Ok(()) => {
                 apply_appearance(value, Some(window), cx);
+                apply_text_size(self.store.text_size(), cx);
                 window.push_notification(Notification::success(format!("Appearance: {value}")), cx);
                 cx.notify();
                 true
@@ -1300,6 +1352,33 @@ impl AppView {
             Err(error) => {
                 window.push_notification(
                     Notification::error(format!("Appearance change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    pub(crate) fn commit_text_size(
+        &mut self,
+        size: TextSize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_text_size(size) {
+            Ok(()) => {
+                apply_text_size(size, cx);
+                window.push_notification(
+                    Notification::success(format!("Text size: {}", size.label())),
+                    cx,
+                );
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Text size change failed: {error}")),
                     cx,
                 );
                 cx.notify();
@@ -1595,6 +1674,7 @@ impl AppView {
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
         let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
+        let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
         let last_check_state = Rc::new(RefCell::new(self.store.last_update_check()));
@@ -1760,6 +1840,7 @@ impl AppView {
         let state = SettingsState {
             view: view.clone(),
             appearance: appearance_state.clone(),
+            text_size: text_size_state.clone(),
             autostart: autostart_state.clone(),
             restore: restore_state.clone(),
             auto_restart: auto_restart_state.clone(),

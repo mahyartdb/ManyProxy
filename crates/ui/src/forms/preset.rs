@@ -98,7 +98,7 @@ impl PresetForm {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(Textarea::new(state).h(px(56.))),
+                        .child(labelled_textarea(r#box.label(), state).h(px(56.))),
                 );
         }
         let invalid_lines = simple_rules_invalid_rows(&self, cx);

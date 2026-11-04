@@ -46,10 +46,21 @@ impl RowMetrics {
     /// The gap between two cards.
     pub const CARD_GAP: f32 = 1.;
 
-    pub const LAMP_CHECK: f32 = 28.;
+    /// The whole leading gutter: the lamp's hit target, the gap, and the
+    /// checkbox. It reads 40 because the lamp's target is 24, not the 12px
+    /// dot it paints; the dot keeps the flat occupancy read while the target
+    /// meets the 24px pointer minimum without moving the checkbox.
+    pub const LAMP_CHECK: f32 = 40.;
+    /// The invisible dot is still the signal. Its target is the wrapper.
+    pub const LAMP_DOT: f32 = 12.;
+    /// A 12px dot is a 12px hit target on most rows; 24 is the smallest
+    /// pointer target that clears WCAG 2.2 AA without crowding the 28px card.
+    pub const LAMP_TARGET: f32 = 24.;
     /// The empty slot keeps the name column aligned with the header strip.
     /// The constant is geometry, not a chip width, since K4 dropped numerals.
-    pub const CHECK_SLOT: f32 = 32.;
+    /// The lamp's larger target is reclaimed here, so the name column keeps
+    /// its old 60px offset and the table budget does not move.
+    pub const CHECK_SLOT: f32 = 20.;
     pub const NAME_MIN: f32 = 160.;
     pub const GROUP: f32 = 100.;
     pub const PROTOCOL: f32 = 90.;

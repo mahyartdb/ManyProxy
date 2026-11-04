@@ -1,21 +1,40 @@
 use crate::*;
 
-/// T-31: theme *background* tokens (amber, danger red) are legible behind white
-/// text on a dark surface, but well under WCAG AA as text on the light theme's
-/// white — so in light mode both back off toward black along their own hue (the
-/// T-30 `danger.blend(...)` precedent). Dark mode keeps the raw tokens.
-pub(crate) fn warning_text_color(theme: &Theme) -> Hsla {
+/// T-31: the kit's signal tokens (green, amber, red) are *fills* paired with a
+/// light foreground — a button ground, not text. On the light theme's paper
+/// every one of them is far under WCAG AA as text, so in light mode each backs
+/// off toward black along its own hue until it reads on the quiet surface
+/// (#f5f5f5, the most-tinted ground a label sits on in light mode). Dark keeps
+/// the raw tokens, which already read on near-black. Hue still identifies the
+/// signal; only lightness moves.
+fn signal_text_color(signal: Hsla, darken: f32, theme: &Theme) -> Hsla {
     match theme.mode {
-        ThemeMode::Light => theme.warning.blend(hsla(0., 0., 0., 0.45)),
-        ThemeMode::Dark => theme.warning,
+        ThemeMode::Light => signal.blend(hsla(0., 0., 0., darken)),
+        ThemeMode::Dark => signal,
     }
 }
 
+pub(crate) fn warning_text_color(theme: &Theme) -> Hsla {
+    signal_text_color(theme.warning, 0.45, theme)
+}
+
 pub(crate) fn danger_text_color(theme: &Theme) -> Hsla {
-    match theme.mode {
-        ThemeMode::Light => theme.danger.blend(hsla(0., 0., 0., 0.35)),
-        ThemeMode::Dark => theme.danger,
-    }
+    signal_text_color(theme.danger, 0.35, theme)
+}
+
+pub(crate) fn success_text_color(theme: &Theme) -> Hsla {
+    signal_text_color(theme.success, 0.40, theme)
+}
+
+/// One step *away* from the ground: darker on light paper, brighter on
+/// near-black. Used where a state must outrank another in the same hue, so the
+/// step reads as emphasis in both palettes instead of as a dimmer red.
+fn emphasized_text_color(color: Hsla, theme: &Theme) -> Hsla {
+    let toward = match theme.mode {
+        ThemeMode::Light => hsla(0., 0., 0., 0.35),
+        ThemeMode::Dark => hsla(0., 0., 1., 0.35),
+    };
+    color.blend(toward)
 }
 
 /// T-31: the tone each level paints in, from the active theme. `Info` keeps the
@@ -55,17 +74,42 @@ pub(crate) enum ServingTone {
 }
 
 /// Theme color for a probe's LatencyTone: Throne §F.1 bands map green /
-/// yellow / red with the 100/300 boundaries, a failed probe reads a darker
-/// red than a plain poor latency, and an untested/no-sample row keeps the
+/// yellow / red with the 100/300 boundaries, a failed probe reads one step
+/// stronger than a plain poor latency, and an untested/no-sample row keeps the
 /// neutral muted tone. Colors only — no probe, classification, or cutoff
 /// change rides along.
-pub(crate) fn health_tone_color(tone: LatencyTone, cx: &App) -> Hsla {
+pub(crate) fn health_tone_color(tone: LatencyTone, theme: &Theme) -> Hsla {
     match tone {
-        LatencyTone::Fast => cx.theme().success,
-        LatencyTone::Slow => cx.theme().warning,
-        LatencyTone::Poor => cx.theme().danger,
-        LatencyTone::Failed => cx.theme().danger.blend(hsla(0., 0., 0., 0.35)),
-        LatencyTone::Unknown => cx.theme().muted_foreground,
+        LatencyTone::Fast => success_text_color(theme),
+        LatencyTone::Slow => warning_text_color(theme),
+        LatencyTone::Poor => danger_text_color(theme),
+        // Failed keeps its old relation to poor — one visible step stronger —
+        // but the step follows the ground instead of always darkening, which
+        // on near-black turned the alarm red into 3.4:1 mud.
+        LatencyTone::Failed => emphasized_text_color(danger_text_color(theme), theme),
+        LatencyTone::Unknown => theme.muted_foreground,
+    }
+}
+
+/// One verdict, one color: the row's occupancy lamp, the inspector badge dot,
+/// and the badge text all read this. A stopped badge used the kit's
+/// `secondary` fill, which is a *surface* — on light paper it painted #e5e5e5
+/// on #ffffff, so a stopped row had no badge at all.
+pub(crate) fn serving_tone_color(tone: ServingTone, theme: &Theme) -> Hsla {
+    match tone {
+        ServingTone::Serving => success_text_color(theme),
+        ServingTone::Failed => danger_text_color(theme),
+        ServingTone::Stopped => theme.muted_foreground,
+    }
+}
+
+impl From<BadgeState> for ServingTone {
+    fn from(state: BadgeState) -> Self {
+        match state {
+            BadgeState::Running => Self::Serving,
+            BadgeState::Failed => Self::Failed,
+            BadgeState::Stopped => Self::Stopped,
+        }
     }
 }
 

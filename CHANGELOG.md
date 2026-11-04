@@ -8,6 +8,8 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 - The row you just started or stopped shows a 150 ms accent on its leading edge, then settles. Nothing moves: the row height, the pitch, and the painted row count are unchanged.
 - One-line library rows with a right-hand inspector drawer: one 5-tab switcher (Details, Health, Logs, Links, Traffic), a single-scroll Details tab with merged endpoints and one copy action, and a Start/Stop/Test kebab. The tab bar sizes to its labels at the default window width.
+- Sort headers are buttons: click, Enter, or Space sorts by that column and reverses on a second press, and the command palette carries every sort key plus Reverse and Clear.
+- A `Text size` setting in Settings → General scales the window's text to 100% or 125%, and the palette's `Toggle large text` flips it.
 - Filter row `Search · Group · N of M`. Clicking a row's status lamp filters by that endpoint state. The eight-way status dropdown is gone; Enabled and Disabled live under the Group menu.
 - Checked-set bulk bar: `N checked (of M)` with Start, Stop, and `More ▾`. Checked rows carry a 3px accent bar and a filled chip. `Copy proxies` copies the running endpoints as one sheet, and bulk verbs route through the batch engine ops.
 - Toasts, bottom-right above the status bar, at most two at a time: batched test sweeps (`Testing N…` then one `Tested N: X live · Y dead`), single-row test results, and delete with Undo. Deletion is immediate. An 8-second stash restores the rows and their group assignments, and expiry is permanent.
@@ -18,7 +20,9 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Changed
 
+- A row's status lamp is a 24px target around the same 12px dot: easier to hit, and it announces itself as a pressed/not-pressed endpoint-state filter to assistive tech.
 - Motion is one vocabulary: panels fade in over 150 ms with an ease-out curve instead of appearing flat, and one duration, one easing, and the reduced-motion switch govern all of it.
+- Every labeled field carries its visible label as the input's accessible name, so a screen reader hears `Bind address`, not an unlabeled text box; required-field stars stay visual.
 
 - The Add/Edit dialog follows Throne grammar: Common fields, one collapsed Advanced Settings expander, then the protocol-specific section. The raw JSON editor is gone.
 - Routing presets have one creation path: three grammar boxes with inline placeholders plus an `Add remote ruleset…` row. The Rules JSON textarea is gone.
@@ -33,12 +37,15 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Fixed
 
+- High display scaling no longer forces a 620-point window minimum onto a shorter work area: the window floor and a restored rectangle both clamp to the primary display, keeping the status strip reachable.
 - Opening Settings costs what it paints: the three core binaries, the two data folders, and the theme are read once when the dialog opens instead of on every frame of the entry animation, and a row's filter check no longer allocates.
+- A second launch wakes the running window the moment it forwards its argv. The 200 ms instance poll is gone, so an idle app no longer wakes four times a second.
 - Ships as a GUI binary with no console window. The release workflow stamps the version, gates the tag, bundles licenses, and carries the arm64 row.
 - Export no longer loses the file when Windows strips ACLs from the temp file before rename.
 - Overlays created during boot no longer precede the Root layer, which had panicked at startup.
 - Engine batches survive individual row failures: a dead active row, a bad port on one row, or a failed batch no longer stalls the rest or restores a stale Running status.
 - Log tones stay legible in the light theme, with contrast asserted in tests.
+- Health bands, the serving badge, and error text stay legible in the light theme, and a stopped endpoint now shows a real `Stopped` badge instead of one painted near-white. Muted labels clear AA on row cards and the status band in both themes.
 - The inspector tab bar no longer clips Links and Traffic at the default drawer width. A paint test pins this.
 - Stop and Test stay live on a stopped endpoint and answer with an honest toast; the operate row no longer fakes unavailability or lights a Stop spinner during a start. Import keeps its `Importing…` label and spinner while it works.
 - The Group filter round-trips the status lamp's Running, Dead, and Stopped choices, so its collapsed label and tooltip always name the filter the list is actually showing.

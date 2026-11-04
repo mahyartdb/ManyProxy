@@ -1100,15 +1100,11 @@ impl ListDelegate for LibraryDelegate {
         // The cell text and the color carry the same verdict: a crashed row
         // never probed still reads `● Failed` in the failure tone.
         let health_text_color = if crashed || tone == ServingTone::Failed {
-            health_tone_color(LatencyTone::Failed, cx)
+            health_tone_color(LatencyTone::Failed, cx.theme())
         } else {
-            health_tone_color(probe_tone, cx)
+            health_tone_color(probe_tone, cx.theme())
         };
-        let lamp_color = match tone {
-            ServingTone::Failed => cx.theme().danger,
-            ServingTone::Serving => cx.theme().success,
-            ServingTone::Stopped => cx.theme().muted_foreground,
-        };
+        let lamp_color = serving_tone_color(tone, cx.theme());
         let lamp_label = lamp_access_label(tone, &row_name);
         // K11/A2-1: the occupancy lamp doubles as the health filter's toggle —
         // its tone names the verdict a click filters by.
@@ -1126,6 +1122,26 @@ impl ListDelegate for LibraryDelegate {
                 lamp_status.label().to_lowercase()
             )
         };
+        // One activation path for pointer and assistive tech: the lamp now
+        // carries a real button role, and a role without an action is a lie.
+        let lamp_activate = Rc::new(move |window: &mut Window, cx: &mut App| {
+            lamp_view.update(cx, |state, cx| {
+                let delegate = state.delegate_mut();
+                if delegate.facet_status == Some(lamp_status) {
+                    delegate.set_facet_status(None);
+                } else {
+                    delegate.set_facet_status(Some(lamp_status));
+                }
+                cx.notify();
+            });
+            // Keep the one facet menu honest: the lamp is its second input,
+            // so the collapsed display must re-sync in the same click.
+            if let Some(app) = lamp_app.as_ref() {
+                app.update(cx, |view, cx| {
+                    view.sync_facet_pickers(window, cx);
+                });
+            }
+        });
         {
             let name = row_name.clone();
             let metrics = self.row_metrics;
@@ -1312,38 +1328,42 @@ impl ListDelegate for LibraryDelegate {
                             div()
                                 .id(format!("row-dot-{row_id}"))
                                 .test_support()
-                                .size(px(12.))
+                                .size(px(RowMetrics::LAMP_TARGET))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded_full()
-                                .bg(lamp_color)
+                                .role(Role::Button)
+                                .aria_label(lamp_hint.clone())
+                                .aria_toggled(if lamp_active {
+                                    Toggled::True
+                                } else {
+                                    Toggled::False
+                                })
                                 .cursor_pointer()
                                 .tooltip({
                                     let tip = lamp_hint.clone();
                                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                                 })
-                                .aria_label(lamp_hint.clone())
-                                .on_click(move |_, window, cx| {
-                                    // The lamp owns its click; the card's
-                                    // double-click-to-edit must not swallow it.
-                                    cx.stop_propagation();
-                                    let status = lamp_status;
-                                    lamp_view.update(cx, |state, cx| {
-                                        let delegate = state.delegate_mut();
-                                        if delegate.facet_status == Some(status) {
-                                            delegate.set_facet_status(None);
-                                        } else {
-                                            delegate.set_facet_status(Some(status));
-                                        }
-                                        cx.notify();
-                                    });
-                                    // Keep the one facet menu honest: the lamp is
-                                    // its second input, so the collapsed display
-                                    // must re-sync in the same click.
-                                    if let Some(app) = lamp_app.as_ref() {
-                                        app.update(cx, |view, cx| {
-                                            view.sync_facet_pickers(window, cx);
-                                        });
+                                .on_click({
+                                    let activate = lamp_activate.clone();
+                                    move |_, window, cx| {
+                                        // The lamp owns its click; the card's
+                                        // double-click-to-edit must not swallow it.
+                                        cx.stop_propagation();
+                                        activate(window, cx);
                                     }
-                                }),
+                                })
+                                .on_a11y_action(AccessibleAction::Click, move |_, window, cx| {
+                                    lamp_activate(window, cx);
+                                })
+                                .child(
+                                    div()
+                                        .size(px(RowMetrics::LAMP_DOT))
+                                        .rounded_full()
+                                        .bg(lamp_color),
+                                ),
                         )
                         .child(checkbox),
                 )

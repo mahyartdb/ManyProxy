@@ -94,12 +94,7 @@ pub(crate) fn password_row(
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .id(id)
-                    .test_support()
-                    .child(Input::new(secret).mask_toggle()),
-            )
+            .child(labelled_masked_input(label, secret).id(id))
             .child(
                 div()
                     .id(format!("{id}-state"))
@@ -1697,7 +1692,7 @@ impl ConfigForm {
                                 .flex_1()
                                 .id(format!("{id_prefix}-uuid"))
                                 .test_support()
-                                .child(Input::new(secret).mask_toggle()),
+                                .child(labelled_masked_input("UUID", secret)),
                         )
                         .child(
                             Button::new(format!("{id_prefix}-uuid-generate"))
@@ -1860,7 +1855,7 @@ impl ConfigForm {
         let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
             field()
                 .label(label.to_string())
-                .child(div().id(id).test_support().child(Input::new(state)))
+                .child(labelled_input(label, state).id(id))
         };
         let mut body = div().flex().flex_col().gap_1();
         let disguised = match network.as_str() {
@@ -1998,7 +1993,7 @@ impl ConfigForm {
                     div()
                         .id("s2-sni")
                         .test_support()
-                        .child(Input::new(&self.s2_sni)),
+                        .child(labelled_input("SNI", &self.s2_sni)),
                 ),
             )
             .child(
@@ -2006,7 +2001,7 @@ impl ConfigForm {
                     div()
                         .id("s2-alpn")
                         .test_support()
-                        .child(Input::new(&self.s2_alpn)),
+                        .child(labelled_input("ALPN (comma list)", &self.s2_alpn)),
                 ),
             )
             .child(
@@ -2073,7 +2068,7 @@ impl ConfigForm {
                     div()
                         .id("s2-pbk")
                         .test_support()
-                        .child(Input::new(&self.s2_pbk)),
+                        .child(labelled_input("Reality public key", &self.s2_pbk)),
                 ),
             )
             .child(
@@ -2081,7 +2076,7 @@ impl ConfigForm {
                     div()
                         .id("s2-sid")
                         .test_support()
-                        .child(Input::new(&self.s2_sid)),
+                        .child(labelled_input("Reality short id", &self.s2_sid)),
                 ),
             );
         field().label_indent(false).child(
@@ -2184,7 +2179,7 @@ impl ConfigForm {
                     div()
                         .id("s3-up")
                         .test_support()
-                        .child(Input::new(&self.s3_up)),
+                        .child(labelled_input("Brutal up Mbps", &self.s3_up)),
                 ),
             )
             .child(
@@ -2192,7 +2187,7 @@ impl ConfigForm {
                     div()
                         .id("s3-down")
                         .test_support()
-                        .child(Input::new(&self.s3_down)),
+                        .child(labelled_input("Brutal down Mbps", &self.s3_down)),
                 ),
             );
         field()
@@ -2295,7 +2290,7 @@ impl ConfigForm {
                     div()
                         .id("s4-timeout")
                         .test_support()
-                        .child(Input::new(&self.s4_timeout)),
+                        .child(labelled_input("Connect timeout", &self.s4_timeout)),
                 ),
             )
             .child(
@@ -2303,7 +2298,7 @@ impl ConfigForm {
                     div()
                         .id("s4-bind")
                         .test_support()
-                        .child(Input::new(&self.s4_bind)),
+                        .child(labelled_input("Bind interface", &self.s4_bind)),
                 ),
             )
             .child(
@@ -2311,7 +2306,7 @@ impl ConfigForm {
                     div()
                         .id("s4-inet4")
                         .test_support()
-                        .child(Input::new(&self.s4_inet4)),
+                        .child(labelled_input("IPv4 bind address", &self.s4_inet4)),
                 ),
             )
             .child(
@@ -2319,7 +2314,7 @@ impl ConfigForm {
                     div()
                         .id("s4-inet6")
                         .test_support()
-                        .child(Input::new(&self.s4_inet6)),
+                        .child(labelled_input("IPv6 bind address", &self.s4_inet6)),
                 ),
             );
 
@@ -2353,7 +2348,7 @@ impl ConfigForm {
                 div()
                     .id("vmess-aid")
                     .test_support()
-                    .child(Input::new(&self.vmess_aid)),
+                    .child(labelled_input("Alter ID", &self.vmess_aid)),
             ),
         );
         block = block.child(Self::panel_select_row(
@@ -2427,7 +2422,7 @@ impl ConfigForm {
                 div()
                     .id("ss-plugin-opts")
                     .test_support()
-                    .child(Input::new(&self.ss_plugin_opts)),
+                    .child(labelled_input("Plugin options", &self.ss_plugin_opts)),
             ),
         );
         let uot_cell = self.ss_uot.clone();
@@ -2476,15 +2471,12 @@ impl ConfigForm {
         let row = |id: String, label: &str, state: &Entity<InputState>| {
             field()
                 .label(label.to_string())
-                .child(div().id(id).test_support().child(Input::new(state)))
+                .child(labelled_input(label, state).id(id))
         };
         let masked_row = |id: String, label: &str, state: &Entity<InputState>| {
-            field().label(label.to_string()).child(
-                div()
-                    .id(id)
-                    .test_support()
-                    .child(Input::new(state).mask_toggle()),
-            )
+            field()
+                .label(label.to_string())
+                .child(labelled_masked_input(label, state).id(id))
         };
         div()
             .flex()
@@ -2507,7 +2499,7 @@ impl ConfigForm {
                                         .flex_1()
                                         .id(format!("{prefix}-private-key"))
                                         .test_support()
-                                        .child(Input::new(peer.private_key).mask_toggle()),
+                                        .child(labelled_masked_input("Private key", peer.private_key)),
                                 )
                                 .child(
                                     Button::new(format!("{prefix}-private-key-generate"))
@@ -2636,7 +2628,7 @@ impl ConfigForm {
         let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
             field()
                 .label(label.to_string())
-                .child(div().id(id).test_support().child(Input::new(state)))
+                .child(labelled_input(label, state).id(id))
         };
         let switch_row = |id: &'static str,
                           switch_id: String,
@@ -2804,7 +2796,7 @@ impl ConfigForm {
         let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
             field()
                 .label(label.to_string())
-                .child(div().id(id).test_support().child(Input::new(state)))
+                .child(labelled_input(label, state).id(id))
         };
         let switch_row = |id: &'static str,
                           switch_id: String,
@@ -3016,7 +3008,7 @@ impl ConfigForm {
                 div()
                     .id("tuic-heartbeat")
                     .test_support()
-                    .child(Input::new(&self.tuic_heartbeat)),
+                    .child(labelled_input("Heartbeat", &self.tuic_heartbeat)),
             ),
         );
 
@@ -3050,7 +3042,7 @@ impl ConfigForm {
                 div()
                     .id("socks-username")
                     .test_support()
-                    .child(Input::new(&self.socks_username)),
+                    .child(labelled_input("Username", &self.socks_username)),
             ),
         );
         block = block.child(password_row(
@@ -3106,7 +3098,7 @@ impl ConfigForm {
                     div()
                         .id("http-username")
                         .test_support()
-                        .child(Input::new(&self.http_username)),
+                        .child(labelled_input("Username", &self.http_username)),
                 ),
             )
             .child(password_row(
@@ -3120,7 +3112,7 @@ impl ConfigForm {
                     div()
                         .id("http-path")
                         .test_support()
-                        .child(Input::new(&self.http_path)),
+                        .child(labelled_input("Path", &self.http_path)),
                 ),
             )
             .child(
@@ -3128,7 +3120,7 @@ impl ConfigForm {
                     div()
                         .id("http-headers")
                         .test_support()
-                        .child(Input::new(&self.http_headers)),
+                        .child(labelled_input("Headers", &self.http_headers)),
                 ),
             );
 
@@ -3160,7 +3152,7 @@ impl ConfigForm {
                     div()
                         .id("anytls-interval")
                         .test_support()
-                        .child(Input::new(&self.anytls_interval)),
+                        .child(labelled_input("Idle check interval", &self.anytls_interval)),
                 ),
             )
             .child(
@@ -3168,7 +3160,7 @@ impl ConfigForm {
                     div()
                         .id("anytls-timeout")
                         .test_support()
-                        .child(Input::new(&self.anytls_timeout)),
+                        .child(labelled_input("Idle timeout", &self.anytls_timeout)),
                 ),
             )
             .child(
@@ -3176,7 +3168,7 @@ impl ConfigForm {
                     div()
                         .id("anytls-min")
                         .test_support()
-                        .child(Input::new(&self.anytls_min)),
+                        .child(labelled_input("Min idle sessions", &self.anytls_min)),
                 ),
             );
 
@@ -3227,7 +3219,7 @@ impl ConfigForm {
                     div()
                         .id("naive-username")
                         .test_support()
-                        .child(Input::new(&self.naive_username)),
+                        .child(labelled_input("Username", &self.naive_username)),
                 ),
             )
             .child(password_row(
@@ -3286,7 +3278,7 @@ impl ConfigForm {
                     div()
                         .id("ssh-user")
                         .test_support()
-                        .child(Input::new(&self.ssh_user)),
+                        .child(labelled_input("User", &self.ssh_user)),
                 ),
             )
             .child(password_row(
@@ -3300,7 +3292,7 @@ impl ConfigForm {
                     div()
                         .id("ssh-private-key")
                         .test_support()
-                        .child(Textarea::new(&self.ssh_private_key).h(px(96.))),
+                        .child(labelled_textarea("Private key", &self.ssh_private_key).h(px(96.))),
                 ),
             )
             .child(
@@ -3315,7 +3307,7 @@ impl ConfigForm {
                                 .flex_1()
                                 .id("ssh-key-path")
                                 .test_support()
-                                .child(Input::new(&self.ssh_key_path)),
+                                .child(labelled_input("Private key path", &self.ssh_key_path)),
                         )
                         .child(
                             Button::new("ssh-key-browse")
@@ -3343,7 +3335,10 @@ impl ConfigForm {
                     div()
                         .id("ssh-key-pass")
                         .test_support()
-                        .child(Input::new(&self.ssh_key_pass).mask_toggle()),
+                        .child(labelled_masked_input(
+                            "Private key passphrase",
+                            &self.ssh_key_pass,
+                        )),
                 ),
             )
             .child(
@@ -3351,7 +3346,7 @@ impl ConfigForm {
                     div()
                         .id("ssh-host-key")
                         .test_support()
-                        .child(Input::new(&self.ssh_host_key)),
+                        .child(labelled_input("Host key (comma list)", &self.ssh_host_key)),
                 ),
             )
             .child(
@@ -3361,7 +3356,10 @@ impl ConfigForm {
                         div()
                             .id("ssh-host-key-algs")
                             .test_support()
-                            .child(Input::new(&self.ssh_host_key_algs)),
+                            .child(labelled_input(
+                                "Host key algorithms (comma list)",
+                                &self.ssh_host_key_algs,
+                            )),
                     ),
             )
             .child(
@@ -3369,7 +3367,7 @@ impl ConfigForm {
                     div()
                         .id("ssh-client-version")
                         .test_support()
-                        .child(Input::new(&self.ssh_client_version)),
+                        .child(labelled_input("Client version", &self.ssh_client_version)),
                 ),
             );
 
@@ -3406,7 +3404,7 @@ impl ConfigForm {
                     div()
                         .id("snell-obfs-mode")
                         .test_support()
-                        .child(Input::new(&self.snell_obfs_mode)),
+                        .child(labelled_input("Obfs mode", &self.snell_obfs_mode)),
                 ),
             )
             .child(
@@ -3414,7 +3412,7 @@ impl ConfigForm {
                     div()
                         .id("snell-obfs-host")
                         .test_support()
-                        .child(Input::new(&self.snell_obfs_host)),
+                        .child(labelled_input("Obfs host", &self.snell_obfs_host)),
                 ),
             )
             .child(
@@ -3422,7 +3420,7 @@ impl ConfigForm {
                     div()
                         .id("snell-userkey")
                         .test_support()
-                        .child(Input::new(&self.snell_userkey)),
+                        .child(labelled_input("User key", &self.snell_userkey)),
                 ),
             )
             .child(
@@ -3430,7 +3428,7 @@ impl ConfigForm {
                     div()
                         .id("snell-network")
                         .test_support()
-                        .child(Input::new(&self.snell_network)),
+                        .child(labelled_input("Network", &self.snell_network)),
                 ),
             )
             .child(
@@ -3438,7 +3436,7 @@ impl ConfigForm {
                     div()
                         .id("snell-mode")
                         .test_support()
-                        .child(Input::new(&self.snell_mode)),
+                        .child(labelled_input("Mode", &self.snell_mode)),
                 ),
             );
         block = block.child(
@@ -3515,7 +3513,7 @@ impl ConfigForm {
                     div()
                         .id("xray-enc")
                         .test_support()
-                        .child(Input::new(&self.xray_enc)),
+                        .child(labelled_input("Encryption", &self.xray_enc)),
                 ),
             )
             .child(Self::panel_select_row(
@@ -3531,7 +3529,7 @@ impl ConfigForm {
                     div()
                         .id("xray-sni")
                         .test_support()
-                        .child(Input::new(&self.xray_sni)),
+                        .child(labelled_input("SNI", &self.xray_sni)),
                 ),
             )
             .child(Self::panel_select_row(
@@ -3547,7 +3545,7 @@ impl ConfigForm {
                     div()
                         .id("xray-alpn")
                         .test_support()
-                        .child(Input::new(&self.xray_alpn)),
+                        .child(labelled_input("ALPN (comma list)", &self.xray_alpn)),
                 ),
             )
             .child(
@@ -3555,7 +3553,7 @@ impl ConfigForm {
                     div()
                         .id("xray-pbk")
                         .test_support()
-                        .child(Input::new(&self.xray_pbk)),
+                        .child(labelled_input("REALITY public key (pbk)", &self.xray_pbk)),
                 ),
             )
             .child(
@@ -3563,7 +3561,7 @@ impl ConfigForm {
                     div()
                         .id("xray-sid")
                         .test_support()
-                        .child(Input::new(&self.xray_sid)),
+                        .child(labelled_input("REALITY short id (sid)", &self.xray_sid)),
                 ),
             )
             .child(
@@ -3571,7 +3569,7 @@ impl ConfigForm {
                     div()
                         .id("xray-spiderx")
                         .test_support()
-                        .child(Input::new(&self.xray_spiderx)),
+                        .child(labelled_input("REALITY spiderX path", &self.xray_spiderx)),
                 ),
             )
             .child(Self::panel_select_row(
@@ -3587,7 +3585,7 @@ impl ConfigForm {
                     div()
                         .id("xray-mode")
                         .test_support()
-                        .child(Input::new(&self.xray_mode)),
+                        .child(labelled_input("Mode", &self.xray_mode)),
                 ),
             )
             .child(Self::panel_select_row(
@@ -3769,13 +3767,9 @@ impl ConfigForm {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .id("extra-exe")
-                                    .test_support()
-                                    .child(Input::new(&self.extra_exe)),
-                            )
+                            .child(div().flex_1().id("extra-exe").test_support().child(
+                                labelled_input("Executable (app dir file name)", &self.extra_exe),
+                            ))
                             .child(
                                 Button::new("extra-exe-browse")
                                     .small()
@@ -3799,17 +3793,17 @@ impl ConfigForm {
                     div()
                         .id("extra-args")
                         .test_support()
-                        .child(Input::new(&self.extra_args)),
+                        .child(labelled_input("Args", &self.extra_args)),
                 ),
             )
             .child(
                 field()
                     .label("Config (passed as -c <file>)".to_string())
                     .child(
-                        div()
-                            .id("extra-config")
-                            .test_support()
-                            .child(Textarea::new(&self.extra_config).h(px(96.))),
+                        div().id("extra-config").test_support().child(
+                            labelled_textarea("Config (passed as -c <file>)", &self.extra_config)
+                                .h(px(96.)),
+                        ),
                     ),
             );
         block = block.child(field().label_indent(false).child(
@@ -3957,7 +3951,7 @@ impl ConfigForm {
             .flex_col()
             .gap_1()
             .child(div().child(Label::new("Params")))
-            .child(Textarea::new(&self.params).h(px(96.)))
+            .child(labelled_textarea("Params", &self.params).h(px(96.)))
             .child({
                 let format_view = view.clone();
                 let format_params = self.params.clone();
@@ -4034,7 +4028,7 @@ impl ConfigForm {
                         div()
                             .id("field-name")
                             .test_support()
-                            .child(Input::new(&self.name)),
+                            .child(labelled_input("Name", &self.name)),
                     ),
             ),
         );
@@ -4102,7 +4096,7 @@ impl ConfigForm {
                                         div()
                                             .id("field-guided-server")
                                             .test_support()
-                                            .child(Input::new(&self.guided_server))
+                                            .child(labelled_input("Server", &self.guided_server))
                                             .children(local_field_error(
                                                 "field-guided-server-error",
                                                 form_error.as_ref(),
@@ -4127,7 +4121,7 @@ impl ConfigForm {
                                         div()
                                             .id("field-guided-port")
                                             .test_support()
-                                            .child(Input::new(&self.guided_port))
+                                            .child(labelled_input("Server port", &self.guided_port))
                                             .children(local_field_error(
                                                 "field-guided-port-error",
                                                 form_error.as_ref(),
@@ -4153,12 +4147,12 @@ impl ConfigForm {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(
-                                div()
-                                    .id("field-guided-identity")
-                                    .test_support()
-                                    .child(Input::new(&self.guided_identity).mask_toggle()),
-                            )
+                            .child(div().id("field-guided-identity").test_support().child(
+                                labelled_masked_input(
+                                    &guided_identity_label(&protocol_text),
+                                    &self.guided_identity,
+                                ),
+                            ))
                             .child(
                                 div()
                                     .id("field-guided-identity-state")

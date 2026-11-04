@@ -213,6 +213,7 @@ impl AppView {
         let facet_group = FacetPicker::new(FacetMenu::Group, choices, current, window, cx);
 
         apply_appearance(&store.appearance(), Some(window), cx);
+        apply_text_size(store.text_size(), cx);
         // K5: the toast park rides `apply_appearance` (bottom-right above the
         // status bar, max 2) so it survives every theme change for free.
 
@@ -2207,7 +2208,7 @@ impl AppView {
                 .test_support()
                 .w_full()
                 .min_w_0()
-                .text_color(health_tone_color(caption_tone, cx))
+                .text_color(health_tone_color(caption_tone, cx.theme()))
                 .child(match latencies.len() {
                     1 => format!("1 probe recorded — no trend yet ({})", latencies[0]),
                     _ => "no health history yet — press Test to record a probe".to_string(),
@@ -2226,7 +2227,7 @@ impl AppView {
             .min_w_0()
             .child(
                 div()
-                    .text_color(health_tone_color(caption_tone, cx))
+                    .text_color(health_tone_color(caption_tone, cx.theme()))
                     .child(format!("{} samples · latest {}ms", latencies.len(), latest)),
             )
             .child(Self::latency_sparkline(&latencies))

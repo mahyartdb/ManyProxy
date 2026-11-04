@@ -1,9 +1,30 @@
 use crate::*;
 
+/// K12: the visible `Field` label is not an accessible name, so a labelled
+/// input carries the same words through `aria_label`. Required-field stars are
+/// visual, not spoken.
+fn accessible_label(label: &str) -> String {
+    label.trim_end_matches('*').trim_end().to_string()
+}
+
+pub(crate) fn labelled_input(label: &str, state: &Entity<InputState>) -> Input {
+    Input::new(state).aria_label(accessible_label(label))
+}
+
+pub(crate) fn labelled_masked_input(label: &str, state: &Entity<InputState>) -> Input {
+    Input::new(state)
+        .mask_toggle()
+        .aria_label(accessible_label(label))
+}
+
+pub(crate) fn labelled_textarea(label: &str, state: &Entity<TextareaState>) -> Textarea {
+    Textarea::new(state).aria_label(accessible_label(label))
+}
+
 pub(crate) fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> Field {
     field()
         .label(label.to_string())
-        .child(div().id(id).test_support().child(Input::new(&state)))
+        .child(labelled_input(label, &state).id(id))
 }
 
 pub(crate) type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
@@ -132,5 +153,20 @@ pub(crate) fn field_error_target(error: &StoreError) -> Option<(&'static str, St
             .first()
             .map(|first| (first.field, first.message.clone())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accessible_label;
+
+    #[test]
+    fn required_stars_are_visual_only() {
+        assert_eq!(accessible_label("Password *"), "Password");
+        assert_eq!(accessible_label("Name*"), "Name");
+        assert_eq!(
+            accessible_label("Test URL (blank = global)"),
+            "Test URL (blank = global)"
+        );
     }
 }

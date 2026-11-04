@@ -383,12 +383,11 @@ pub fn run() {
         gpui_kit::init(cx);
 
         bind_app_keys(cx);
-        let startup_bounds = startup_window_bounds(
-            startup_geometry,
-            cx.primary_display().map(|display| display.visible_bounds()),
-        );
+        let visible_bounds = cx.primary_display().map(|display| display.visible_bounds());
+        let startup_bounds = startup_window_bounds(startup_geometry, visible_bounds);
+        let window_options = app_window_options(startup_bounds, visible_bounds);
         cx.spawn(async move |cx| {
-            cx.open_window(app_window_options(startup_bounds), |window, cx| {
+            cx.open_window(window_options, |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 view.update(cx, |view, cx| {
                     view.refresh_due_on_startup_deferred(cx);
@@ -408,14 +407,14 @@ pub fn run() {
                     }
                 });
 
-                if let Some(rx) = instance_rx {
+                if let Some(mut rx) = instance_rx {
                     let forward_view = view.clone();
                     let forward_handle = window.window_handle();
-                    cx.spawn(async move |cx| loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(INSTANCE_POLL_MILLIS))
-                            .await;
-                        while let Ok(argv) = rx.try_recv() {
+                    cx.spawn(async move |cx| {
+                        use futures::StreamExt as _;
+                        // Awaiting the channel wakes this task exactly when a
+                        // second launch forwards its argv — no idle timer.
+                        while let Some(argv) = rx.next().await {
                             // A plain relaunch has no intake; it still raises
                             // the window, including from the tray.
                             let intake = argv.iter().find_map(|arg| classify_open_with(arg));

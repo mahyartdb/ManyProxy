@@ -809,11 +809,10 @@ impl AppView {
             None
         };
         let badge = inspector_badge_text(state, &config.bind_ip, config.port, latency_ms);
-        let badge_color = match state {
-            BadgeState::Running => cx.theme().success,
-            BadgeState::Failed => cx.theme().danger,
-            BadgeState::Stopped => cx.theme().secondary,
-        };
+        // DESIGN: the lamp, the badge dot, and the badge text agree. Stopped
+        // used to take `secondary`, a surface token, which painted the badge
+        // #e5e5e5 on white paper and erased it.
+        let badge_color = serving_tone_color(state.into(), cx.theme());
         div()
             .id("detail-header-line")
             .test_support()
@@ -1026,7 +1025,7 @@ impl AppView {
                 .into_any_element(),
             crate::health::RowState::Dead => div()
                 .text_sm()
-                .text_color(cx.theme().danger)
+                .text_color(danger_text_color(cx.theme()))
                 .child(format!(
                     "Failed — {}",
                     status.cause.as_deref().unwrap_or("endpoint dead")
@@ -1363,7 +1362,7 @@ impl AppView {
                     .test_support()
                     .w_full()
                     .text_sm()
-                    .text_color(cx.theme().danger)
+                    .text_color(danger_text_color(cx.theme()))
                     .truncate()
                     .child(warning)
                     .into_any_element(),

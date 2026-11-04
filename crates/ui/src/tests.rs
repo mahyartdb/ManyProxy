@@ -34,7 +34,7 @@ fn seed_input(name: &str) -> NewConfig {
 
 #[test]
 fn window_options_carry_app_title() {
-    let options = crate::app_window_options(crate::startup_window_bounds(None, None));
+    let options = crate::app_window_options(crate::startup_window_bounds(None, None), None);
     let title = options
         .titlebar
         .expect("titlebar options")
@@ -45,7 +45,7 @@ fn window_options_carry_app_title() {
 
 #[test]
 fn window_options_carry_startup_size() {
-    let options = crate::app_window_options(crate::startup_window_bounds(None, None));
+    let options = crate::app_window_options(crate::startup_window_bounds(None, None), None);
     let bounds = options
         .window_bounds
         .expect("startup window bounds")
@@ -67,7 +67,7 @@ fn t82_app_options_seeds_stored_geometry() {
         width: 1280.,
         height: 900.,
     };
-    let options = crate::app_window_options(crate::startup_window_bounds(Some(stored), None));
+    let options = crate::app_window_options(crate::startup_window_bounds(Some(stored), None), None);
     let bounds = options
         .window_bounds
         .expect("startup window bounds")
@@ -77,15 +77,18 @@ fn t82_app_options_seeds_stored_geometry() {
     let min = options.window_min_size.expect("startup window minimum");
     assert_eq!(min, size(px(880.), px(620.)), "minimums are unchanged");
 
-    let undersized = crate::app_window_options(crate::startup_window_bounds(
-        Some(WindowGeometry {
-            x: 0.,
-            y: 0.,
-            width: 100.,
-            height: 100.,
-        }),
+    let undersized = crate::app_window_options(
+        crate::startup_window_bounds(
+            Some(WindowGeometry {
+                x: 0.,
+                y: 0.,
+                width: 100.,
+                height: 100.,
+            }),
+            None,
+        ),
         None,
-    ));
+    );
     let bounds = undersized
         .window_bounds
         .expect("startup window bounds")
@@ -104,8 +107,10 @@ fn t82_app_options_seeds_stored_geometry() {
 fn t82_default_bounds_when_meta_absent_or_corrupt() {
     let mut store = Store::open_in_memory().expect("in-memory store opens");
 
-    let absent =
-        crate::app_window_options(crate::startup_window_bounds(store.window_geometry(), None));
+    let absent = crate::app_window_options(
+        crate::startup_window_bounds(store.window_geometry(), None),
+        None,
+    );
     let bounds = absent
         .window_bounds
         .expect("startup window bounds")
@@ -121,8 +126,10 @@ fn t82_default_bounds_when_meta_absent_or_corrupt() {
         None,
         "corrupt JSON reads as absent"
     );
-    let corrupt =
-        crate::app_window_options(crate::startup_window_bounds(store.window_geometry(), None));
+    let corrupt = crate::app_window_options(
+        crate::startup_window_bounds(store.window_geometry(), None),
+        None,
+    );
     let bounds = corrupt
         .window_bounds
         .expect("startup window bounds")
@@ -138,8 +145,10 @@ fn t82_default_bounds_when_meta_absent_or_corrupt() {
         None,
         "a partial rectangle reads as absent"
     );
-    let partial =
-        crate::app_window_options(crate::startup_window_bounds(store.window_geometry(), None));
+    let partial = crate::app_window_options(
+        crate::startup_window_bounds(store.window_geometry(), None),
+        None,
+    );
     let bounds = partial
         .window_bounds
         .expect("startup window bounds")
@@ -194,6 +203,57 @@ fn startup_window_centers_when_unplaced() {
             .origin,
         point(px(2380.), px(170.)),
         "centering follows the display's own origin"
+    );
+}
+
+/// High display scaling shrinks the logical work area below the design
+/// minimum: a 1080p panel at 200% leaves roughly 540 points of height, less
+/// than the 620-point floor. The window follows the display so its status
+/// strip is never pinned below the desktop with no drag edge to recover it.
+#[test]
+fn window_minimum_height_follows_the_work_area() {
+    let scaled = Bounds::new(point(px(0.), px(0.)), size(px(960.), px(540.)));
+    assert_eq!(
+        crate::window_min_size(Some(scaled)).height,
+        px(540.),
+        "the minimum height never exceeds the work area"
+    );
+    assert_eq!(
+        crate::window_min_size(Some(scaled)).width,
+        px(880.),
+        "a work area wider than the design floor keeps the design width"
+    );
+    assert_eq!(
+        crate::window_min_size(None),
+        size(px(880.), px(620.)),
+        "a headless caller keeps the design minimum"
+    );
+
+    let options = crate::app_window_options(
+        crate::startup_window_bounds(None, Some(scaled)),
+        Some(scaled),
+    );
+    assert_eq!(
+        options
+            .window_min_size
+            .expect("startup window minimum")
+            .height,
+        px(540.),
+        "the OS minimum follows the display, not the design floor"
+    );
+
+    let stored = WindowGeometry {
+        x: 240.,
+        y: 120.,
+        width: 1280.,
+        height: 900.,
+    };
+    assert_eq!(
+        crate::startup_window_bounds(Some(stored), Some(scaled))
+            .get_bounds()
+            .size,
+        size(px(960.), px(540.)),
+        "a stored rectangle measured on a larger display opens inside the work area"
     );
 }
 
@@ -363,7 +423,7 @@ fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
 }
 
 /// WCAG 2.1 relative luminance of `color` composited over `background`.
-fn log_relative_luminance(color: Hsla, background: Hsla) -> f32 {
+fn relative_luminance(color: Hsla, background: Hsla) -> f32 {
     let front = color.to_rgb();
     let back = background.to_rgb();
     let channel = |value: f32| {
@@ -381,9 +441,9 @@ fn log_relative_luminance(color: Hsla, background: Hsla) -> f32 {
 }
 
 /// WCAG 2.1 contrast ratio of a text tone against the surface behind it.
-fn log_contrast_ratio(color: Hsla, background: Hsla) -> f32 {
-    let text = log_relative_luminance(color, background);
-    let surface = log_relative_luminance(background, background);
+fn contrast_ratio(color: Hsla, background: Hsla) -> f32 {
+    let text = relative_luminance(color, background);
+    let surface = relative_luminance(background, background);
     let (lighter, darker) = if text >= surface {
         (text, surface)
     } else {
@@ -413,7 +473,7 @@ fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
             assert_eq!(theme.mode, mode, "the tone check runs in {mode:?}");
             for level in levels {
                 let ratio =
-                    log_contrast_ratio(crate::log_level_text_color(level, theme), theme.background);
+                    contrast_ratio(crate::log_level_text_color(level, theme), theme.background);
                 assert!(
                     ratio >= 4.5,
                     "{level:?} text reaches WCAG AA in {mode:?}, got {ratio:.2}:1"
@@ -452,6 +512,118 @@ fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
         crate::LogLevel::Info,
         "an unprefixed line keeps the default tone"
     );
+}
+
+/// Every signal and muted tone the shell paints as text, measured where it
+/// actually sits: paper (window, dialogs, inspector) and the quiet surface
+/// (row cards, tab bar, status band), in both themes. Light is where the three
+/// easy mistakes live — the kit's signal tokens are fills, the stopped badge
+/// borrowed a surface token, and the kit's muted ink lands under AA on
+/// #f5f5f5 — so this asserts by usage, not by token.
+#[gpui_kit::test]
+fn signal_and_muted_text_clear_aa_on_paper_and_quiet_surface(cx: &mut TestAppContext) {
+    use crate::health::LatencyTone;
+    use crate::{
+        danger_text_color, health_tone_color, serving_tone_color, warning_text_color, ServingTone,
+    };
+
+    cx.update(gpui_kit::init);
+    for appearance in ["light", "dark"] {
+        cx.update(|cx| crate::apply_appearance(appearance, None, cx));
+        cx.update(|cx| {
+            let theme = crate::Theme::global(cx);
+            let surfaces = [
+                ("paper", theme.background),
+                ("quiet surface", theme.group_box),
+            ];
+            let text_usages = [
+                (
+                    "row health · fast",
+                    health_tone_color(LatencyTone::Fast, theme),
+                ),
+                (
+                    "row health · slow",
+                    health_tone_color(LatencyTone::Slow, theme),
+                ),
+                (
+                    "row health · poor",
+                    health_tone_color(LatencyTone::Poor, theme),
+                ),
+                (
+                    "row health · failed",
+                    health_tone_color(LatencyTone::Failed, theme),
+                ),
+                (
+                    "row health · untested",
+                    health_tone_color(LatencyTone::Unknown, theme),
+                ),
+                (
+                    "inspector badge · running",
+                    serving_tone_color(ServingTone::Serving, theme),
+                ),
+                (
+                    "inspector badge · failed",
+                    serving_tone_color(ServingTone::Failed, theme),
+                ),
+                (
+                    "inspector badge · stopped",
+                    serving_tone_color(ServingTone::Stopped, theme),
+                ),
+                ("write banner and status error", danger_text_color(theme)),
+                ("log warning", warning_text_color(theme)),
+                ("row metadata, `Acting on:`, status band", theme.muted_foreground),
+            ];
+            let graphic_usages = [
+                (
+                    "row lamp · serving",
+                    serving_tone_color(ServingTone::Serving, theme),
+                ),
+                (
+                    "row lamp · failed",
+                    serving_tone_color(ServingTone::Failed, theme),
+                ),
+                (
+                    "row lamp · stopped",
+                    serving_tone_color(ServingTone::Stopped, theme),
+                ),
+            ];
+
+            for (usage, color) in text_usages {
+                for (surface, ground) in surfaces {
+                    let ratio = contrast_ratio(color, ground);
+                    assert!(
+                        ratio >= 4.5,
+                        "{usage} text on {surface} in {appearance} clears AA, got {ratio:.2}:1"
+                    );
+                }
+            }
+            for (usage, color) in graphic_usages {
+                for (surface, ground) in surfaces {
+                    let ratio = contrast_ratio(color, ground);
+                    assert!(
+                        ratio >= 3.0,
+                        "{usage} on {surface} in {appearance} clears the 3:1 graphic floor, got {ratio:.2}:1"
+                    );
+                }
+            }
+
+            assert_eq!(
+                serving_tone_color(ServingTone::Stopped, theme),
+                theme.muted_foreground,
+                "the stopped lamp and the stopped badge read one muted ink in {appearance}"
+            );
+            assert!(
+                contrast_ratio(
+                    health_tone_color(LatencyTone::Failed, theme),
+                    theme.background
+                ) > contrast_ratio(
+                    health_tone_color(LatencyTone::Poor, theme),
+                    theme.background
+                ),
+                "a failed probe outranks a poor latency in {appearance}"
+            );
+        });
+    }
 }
 
 /// T-31: filter/exclude/regex/level/tail output is byte-identical at any
@@ -779,6 +951,16 @@ fn add_dialog_opens_with_fields(cx: &mut TestAppContext) {
             "add dialog renders {field}"
         );
     }
+    assert_eq!(
+        label_of("field-bind", cx),
+        "Bind address",
+        "the visible Field label is the input's accessible name"
+    );
+    assert_eq!(
+        label_of("field-port", cx),
+        "Port",
+        "every dialog_field carries its label into aria_label"
+    );
 }
 
 #[gpui_kit::test]
@@ -13400,7 +13582,7 @@ fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t01_lamp_meets_twelve_px_minimum(cx: &mut TestAppContext) {
+fn t01_lamp_meets_twenty_four_px_target(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -13423,8 +13605,9 @@ fn t01_lamp_meets_twelve_px_minimum(cx: &mut TestAppContext) {
     assert_painted(cx, &id);
     let bounds = cx.update(|window, _| window.try_find(id.clone()).expect("lamp finds").bounds());
     assert!(
-        bounds.size.width >= px(12.) && bounds.size.height >= px(12.),
-        "lamp keeps a 12px-minimum target: {bounds:?}"
+        bounds.size.width >= px(crate::RowMetrics::LAMP_TARGET)
+            && bounds.size.height >= px(crate::RowMetrics::LAMP_TARGET),
+        "lamp keeps a 24px-minimum target: {bounds:?}"
     );
 }
 
@@ -16132,6 +16315,22 @@ fn lamp_click_toggles_endpoint_state_filter(cx: &mut TestAppContext) {
         view.libraries.read(cx).delegate().facet_status
     });
     assert_eq!(status, None, "a second click releases the filter");
+
+    // The target is the 24px wrapper, not the 12px dot: a click near the
+    // wrapper's edge still toggles.
+    cx.update(|window, cx| {
+        window.click_at(lamp.clone(), point(px(1.), px(12.)), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let status = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().facet_status
+    });
+    assert_eq!(
+        status,
+        Some(FacetStatus::Stopped),
+        "the enlarged target owns its edge"
+    );
 }
 
 #[gpui_kit::test]
@@ -16409,7 +16608,7 @@ fn action_table_is_the_single_source() {
     assert_eq!(
         palette_action_at(IndexPath::new(0).section(PALETTE_GROUPS.len())),
         None,
-        "there is no third group"
+        "no group exists past the table's last section"
     );
 }
 
@@ -24748,7 +24947,7 @@ fn k9_engine_rows_are_lean_summaries(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
     });
     paint_dialog_open(cx);
-    scroll_settings_into_view(cx, "settings-row-engine-sing-box");
+    scroll_settings_into_view(cx, "settings-row-engine-xray");
 
     for (row, name) in [
         ("settings-row-engine-sing-box", "sing-box"),
@@ -31507,31 +31706,33 @@ fn t65_failed_tone_distinct_from_unknown_in_row_text(cx: &mut TestAppContext) {
     assert_painted(cx, &format!("row-health-{untested}"));
 
     cx.update(|_, cx| {
+        let theme = cx.theme();
         assert_ne!(
-            health_tone_color(LatencyTone::Failed, cx),
-            health_tone_color(LatencyTone::Unknown, cx),
+            health_tone_color(LatencyTone::Failed, theme),
+            health_tone_color(LatencyTone::Unknown, theme),
             "the failed probe renders darker than the neutral unknown tone"
         );
         assert_eq!(
-            health_tone_color(LatencyTone::Fast, cx),
-            cx.theme().success,
-            "the fast band keeps the success color"
+            health_tone_color(LatencyTone::Fast, theme),
+            crate::success_text_color(theme),
+            "the fast band resolves to the light-safe success tone"
         );
         assert_eq!(
-            health_tone_color(LatencyTone::Slow, cx),
-            cx.theme().warning,
-            "the slow band keeps the warning color"
+            health_tone_color(LatencyTone::Slow, theme),
+            crate::warning_text_color(theme),
+            "the slow band resolves to the light-safe warning tone"
         );
         assert_eq!(
-            health_tone_color(LatencyTone::Poor, cx),
-            cx.theme().danger,
-            "the poor band keeps the danger color"
+            health_tone_color(LatencyTone::Poor, theme),
+            crate::danger_text_color(theme),
+            "the poor band resolves to the light-safe danger tone"
         );
-        let failed_color = health_tone_color(LatencyTone::Failed, cx);
-        let poor_color = health_tone_color(LatencyTone::Poor, cx);
+        let failed_color = health_tone_color(LatencyTone::Failed, theme);
+        let poor_color = health_tone_color(LatencyTone::Poor, theme);
         assert!(
-            failed_color.l < poor_color.l,
-            "the failed tone darkens the poor band: {failed_color:?} vs {poor_color:?}"
+            contrast_ratio(failed_color, theme.background)
+                > contrast_ratio(poor_color, theme.background),
+            "the failed tone outranks the poor band: {failed_color:?} vs {poor_color:?}"
         );
     });
 
@@ -31611,9 +31812,10 @@ fn t65_failed_tone_distinct_in_health_tab_detail(cx: &mut TestAppContext) {
         "the untested detail line keeps its no-probe text: {untested_detail}"
     );
     cx.update(|_, cx| {
+        use gpui_kit::component::ActiveTheme as _;
         assert_ne!(
-            health_tone_color(failed_tone, cx),
-            health_tone_color(untested_tone, cx),
+            health_tone_color(failed_tone, cx.theme()),
+            health_tone_color(untested_tone, cx.theme()),
             "failed and untested tones render distinctly on the Health tab"
         );
     });
@@ -32208,6 +32410,97 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
         ),
         "picking a key keeps the direction and persists the pair"
     );
+}
+
+/// T-27: the header itself is the mouse and keyboard route to sorting —
+/// click picks the column's natural key, click again reverses it, and a
+/// focused header activates on Enter/Space like any button.
+#[gpui_kit::test]
+fn t77_header_click_and_keyboard_sort(cx: &mut TestAppContext) {
+    use crate::store::{LibrarySort, LibrarySortKey, SortDirection};
+
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .set_library_columns("upstream,health,traffic")
+        .expect("column choice writes");
+    store
+        .add(facet_seed("Work", "vless", "travel", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let sort = |view: &Entity<AppView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            (
+                view.libraries.read(cx).delegate().sort,
+                view.store.library_sort(),
+            )
+        })
+    };
+    assert_eq!(
+        sort(&view, cx).0,
+        LibrarySort::default(),
+        "the library starts unsorted"
+    );
+
+    cx.update(|window, cx| window.click("sort-header-health", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        sort(&view, cx),
+        (
+            LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
+            LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
+        ),
+        "a click on a cold header picks its natural key and persists it"
+    );
+
+    cx.update(|window, cx| window.click("sort-header-health", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        sort(&view, cx).0,
+        LibrarySort::new(LibrarySortKey::Latency, SortDirection::Descending),
+        "clicking the active header reverses it"
+    );
+
+    // The click focused the header, so Enter and Space are the keyboard route.
+    for (key, direction) in [
+        ("enter", SortDirection::Ascending),
+        ("space", SortDirection::Descending),
+    ] {
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                gpui_kit::PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            sort(&view, cx).0,
+            LibrarySort::new(LibrarySortKey::Latency, direction),
+            "{key} activates the focused header"
+        );
+    }
 }
 
 // ---- T-28: share-dialog QR ------------------------------------------
@@ -35243,4 +35536,168 @@ fn b16_search_no_matches_keeps_its_copy_while_a_refresh_is_in_flight(cx: &mut Te
     assert_painted(cx, "clear-search-hint");
     assert_absent(cx, "library-loading".to_string());
     assert_absent(cx, "skeleton-row-0".to_string());
+}
+
+/// K12: the palette's Sort group is a full route to the sort model, and the
+/// text-size toggle is reachable without opening Settings.
+#[gpui_kit::test]
+fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
+    use crate::app::actions::{palette_action_at, PALETTE_GROUPS};
+    use crate::store::{LibrarySort, LibrarySortKey, SortDirection, TextSize};
+    use gpui_kit::component::IndexPath;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let op = |id: &str| {
+        let (section, row) = PALETTE_GROUPS
+            .iter()
+            .enumerate()
+            .find_map(|(section, (_, ids))| {
+                ids.iter()
+                    .position(|candidate| *candidate == id)
+                    .map(|row| (section, row))
+            })
+            .unwrap_or_else(|| panic!("{id} is in a palette group"));
+        IndexPath::new(row).section(section)
+    };
+    assert_eq!(
+        PALETTE_GROUPS[2].0, "Sort",
+        "the Sort group sits after Manage so Settings keeps its palette index"
+    );
+    assert_eq!(
+        palette_action_at(op("sort-latency")),
+        Some("sort-latency"),
+        "every sort action resolves through the palette table"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.run_palette_op(op("sort-latency"), window, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, cx| (
+            view.libraries.read(cx).delegate().sort,
+            view.store.library_sort(),
+        )),
+        (
+            LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
+            LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
+        ),
+        "the palette picks the same key a header click would"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.run_palette_op(op("sort-direction"), window, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.library_sort()),
+        LibrarySort::new(LibrarySortKey::Latency, SortDirection::Descending),
+        "the palette reverses the live sort"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.run_palette_op(op("sort-none"), window, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.store.library_sort().is_none()),
+        "the palette can clear the sort"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.run_palette_op(op("text-size"), window, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.text_size()),
+        TextSize::Large,
+        "the palette persists the larger reading scale"
+    );
+    assert_eq!(
+        cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
+        px(18.),
+        "the palette toggle scales the theme"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.run_palette_op(op("text-size"), window, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.text_size()),
+        TextSize::Default,
+        "the toggle returns to the stock scale"
+    );
+}
+
+/// K12: text size persists, applies at boot, and survives an appearance swap
+/// (which rebuilds the theme and resets its font sizes).
+#[gpui_kit::test]
+fn k12_text_size_persists_and_survives_appearance(cx: &mut TestAppContext) {
+    use crate::store::TextSize;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .set_text_size(TextSize::Large)
+        .expect("text size writes");
+    assert_eq!(store.text_size(), TextSize::Large);
+
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
+        px(18.),
+        "boot applies the stored scale"
+    );
+    assert_eq!(
+        cx.update(|window, _| window.rem_size()),
+        px(18.),
+        "the root feeds the scaled rem to the window"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_appearance("light", window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
+        px(18.),
+        "an appearance swap keeps the reading scale"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_text_size(TextSize::Default, window, cx)
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
+        px(16.),
+        "the stock scale restores the kit's base size"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.text_size()),
+        TextSize::Default,
+        "the choice persists"
+    );
 }

@@ -123,7 +123,7 @@ impl AppView {
                             .min_w_0()
                             .max_w(px(280.))
                             .truncate()
-                            .text_color(cx.theme().danger)
+                            .text_color(danger_text_color(cx.theme()))
                             .aria_label(error.clone())
                             .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                             .child(error)

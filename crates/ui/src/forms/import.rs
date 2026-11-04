@@ -76,7 +76,7 @@ impl ImportForm {
                     div()
                         .id("field-import-text")
                         .test_support()
-                        .child(Textarea::new(&self.text).h(px(160.))),
+                        .child(labelled_textarea("Links, JSON, or conf", &self.text).h(px(160.))),
                 ),
             )
             .child(dialog_field(

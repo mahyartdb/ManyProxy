@@ -2,6 +2,8 @@ use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
+use crate::store::TextSize;
+
 pub(crate) const APPEARANCE_CHOICES: &[(&str, &str)] =
     &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
 pub(crate) fn windows_apps_light_theme() -> Option<bool> {
@@ -38,11 +40,39 @@ pub(crate) fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
 /// dialog backdrop paints this exact token (`Theme::overlay`).
 pub(crate) const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
 
+/// The kit's light muted ink is `neutral-500` (#737373): 4.35:1 on the quiet
+/// surface (#f5f5f5), under WCAG AA for text. Row cards, the tab bar, and the
+/// status band all paint muted labels on grounds that reach #f5f5f5, so light
+/// backs this one token off toward black (4.98:1 there). Dark keeps the kit's
+/// `neutral-400`, which reads at 7.8:1. Overriding the token also fixes the
+/// kit's own muted text (group-box titles, table heads).
+pub(crate) const LIGHT_MUTED_INK_DARKEN: f32 = 0.08;
+
+/// K12: the kit's stock sizes (`Theme::default`). `Theme::change` rebuilds the
+/// theme from its config, so every appearance swap resets these before the
+/// reading scale is applied again.
+pub(crate) const BASE_FONT_SIZE: f32 = 16.;
+pub(crate) const BASE_MONO_FONT_SIZE: f32 = 13.;
+
+/// K12: scale the rem the whole window resolves against. Text roles keep
+/// their two steps; only the base moves. `Root` re-reads `theme.font_size` for
+/// `window.set_rem_size` every frame, so refreshing windows is enough.
+pub(crate) fn apply_text_size(size: TextSize, cx: &mut App) {
+    let scale = size.scale();
+    let theme = Theme::global_mut(cx);
+    theme.font_size = px(BASE_FONT_SIZE * scale);
+    theme.mono_font_size = px(BASE_MONO_FONT_SIZE * scale);
+    cx.refresh_windows();
+}
+
 pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
     let mode = resolve_appearance_mode(appearance);
     Theme::change(mode, window, cx);
     if !mode.is_dark() {
-        Theme::global_mut(cx).overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
+        let theme = Theme::global_mut(cx);
+        theme.overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
+        let muted = theme.muted_foreground;
+        theme.muted_foreground = muted.blend(hsla(0., 0., 0., LIGHT_MUTED_INK_DARKEN));
         // Theme::change already refreshed the window; the override landed after.
         cx.refresh_windows();
     }
@@ -59,9 +89,12 @@ pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx
 mod tokens {
     use gpui_kit::component::{Theme, ThemeMode};
 
+    /// Read the theme the app actually paints: `apply_appearance` owns the
+    /// light-mode token overrides, so a bare `Theme::change` would test a
+    /// palette no window ever shows.
     fn theme_for(mode: ThemeMode, cx: &mut gpui_kit::TestAppContext) -> Theme {
         cx.update(|cx| {
-            Theme::change(mode, None, cx);
+            crate::apply_appearance(if mode.is_dark() { "dark" } else { "light" }, None, cx);
             Theme::global(cx).clone()
         })
     }

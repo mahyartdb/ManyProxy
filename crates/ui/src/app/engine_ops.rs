@@ -481,6 +481,30 @@ impl AppView {
         );
     }
 
+    /// T-27: a header's primary key when the column is not already sorting.
+    /// The first non-`None` key is the column's natural order (latency for
+    /// health, total traffic for traffic), so a click never lands on "no sort".
+    pub(crate) fn sort_by_header(
+        &mut self,
+        column: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.libraries.read(cx).delegate().sort;
+        if sort_header_keys(column).contains(&current.key) && current.key != LibrarySortKey::None {
+            self.toggle_library_sort_direction(window, cx);
+            return;
+        }
+        let Some(key) = sort_header_keys(column)
+            .iter()
+            .copied()
+            .find(|key| *key != LibrarySortKey::None)
+        else {
+            return;
+        };
+        self.set_library_sort(key, window, cx);
+    }
+
     pub(crate) fn drain_engine_logs(&mut self, active: &[ProxyConfig]) {
         let lines = self.engine.drain_log_lines();
         if lines.is_empty() {
