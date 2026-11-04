@@ -639,7 +639,17 @@ impl LibraryDelegate {
         }
         // F3: M is the visible row count, so it must read as the current
         // scope of the bar, never as the library total.
-        format!("{} checked (of {})", self.checked.len(), self.visible.len())
+        let checked = self.checked.len();
+        let selected = self.selection_count();
+        // Checked is the bulk set; selection is the pointer set. Two counts
+        // only earn their width when both exist and disagree.
+        if self.selection_explicit && selected > 0 && selected != checked {
+            return format!(
+                "{checked} checked · {selected} selected (of {})",
+                self.visible.len()
+            );
+        }
+        format!("{checked} checked (of {})", self.visible.len())
     }
 
     pub(crate) fn checked_rows(&self) -> Vec<ProxyConfig> {
@@ -845,6 +855,77 @@ impl LibraryDelegate {
         self.selection_explicit = true;
         self.selection.clear();
         self.selection_anchor = None;
+    }
+
+    /// Shift+Up/Down: move the focus row one step and re-draw the range from
+    /// the anchor. Returns the new focus index for the kit to confirm.
+    pub(crate) fn shift_focus(&mut self, delta: isize) -> Option<IndexPath> {
+        let len = self.visible.len();
+        if len == 0 {
+            return None;
+        }
+        let position = |delegate: &Self, id: &str| {
+            delegate
+                .visible
+                .iter()
+                .position(|&index| delegate.rows.get(index).is_some_and(|row| row.id == id))
+        };
+        let current = self
+            .selected
+            .map(|index| index.row)
+            .filter(|&row| row < len);
+        let anchor = self
+            .selection_anchor
+            .as_deref()
+            .and_then(|id| position(self, id));
+        let base = current.or(anchor);
+        let target_row = match base {
+            Some(row) => (row as isize + delta).clamp(0, len as isize - 1) as usize,
+            // No focus and no anchor: Shift+Down enters at the top, Shift+Up
+            // at the bottom, matching the kit's plain Up/Down.
+            None => {
+                if delta < 0 {
+                    len - 1
+                } else {
+                    0
+                }
+            }
+        };
+        let target_id = self.row_ref(IndexPath::new(target_row))?.id.clone();
+        match base {
+            Some(row) => {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor =
+                        self.row_ref(IndexPath::new(row)).map(|row| row.id.clone());
+                }
+                self.extend_selection_to(&target_id);
+            }
+            None => self.select_only(&target_id),
+        }
+        // The kit confirms this index right after the caller sets it; the flag
+        // tells its sync this move is a range extension, not a fresh pick.
+        self.pending_pointer_sync = Some(target_id);
+        Some(IndexPath::new(target_row))
+    }
+
+    /// Ctrl+A: every row the filters keep, with the first one as the anchor.
+    pub(crate) fn select_all_visible(&mut self) {
+        self.selection_explicit = true;
+        self.selection = self
+            .visible
+            .iter()
+            .filter_map(|&index| self.rows.get(index))
+            .map(|row| row.id.clone())
+            .collect();
+        self.selection_anchor = self
+            .visible
+            .first()
+            .and_then(|&index| self.rows.get(index))
+            .map(|row| row.id.clone());
+    }
+
+    pub(crate) fn selection_count(&self) -> usize {
+        self.selected_ids().len()
     }
 
     pub(crate) fn set_health(&mut self, health: HashMap<String, String>) {

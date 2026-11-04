@@ -29931,6 +29931,9 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Stop Testing", "Ctrl-."),
         ("Edit selected", "Ctrl-E"),
         ("Delete selected", "Delete"),
+        ("Extend selection up", "Shift-Up"),
+        ("Extend selection down", "Shift-Down"),
+        ("Select all visible", "Ctrl-A"),
         ("Focus search", "Ctrl-F"),
         ("Inspector details", "Ctrl-1"),
         ("Inspector health", "Ctrl-2"),
@@ -36048,4 +36051,272 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
     assert!(lines.iter().any(|line| line.starts_with("Alpha\t")));
     assert!(lines.iter().any(|line| line.starts_with("Bravo\t")));
     assert!(lines.iter().any(|line| line.starts_with("Charlie\t")));
+}
+
+fn press_key(cx: &mut VisualTestContext, key: &str) {
+    let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn focus_library(view: &Entity<AppView>, cx: &mut VisualTestContext) {
+    use gpui_kit::Focusable as _;
+    let handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&handle, cx));
+}
+
+/// Task 2: Shift+Down/Down grows from the anchor, Shift+Up shrinks the same
+/// range without re-anchoring at the new focus.
+#[gpui_kit::test]
+fn multi_select_shift_arrows_extend_and_collapse(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let delta = store
+        .add(facet_seed("Delta", "vless", "team", "10804"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    click_row_with(
+        cx,
+        &format!("library-row-{}", alpha.id),
+        Modifiers::default(),
+    );
+    focus_library(&view, cx);
+    press_key(cx, "shift-down");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()]
+    );
+    press_key(cx, "shift-down");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()],
+        "each Shift+Down grows the same anchored range"
+    );
+    press_key(cx, "shift-up");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()],
+        "Shift+Up shrinks the range instead of starting a new one"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .selection_anchor
+            .clone()),
+        Some(alpha.id.clone()),
+        "the anchor never moves while the range is redrawn"
+    );
+    assert!(
+        !row_aria_selected(cx, &delta.id),
+        "rows outside the range stay unselected"
+    );
+}
+
+/// Task 2: Ctrl+A takes exactly the rows the filters keep.
+#[gpui_kit::test]
+fn multi_select_ctrl_a_takes_visible_rows_only(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "home", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state
+                    .delegate_mut()
+                    .set_facet_group(Some("team".to_string()));
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    focus_library(&view, cx);
+    press_key(cx, "ctrl-a");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()],
+        "the hidden home row is not selected"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .selection_anchor
+            .clone()),
+        Some(alpha.id.clone()),
+        "the first visible row anchors the set"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().clear_facets();
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    focus_library(&view, cx);
+    press_key(cx, "ctrl-a");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()]
+    );
+}
+
+/// Task 2: Delete on a multi-selection uses the K17 bulk path — immediate
+/// removal with one Undo toast, never a dialog per row.
+#[gpui_kit::test]
+fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("M2 Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("M2 Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("M2 Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    click_row_with(
+        cx,
+        &format!("library-row-{}", alpha.id),
+        Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("library-row-{}", bravo.id),
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone()]
+    );
+
+    focus_library(&view, cx);
+    let before = notification_count(cx);
+    press_key(cx, "delete");
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "multi-delete is immediate, not a confirm per row"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        1,
+        "both selected rows are gone"
+    );
+    assert_eq!(notification_count(cx), before + 1, "one batched Undo toast");
+    assert!(
+        selected_ids(&view, cx).is_empty(),
+        "the deleted rows leave the selection"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .libraries
+            .read(cx)
+            .delegate()
+            .visible_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>()),
+        vec![charlie.id.clone()],
+        "the untouched row remains"
+    );
+    assert_eq!(crate::undo_stash_count_named("M2 Alpha"), 1);
+    assert_eq!(crate::undo_stash_count_named("M2 Bravo"), 1);
+}
+
+/// Task 2: the bulk bar shows the selection count only when it disagrees with
+/// the checked count, so one browser of checked rows keeps its compact label.
+#[test]
+fn bulk_label_adds_the_selection_count_when_it_differs() {
+    use crate::store::ProxyConfig;
+    fn row(id: &str, name: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: r#"{"server":"a.example.com"}"#.to_string().into(),
+            group: "team".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+    let mut delegate = LibraryDelegate::new();
+    delegate.set_rows(vec![
+        row("1", "Alpha"),
+        row("2", "Bravo"),
+        row("3", "Charlie"),
+    ]);
+
+    delegate.toggle_checked("1");
+    delegate.select_only("2");
+    delegate.extend_selection_to("3");
+    assert_eq!(
+        delegate.bulk_label(),
+        "1 checked · 2 selected (of 3)",
+        "both sets are named when they disagree"
+    );
+
+    delegate.select_only("1");
+    assert_eq!(
+        delegate.bulk_label(),
+        "1 checked (of 3)",
+        "equal counts collapse back to the checked label"
+    );
+
+    delegate.clear_selection();
+    assert_eq!(
+        delegate.bulk_label(),
+        "1 checked (of 3)",
+        "a checks-only bulk session never shows a zero selection"
+    );
 }

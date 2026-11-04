@@ -51,6 +51,15 @@ impl AppView {
             .on_action(cx.listener(|view, _: &DeleteSelected, window, cx| {
                 shortcut_action(view, "delete", window, cx);
             }))
+            .on_action(cx.listener(|view, _: &SelectPreviousRow, window, cx| {
+                view.extend_selection_by(-1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &SelectNextRow, window, cx| {
+                view.extend_selection_by(1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &SelectAllRows, window, cx| {
+                view.select_all_visible(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
                 shortcut_action(view, "focus-search", window, cx);
             }))

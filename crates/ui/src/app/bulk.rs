@@ -173,6 +173,33 @@ impl AppView {
         cx.notify();
     }
 
+    /// Shift+Up/Down: move the focus row one step and re-draw the range from
+    /// the anchor, keeping the kit's focus update from collapsing the set.
+    pub(crate) fn extend_selection_by(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.libraries.update(cx, |state, list_cx| {
+            let Some(target) = state.delegate_mut().shift_focus(delta) else {
+                return;
+            };
+            state.set_selected_index(Some(target), window, list_cx);
+            list_cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Ctrl+A: select every row the filters keep, without moving the focus.
+    pub(crate) fn select_all_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().select_all_visible();
+            list_cx.notify();
+        });
+        cx.notify();
+    }
+
     pub(crate) fn clear_checked_unless_dialog(
         &mut self,
         window: &mut Window,
