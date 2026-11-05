@@ -307,6 +307,10 @@ impl AppView {
         fallback: Option<WriteFallback>,
     ) -> Self {
         let mut store = store;
+        // The locale seam is reserved for a future language picker. Reading it
+        // before the first copy is built keeps this session's strings coherent.
+        let locale_override = store.get_meta(crate::i18n::LOCALE_META_KEY).ok().flatten();
+        crate::i18n::set_locale(&crate::i18n::resolve_locale(locale_override.as_deref()));
         // T-34: read the previous session's verdict first, then assume this
         // session is dirty. The write lands before any restore logic, so a
         // kill/crash leaves "0" (unclean) for the next boot.

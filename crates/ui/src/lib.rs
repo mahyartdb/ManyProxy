@@ -5,6 +5,7 @@ mod appearance;
 mod chain;
 mod dialog;
 mod forms;
+mod i18n;
 mod keys;
 mod library;
 mod os;
@@ -120,6 +121,8 @@ pub(crate) const INSPECTOR_DRAWER_BREAKPOINT: f32 = 1080.;
 pub(crate) const INSPECTOR_WIDTH: f32 = 260.;
 pub(crate) const INSPECTOR_WIDTH_MIN: f32 = 240.;
 pub(crate) const INSPECTOR_WIDTH_MAX: f32 = 360.;
+
+pub(crate) use i18n::t;
 
 use app::actions::*;
 use app::bits::*;
