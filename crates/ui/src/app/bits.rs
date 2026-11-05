@@ -51,6 +51,24 @@ pub(crate) const SEARCH_HINT: &str =
 /// value reads as enabled, matching the engine's default.
 pub(crate) const META_AUTO_RESTART: &str = "auto_restart_enabled";
 
+/// Store meta key for "Notify from the tray"; a missing or corrupt value reads
+/// as enabled, because the notifications exist precisely for a hidden window.
+pub(crate) const META_NOTIFY_FROM_TRAY: &str = "notify_from_tray_enabled";
+
+/// Bind failures are the ones where "start" did nothing because the endpoint's
+/// address was taken or unusable; the user needs the log even when the window
+/// is hidden.
+pub(crate) fn is_port_bind_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::PortConflict { .. }
+            | EngineError::RowPortUnavailable { .. }
+            | EngineError::SharedPortUnavailable { .. }
+            | EngineError::ReservedPort { .. }
+            | EngineError::BadBind { .. }
+    )
+}
+
 pub(crate) fn is_row_local_start_error(error: &EngineError) -> bool {
     crate::engine::is_row_local_error(error)
 }

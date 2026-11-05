@@ -21524,6 +21524,20 @@ fn honest_engine_feedback_copies() {
             second: "Beta".to_string(),
         }
     ));
+    assert!(crate::is_port_bind_error(
+        &crate::engine::EngineError::PortConflict {
+            bind: "127.0.0.1".to_string(),
+            port: 10901,
+            first: "Alpha".to_string(),
+            second: "Beta".to_string(),
+        }
+    ));
+    assert!(!crate::is_port_bind_error(
+        &crate::engine::EngineError::BadParams {
+            name: "Broken".to_string(),
+            field: "server",
+        }
+    ));
     assert_eq!(search_count_text(0, 5), "0 of 5");
     assert_eq!(search_count_text(4, 5), "4 of 5");
     assert!(
@@ -27878,6 +27892,34 @@ fn settings_auto_restart_commit_round_trips(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn settings_notify_from_tray_commit_round_trips(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    assert!(
+        view.read_with(cx, |view, _| view.notify_from_tray_enabled()),
+        "missing meta reads as on"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_notify_from_tray(false, window, cx)
+        });
+    });
+    assert!(!view.read_with(cx, |view, _| view.notify_from_tray_enabled()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_notify_from_tray(true, window, cx)
+        });
+    });
+    assert!(view.read_with(cx, |view, _| view.notify_from_tray_enabled()));
+    assert_eq!(notification_count(cx), 2, "each commit toasts once");
+}
+
+#[gpui_kit::test]
 fn startup_applies_persisted_auto_restart(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -27934,6 +27976,9 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         "settings-row-link-handler",
         "settings-link-handler-switch",
         "settings-row-link-handler-help",
+        "settings-row-notify-from-tray",
+        "settings-notify-from-tray-switch",
+        "settings-row-notify-from-tray-help",
         "settings-row-restore",
         "settings-restore-switch",
         "settings-row-restore-help",

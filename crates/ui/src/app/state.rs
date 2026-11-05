@@ -445,6 +445,8 @@ impl AppView {
             close_confirmed: false,
             tray: None,
             os_taskbar: None,
+            os_notifier: None,
+            os_notice_policy: crate::os::notify::NoticePolicy::default(),
             last_snapshot,
             start_in_flight: false,
             ticks_started: false,
@@ -734,7 +736,13 @@ impl AppView {
         }
         let detail = detail?;
         self.engine.clear_pending_crash();
-        Some(Notification::error(crash_notification_text(&detail)))
+        let text = crash_notification_text(&detail);
+        self.os_notify(
+            crate::os::notify::NoticeKind::EngineCrash,
+            "Engine crashed",
+            &redact_secrets(&text),
+        );
+        Some(Notification::error(text))
     }
 
     pub(crate) fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1960,6 +1968,11 @@ impl AppView {
             // next step is usually the Subscriptions sheet, so put it on the
             // toast instead of making them hunt for the menu row.
             let notice = if failed > 0 {
+                self.os_notify(
+                    crate::os::notify::NoticeKind::SubscriptionFailure,
+                    "Subscription refresh failed",
+                    "A subscription could not be refreshed. Open Subscriptions for details.",
+                );
                 let view = cx.entity().downgrade();
                 notice.action("toast-show-subscriptions", "Show", move |window, cx| {
                     let _ = view.update(cx, |view, cx| {

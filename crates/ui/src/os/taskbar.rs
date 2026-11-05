@@ -14,9 +14,9 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThumbAction {
-    StartAll,
-    StopAll,
-    TestAll,
+    Start,
+    Stop,
+    Test,
 }
 
 pub mod button_id {
@@ -26,9 +26,9 @@ pub mod button_id {
 }
 
 pub const THUMB_BUTTONS: [(u32, ThumbAction, &str); 3] = [
-    (button_id::START_ALL, ThumbAction::StartAll, "Start all"),
-    (button_id::STOP_ALL, ThumbAction::StopAll, "Stop all"),
-    (button_id::TEST_ALL, ThumbAction::TestAll, "Test"),
+    (button_id::START_ALL, ThumbAction::Start, "Start all"),
+    (button_id::STOP_ALL, ThumbAction::Stop, "Stop all"),
+    (button_id::TEST_ALL, ThumbAction::Test, "Test"),
 ];
 
 pub fn action_for_button_id(id: u32) -> Option<ThumbAction> {
@@ -67,9 +67,9 @@ pub struct ButtonStates {
 impl ButtonStates {
     pub fn is_enabled(self, action: ThumbAction) -> bool {
         match action {
-            ThumbAction::StartAll => self.start_all,
-            ThumbAction::StopAll => self.stop_all,
-            ThumbAction::TestAll => self.test_all,
+            ThumbAction::Start => self.start_all,
+            ThumbAction::Stop => self.stop_all,
+            ThumbAction::Test => self.test_all,
         }
     }
 }
@@ -155,7 +155,7 @@ mod win {
     use std::ffi::c_void;
 
     use windows::core::w;
-    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
@@ -165,9 +165,11 @@ mod win {
         THB_ICON, THB_TOOLTIP, THUMBBUTTON, THUMBBUTTONFLAGS,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        ChangeWindowMessageFilterEx, CreateIcon, DestroyIcon, RegisterWindowMessageW, HICON,
-        MSGFLT_ALLOW, WM_COMMAND,
+        ChangeWindowMessageFilterEx, DestroyIcon, RegisterWindowMessageW, HICON, MSGFLT_ALLOW,
+        WM_COMMAND,
     };
+
+    use crate::os::icon::hicon_from_rgba;
 
     const SUBCLASS_ID: usize = 0x4D50_5854;
     const ICON_SIZE: usize = 32;
@@ -339,42 +341,6 @@ mod win {
         rgba
     }
 
-    fn icon_from_rgba(rgba: &[u8]) -> Option<HICON> {
-        if rgba.len() != ICON_SIZE * ICON_SIZE * 4 {
-            return None;
-        }
-        let mask_stride = ICON_SIZE.div_ceil(32) * 4;
-        let mut and_mask = vec![0u8; mask_stride * ICON_SIZE];
-        let mut xor_bits = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
-        for y in 0..ICON_SIZE {
-            let source_row = ICON_SIZE - 1 - y;
-            for x in 0..ICON_SIZE {
-                let source = (source_row * ICON_SIZE + x) * 4;
-                let alpha = rgba[source + 3];
-                if alpha < 128 {
-                    and_mask[y * mask_stride + x / 8] |= 1 << (7 - (x % 8));
-                }
-                let target = (y * ICON_SIZE + x) * 4;
-                xor_bits[target] = rgba[source + 2];
-                xor_bits[target + 1] = rgba[source + 1];
-                xor_bits[target + 2] = rgba[source];
-                xor_bits[target + 3] = alpha;
-            }
-        }
-        unsafe {
-            CreateIcon(
-                HINSTANCE(std::ptr::null_mut()),
-                ICON_SIZE as i32,
-                ICON_SIZE as i32,
-                1,
-                32,
-                and_mask.as_ptr(),
-                xor_bits.as_ptr(),
-            )
-            .ok()
-        }
-    }
-
     fn tip(text: &str) -> [u16; 260] {
         let mut wide = [0u16; 260];
         for (slot, unit) in wide.iter_mut().zip(text.encode_utf16().take(259)) {
@@ -448,9 +414,9 @@ mod win {
             }
 
             let icons = [
-                icon_from_rgba(&glyph_rgba(Glyph::Start)),
-                icon_from_rgba(&glyph_rgba(Glyph::Stop)),
-                icon_from_rgba(&glyph_rgba(Glyph::Test)),
+                hicon_from_rgba(&glyph_rgba(Glyph::Start), ICON_SIZE, ICON_SIZE),
+                hicon_from_rgba(&glyph_rgba(Glyph::Stop), ICON_SIZE, ICON_SIZE),
+                hicon_from_rgba(&glyph_rgba(Glyph::Test), ICON_SIZE, ICON_SIZE),
             ];
             let mut taskbar = Self {
                 hwnd,

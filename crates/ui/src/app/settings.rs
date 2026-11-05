@@ -203,6 +203,7 @@ struct SettingsState {
     link_handler: Rc<RefCell<bool>>,
     restore: Rc<RefCell<bool>>,
     auto_restart: Rc<RefCell<bool>>,
+    notify_from_tray: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
     test_all_scope: Rc<RefCell<TestAllScope>>,
     bind_hosts: Rc<RefCell<Vec<String>>>,
@@ -583,6 +584,35 @@ impl SettingsState {
             Some(close_action.explanation().to_string()),
             muted,
             group,
+        ));
+
+        // Task 10: failures that happen while the window is hidden reach the
+        // user through a balloon; visible windows already have the toast.
+        let notify_cell = self.notify_from_tray.clone();
+        let notify_view = self.view.clone();
+        let notify_on = *notify_cell.borrow();
+        body = body.child(settings_row(
+            self,
+            "settings-row-notify-from-tray",
+            "Notify from the tray",
+            Some(
+                "Shows a Windows notification for a crash, a failed subscription refresh or a taken port while the window is hidden."
+                    .to_string(),
+            ),
+            muted,
+            Switch::new("settings-notify-from-tray-switch")
+                .checked(notify_on)
+                .accessibility_label("Notify from the tray")
+                .on_change(move |next: &bool, window, cx| {
+                    let next = *next;
+                    let cell = notify_cell.clone();
+                    notify_view.update(cx, |view, cx| {
+                        if view.commit_notify_from_tray(next, window, cx) {
+                            *cell.borrow_mut() = next;
+                            cx.notify();
+                        }
+                    });
+                }),
         ));
 
         // K17 ruling (spec line 91): no blocking delete confirms — the undo
@@ -1368,6 +1398,45 @@ impl AppView {
         });
     }
 
+    /// "Notify from the tray"; missing or corrupt reads as on.
+    pub(crate) fn notify_from_tray_enabled(&self) -> bool {
+        self.store
+            .get_meta(META_NOTIFY_FROM_TRAY)
+            .map(|value| value.as_deref() != Some("0"))
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn commit_notify_from_tray(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self
+            .store
+            .set_meta(META_NOTIFY_FROM_TRAY, if enabled { "1" } else { "0" })
+        {
+            Ok(()) => {
+                let message = if enabled {
+                    "Tray notifications on — hidden windows report crashes, failed refreshes and taken ports"
+                } else {
+                    "Tray notifications off — failures stay in the app"
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Tray notification setting failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     pub(crate) fn commit_auto_restart(
         &mut self,
         enabled: bool,
@@ -1739,6 +1808,7 @@ impl AppView {
         let link_handler_state = Rc::new(RefCell::new(crate::os::scheme::is_registered()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
         let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
+        let notify_from_tray_state = Rc::new(RefCell::new(self.notify_from_tray_enabled()));
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
         let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
@@ -1911,6 +1981,7 @@ impl AppView {
             link_handler: link_handler_state.clone(),
             restore: restore_state.clone(),
             auto_restart: auto_restart_state.clone(),
+            notify_from_tray: notify_from_tray_state.clone(),
             close_action: close_action_state.clone(),
             test_all_scope: test_all_scope_state.clone(),
             bind_hosts: bind_hosts_cell.clone(),
