@@ -446,6 +446,9 @@ pub fn run() {
                 view.update(cx, |view, cx| {
                     view.create_tray(window, cx);
                     view.install_os(window, cx);
+                    if let Err(error) = crate::os::scheme::repair_if_registered() {
+                        eprintln!("link handler repair failed: {error}");
+                    }
                     view.restore_on_launch(window, cx);
 
                     if crate::tray::launched_minimized() {
