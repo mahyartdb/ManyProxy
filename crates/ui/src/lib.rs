@@ -229,6 +229,10 @@ struct AppView {
 
     group_test_in_flight: bool,
 
+    /// K5: this view's fixed key for the one `Testing N…` toast, so a sweep's
+    /// progress repaints that toast instead of pushing another.
+    probe_toast_key: u64,
+
     subs_form: Option<SubForm>,
 
     preset_form: Option<PresetForm>,

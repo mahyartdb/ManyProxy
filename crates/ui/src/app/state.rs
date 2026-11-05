@@ -6,6 +6,81 @@ use crate::*;
 use gpui_kit::base::VirtualListScrollHandle;
 use gpui_kit::component::list::ListState;
 
+/// Live completion count for the `Testing N…` toast. Probes run on worker
+/// threads, so the sweep writes here and a UI poller copies the snapshot into
+/// the ring at 10fps — no thread ever touches an entity.
+#[derive(Clone, Copy)]
+struct ProbeProgress {
+    done: usize,
+    total: usize,
+}
+
+struct CountingProber<'a> {
+    inner: &'a (dyn HealthProber + Sync),
+    progress: Arc<std::sync::Mutex<ProbeProgress>>,
+}
+
+fn note_probe_complete(progress: &std::sync::Mutex<ProbeProgress>) {
+    let mut state = progress.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.done = (state.done + 1).min(state.total);
+}
+
+impl HealthProber for CountingProber<'_> {
+    fn supports(&self, config: &ProxyConfig) -> bool {
+        let supported = self.inner.supports(config);
+        if !supported {
+            note_probe_complete(&self.progress);
+        }
+        supported
+    }
+
+    fn url_test(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+        url: &str,
+    ) -> Result<ProbeSuccess, String> {
+        let result = self.inner.url_test(config, bind, port, url);
+        note_probe_complete(&self.progress);
+        result
+    }
+
+    fn tcp_ping(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+    ) -> Result<ProbeSuccess, String> {
+        let result = self.inner.tcp_ping(config, bind, port);
+        note_probe_complete(&self.progress);
+        result
+    }
+}
+
+fn spawn_probe_progress_poller(
+    toast: ToastHandle,
+    progress: Arc<std::sync::Mutex<ProbeProgress>>,
+    active: Arc<AtomicBool>,
+    handle: AnyWindowHandle,
+    cx: &mut Context<AppView>,
+) {
+    cx.spawn(async move |_entity, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(120))
+            .await;
+        let snapshot = *progress.lock().unwrap_or_else(|poison| poison.into_inner());
+        let running = active.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = handle.update(cx, |_, _, cx| {
+            update_probe_progress(toast, snapshot.done, snapshot.total, cx);
+        });
+        if !running {
+            break;
+        }
+    })
+    .detach();
+}
+
 /// F16: the refresh batch's progress counters and the in-flight set, together
 /// so a refresh starts, reports and clears as one unit. `AppView` reads
 /// `refresh_batch_progress` through it; nothing else may be added here without
@@ -299,6 +374,7 @@ impl AppView {
             update_check_in_flight: false,
             probe_stop: Arc::new(AtomicBool::new(false)),
             group_test_in_flight: false,
+            probe_toast_key: next_toast_key(),
             subs_form: None,
             preset_form: None,
             import_form: None,
@@ -885,21 +961,49 @@ impl AppView {
         let url = self.effective_test_url(&rows);
         self.group_test_in_flight = true;
         self.probe_stop.store(false, Ordering::SeqCst);
-        if let Some(handle) = window {
-            let _ = handle.update(cx, |_, window, cx| {
-                push_probe_start_toast(probe_start_toast(count), window, cx);
-            });
+        let progress = Arc::new(std::sync::Mutex::new(ProbeProgress {
+            done: 0,
+            total: count,
+        }));
+        let active = Arc::new(AtomicBool::new(true));
+        let probe_key = self.probe_toast_key;
+        let probe_toast = window.and_then(|handle| {
+            handle
+                .update(cx, |_, window, cx| {
+                    push_probe_start_toast(
+                        probe_key,
+                        probe_start_toast(count),
+                        0,
+                        count,
+                        window,
+                        cx,
+                    )
+                })
+                .ok()
+        });
+        if let (Some(handle), Some(toast)) = (window, probe_toast) {
+            spawn_probe_progress_poller(toast, progress.clone(), active.clone(), handle, cx);
         }
         let stop = self.probe_stop.clone();
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
+        let retry_group = group.clone();
         cx.spawn(async move |_entity, cx| {
+            let sweep_progress = progress;
+            let sweep_active = active;
             let (outcomes, prober, stopped) = cx
                 .background_executor()
                 .spawn(async move {
                     let prober = prober;
-                    let outcomes = test_group(&rows, &url, &*prober, &stop, |_, _| {});
+                    let outcomes = test_group(&rows, &url, &*prober, &stop, move |done, total| {
+                        let mut state = sweep_progress
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.done = done;
+                        state.total = total;
+                    });
                     let stopped = stop.load(Ordering::SeqCst);
+                    sweep_active.store(false, Ordering::SeqCst);
                     (outcomes, prober, stopped)
                 })
                 .await;
@@ -914,9 +1018,13 @@ impl AppView {
                     // probe pass lives anywhere.
                     let cleared = view.auto_clear_after_sweep(&group);
                     let (live, dead) = view.health_counts();
-                    (live, dead, cleared)
+                    let sweep_dead = outcomes
+                        .iter()
+                        .filter(|outcome| outcome.sample.latency_ms.is_none())
+                        .count();
+                    (live, dead, cleared, sweep_dead)
                 });
-                let Ok((live, dead, auto_cleared)) = recorded else {
+                let Ok((live, dead, auto_cleared, sweep_dead)) = recorded else {
                     return;
                 };
                 let Some(view) = weak.upgrade() else {
@@ -936,8 +1044,28 @@ impl AppView {
                                 view.reload(window, cx);
                                 // K5: the start toast leaves exactly when the
                                 // sweep's own summary arrives.
-                                close_probe_start_toast(window, cx);
-                                window.push_notification(Notification::success(message), cx);
+                                if let Some(toast) = probe_toast {
+                                    close_probe_start_toast(toast, window, cx);
+                                }
+                                let mut summary = if sweep_dead > 0 {
+                                    ToastSpec::warning(message)
+                                } else {
+                                    ToastSpec::success(message)
+                                };
+                                if sweep_dead > 0 {
+                                    let retry_view = cx.entity().downgrade();
+                                    let retry_group = retry_group.clone();
+                                    summary = summary.action(
+                                        "toast-retry-test",
+                                        "Retry",
+                                        move |window, cx| {
+                                            let _ = retry_view.update(cx, |view, cx| {
+                                                view.retry_group_probe(&retry_group, window, cx);
+                                            });
+                                        },
+                                    );
+                                }
+                                view.push_toast(summary, window, cx);
                                 // T-19: exactly ONE auto-clear summary per
                                 // sweep — success when rows went, info when
                                 // every candidate was protected.
@@ -1083,6 +1211,54 @@ impl AppView {
         effective_probe_url(None, global.as_deref())
     }
 
+    /// K5: Retry from a test-result toast. Rows are re-resolved because the
+    /// library may have changed while the toast sat there; stopped or removed
+    /// rows simply drop out of the retry.
+    pub(crate) fn retry_probe(
+        &mut self,
+        ids: Vec<String>,
+        ping: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let running = self.engine.running_ids();
+        let rows: Vec<ProxyConfig> = ids
+            .iter()
+            .filter_map(|id| self.row_config(id))
+            .filter(|row| running.contains(&row.id))
+            .collect();
+        if rows.is_empty() {
+            window.push_notification(Notification::warning("No running endpoints to test"), cx);
+            return;
+        }
+        self.spawn_probe(rows, ping, true, Some(window.window_handle()), cx);
+    }
+
+    /// K5: Retry from a group sweep summary. The group's running set is read
+    /// again so a row started or stopped since the first pass is respected.
+    pub(crate) fn retry_group_probe(
+        &mut self,
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        let rows = self.group_running_rows(group);
+        if rows.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no running endpoints to test"
+                )),
+                cx,
+            );
+            return;
+        }
+        self.spawn_group_probe(rows, group.to_string(), Some(window.window_handle()), cx);
+    }
+
     pub(crate) fn spawn_probe(
         &mut self,
         rows: Vec<ProxyConfig>,
@@ -1108,27 +1284,55 @@ impl AppView {
         // K5: batched runs say once that they started. Single-row runs keep
         // the established one-shot result toast, so the editor's own Health
         // tab stays the per-row detail surface.
-        if toast && count > 1 {
-            if let Some(handle) = window {
-                let _ = handle.update(cx, |_, window, cx| {
-                    push_probe_start_toast(probe_start_toast(count), window, cx);
-                });
-            }
+        let progress = Arc::new(std::sync::Mutex::new(ProbeProgress {
+            done: 0,
+            total: count,
+        }));
+        let active = Arc::new(AtomicBool::new(true));
+        let probe_key = self.probe_toast_key;
+        let probe_toast = if toast && count > 1 {
+            window.and_then(|handle| {
+                handle
+                    .update(cx, |_, window, cx| {
+                        push_probe_start_toast(
+                            probe_key,
+                            probe_start_toast(count),
+                            0,
+                            count,
+                            window,
+                            cx,
+                        )
+                    })
+                    .ok()
+            })
+        } else {
+            None
+        };
+        if let (Some(handle), Some(toast)) = (window, probe_toast) {
+            spawn_probe_progress_poller(toast, progress.clone(), active.clone(), handle, cx);
         }
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
 
         let toast_ping = ping;
         cx.spawn(async move |_entity, cx| {
+            let sweep_progress = progress;
+            let sweep_active = active;
             let (outcomes, prober) = cx
                 .background_executor()
                 .spawn(async move {
                     let prober = prober;
-                    let outcomes = if ping {
-                        ping_all(&rows, &*prober)
-                    } else {
-                        test_all(&rows, &url, &*prober)
+                    let counting = CountingProber {
+                        inner: &*prober,
+                        progress: sweep_progress,
                     };
+                    let outcomes = if ping {
+                        ping_all(&rows, &counting)
+                    } else {
+                        test_all(&rows, &url, &counting)
+                    };
+                    sweep_active.store(false, std::sync::atomic::Ordering::SeqCst);
                     (outcomes, prober)
                 })
                 .await;
@@ -1151,6 +1355,11 @@ impl AppView {
                 };
 
                 if toast {
+                    let failed_ids: Vec<String> = outcomes
+                        .iter()
+                        .filter(|outcome| outcome.sample.latency_ms.is_none())
+                        .map(|outcome| outcome.sample.config_id.clone())
+                        .collect();
                     let message = if count == 1 {
                         match outcomes.first() {
                             Some(outcome) => {
@@ -1166,6 +1375,21 @@ impl AppView {
                     } else {
                         probe_batched_toast(count, live, dead)
                     };
+                    let mut spec = if failed_ids.is_empty() {
+                        ToastSpec::success(message)
+                    } else {
+                        ToastSpec::warning(message)
+                    };
+                    if !failed_ids.is_empty() {
+                        let retry_ids = if count == 1 { ids.clone() } else { failed_ids };
+                        let retry_view = view.downgrade();
+                        spec = spec.action("toast-retry-test", "Retry", move |window, cx| {
+                            let retry_ids = retry_ids.clone();
+                            let _ = retry_view.update(cx, |view, cx| {
+                                view.retry_probe(retry_ids, toast_ping, window, cx);
+                            });
+                        });
+                    }
                     if let Some(handle) = window {
                         if handle
                             .update(cx, |_, window, cx| {
@@ -1173,13 +1397,10 @@ impl AppView {
                                     view.reload(window, cx);
                                     // K5: the start toast leaves exactly when
                                     // the result arrives.
-                                    close_probe_start_toast(window, cx);
-                                    if count == 1 {
-                                        window
-                                            .push_notification(Notification::success(message), cx);
-                                    } else {
-                                        view.toast_success(message, window, cx);
+                                    if let Some(toast) = probe_toast {
+                                        close_probe_start_toast(toast, window, cx);
                                     }
+                                    view.push_toast(spec, window, cx);
                                 });
                             })
                             .is_ok()
@@ -1617,7 +1838,12 @@ impl AppView {
         Some((total.saturating_sub(self.refresh.members.len()), total))
     }
 
-    pub(crate) fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
+    pub(crate) fn close_batch_slot(
+        &mut self,
+        sub_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_batch_member(sub_id)
             && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[])
         {
@@ -1633,7 +1859,7 @@ impl AppView {
     pub(crate) fn route_refresh_completion(
         &mut self,
         sub_id: &str,
-        notice: Notification,
+        notice: ToastSpec,
         added: usize,
         updated: usize,
         removed: usize,
@@ -1645,7 +1871,7 @@ impl AppView {
         removed_names: &[String],
         kept_in_use_names: &[String],
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) {
         if self.is_batch_member(sub_id) {
             if self.accumulate_batch_member(
@@ -1664,7 +1890,20 @@ impl AppView {
                 self.flush_refresh_batch(window, cx);
             }
         } else {
-            window.push_notification(notice, cx);
+            // A failed refresh leaves the user looking at the library; the
+            // next step is usually the Subscriptions sheet, so put it on the
+            // toast instead of making them hunt for the menu row.
+            let notice = if failed > 0 {
+                let view = cx.entity().downgrade();
+                notice.action("toast-show-subscriptions", "Show", move |window, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        view.open_subscriptions_dialog(window, cx);
+                    });
+                })
+            } else {
+                notice
+            };
+            self.push_toast(notice, window, cx);
         }
     }
 
@@ -1684,8 +1923,18 @@ impl AppView {
                 false
             }
             Err(error) => {
-                window.push_notification(
-                    Notification::error(format!("Cannot refresh subscription: {error}")),
+                let view = cx.entity().downgrade();
+                self.push_toast(
+                    ToastSpec::error(format!("Cannot refresh subscription: {error}")).action(
+                        "toast-show-subscriptions",
+                        "Show",
+                        move |window, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                view.open_subscriptions_dialog(window, cx);
+                            });
+                        },
+                    ),
+                    window,
                     cx,
                 );
                 false

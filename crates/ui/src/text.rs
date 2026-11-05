@@ -21,14 +21,14 @@ pub(crate) fn unclean_exit_notice(
 /// nothing removed = error, partial = warning) — and the sentence the Undo
 /// toast carries. The blocking confirm the old copy described is gone
 /// (spec line 91); naming the rows stays.
-pub(crate) fn bulk_delete_note(removed: &[String], failed: &[String]) -> Notification {
+pub(crate) fn bulk_delete_note(removed: &[String], failed: &[String]) -> ToastSpec {
     let text = bulk_delete_result_message(removed, failed);
     if failed.is_empty() {
-        Notification::success(text)
+        ToastSpec::success(text)
     } else if removed.is_empty() {
-        Notification::error(text)
+        ToastSpec::error(text)
     } else {
-        Notification::warning(text)
+        ToastSpec::warning(text)
     }
 }
 pub(crate) fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> ServingTone {

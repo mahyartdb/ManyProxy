@@ -13,6 +13,7 @@ qrcodegen = "1.8.0"
 serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"
 futures = "0.3"
+web-time = "1"
 
 [dev-dependencies]
 manyproxy-core = { path = "../core", features = ["test-support"] }
