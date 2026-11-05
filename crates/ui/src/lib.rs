@@ -265,6 +265,14 @@ struct AppView {
     /// handle exists; the install is a no-op under the test harness.
     os_taskbar: Option<crate::os::taskbar::Taskbar>,
 
+    /// Hidden-window balloons for failures that happen while the window is
+    /// gone. Same lifecycle as `os_taskbar`.
+    os_notifier: Option<crate::os::notify::Notifier>,
+
+    /// Dedup and flood rules for [`Self::os_notifier`], kept in the view so the
+    /// policy outlives any single balloon.
+    os_notice_policy: crate::os::notify::NoticePolicy,
+
     last_snapshot: Vec<String>,
 
     start_in_flight: bool,

@@ -13,6 +13,7 @@ impl AppView {
             return;
         };
         self.os_taskbar = Some(crate::os::taskbar::Taskbar::install(hwnd));
+        self.os_notifier = Some(crate::os::notify::Notifier::install(hwnd));
         self.sync_taskbar_buttons(cx);
     }
 
@@ -30,17 +31,53 @@ impl AppView {
                     }
                 }
                 crate::os::taskbar::TaskbarEvent::Action(action) => match action {
-                    crate::os::taskbar::ThumbAction::StartAll => {
+                    crate::os::taskbar::ThumbAction::Start => {
                         self.start_all_engines(window, cx);
                     }
-                    crate::os::taskbar::ThumbAction::StopAll => {
+                    crate::os::taskbar::ThumbAction::Stop => {
                         self.stop_all_engines(window, cx);
                     }
-                    crate::os::taskbar::ThumbAction::TestAll => {
+                    crate::os::taskbar::ThumbAction::Test => {
                         self.test_all_health(window, cx);
                     }
                 },
             }
+        }
+        for target in crate::os::notify::drain_clicks() {
+            self.show_window_from_tray(window, cx);
+            match target {
+                crate::os::notify::NoticeTarget::Logs => {
+                    self.set_inspector_tab(InspectorTab::Logs);
+                }
+                crate::os::notify::NoticeTarget::Subscriptions => {
+                    self.open_subscriptions_dialog(window, cx);
+                }
+            }
+        }
+    }
+
+    /// One balloon, subject to the same visibility/setting/dedup rules the
+    /// policy unit tests pin. The caller supplies the event text the in-app
+    /// toast would have shown.
+    pub(crate) fn os_notify(
+        &mut self,
+        kind: crate::os::notify::NoticeKind,
+        title: &str,
+        body: &str,
+    ) {
+        let enabled = self.notify_from_tray_enabled();
+        let Some(notifier) = self.os_notifier.as_ref() else {
+            return;
+        };
+        let hidden = notifier.window_hidden();
+        if !self
+            .os_notice_policy
+            .allow(kind, std::time::Instant::now(), hidden, enabled)
+        {
+            return;
+        }
+        if let Some(notifier) = self.os_notifier.as_mut() {
+            notifier.show(kind, title, body);
         }
     }
 

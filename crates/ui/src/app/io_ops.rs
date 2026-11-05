@@ -409,6 +409,13 @@ impl AppView {
             ToastSpec::success(text)
         };
         if failed > 0 {
+            self.os_notify(
+                crate::os::notify::NoticeKind::SubscriptionFailure,
+                "Subscription refresh failed",
+                &format!(
+                    "{failed} route(s) could not be refreshed. Open Subscriptions for details."
+                ),
+            );
             let view = cx.entity().downgrade();
             spec = spec.action("toast-show-subscriptions", "Show", move |window, cx| {
                 let _ = view.update(cx, |view, cx| {

@@ -138,8 +138,15 @@ impl AppView {
                 }
             },
             Err(error) => {
-                window
-                    .push_notification(Notification::error(redact_secrets(&error.to_string())), cx);
+                let text = redact_secrets(&error.to_string());
+                if is_port_bind_error(&error) {
+                    self.os_notify(
+                        crate::os::notify::NoticeKind::PortConflict,
+                        "Cannot bind the endpoint",
+                        &text,
+                    );
+                }
+                window.push_notification(Notification::error(text), cx);
             }
         }
         self.start_in_flight = false;
@@ -206,6 +213,13 @@ impl AppView {
                 }
             }
             Err(fast_error) => {
+                if is_port_bind_error(&fast_error) {
+                    self.os_notify(
+                        crate::os::notify::NoticeKind::PortConflict,
+                        "Cannot bind an endpoint",
+                        &redact_secrets(&fast_error.to_string()),
+                    );
+                }
                 if !is_row_local_start_error(&fast_error) {
                     self.reload(window, cx);
                     self.start_in_flight = false;
