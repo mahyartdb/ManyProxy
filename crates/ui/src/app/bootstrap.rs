@@ -85,12 +85,18 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Task 14: the setting owns the icon. With it off, closing has no tray
+        // to hide to, and `close_route` falls through to Quit.
+        if !self.store.show_tray_icon() {
+            return false;
+        }
         match crate::tray::TrayHandle::build() {
             Ok(tray) => {
                 tray.set_running(self.engine.running_count());
                 self.tray = Some(tray);
                 cx.notify();
+                true
             }
             Err(error) => {
                 self.notify_after_root(
@@ -100,6 +106,7 @@ impl AppView {
                     window,
                     cx,
                 );
+                false
             }
         }
     }

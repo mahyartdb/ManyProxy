@@ -11322,6 +11322,7 @@ fn ticket43_chrome_paints(cx: &mut TestAppContext) {
     // K9/A7-5: lean engine rows + Details; no timer jargon.
     assert_painted(cx, "settings-engine-details-sing-box");
     assert_absent(cx, "settings-ticks".to_string());
+    scroll_settings_into_view(cx, "settings-section-addresses");
     assert_painted(cx, "settings-section-addresses");
     scroll_settings_into_view(cx, "settings-clear-traffic");
     for id in [
@@ -25185,6 +25186,7 @@ fn settings_spine_lists_one_column_and_filters_it(cx: &mut TestAppContext) {
     // section is one small scroll down.
     for id in [
         "settings-row-window-behaviour",
+        "settings-row-show-tray",
         "settings-row-autostart",
         "settings-row-restore",
     ] {
@@ -28118,6 +28120,9 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         "settings-restore-switch",
         "settings-row-restore-help",
         "settings-row-window-behaviour",
+        "settings-row-show-tray",
+        "settings-show-tray-switch",
+        "settings-row-show-tray-help",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
@@ -34144,6 +34149,83 @@ fn t04_tray_hint_shows_exactly_once(cx: &mut TestAppContext) {
         cx.update(|window, cx| view.update(cx, |view, cx| view.show_tray_hint_once(window, cx)));
     assert!(!second, "the second hide stays quiet");
     assert_eq!(notification_count(cx), before + 1, "no second toast");
+}
+
+/// Task 14: turning the icon off makes close mean Quit, records the one-time
+/// hint, and turning it back on restores the setting. The stored close choice
+/// is preserved for when the icon returns.
+#[gpui_kit::test]
+fn task14_tray_toggle_forces_quit_and_hints_once(cx: &mut TestAppContext) {
+    use crate::app::settings::CloseRoute;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    assert!(
+        view.read_with(cx, |view, _| view.store.show_tray_icon()),
+        "the icon ships on"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(true)),
+        CloseRoute::HideToTray,
+        "with a tray the default close still hides"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-show-tray");
+    assert_painted(cx, "settings-row-show-tray");
+    assert_painted(cx, "settings-show-tray-switch");
+
+    let before = notification_count(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_show_tray_icon(false, window, cx),
+                "the switch commits"
+            );
+        });
+    });
+    assert!(
+        !view.read_with(cx, |view, _| view.store.show_tray_icon()),
+        "the choice persists"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.store.seen_tray_disable_hint()),
+        "the first disable records the hint"
+    );
+    assert_eq!(notification_count(cx), before + 1, "one hint toast");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(true)),
+        CloseRoute::Quit,
+        "with the icon off, close quits even if a stale tray flag says otherwise"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.close_action()),
+        crate::store::CloseAction::Tray,
+        "the saved close choice survives underneath"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_show_tray_icon(true, window, cx),
+                "the switch turns back on"
+            );
+        });
+    });
+    assert!(
+        view.read_with(cx, |view, _| view.store.show_tray_icon()),
+        "the icon setting is restored"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.close_route(true)),
+        CloseRoute::HideToTray,
+        "the saved close choice works again with the icon back"
+    );
 }
 
 /// T-04: the Settings dialog's Window behaviour row writes the persisted
