@@ -35535,6 +35535,279 @@ fn k5_update_feed_failure_copy() {
     );
 }
 
+#[gpui_kit::test]
+fn k5_hover_pauses_toast_expiry_and_leaving_resumes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let toast = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.push_toast(crate::ToastSpec::success("Read me"), window, cx)
+        })
+    });
+    let key = toast.key();
+    cx.run_until_parked();
+    assert_eq!(notification_count(cx), 1);
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.hover(("toast-body", key as usize), cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(6000));
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "a hovered success toast outlives its nominal ~4.2s"
+    );
+
+    paint_frame(cx);
+    cx.update(|window, cx| window.hover("config-list", cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(3000));
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "resume keeps the time that was left after the pointer left"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(2000));
+    cx.run_until_parked();
+    assert_eq!(notification_count(cx), 0, "the resumed clock finishes");
+}
+
+#[gpui_kit::test]
+fn k5_error_hover_still_hits_its_hard_cap(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let toast = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.push_toast(crate::ToastSpec::error("Hover trap"), window, cx)
+        })
+    });
+    let key = toast.key();
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.hover(("toast-body", key as usize), cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(14_000));
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "hover buys reading time inside the hard cap"
+    );
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1500));
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        0,
+        "a forgotten hover cannot leave an error toast wedged in the corner"
+    );
+}
+
+#[gpui_kit::test]
+fn k5_toast_carries_two_keyboard_reachable_actions(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let fired = Rc::new(RefCell::new(Vec::new()));
+    let retry_fired = fired.clone();
+    let show_fired = fired.clone();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.push_toast(
+                crate::ToastSpec::warning("Two actions")
+                    .no_timeout()
+                    .action("toast-test-retry", "Retry", move |_, _| {
+                        retry_fired.borrow_mut().push("retry");
+                    })
+                    .action("toast-test-show", "Show", move |_, _| {
+                        show_fired.borrow_mut().push("show");
+                    }),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let retry = cx.update(|window, _| window.try_find("toast-test-retry"));
+    let retry = retry.expect("the first action renders");
+    assert_eq!(retry.label(), Some("Retry"), "actions use button grammar");
+    assert_eq!(
+        retry.role().map(|role| format!("{role:?}")),
+        Some("Button".into())
+    );
+
+    cx.update(|window, cx| window.click("toast-test-retry", cx));
+    cx.update(|window, cx| window.click("toast-test-show", cx));
+    assert_eq!(fired.borrow().as_slice(), ["retry", "show"]);
+}
+
+#[gpui_kit::test]
+fn k5_progress_reuses_one_toast_key(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (_view, cx) = mount_view(store, cx);
+    let key = crate::next_toast_key();
+    let toast = cx.update(|window, cx| {
+        crate::push_probe_start_toast(key, "Testing 4…".to_string(), 0, 4, window, cx);
+        crate::push_probe_start_toast(key, "Testing 4…".to_string(), 0, 4, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "the same key replaces the probe toast instead of stacking"
+    );
+    assert_eq!(
+        cx.update(|_, cx| crate::toast_progress_label(key, cx)),
+        Some("4 remaining".to_string())
+    );
+
+    cx.update(|_, cx| crate::update_probe_progress(toast, 3, 4, cx));
+    assert_eq!(
+        cx.update(|_, cx| crate::toast_progress_label(key, cx)),
+        Some("1 remaining".to_string()),
+        "progress repaints the ring in place"
+    );
+    cx.update(|_, cx| crate::update_probe_progress(toast, 1, 4, cx));
+    assert_eq!(
+        cx.update(|_, cx| crate::toast_progress_label(key, cx)),
+        Some("1 remaining".to_string()),
+        "a group warm-up tick never rewinds the ring"
+    );
+    assert_eq!(
+        notification_count(cx),
+        1,
+        "a progress tick never adds a toast"
+    );
+}
+
+#[gpui_kit::test]
+fn k5_failed_test_result_offers_retry(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    use crate::health::FakeHealthProber;
+
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t19_auto_clear_seed("Retry me", "10864", "g"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let (prober, handle) = FakeHealthProber::shared();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            let (engine, _) = EngineController::fake();
+            view.engine = engine;
+            view.prober = Box::new(prober);
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&row.id, window, cx));
+    });
+    cx.run_until_parked();
+    handle.script_failure(&row.id, "timeout");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.test_row(&row.id, window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "toast-retry-test");
+
+    let before = handle.calls_for(&row.id).len();
+    cx.update(|window, cx| window.click("toast-retry-test", cx));
+    cx.run_until_parked();
+    assert!(
+        handle.calls_for(&row.id).len() > before,
+        "Retry re-runs the failed probe"
+    );
+}
+
+#[gpui_kit::test]
+fn k5_failed_import_offers_retry(cx: &mut TestAppContext) {
+    use manyproxy_core::import::{BatchResult, ImportErrorKind, ImportFailure};
+
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let batch = BatchResult {
+        configs: Vec::new(),
+        failures: vec![ImportFailure {
+            index: 0,
+            label: "broken link".to_string(),
+            reason: "bad host".to_string(),
+            code: ImportErrorKind::BadHost,
+        }],
+    };
+    let committed = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_import_batch(batch, "travel", window, cx)
+        })
+    });
+    assert!(!committed, "an all-failure batch does not land");
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "toast-retry-import");
+
+    cx.update(|window, cx| window.click("toast-retry-import", cx));
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        2,
+        "Retry re-runs the same deterministic batch and reports again"
+    );
+}
+
+#[gpui_kit::test]
+fn k5_refresh_failure_offers_show_subscriptions(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.route_refresh_completion(
+                "sub-failure",
+                crate::ToastSpec::error("Sub refresh failed"),
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                &[],
+                &[],
+                &[],
+                &[],
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "toast-show-subscriptions");
+
+    cx.update(|window, cx| window.click("toast-show-subscriptions", cx));
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.subs_form.is_some()),
+        "Show opens the Subscriptions sheet"
+    );
+}
+
 /// B19: the audit read "no UIA actions at all" off the chrome strip, the bulk
 /// More, the row More and Close inspector. Each of those is a kit Button, and
 /// a Button with a click listener adds `Action::Click` to its accessibility

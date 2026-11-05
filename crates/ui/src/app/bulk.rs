@@ -686,7 +686,7 @@ impl AppView {
         let note = bulk_delete_note(&removed, &failed);
         if removed.is_empty() {
             // Nothing was removed: an honest outcome, nothing to undo.
-            window.push_notification(note, cx);
+            self.push_toast(note, window, cx);
         } else {
             let batch = next_undo_batch_id();
             stash_undo_rows(undo_rows, batch);

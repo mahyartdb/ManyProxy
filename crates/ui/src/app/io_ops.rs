@@ -384,7 +384,7 @@ impl AppView {
         (total, added, updated, removed, failed, conflicts, in_use)
     }
 
-    pub(crate) fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
+    pub(crate) fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (added_names, updated_names, removed_names, kept_in_use_names) =
             self.take_batch_name_lists();
         let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
@@ -403,14 +403,20 @@ impl AppView {
             text.push('\n');
             text.push_str(&report);
         }
-        window.push_notification(
-            if warn {
-                Notification::warning(text)
-            } else {
-                Notification::success(text)
-            },
-            cx,
-        );
+        let mut spec = if warn {
+            ToastSpec::warning(text)
+        } else {
+            ToastSpec::success(text)
+        };
+        if failed > 0 {
+            let view = cx.entity().downgrade();
+            spec = spec.action("toast-show-subscriptions", "Show", move |window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.open_subscriptions_dialog(window, cx);
+                });
+            });
+        }
+        self.push_toast(spec, window, cx);
     }
 
     /// Post-download staging shared by both finish variants: write the staged

@@ -146,16 +146,42 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // The parse result is deterministic, so Retry re-runs the same batch
+        // rather than asking the user to paste the text again.
+        let retry_batch = batch.clone();
+        let retry_group = group.to_string();
+        let view = cx.entity().downgrade();
         match commit_batch(&mut self.store, batch, group) {
             Ok(outcome) => {
                 self.reload(window, cx);
 
                 if outcome.imported == 0 && !outcome.failures.is_empty() {
-                    window.push_notification(
-                        Notification::error(format!(
+                    let retry = retry_batch.clone();
+                    let retry_group = retry_group.clone();
+                    let view = view.clone();
+                    self.push_toast(
+                        ToastSpec::error(format!(
                             "Import failed: {}",
                             format_import_failures(&outcome.failures)
-                        )),
+                        ))
+                        .action(
+                            "toast-retry-import",
+                            "Retry",
+                            move |window, cx| {
+                                let _ = view.update(cx, |view, cx| {
+                                    if view.finish_import_batch(
+                                        retry.clone(),
+                                        &retry_group,
+                                        window,
+                                        cx,
+                                    ) {
+                                        window.close_all_dialogs(cx);
+                                        reclaim_shell_focus(window, cx);
+                                    }
+                                });
+                            },
+                        ),
+                        window,
                         cx,
                     );
                     return false;
@@ -185,8 +211,27 @@ impl AppView {
                 true
             }
             Err(error) => {
-                window
-                    .push_notification(Notification::error(format!("Import failed: {error}")), cx);
+                self.push_toast(
+                    ToastSpec::error(format!("Import failed: {error}")).action(
+                        "toast-retry-import",
+                        "Retry",
+                        move |window, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                if view.finish_import_batch(
+                                    retry_batch.clone(),
+                                    &retry_group,
+                                    window,
+                                    cx,
+                                ) {
+                                    window.close_all_dialogs(cx);
+                                    reclaim_shell_focus(window, cx);
+                                }
+                            });
+                        },
+                    ),
+                    window,
+                    cx,
+                );
                 false
             }
         }
@@ -220,7 +265,7 @@ impl AppView {
                 ));
                 self.route_refresh_completion(
                     sub_id,
-                    Notification::error(format!("Cannot refresh subscription: {error}")),
+                    ToastSpec::error(format!("Cannot refresh subscription: {error}")),
                     0,
                     0,
                     0,
@@ -255,7 +300,7 @@ impl AppView {
                             ));
                             self.route_refresh_completion(
                                 sub_id,
-                                Notification::error(format!("{label}: refresh failed ({error})")),
+                                ToastSpec::error(format!("{label}: refresh failed ({error})")),
                                 0,
                                 0,
                                 0,
@@ -308,9 +353,9 @@ impl AppView {
                                 self.push_refresh_log(&format!("subscription refresh {summary}"));
                             }
                             let notice = if warn {
-                                Notification::warning(summary)
+                                ToastSpec::warning(summary)
                             } else {
-                                Notification::success(summary)
+                                ToastSpec::success(summary)
                             };
                             self.route_refresh_completion(
                                 sub_id,
@@ -340,7 +385,7 @@ impl AppView {
                             ));
                             self.route_refresh_completion(
                                 sub_id,
-                                Notification::error(format!("{label}: refresh failed ({error})")),
+                                ToastSpec::error(format!("{label}: refresh failed ({error})")),
                                 0,
                                 0,
                                 0,
@@ -371,7 +416,7 @@ impl AppView {
                     ));
                     self.route_refresh_completion(
                         sub_id,
-                        Notification::error(format!("{label}: {error}")),
+                        ToastSpec::error(format!("{label}: {error}")),
                         0,
                         0,
                         0,
@@ -396,7 +441,7 @@ impl AppView {
                     ));
                     self.route_refresh_completion(
                         sub_id,
-                        Notification::error(format!("Cannot refresh subscription: {db_error}")),
+                        ToastSpec::error(format!("Cannot refresh subscription: {db_error}")),
                         0,
                         0,
                         0,

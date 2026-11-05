@@ -332,7 +332,7 @@ impl AppView {
                     stash_undo_rows(vec![row], batch);
                     self.push_delete_undo_toast(
                         batch,
-                        Notification::success(removed_message(&name, was_running)),
+                        ToastSpec::success(removed_message(&name, was_running)),
                         window,
                         cx,
                     );
