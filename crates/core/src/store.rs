@@ -8403,6 +8403,37 @@ impl Store {
         self.set_meta(Self::META_SEEN_TRAY_HINT, if seen { "1" } else { "0" })
     }
 
+    pub const META_SHOW_TRAY_ICON: &str = "show_tray_icon";
+
+    /// Task 14: whether the notification-area icon exists. Absent or corrupt
+    /// reads as on, matching the shipped default.
+    pub fn show_tray_icon(&self) -> bool {
+        self.get_meta(Self::META_SHOW_TRAY_ICON)
+            .map(|value| value.as_deref() != Some("0"))
+            .unwrap_or(true)
+    }
+
+    pub fn set_show_tray_icon(&mut self, show: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_SHOW_TRAY_ICON, if show { "1" } else { "0" })
+    }
+
+    pub const META_SEEN_TRAY_DISABLE_HINT: &str = "seen_tray_disable_hint";
+
+    /// Task 14: the one-time "without the icon, closing quits" hint. Absent or
+    /// corrupt reads as not-seen.
+    pub fn seen_tray_disable_hint(&self) -> bool {
+        self.get_meta(Self::META_SEEN_TRAY_DISABLE_HINT)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_seen_tray_disable_hint(&mut self, seen: bool) -> Result<(), StoreError> {
+        self.set_meta(
+            Self::META_SEEN_TRAY_DISABLE_HINT,
+            if seen { "1" } else { "0" },
+        )
+    }
+
     pub const META_PROBE_TIMEOUT_SECS: &str = "probe_timeout_secs";
 
     /// T-04: how long one URL probe may take. A missing or out-of-range value
@@ -15590,6 +15621,28 @@ mod tests {
             .set_meta(Store::META_ACCENT, "chartreuse")
             .expect("raw write");
         assert_eq!(store.accent(), Accent::Blue, "corrupt reads blue");
+    }
+
+    #[test]
+    fn task14_tray_icon_round_trips_and_defaults_on() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(store.show_tray_icon(), "the icon ships on");
+        store.set_show_tray_icon(false).expect("off writes");
+        assert!(!store.show_tray_icon(), "off reads back");
+        store.set_show_tray_icon(true).expect("on writes");
+        assert!(store.show_tray_icon(), "on reads back");
+        store
+            .set_meta(Store::META_SHOW_TRAY_ICON, "sideways")
+            .expect("raw write");
+        assert!(store.show_tray_icon(), "corrupt reads on");
+        assert!(
+            !store.seen_tray_disable_hint(),
+            "the disable hint starts unseen"
+        );
+        store
+            .set_seen_tray_disable_hint(true)
+            .expect("hint flag writes");
+        assert!(store.seen_tray_disable_hint(), "the hint flag reads back");
     }
 
     #[test]

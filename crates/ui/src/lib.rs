@@ -464,7 +464,10 @@ pub fn run() {
                     }
                     view.restore_on_launch(window, cx);
 
-                    if crate::tray::launched_minimized() {
+                    // Task 14: with the icon off there is no way back from a
+                    // hidden window, so an autostart `--tray` launch stays
+                    // visible rather than stranding the user.
+                    if crate::tray::launched_minimized() && view.tray.is_some() {
                         view.hide_to_tray(window, cx);
                     }
 

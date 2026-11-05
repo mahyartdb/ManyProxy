@@ -208,6 +208,7 @@ struct SettingsState {
     auto_restart: Rc<RefCell<bool>>,
     notify_from_tray: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
+    show_tray: Rc<RefCell<bool>>,
     window_corners: Rc<RefCell<WindowCorners>>,
     test_all_scope: Rc<RefCell<TestAllScope>>,
     bind_hosts: Rc<RefCell<Vec<String>>>,
@@ -624,15 +625,24 @@ impl SettingsState {
                 }),
         ));
 
-        // Window behaviour — the close button's two meanings.
+        // Window behaviour — the close button's two meanings. With the tray
+        // icon off there is no "close to tray" destination, so the row shows
+        // the effective Quit and explains where the saved choice went.
         let close_cell = self.close_action.clone();
         let close_view = self.view.clone();
         let close_action = *close_cell.borrow();
+        let tray_on = *self.show_tray.borrow();
+        let effective_close = if tray_on {
+            close_action
+        } else {
+            CloseAction::Quit
+        };
         let mut group = RadioGroup::horizontal("settings-close-action-options")
-            .selected_index(match close_action {
+            .selected_index(match effective_close {
                 CloseAction::Tray => Some(0),
                 CloseAction::Quit => Some(1),
             })
+            .disabled(!tray_on)
             .on_change(move |ix, window, cx| {
                 let action = match ix {
                     0 => CloseAction::Tray,
@@ -658,9 +668,46 @@ impl SettingsState {
             self,
             "settings-row-window-behaviour",
             "Window behaviour",
-            Some(close_action.explanation().to_string()),
+            Some(if tray_on {
+                close_action.explanation().to_string()
+            } else {
+                "Show tray icon is off, so closing quits. The saved choice returns when the icon is back."
+                    .to_string()
+            }),
             muted,
             group,
+        ));
+
+        // Task 14: the icon is the one way back from a hidden window, so its
+        // switch also owns what closing means — and says so when it goes off.
+        let show_tray_cell = self.show_tray.clone();
+        let show_tray_view = self.view.clone();
+        let show_tray = *show_tray_cell.borrow();
+        body = body.child(settings_row(
+            self,
+            "settings-row-show-tray",
+            "Show tray icon",
+            Some(if show_tray {
+                "Keeps an icon in the notification area so the window can close while proxies keep running."
+                    .to_string()
+            } else {
+                "The icon is hidden, so closing ManyProxy quits. Turn this on to close to the tray again."
+                    .to_string()
+            }),
+            muted,
+            Switch::new("settings-show-tray-switch")
+                .checked(show_tray)
+                .accessibility_label("Show tray icon")
+                .on_change(move |next: &bool, window, cx| {
+                    let next = *next;
+                    let cell = show_tray_cell.clone();
+                    show_tray_view.update(cx, |view, cx| {
+                        if view.commit_show_tray_icon(next, window, cx) {
+                            *cell.borrow_mut() = next;
+                            cx.notify();
+                        }
+                    });
+                }),
         ));
 
         // Task 12: the frame's outer corners are an OS preference, not app
@@ -1729,6 +1776,55 @@ impl AppView {
         }
     }
 
+    /// Task 14: own the tray icon at runtime. Off drops the icon and, by
+    /// removing the only way back from a hidden window, makes close mean Quit;
+    /// on rebuilds the icon. The stored close choice is untouched, so it
+    /// returns with the icon.
+    pub(crate) fn commit_show_tray_icon(
+        &mut self,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_show_tray_icon(show) {
+            Ok(()) => {
+                if show {
+                    if self.create_tray(window, cx) {
+                        window.push_notification(Notification::success("Tray icon: shown"), cx);
+                    }
+                } else {
+                    self.tray = None;
+                    if self.store.seen_tray_disable_hint() {
+                        window.push_notification(
+                            Notification::info("Tray icon hidden — closing now quits"),
+                            cx,
+                        );
+                    } else {
+                        if let Err(error) = self.store.set_seen_tray_disable_hint(true) {
+                            eprintln!("tray disable hint flag failed: {error}");
+                        }
+                        window.push_notification(
+                            Notification::warning(
+                                "Tray icon hidden — closing ManyProxy now quits. Turn Show tray icon back on to close to the tray again.",
+                            ),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Tray icon change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     /// T-04: how long one URL probe may take.
     pub(crate) fn commit_probe_timeout(
         &mut self,
@@ -1947,12 +2043,12 @@ impl AppView {
         cx.notify();
     }
 
-    /// T-04: the close button's route. `Tray` hides the window only when a
-    /// tray is there to hide to; without one there is nothing to hide to, so
-    /// the close takes the quit path. `Quit` always takes it.
+    /// T-04/Task 14: the close button's route. `Tray` hides the window only
+    /// when the icon setting is on and a tray actually exists to hide to;
+    /// otherwise there is nothing to hide to, so the close takes the quit path.
     pub(crate) fn close_route(&self, has_tray: bool) -> CloseRoute {
         match self.store.close_action() {
-            CloseAction::Tray if has_tray => CloseRoute::HideToTray,
+            CloseAction::Tray if has_tray && self.store.show_tray_icon() => CloseRoute::HideToTray,
             _ => CloseRoute::Quit,
         }
     }
@@ -1997,6 +2093,7 @@ impl AppView {
                 .default_value(self.store.text_size().percent() as f32)
         });
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
+        let show_tray_state = Rc::new(RefCell::new(self.store.show_tray_icon()));
         let window_corners_state = Rc::new(RefCell::new(self.store.window_corners()));
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
         let last_check_state = Rc::new(RefCell::new(self.store.last_update_check()));
@@ -2202,6 +2299,7 @@ impl AppView {
             auto_restart: auto_restart_state.clone(),
             notify_from_tray: notify_from_tray_state.clone(),
             close_action: close_action_state.clone(),
+            show_tray: show_tray_state.clone(),
             window_corners: window_corners_state.clone(),
             test_all_scope: test_all_scope_state.clone(),
             bind_hosts: bind_hosts_cell.clone(),
