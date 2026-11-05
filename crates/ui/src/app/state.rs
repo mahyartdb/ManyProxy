@@ -361,6 +361,7 @@ impl AppView {
 
         apply_appearance(&store.appearance(), store.accent(), Some(window), cx);
         apply_text_size(store.text_size(), cx);
+        crate::os::window::apply_corner_preference(window, store.window_corners());
         // K5: the toast park rides `apply_appearance` (bottom-right above the
         // status bar, max 2) so it survives every theme change for free.
 
@@ -444,6 +445,7 @@ impl AppView {
             import_cancel_epoch: None,
             close_confirmed: false,
             tray: None,
+            window_was_maximized: false,
             os_taskbar: None,
             os_notifier: None,
             os_notice_policy: crate::os::notify::NoticePolicy::default(),

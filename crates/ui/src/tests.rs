@@ -25191,6 +25191,8 @@ fn settings_spine_lists_one_column_and_filters_it(cx: &mut TestAppContext) {
         scroll_settings_into_view(cx, id);
         assert_painted(cx, id);
     }
+    scroll_settings_into_view(cx, "settings-row-window-corners");
+    assert_painted(cx, "settings-row-window-corners");
     // The link-handler row makes General taller than one viewport; Probing is
     // still there, one small scroll down.
     scroll_settings_into_view(cx, "settings-body-probing");
@@ -25822,6 +25824,45 @@ fn accent_choice_persists_paints_live_and_survives_a_theme_swap(cx: &mut TestApp
             "blue restores the kit's selection, got {selection:?}"
         );
     });
+}
+
+#[gpui_kit::test]
+fn window_corner_choice_persists_and_paints_in_settings(cx: &mut TestAppContext) {
+    use crate::store::WindowCorners;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-window-corners");
+    assert_painted(cx, "settings-row-window-corners");
+
+    let before = notification_count(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_window_corners(WindowCorners::Square, window, cx),
+                "Square commits"
+            );
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.window_corners()),
+        WindowCorners::Square,
+        "the pick persists"
+    );
+    assert_eq!(notification_count(cx), before + 1, "the pick toasts once");
+
+    // The OS call is best-effort under the harness (no HWND); it must not
+    // panic, and the choice stays readable for the next boot's apply.
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.window_corners()),
+        WindowCorners::Square
+    );
 }
 
 #[gpui_kit::test]

@@ -206,6 +206,7 @@ struct SettingsState {
     auto_restart: Rc<RefCell<bool>>,
     notify_from_tray: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
+    window_corners: Rc<RefCell<WindowCorners>>,
     test_all_scope: Rc<RefCell<TestAllScope>>,
     bind_hosts: Rc<RefCell<Vec<String>>>,
     bind_host_error: Rc<RefCell<Option<String>>>,
@@ -640,6 +641,45 @@ impl SettingsState {
             Some(close_action.explanation().to_string()),
             muted,
             group,
+        ));
+
+        // Task 12: the frame's outer corners are an OS preference, not app
+        // paint, so the radio saves and asks DWM; Windows 10 ignores it.
+        let corners_cell = self.window_corners.clone();
+        let corners_view = self.view.clone();
+        let corners = *corners_cell.borrow();
+        let mut corner_group = RadioGroup::horizontal("settings-window-corners-options")
+            .selected_index(
+                WindowCorners::ALL
+                    .iter()
+                    .position(|choice| *choice == corners),
+            )
+            .on_change(move |ix, window, cx| {
+                let Some(corners) = WindowCorners::ALL.get(*ix).copied() else {
+                    return;
+                };
+                let cell = corners_cell.clone();
+                corners_view.update(cx, |view, cx| {
+                    if view.commit_window_corners(corners, window, cx) {
+                        *cell.borrow_mut() = corners;
+                        cx.notify();
+                    }
+                });
+            });
+        for choice in WindowCorners::ALL {
+            corner_group = corner_group.child(
+                Radio::new(choice.label())
+                    .label(choice.label().to_string())
+                    .tooltip(choice.explanation()),
+            );
+        }
+        body = body.child(settings_row(
+            self,
+            "settings-row-window-corners",
+            "Window corners",
+            Some(corners.explanation().to_string()),
+            muted,
+            corner_group,
         ));
 
         // Task 10: failures that happen while the window is hidden reach the
@@ -1639,6 +1679,36 @@ impl AppView {
         }
     }
 
+    /// Task 12: save the frame style and hand it to DWM at once. The attribute
+    /// is unknown below Windows 11, so a failure there leaves stock corners and
+    /// is not a user error.
+    pub(crate) fn commit_window_corners(
+        &mut self,
+        corners: WindowCorners,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_window_corners(corners) {
+            Ok(()) => {
+                crate::os::window::apply_corner_preference(window, corners);
+                window.push_notification(
+                    Notification::success(format!("Window corners: {}", corners.label())),
+                    cx,
+                );
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Window corners change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     /// T-04: how long one URL probe may take.
     pub(crate) fn commit_probe_timeout(
         &mut self,
@@ -1900,6 +1970,7 @@ impl AppView {
         let accent_state = Rc::new(RefCell::new(self.store.accent()));
         let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
+        let window_corners_state = Rc::new(RefCell::new(self.store.window_corners()));
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
         let last_check_state = Rc::new(RefCell::new(self.store.last_update_check()));
 
@@ -2072,6 +2143,7 @@ impl AppView {
             auto_restart: auto_restart_state.clone(),
             notify_from_tray: notify_from_tray_state.clone(),
             close_action: close_action_state.clone(),
+            window_corners: window_corners_state.clone(),
             test_all_scope: test_all_scope_state.clone(),
             bind_hosts: bind_hosts_cell.clone(),
             bind_host_error: bind_host_error_cell.clone(),

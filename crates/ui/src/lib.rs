@@ -261,6 +261,11 @@ struct AppView {
 
     tray: Option<crate::tray::TrayHandle>,
 
+    /// Task 12: DWM can drop the corner preference when the window leaves the
+    /// maximized state, so render re-applies the stored style on that edge
+    /// only — never once per frame.
+    window_was_maximized: bool,
+
     /// Taskbar progress + thumbnail toolbar. `None` until the main window's
     /// handle exists; the install is a no-op under the test harness.
     os_taskbar: Option<crate::os::taskbar::Taskbar>,

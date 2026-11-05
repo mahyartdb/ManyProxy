@@ -228,6 +228,69 @@ impl Accent {
     }
 }
 
+/// Task 12: the Windows 11 frame corner style. `Auto` leaves the DWM default
+/// (rounded on Windows 11); the other choices ask DWM for that shape. Below
+/// Windows 11 the attribute is unknown and the preference is a no-op.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WindowCorners {
+    #[default]
+    Auto,
+    Rounded,
+    Small,
+    Square,
+}
+
+impl WindowCorners {
+    pub const ALL: [WindowCorners; 4] = [
+        WindowCorners::Auto,
+        WindowCorners::Rounded,
+        WindowCorners::Small,
+        WindowCorners::Square,
+    ];
+
+    /// The value written to the store's meta table.
+    pub fn stored(self) -> &'static str {
+        match self {
+            WindowCorners::Auto => "auto",
+            WindowCorners::Rounded => "rounded",
+            WindowCorners::Small => "small",
+            WindowCorners::Square => "square",
+        }
+    }
+
+    /// Reads a stored value back. Anything unknown is `None`, so the caller
+    /// falls back to the default instead of guessing.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "auto" => Some(WindowCorners::Auto),
+            "rounded" => Some(WindowCorners::Rounded),
+            "small" => Some(WindowCorners::Small),
+            "square" => Some(WindowCorners::Square),
+            _ => None,
+        }
+    }
+
+    /// The label the Settings radio shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowCorners::Auto => "Auto",
+            WindowCorners::Rounded => "Rounded",
+            WindowCorners::Small => "Small",
+            WindowCorners::Square => "Square",
+        }
+    }
+
+    /// The one-line explanation under the selected radio.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            WindowCorners::Auto => "Follow the Windows 11 frame default.",
+            WindowCorners::Rounded => "Round the window's outer corners.",
+            WindowCorners::Small => "Use the smaller Windows 11 corner radius.",
+            WindowCorners::Square => "Square off the window's outer corners.",
+        }
+    }
+}
+
 /// T-04: which rows a "Test all" run covers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TestAllScope {
@@ -8266,6 +8329,21 @@ impl Store {
         self.set_meta(Self::META_ACCENT, accent.stored())
     }
 
+    pub const META_WINDOW_CORNERS: &str = "window_corners";
+
+    /// Task 12: the Windows 11 frame corner style. A missing or corrupt value
+    /// reads as `Auto`, which leaves the DWM default alone.
+    pub fn window_corners(&self) -> WindowCorners {
+        match self.get_meta(Self::META_WINDOW_CORNERS) {
+            Ok(Some(raw)) => WindowCorners::from_stored(&raw).unwrap_or_default(),
+            _ => WindowCorners::default(),
+        }
+    }
+
+    pub fn set_window_corners(&mut self, corners: WindowCorners) -> Result<(), StoreError> {
+        self.set_meta(Self::META_WINDOW_CORNERS, corners.stored())
+    }
+
     /// K12: the window's reading scale. A missing or corrupt value reads as
     /// `Default`, so a legacy library opens at the stock size.
     pub fn text_size(&self) -> TextSize {
@@ -15502,6 +15580,31 @@ mod tests {
             .set_meta(Store::META_ACCENT, "chartreuse")
             .expect("raw write");
         assert_eq!(store.accent(), Accent::Blue, "corrupt reads blue");
+    }
+
+    #[test]
+    fn window_corners_default_auto_and_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.window_corners(), WindowCorners::Auto, "default auto");
+        for corners in WindowCorners::ALL {
+            store
+                .set_window_corners(corners)
+                .expect("every choice writes");
+            assert_eq!(
+                store.window_corners(),
+                corners,
+                "{} reads back",
+                corners.label()
+            );
+        }
+        store
+            .set_meta(Store::META_WINDOW_CORNERS, "hexagon")
+            .expect("raw write");
+        assert_eq!(
+            store.window_corners(),
+            WindowCorners::Auto,
+            "corrupt reads auto"
+        );
     }
 
     #[test]

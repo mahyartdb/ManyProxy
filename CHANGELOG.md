@@ -14,6 +14,7 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - Sort headers are buttons: click, Enter, or Space sorts by that column and reverses on a second press, and the command palette carries every sort key plus Reverse and Clear.
 - A `Text size` setting in Settings → General scales the window's text to 100% or 125%, and the palette's `Toggle large text` flips it.
 - Settings → General has an accent color picker: blue (the default), indigo, violet, magenta, rose, teal, and amber. A pick tints selection, checked controls, the focus ring, and active pills at once; health and error colors never follow it.
+- Settings → General has a `Window corners` choice — Auto, Rounded, Small, Square — applied through Windows 11's DWM frame preference. Windows 10 and older ignore it and keep their stock corners.
 - Filter row `Search · Group · N of M`. Clicking a row's status lamp filters by that endpoint state. The eight-way status dropdown is gone; Enabled and Disabled live under the Group menu.
 - Checked-set bulk bar: `N checked (of M)` with Start, Stop, and `More ▾`. Checked rows carry a 3px accent bar and a filled chip. `Copy proxies` copies the running endpoints as one sheet, and bulk verbs route through the batch engine ops.
 - Toasts, bottom-right above the status bar, at most two at a time: batched test sweeps (`Testing N…` then one `Tested N: X live · Y dead`), single-row test results, and delete with Undo. Deletion is immediate. An 8-second stash restores the rows and their group assignments, and expiry is permanent.
