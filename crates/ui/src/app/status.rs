@@ -24,7 +24,7 @@ impl AppView {
             }
         };
         let filter_text = delegate.active_filter_text();
-        let engine_text = self.engine.status_text();
+        let engine_text = engine_status_text(&self.engine);
         let health_text = self.health_status_text();
         let usage_text = summed_traffic_text(&self.store);
         // A crash names its cause in `status_text` and stores the same words
@@ -171,7 +171,7 @@ impl AppView {
                 // B19: the chip is one fixed token, so the zone's squeeze
                 // lands on the traffic numbers (they truncate), never here.
                 .flex_shrink_0()
-                .aria_label("Command palette (Ctrl+K)")
+                .aria_label(t!("status-palette-hint"))
                 .child(shortcut_kbd("ctrl-k", "Ctrl+K")),
         );
 
@@ -206,8 +206,8 @@ impl AppView {
             .child(if has_query {
                 Button::new("clear-search")
                     .small()
-                    .label("Clear search")
-                    .tooltip("Clear the search query (keeps facet filters and checked)")
+                    .label(t!("status-clear-search"))
+                    .tooltip(t!("status-clear-search-tip"))
                     .on_click(move |_, window, cx| {
                         clear_view.update(cx, |view, cx| {
                             view.clear_library_search(window, cx);

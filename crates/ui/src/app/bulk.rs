@@ -9,7 +9,7 @@ use crate::*;
 /// once — no blocking confirm — and the Undo toast is the safety net.
 fn bulk_menu_item(
     id: &'static str,
-    label: &'static str,
+    label: String,
     danger: bool,
     view: Entity<AppView>,
     act: impl Fn(&mut AppView, &mut Window, &mut Context<AppView>) + 'static,
@@ -19,12 +19,12 @@ fn bulk_menu_item(
             .id(id)
             .test_support()
             .role(Role::MenuItem)
-            .aria_label(label)
+            .aria_label(label.clone())
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .child(label);
+            .child(label.clone());
         if danger {
             row.text_color(danger_text_color(cx.theme()))
         } else {
@@ -73,21 +73,14 @@ impl AppView {
                         // B19: the count is the bar's only status text, so it
                         // names itself like every other bar segment does.
                         .aria_label(label.clone())
-                        .tooltip(|_, cx| {
-                            cx.new(|_| {
-                                Tooltip::new(
-                                    "Blue wash = selected (F5). Blue bar + filled checkbox = checked (bulk).",
-                                )
-                            })
-                            .into()
-                        })
+                        .tooltip(|_, cx| cx.new(|_| Tooltip::new(t!("bulk-tooltip"))).into())
                         .child(label),
                 )
                 .child(
                     Button::new("bulk-start")
                         .small()
-                        .label("Start")
-                        .tooltip("Start every checked endpoint")
+                        .label(t!("bulk-start"))
+                        .tooltip(t!("bulk-start-tip"))
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_start(window, cx);
                         })),
@@ -95,8 +88,8 @@ impl AppView {
                 .child(
                     Button::new("bulk-stop")
                         .small()
-                        .label("Stop")
-                        .tooltip("Stop every checked endpoint")
+                        .label(t!("bulk-stop"))
+                        .tooltip(t!("bulk-stop-tip"))
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_stop(window, cx);
                         })),
@@ -104,21 +97,21 @@ impl AppView {
                 .child(
                     Button::new("bulk-more")
                         .small()
-                        .label("More")
+                        .label(t!("bulk-more"))
                         .dropdown_caret(true)
-                        .accessibility_label("More bulk actions")
-                        .tooltip("Move, copy, or delete the checked rows")
+                        .accessibility_label(t!("bulk-more-aria"))
+                        .tooltip(t!("bulk-more-tip"))
                         .dropdown_menu(move |menu, _, _| {
                             menu.item(bulk_menu_item(
                                 "bulk-more-select-visible",
-                                "Check all visible",
+                                t!("bulk-check-visible"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.select_visible_checked(window, cx),
                             ))
                             .item(bulk_menu_item(
                                 "bulk-more-clear",
-                                "Uncheck all",
+                                t!("bulk-uncheck-all"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.clear_checked(window, cx),
@@ -126,14 +119,14 @@ impl AppView {
                             .separator()
                             .item(bulk_menu_item(
                                 "bulk-more-move",
-                                "Move to group",
+                                t!("bulk-move"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.open_bulk_move_dialog(window, cx),
                             ))
                             .item(bulk_menu_item(
                                 "bulk-more-copy",
-                                "Copy proxies",
+                                t!("bulk-copy-proxies"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.commit_bulk_copy_proxies(window, cx),
@@ -141,7 +134,7 @@ impl AppView {
                             .separator()
                             .item(bulk_menu_item(
                                 "bulk-more-delete",
-                                "Delete",
+                                t!("bulk-delete"),
                                 true,
                                 more_view.clone(),
                                 |view, window, cx| view.bulk_delete_checked(window, cx),

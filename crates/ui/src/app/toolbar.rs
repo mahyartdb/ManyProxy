@@ -19,42 +19,39 @@ impl AppView {
         let running = self.engine.running_count();
         let busy = self.start_in_flight;
         let show_security = self.libraries.read(cx).delegate().show_security;
-        let (glyph, name) = global_toggle_present(running, busy);
+        let (glyph, name) = global_toggle_text(running, busy);
         let toggle_tip = if busy {
-            "Starting every endpoint…"
+            t!("toolbar-starting-tip")
         } else if running == 0 {
-            "Start every configuration"
+            t!("toolbar-start-all-tip")
         } else {
-            "Stop every endpoint"
+            t!("toolbar-stop-all-tip")
         };
         div()
             .id("manyproxy-toolbar")
             .flex()
             .flex_row()
-
             .flex_nowrap()
             .items_center()
             .gap_1()
             .p_2()
-
             .border_b_1()
             .border_color(cx.theme().border)
-
             .child(
                 Button::new("program-menu")
                     .small()
-                    .label("Program")
-                    .accessibility_label("Program")
-                    .tooltip("App and single-config intake")
+                    .label(t!("toolbar-program"))
+                    .accessibility_label(t!("toolbar-program"))
+                    .tooltip(t!("toolbar-program-tip"))
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "export-library",
-                                    "Export…",
-                                    "Export…",
-                                    "Export library to JSON",
+                                    t!("toolbar-export"),
+                                    t!("toolbar-export"),
+                                    t!("toolbar-export-tip"),
                                     None,
                                 )
                             })
@@ -71,9 +68,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "about-dialog",
-                                    "About",
-                                    "About",
-                                    "Version, sidecars, shortcuts",
+                                    t!("toolbar-about"),
+                                    t!("toolbar-about"),
+                                    t!("toolbar-about-tip"),
                                     None,
                                 )
                             })
@@ -88,33 +85,31 @@ impl AppView {
                         )
                     }),
             )
-
             .child(
                 Button::new("settings-menu")
                     .small()
-                    .label("Settings")
-                    .accessibility_label("Settings")
-                    .tooltip("Settings")
+                    .label(t!("action-settings"))
+                    .accessibility_label(t!("action-settings"))
+                    .tooltip(t!("toolbar-settings-tip"))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_settings_dialog(window, cx);
                     })),
             )
-
             .child(
                 Button::new("groups-menu")
                     .small()
-                    .label("Library")
-                    .accessibility_label("Library")
-                    .tooltip("Subscriptions, groups, and cleanup")
+                    .label(t!("toolbar-library"))
+                    .accessibility_label(t!("toolbar-library"))
+                    .tooltip(t!("toolbar-library-tip"))
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "subscriptions",
-                                    "Subscriptions…",
-                                    "Subscriptions…",
-                                    "Manage subscription lists",
+                                    t!("toolbar-subscriptions"),
+                                    t!("toolbar-subscriptions"),
+                                    t!("toolbar-subscriptions-tip"),
                                     None,
                                 )
                             })
@@ -131,9 +126,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "menu-groups-dialog",
-                                    "Groups…",
-                                    "Groups…",
-                                    "Rename or merge groups",
+                                    t!("toolbar-groups"),
+                                    t!("toolbar-groups"),
+                                    t!("toolbar-groups-tip"),
                                     None,
                                 )
                             })
@@ -146,14 +141,14 @@ impl AppView {
                                 }
                             }),
                         )
-
                         .item(
                             PopupMenuItem::element(|_, _| {
+                                let label = group_prune_label(GroupPruneKind::Duplicates);
                                 topbar_menu_row(
                                     "prune-duplicates",
-                                    GroupPruneKind::Duplicates.label(),
-                                    GroupPruneKind::Duplicates.label(),
-                                    "Remove later copies in the focused group (asks first)",
+                                    label.clone(),
+                                    label,
+                                    t!("toolbar-prune-duplicates-tip"),
                                     None,
                                 )
                             })
@@ -172,11 +167,12 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
+                                let label = group_prune_label(GroupPruneKind::Unavailable);
                                 topbar_menu_row(
                                     "prune-unavailable",
-                                    GroupPruneKind::Unavailable.label(),
-                                    GroupPruneKind::Unavailable.label(),
-                                    "Remove dead rows in the focused group (asks first)",
+                                    label.clone(),
+                                    label,
+                                    t!("toolbar-prune-unavailable-tip"),
                                     None,
                                 )
                             })
@@ -195,11 +191,12 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
+                                let label = group_prune_label(GroupPruneKind::Invalid);
                                 topbar_menu_row(
                                     "prune-invalid",
-                                    GroupPruneKind::Invalid.label(),
-                                    GroupPruneKind::Invalid.label(),
-                                    "Remove validation-failing rows in the focused group (asks first)",
+                                    label.clone(),
+                                    label,
+                                    t!("toolbar-prune-invalid-tip"),
                                     None,
                                 )
                             })
@@ -218,11 +215,12 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
+                                let label = group_prune_label(GroupPruneKind::ClearTests);
                                 topbar_menu_row(
                                     "prune-clear-tests",
-                                    GroupPruneKind::ClearTests.label(),
-                                    GroupPruneKind::ClearTests.label(),
-                                    "Clear test results in the focused group (rows kept, asks first)",
+                                    label.clone(),
+                                    label,
+                                    t!("toolbar-prune-clear-tests-tip"),
                                     None,
                                 )
                             })
@@ -241,22 +239,21 @@ impl AppView {
                         )
                     }),
             )
-
             .child(
                 Button::new("routing-menu")
                     .small()
-                    .label("Routing")
-                    .accessibility_label("Routing")
-                    .tooltip("Routing presets and settings")
+                    .label(t!("toolbar-routing"))
+                    .accessibility_label(t!("toolbar-routing"))
+                    .tooltip(t!("toolbar-routing-tip"))
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "routing-presets",
-                                    "Routing presets",
-                                    "Routing presets",
-                                    "Manage routing presets",
+                                    t!("toolbar-routing-presets"),
+                                    t!("toolbar-routing-presets"),
+                                    t!("toolbar-routing-presets-tip"),
                                     None,
                                 )
                             })
@@ -273,9 +270,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "routing-attach-selected",
-                                    "Attach preset to selected row",
-                                    "Attach preset to selected row",
-                                    "Pick a routing preset for the selected row",
+                                    t!("toolbar-attach-preset"),
+                                    t!("toolbar-attach-preset"),
+                                    t!("toolbar-attach-preset-tip"),
                                     None,
                                 )
                             })
@@ -292,9 +289,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "routing-open-settings",
-                                    "Settings",
-                                    "Settings",
-                                    "Open Settings",
+                                    t!("action-settings"),
+                                    t!("action-settings"),
+                                    t!("toolbar-open-settings-tip"),
                                     None,
                                 )
                             })
@@ -309,22 +306,21 @@ impl AppView {
                         )
                     }),
             )
-
             .child(
                 Button::new("tools-menu")
                     .small()
-                    .label("Tools")
-                    .accessibility_label("Tools")
-                    .tooltip("Selection, diagnostics, and commands")
+                    .label(t!("toolbar-tools"))
+                    .accessibility_label(t!("toolbar-tools"))
+                    .tooltip(t!("toolbar-tools-tip"))
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "engine-start-all",
-                                    "Start all",
-                                    "Start all",
-                                    "Start every configuration",
+                                    t!("action-start-all"),
+                                    t!("action-start-all"),
+                                    t!("toolbar-start-all-tip"),
                                     None,
                                 )
                             })
@@ -341,9 +337,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "engine-stop-all",
-                                    "Stop all",
-                                    "Stop all",
-                                    "Stop every endpoint",
+                                    t!("action-stop-all"),
+                                    t!("action-stop-all"),
+                                    t!("toolbar-stop-all-tip"),
                                     None,
                                 )
                             })
@@ -360,9 +356,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "health-test-all",
-                                    "Test all",
-                                    "Test all",
-                                    "Test every running endpoint",
+                                    t!("toolbar-test-all"),
+                                    t!("toolbar-test-all"),
+                                    t!("toolbar-test-all-tip"),
                                     None,
                                 )
                             })
@@ -379,9 +375,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "stop-testing",
-                                    "Stop Testing",
-                                    "Stop Testing",
-                                    "Stop the running group test",
+                                    t!("toolbar-stop-testing"),
+                                    t!("toolbar-stop-testing"),
+                                    t!("toolbar-stop-testing-tip"),
                                     Some(("ctrl-.", "(Ctrl-.)", "Ctrl-.")),
                                 )
                             })
@@ -397,7 +393,13 @@ impl AppView {
                         .separator()
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                topbar_menu_row("menu-logs", "Logs", "Logs", "Sidecar output", None)
+                                topbar_menu_row(
+                                    "menu-logs",
+                                    t!("toolbar-logs"),
+                                    t!("toolbar-logs"),
+                                    t!("toolbar-logs-tip"),
+                                    None,
+                                )
                             })
                             .on_click({
                                 let view = tools_view.clone();
@@ -412,9 +414,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "runtime-stats",
-                                    "Runtime stats",
-                                    "Runtime stats",
-                                    "Process health on one screen",
+                                    t!("toolbar-runtime-stats"),
+                                    t!("toolbar-runtime-stats"),
+                                    t!("toolbar-runtime-stats-tip"),
                                     None,
                                 )
                             })
@@ -431,9 +433,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "traffic-stats",
-                                    "Traffic stats",
-                                    "Traffic stats",
-                                    "Per-exit traffic with period and By Profile",
+                                    t!("toolbar-traffic-stats"),
+                                    t!("toolbar-traffic-stats"),
+                                    t!("toolbar-traffic-stats-tip"),
                                     None,
                                 )
                             })
@@ -451,9 +453,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "show-security",
-                                    "Show security",
-                                    "Show security",
-                                    "Toggle the transport-security column",
+                                    t!("toolbar-show-security"),
+                                    t!("toolbar-show-security"),
+                                    t!("toolbar-show-security-tip"),
                                     None,
                                 )
                             })
@@ -471,9 +473,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "check-for-updates",
-                                    "Check for updates",
-                                    "Check for updates",
-                                    "Fetch the release feed once (JSON only — nothing downloads or runs)",
+                                    t!("toolbar-check-updates"),
+                                    t!("toolbar-check-updates"),
+                                    t!("toolbar-check-updates-tip"),
                                     None,
                                 )
                             })
@@ -490,9 +492,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "menu-row-columns",
-                                    "Row columns",
-                                    "Row columns",
-                                    "Choose which columns each library row shows",
+                                    t!("toolbar-row-columns"),
+                                    t!("toolbar-row-columns"),
+                                    t!("toolbar-row-columns-tip"),
                                     None,
                                 )
                             })
@@ -509,9 +511,9 @@ impl AppView {
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
                                     "open-palette",
-                                    "Command palette",
-                                    "Command palette",
-                                    "Every action, searchable (Ctrl-K)",
+                                    t!("action-command-palette"),
+                                    t!("action-command-palette"),
+                                    t!("toolbar-palette-tip"),
                                     Some(("ctrl-k", "(Ctrl-K)", "Ctrl-K")),
                                 )
                             })
@@ -526,17 +528,15 @@ impl AppView {
                         )
                     }),
             )
-
             .child(div().flex_1())
-
             // T-03: the two intake actions ride the top right: Add is the
             // primary commitment, Import sits beside it.
             .child(
                 Button::new("toolbar-import")
                     .small()
-                    .label("Import")
-                    .accessibility_label("Import")
-                    .tooltip("Import share links or files (Ctrl-O)")
+                    .label(t!("action-import"))
+                    .accessibility_label(t!("action-import"))
+                    .tooltip(t!("toolbar-import-tip"))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_import_config(window, cx);
                     })),
@@ -545,14 +545,13 @@ impl AppView {
                 Button::new("toolbar-add-config")
                     .small()
                     .primary()
-                    .label("+ Add configuration")
-                    .accessibility_label("Add configuration")
-                    .tooltip("Add a proxy configuration (Ctrl-N)")
+                    .label(t!("action-add-config"))
+                    .accessibility_label(t!("action-add-config-accessible"))
+                    .tooltip(t!("action-add-config-tip"))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_add_config(window, cx);
                     })),
             )
-
             .child(
                 Button::new("global-start-stop")
                     .small()

@@ -1535,13 +1535,13 @@ impl AppView {
             return None;
         }
         match id {
-            "start" => Some(format!("Start {count} configurations")),
-            "stop" => Some(format!("Stop {count} configurations")),
-            "test" => Some(format!("Test {count} configurations")),
-            "copy-urls" => Some(format!("Copy {count} URLs")),
-            "copy-proxy" => Some(format!("Copy {count} SOCKS URLs")),
-            "move" => Some(format!("Move {count} configurations to group")),
-            "delete" => Some(format!("Delete {count} configurations")),
+            "start" => Some(t!("rowctx-multi-start", count = count)),
+            "stop" => Some(t!("rowctx-multi-stop", count = count)),
+            "test" => Some(t!("rowctx-multi-test", count = count)),
+            "copy-urls" => Some(t!("rowctx-multi-copy-urls", count = count)),
+            "copy-proxy" => Some(t!("rowctx-multi-copy-proxy", count = count)),
+            "move" => Some(t!("rowctx-multi-move", count = count)),
+            "delete" => Some(t!("rowctx-multi-delete", count = count)),
             _ => None,
         }
     }
@@ -1598,7 +1598,7 @@ impl AppView {
         let reset_id = row_id.to_string();
         let reset_view = view.clone();
         let menu = menu
-            .submenu("Reset…", window, cx, move |menu, _, _| {
+            .submenu(t!("rowctx-reset"), window, cx, move |menu, _, _| {
                 ["reset-traffic", "reset-usage"]
                     .into_iter()
                     .fold(menu, |menu, id| {
@@ -1608,7 +1608,7 @@ impl AppView {
             .item(Self::row_context_item("delete", row_id, view, multi_count));
         let more_id = row_id.to_string();
         let more_view = view.clone();
-        menu.submenu("More ▾", window, cx, move |menu, _, _| {
+        menu.submenu(t!("rowctx-more"), window, cx, move |menu, _, _| {
             ["move", "copy-urls", "share", "duplicate", "ping"]
                 .into_iter()
                 .fold(menu, |menu, id| {
@@ -1633,13 +1633,17 @@ impl AppView {
         config: &ProxyConfig,
     ) -> impl IntoElement {
         let row_view = cx.entity();
-        let auto_note = (if config.enabled { "On" } else { "Off" }).to_string();
+        let auto_note = if config.enabled {
+            t!("row-kebab-on")
+        } else {
+            t!("row-kebab-off")
+        };
 
         Button::new("row-menu")
             .small()
             .label("…")
-            .accessibility_label("More actions")
-            .tooltip("More actions for the selected endpoint")
+            .accessibility_label(t!("row-kebab-aria"))
+            .tooltip(t!("row-kebab-tip"))
             .dropdown_menu(move |menu, _, _| {
                 let view = row_view.clone();
                 let note = auto_note.clone();

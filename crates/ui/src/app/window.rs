@@ -39,12 +39,12 @@ impl TitlebarControl {
 
     /// The maximize cell turns into a restore affordance while maximized, but
     /// keeps its stable id so tests and the platform hit-test never chase it.
-    pub(crate) fn label(self, maximized: bool) -> &'static str {
+    pub(crate) fn label(self, maximized: bool) -> String {
         match self {
-            TitlebarControl::Minimize => "Minimize the window",
-            TitlebarControl::Maximize if maximized => "Restore the window",
-            TitlebarControl::Maximize => "Maximize the window",
-            TitlebarControl::Close => "Close the window",
+            TitlebarControl::Minimize => t!("titlebar-minimize"),
+            TitlebarControl::Maximize if maximized => t!("titlebar-restore"),
+            TitlebarControl::Maximize => t!("titlebar-maximize"),
+            TitlebarControl::Close => t!("titlebar-close"),
         }
     }
 
@@ -307,7 +307,7 @@ pub(crate) fn app_window_options(
 ) -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
-        titlebar.title = Some(APP_TITLE.into());
+        titlebar.title = Some(t!("app-title").into());
     }
     options.window_bounds = Some(bounds);
     options.window_min_size = Some(window_min_size(visible_bounds));

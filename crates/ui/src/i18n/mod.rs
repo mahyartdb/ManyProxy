@@ -123,7 +123,15 @@ impl Cache {
         if !self.bundles.contains_key(locale) {
             let source = source_for(locale)?;
             let langid: LanguageIdentifier = locale.parse().ok()?;
-            let resource = FluentResource::try_new(source.to_string()).ok()?;
+            let resource = match FluentResource::try_new(source.to_string()) {
+                Ok(resource) => resource,
+                Err((_, errors)) => {
+                    if log_once(&format!("parse:{locale}")) {
+                        eprintln!("i18n: failed to parse {locale}: {errors:?}");
+                    }
+                    return None;
+                }
+            };
             let mut bundle = FluentBundle::new_concurrent(vec![langid]);
             // Fluent wraps placeholders in bidi isolates by default. English
             // copy must stay byte-identical, so isolation is off.

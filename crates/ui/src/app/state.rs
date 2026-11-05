@@ -333,7 +333,7 @@ impl AppView {
         let last_query = store.library_last_query().unwrap_or_default();
         let search_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(SEARCH_PLACEHOLDER)
+                .placeholder(crate::search_placeholder())
                 .default_value(last_query.clone())
         });
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
@@ -1621,7 +1621,7 @@ impl AppView {
         });
         if let Err(error) = self.store.set_library_columns(&columns.display()) {
             window.push_notification(
-                Notification::error(format!("Could not save column choice: {error}")),
+                Notification::error(t!("row-columns-save-failed", error = error.to_string())),
                 cx,
             );
         }
@@ -2040,7 +2040,7 @@ impl AppView {
     /// so the list learns it is waiting from one place and never has to read
     /// the app's in-flight set while a frame is borrowing it.
     pub(crate) fn mark_library_loading(&mut self, cx: &mut App) {
-        let load = LibraryLoad::Loading("Fetching subscriptions…".to_string());
+        let load = LibraryLoad::Loading(t!("library-loading-subscriptions"));
         self.libraries.update(cx, |state, cx| {
             if state.delegate_mut().set_load(load) {
                 cx.notify();

@@ -13978,7 +13978,7 @@ fn t44_ui_facets_filter_and_clear(cx: &mut TestAppContext) {
     );
 
     for status in crate::FacetStatus::ALL {
-        let parsed = crate::FacetStatus::from_label(status.label());
+        let parsed = crate::FacetStatus::from_label(&status.label());
         assert_eq!(parsed, Some(status), "label round-trips");
     }
     assert_eq!(crate::FacetStatus::from_label("Nope"), None);
@@ -23570,7 +23570,7 @@ fn ticket03_search_count_persistent_with_live_count(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     assert_eq!(
-        crate::SEARCH_PLACEHOLDER,
+        crate::search_placeholder(),
         "Search configurations",
         "search field placeholder pinned"
     );
@@ -23815,7 +23815,7 @@ fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
-        crate::SEARCH_PLACEHOLDER,
+        crate::search_placeholder(),
         "Search configurations",
         "search field placeholder pinned"
     );

@@ -32,7 +32,7 @@ impl AppView {
             // the visual row gets the check slot and screen readers hear the
             // same fact as words.
             let aria = if checked {
-                format!("{text} — current sort")
+                t!("sort-current-aria", label = &text)
             } else {
                 text.clone()
             };
@@ -153,7 +153,7 @@ impl AppView {
             let delegate = libraries.delegate();
             let (visible, total, _) = delegate.delegate_counts_for_search();
             facet_tip_text(
-                "group or status",
+                &t!("facet-group-dimension"),
                 &FacetMenu::Group.current_display(delegate),
                 visible,
                 total,
@@ -186,53 +186,39 @@ impl AppView {
                         Select::new(&self.facet_group.state)
                             .id("facet-group")
                             .small()
-                            .accessibility_label("Filter by group or status"),
+                            .accessibility_label(t!("facet-group-aria")),
                     ),
             )
             .child(
                 div()
                     .id("facet-latency-tip")
                     .test_support()
-                    .tooltip(|_, cx| {
-                        cx.new(|_| {
-                            Tooltip::new(
-                                "Latest URL-test latency. Buckets are inclusive: ≤100 ms \
-                                 includes exactly 100 ms.",
-                            )
-                        })
-                        .into()
-                    })
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(t!("facet-latency-tip"))).into())
                     .child(
                         Select::new(&self.facet_latency.state)
                             .id("facet-latency")
                             .small()
-                            .accessibility_label("Filter by probe latency"),
+                            .accessibility_label(t!("facet-latency-aria")),
                     ),
             )
             .child(
-                div()
-                    .id("facet-latency-unprobed")
-                    .test_support()
-                    .child(
-                        Switch::new("facet-latency-unprobed-switch")
-                            .checked(latency_now.include_unprobed)
-                            .label("Include unprobed")
-                            .tooltip(
-                                "Keep rows that have not passed a URL test. Off means only \
-                                 measured latencies count.",
-                            )
-                            .accessibility_label("Include rows that have not been probed")
-                            .on_change(cx.listener(|view, next: &bool, _, cx| {
-                                let bucket = view.libraries.read(cx).delegate().latency_facet.bucket;
-                                view.set_latency_facet(
-                                    LatencyFacet {
-                                        bucket,
-                                        include_unprobed: *next,
-                                    },
-                                    cx,
-                                );
-                            })),
-                    ),
+                div().id("facet-latency-unprobed").test_support().child(
+                    Switch::new("facet-latency-unprobed-switch")
+                        .checked(latency_now.include_unprobed)
+                        .label(t!("facet-include-unprobed"))
+                        .tooltip(t!("facet-include-unprobed-tip"))
+                        .accessibility_label(t!("facet-include-unprobed-aria"))
+                        .on_change(cx.listener(|view, next: &bool, _, cx| {
+                            let bucket = view.libraries.read(cx).delegate().latency_facet.bucket;
+                            view.set_latency_facet(
+                                LatencyFacet {
+                                    bucket,
+                                    include_unprobed: *next,
+                                },
+                                cx,
+                            );
+                        })),
+                ),
             )
             .child(
                 div()
@@ -241,11 +227,11 @@ impl AppView {
                     .flex_1()
                     .min_w(px(140.))
                     .max_w(px(320.))
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(SEARCH_HINT)).into())
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(search_hint())).into())
                     .child(
                         Input::new(&self.search_input)
                             .small()
-                            .aria_label("Search configurations"),
+                            .aria_label(t!("search-placeholder")),
                     ),
             )
             .child(self.render_search_count(cx))
@@ -258,15 +244,11 @@ impl AppView {
                         .child(
                             Switch::new(format!("facet-auto-clear-switch-{slug}"))
                                 .checked(facet_auto_clear)
-                                .label("Auto-clear unavailable")
-                                .tooltip(
-                                    "Opt-in per group: after this group's URL test ends, its \
-                                     unavailable rows are removed automatically. Running rows \
-                                     and the row being edited are never removed; enabling asks \
-                                     its own confirmation.",
-                                )
-                                .accessibility_label(format!(
-                                    "Auto-clear unavailable rows in group \"{group}\" after group tests"
+                                .label(t!("facet-auto-clear"))
+                                .tooltip(t!("facet-auto-clear-tip"))
+                                .accessibility_label(t!(
+                                    "facet-auto-clear-aria",
+                                    group = group.clone()
                                 ))
                                 .on_change({
                                     let facet_auto_view = facet_auto_view.clone();
@@ -296,8 +278,8 @@ impl AppView {
             .child(if has_facets {
                 Button::new("clear-facets")
                     .small()
-                    .label("Clear facet filters")
-                    .tooltip("Clear the group, status, and latency filters (keeps search and checked)")
+                    .label(t!("facet-clear"))
+                    .tooltip(t!("facet-clear-tip"))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.clear_facets(window, cx);
                     }))
@@ -383,7 +365,7 @@ impl AppView {
                     .truncate()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Name"),
+                    .child(t!("column-name")),
             );
         for column in *metrics.layout.order() {
             if !metrics.column_visible(column) {
@@ -429,11 +411,12 @@ impl AppView {
         let mut menu = menu;
         for key in sort_header_keys(column) {
             let current = *key == sort.key;
+            let label = library_sort_key_label(*key);
             menu = menu.item(Self::sort_menu_item(
                 column,
                 key.token(),
-                key.label().to_string(),
-                format!("Sort by {}", key.label()),
+                label.clone(),
+                t!("sort-by", label = label),
                 current,
                 SortMenuAction::Key(*key),
                 view,
@@ -443,8 +426,12 @@ impl AppView {
         menu = menu.item(Self::sort_menu_item(
             column,
             "direction",
-            format!("Direction: {} → {}", sort.direction.label(), next.label()),
-            "Reverse the active key (Type | Security keeps its fixed order)".to_string(),
+            t!(
+                "sort-direction",
+                from = sort_direction_label(sort.direction),
+                to = sort_direction_label(next)
+            ),
+            t!("sort-direction-tip"),
             false,
             SortMenuAction::Direction,
             view,
@@ -483,7 +470,11 @@ impl AppView {
     ) -> PopupMenuItem {
         let id = format!("column-menu-{}-{}", column.id(), action.id_suffix());
         let label = action.label();
-        let aria = format!("{} {} column", label, column.label());
+        let aria = t!(
+            "column-width-aria",
+            action = label.clone(),
+            column = library_column_label(column)
+        );
         let view = view.clone();
         PopupMenuItem::element(move |_, _| {
             div()
@@ -491,7 +482,7 @@ impl AppView {
                 .test_support()
                 .role(Role::MenuItem)
                 .aria_label(aria.clone())
-                .child(label)
+                .child(label.clone())
         })
         .on_click(move |_, window, cx| {
             action.apply(&view, column, window, cx);

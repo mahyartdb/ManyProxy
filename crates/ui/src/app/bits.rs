@@ -2,11 +2,14 @@ use crate::*;
 
 pub(crate) fn topbar_menu_row(
     id: &'static str,
-    label: &'static str,
-    accessible: &'static str,
-    tip: &'static str,
+    label: impl Into<SharedString>,
+    accessible: impl Into<SharedString>,
+    tip: impl Into<SharedString>,
     shortcut: Option<(&'static str, &'static str, &'static str)>,
 ) -> AnyElement {
+    let label = label.into();
+    let accessible = accessible.into();
+    let tip = tip.into();
     // A6-5/K8: the label flexes and the chip is parked on the row's right
     // edge, so every chipped item in a menu reads as one aligned column and
     // the chip keeps its full width (never "Ctrl+…").
@@ -21,7 +24,10 @@ pub(crate) fn topbar_menu_row(
             .flex_row()
             .items_center()
             .gap_2()
-            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
+            .tooltip(move |_, cx| {
+                let tip = tip.clone();
+                cx.new(move |_| Tooltip::new(tip)).into()
+            })
             .child(div().flex_1().min_w_0().child(label))
             .child(shortcut_kbd(parse, chip))
             .into_any_element(),
@@ -34,18 +40,24 @@ pub(crate) fn topbar_menu_row(
             .flex_row()
             .items_center()
             .gap_2()
-            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
+            .tooltip(move |_, cx| {
+                let tip = tip.clone();
+                cx.new(move |_| Tooltip::new(tip)).into()
+            })
             .child(label)
             .into_any_element(),
     }
 }
 
-pub(crate) const SEARCH_PLACEHOLDER: &str = "Search configurations";
+pub(crate) fn search_placeholder() -> String {
+    t!("search-placeholder")
+}
 
 /// T-23: the one hint that the `port=` grammar exists — a tooltip on the search
 /// box, because the pinned placeholder is too narrow to carry it.
-pub(crate) const SEARCH_HINT: &str =
-    "port=N or port=N:M filters by listen port (port=10801, port=10800:10900, port=10801:, port=:10900)";
+pub(crate) fn search_hint() -> String {
+    t!("search-hint")
+}
 
 /// Store meta key for "Automatically restart crashed cores"; a missing or corrupt
 /// value reads as enabled, matching the engine's default.
@@ -204,10 +216,10 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
     // K12/A5-1: words instead of the tiny `↓`/`↑` pair, which the UI video
     // showed degrading to a serif "T". `out` is what the endpoints sent
     // (tx), `in` is what came back (rx).
-    Some(format!(
-        "out {} · in {}",
-        format_bytes(tx),
-        format_bytes(rx)
+    Some(t!(
+        "traffic-totals",
+        tx = format_bytes(tx),
+        rx = format_bytes(rx)
     ))
 }
 

@@ -1,15 +1,12 @@
 include!(concat!(env!("OUT_DIR"), "/tray_icon_rgba.rs"));
 
 use crate::store::ProxyConfig;
+use crate::t;
 
-/// T-26: the tray tooltip shares the window title's `· N running` suffix
-/// helper (`crate::running_title_suffix`), so the two surfaces cannot drift.
+/// T-26: the tray tooltip shares the window title helper, so the two surfaces
+/// cannot drift.
 pub fn tray_tooltip(running: usize) -> String {
-    format!(
-        "{}{}",
-        crate::APP_TITLE,
-        crate::running_title_suffix(running)
-    )
+    crate::window_title_text(running)
 }
 
 pub mod menu_id {
@@ -325,13 +322,13 @@ impl TrayHandle {
             .map_err(|error| format!("tray icon invalid ({error:?})"))?;
         let menu = Menu::new();
         for (action, title) in [
-            (TrayAction::Show, "Show"),
-            (TrayAction::SelectExit, "Select exit"),
-            (TrayAction::SelectPreset, "Select preset"),
-            (TrayAction::StartAll, "Start all"),
-            (TrayAction::StopAll, "Stop all"),
-            (TrayAction::OpenConfig, "Open config folder"),
-            (TrayAction::Quit, "Quit"),
+            (TrayAction::Show, t!("tray-show")),
+            (TrayAction::SelectExit, t!("tray-select-exit")),
+            (TrayAction::SelectPreset, t!("tray-select-preset")),
+            (TrayAction::StartAll, t!("tray-start-all")),
+            (TrayAction::StopAll, t!("tray-stop-all")),
+            (TrayAction::OpenConfig, t!("tray-open-config")),
+            (TrayAction::Quit, t!("tray-quit")),
         ] {
             menu.append(&MenuItem::with_id(
                 menu_id_for_action(action),

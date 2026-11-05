@@ -155,13 +155,13 @@ impl FacetStatus {
         FacetStatus::Stopped,
     ];
 
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> String {
         match self {
-            FacetStatus::Enabled => "Enabled",
-            FacetStatus::Disabled => "Disabled",
-            FacetStatus::Running => "Running",
-            FacetStatus::Dead => "Dead",
-            FacetStatus::Stopped => "Stopped",
+            FacetStatus::Enabled => t!("facet-status-enabled"),
+            FacetStatus::Disabled => t!("facet-status-disabled"),
+            FacetStatus::Running => t!("facet-status-running"),
+            FacetStatus::Dead => t!("facet-status-dead"),
+            FacetStatus::Stopped => t!("facet-status-stopped"),
         }
     }
 
@@ -264,7 +264,7 @@ impl LibraryDelegate {
     /// on the wire, so the count line names the wait instead.
     pub(crate) fn count_label(&self) -> String {
         match &self.load {
-            LibraryLoad::Loading(_) if self.rows.is_empty() => "Loading…".to_string(),
+            LibraryLoad::Loading(_) if self.rows.is_empty() => t!("library-loading"),
             _ => search_count_text(self.visible.len(), self.rows.len()),
         }
     }
@@ -277,7 +277,7 @@ impl LibraryDelegate {
             .map(|row| {
                 (
                     row.id.clone(),
-                    upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string()),
+                    upstream_host_port(row).unwrap_or_else(|| t!("library-no-upstream")),
                 )
             })
             .collect();
@@ -647,20 +647,20 @@ impl LibraryDelegate {
     pub(crate) fn active_filter_text(&self) -> String {
         let mut parts = Vec::new();
         if let Some(group) = &self.facet_group {
-            parts.push(format!("group: {group}"));
+            parts.push(t!("filter-group", group = group));
         }
         if let Some(status) = &self.facet_status {
-            parts.push(format!("status: {}", status.label()));
+            parts.push(t!("filter-status", status = status.label()));
         }
         if self.latency_facet.bucket != LatencyBucket::Any {
-            let bucket = self.latency_facet.bucket.label();
+            let bucket = latency_bucket_label(self.latency_facet.bucket);
             if self.latency_facet.include_unprobed {
-                parts.push(format!("latency: {bucket}"));
+                parts.push(t!("filter-latency", bucket = bucket));
             } else {
-                parts.push(format!("latency: {bucket} (probed only)"));
+                parts.push(t!("filter-latency-probed", bucket = bucket));
             }
         } else if !self.latency_facet.include_unprobed {
-            parts.push("latency: probed only".to_string());
+            parts.push(t!("filter-latency-probed-only"));
         }
         let query = self.query.trim();
         if !query.is_empty() {
@@ -670,7 +670,7 @@ impl LibraryDelegate {
             }
             let text = text.trim();
             if !text.is_empty() {
-                parts.push(format!("search: \"{text}\""));
+                parts.push(t!("filter-search", text = text));
             }
         }
         parts.join(" · ")
@@ -687,12 +687,18 @@ impl LibraryDelegate {
         // Checked is the bulk set; selection is the pointer set. Two counts
         // only earn their width when both exist and disagree.
         if self.selection_explicit && selected > 0 && selected != checked {
-            return format!(
-                "{checked} checked · {selected} selected (of {})",
-                self.visible.len()
+            return t!(
+                "bulk-checked-selected",
+                checked = checked,
+                selected = selected,
+                visible = self.visible.len()
             );
         }
-        format!("{checked} checked (of {})", self.visible.len())
+        t!(
+            "bulk-checked",
+            checked = checked,
+            visible = self.visible.len()
+        )
     }
 
     pub(crate) fn checked_rows(&self) -> Vec<ProxyConfig> {
@@ -1239,8 +1245,8 @@ impl ListDelegate for LibraryDelegate {
         let traffic = self.traffic.get(&row_id).copied();
         let upstream = self
             .upstream_for(&row_id)
-            .unwrap_or("no upstream")
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| t!("library-no-upstream"));
         // Everything below the helpers mutates the delegate, so the row borrow
         // ends here; the copies above are the fields the frame actually paints.
         let full_route = library_row_full_route(row, &upstream);
@@ -1265,9 +1271,9 @@ impl ListDelegate for LibraryDelegate {
             .small()
             .checked(is_checked)
             .accessibility_label(if is_checked {
-                format!("Checked {} (bulk action target)", row_name)
+                t!("row-checked-aria", name = &row_name)
             } else {
-                format!("Check {} for bulk actions", row_name)
+                t!("row-check-aria", name = &row_name)
             })
             .on_change(move |_, _, cx| {
                 let toggle_id = toggle_id.clone();
@@ -1401,11 +1407,12 @@ impl ListDelegate for LibraryDelegate {
         };
         let lamp_active = self.facet_status == Some(lamp_status);
         let lamp_hint = if lamp_active {
-            format!("{lamp_label} · click to stop filtering")
+            t!("row-lamp-active-tip", label = lamp_label)
         } else {
-            format!(
-                "{lamp_label} · click to show only {} rows",
-                lamp_status.label().to_lowercase()
+            t!(
+                "row-lamp-idle-tip",
+                label = lamp_label,
+                status = lamp_status.label().to_lowercase()
             )
         };
         // One activation path for pointer and assistive tech: the lamp now
@@ -1494,7 +1501,7 @@ impl ListDelegate for LibraryDelegate {
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .tooltip({
-                                    let tip = format!("Serve bind address {}", row_bind_ip);
+                                    let tip = t!("row-bind-tip", bind = row_bind_ip.clone());
                                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                                 })
                                 .child(row_bind_ip.clone()),
@@ -1507,13 +1514,18 @@ impl ListDelegate for LibraryDelegate {
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .tooltip({
-                                    let tip = format!(
-                                        "Local endpoint {}:{} — edit it in the inspector",
-                                        row_bind_ip, row_port
+                                    let tip = t!(
+                                        "row-port-tip",
+                                        bind = row_bind_ip.clone(),
+                                        port = i64::from(row_port)
                                     );
                                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                                 })
-                                .aria_label(format!("Local port {} on {}", row_port, row_bind_ip))
+                                .aria_label(t!(
+                                    "row-port-aria",
+                                    port = i64::from(row_port),
+                                    bind = row_bind_ip.clone()
+                                ))
                                 .child(format!(":{}", row_port)),
                         )
                         .into_any_element(),
@@ -1568,10 +1580,12 @@ impl ListDelegate for LibraryDelegate {
                             // "Copy SOCKS" label; the default small padding
                             // clipped it at the old 72px width.
                             .compact()
-                            .label("Copy SOCKS")
-                            .accessibility_label(format!("Copy SOCKS URL for {copy_name}"))
-                            .tooltip(format!(
-                                "Copy this row's SOCKS proxy URL only — socks5://{copy_bind}:{copy_port}"
+                            .label(t!("row-copy-socks"))
+                            .accessibility_label(t!("row-copy-socks-aria", name = copy_name))
+                            .tooltip(t!(
+                                "row-copy-socks-tip",
+                                bind = copy_bind,
+                                port = i64::from(copy_port)
                             ))
                             .on_click(move |_, window, cx| {
                                 if let Some(app) = copy_view.clone() {
@@ -1803,18 +1817,15 @@ impl ListDelegate for LibraryDelegate {
                             Empty::new()
                                 .header(
                                     EmptyHeader::new()
-                                        .title(
-                                            EmptyTitle::new()
-                                                .child("Could not load configurations"),
-                                        )
+                                        .title(EmptyTitle::new().child(t!("library-load-failed")))
                                         .description(EmptyDescription::new().child(message)),
                                 )
                                 .content(
                                     EmptyContent::new().child(
                                         Button::new("library-retry")
                                             .small()
-                                            .label("Retry")
-                                            .tooltip("Fetch the subscriptions again")
+                                            .label(t!("library-retry"))
+                                            .tooltip(t!("library-retry-tip"))
                                             .on_click(move |_, window, cx| {
                                                 if let Some(view) = retry.clone() {
                                                     view.update(cx, |view, cx| {
@@ -1847,60 +1858,53 @@ impl ListDelegate for LibraryDelegate {
                 .flex_col()
                 .size_full()
                 .child(
-                Empty::new()
-                    .header(
-                        EmptyHeader::new()
-                            .title(EmptyTitle::new().child(no_matches_text()))
-                            .description(EmptyDescription::new().child(description)),
-                    )
-                    .content(
-                        EmptyContent::new().child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("clear-search-hint")
-
-                                        .small()
-                                        .label("Clear search")
-                                        .tooltip("Clear the search query (keeps facet filters and checked)")
-                                        .on_click(move |_, window, cx| {
-                                            hint_view.update(cx, |state, list_cx| {
-
-
-
-
-
-                                                state.set_query("", window, list_cx);
-                                            });
-                                            if let Some(app) = hint_sync.clone() {
-                                                AppView::sync_search_box(&app, "", window, cx);
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    Button::new("clear-search-facets")
-
-                                        .small()
-                                        .label("Clear all")
-                                        .tooltip("Clear search and every filter")
-                                        .on_click(move |_, window, cx| {
-                                            all_view.update(cx, |state, list_cx| {
-                                                state.set_query("", window, list_cx);
-                                                state.delegate_mut().clear_facets();
-                                                list_cx.notify();
-                                            });
-                                            if let Some(app) = all_sync.clone() {
-                                                AppView::sync_search_box(&app, "", window, cx);
-                                            }
-                                        }),
-                                ),
+                    Empty::new()
+                        .header(
+                            EmptyHeader::new()
+                                .title(EmptyTitle::new().child(no_matches_text()))
+                                .description(EmptyDescription::new().child(description)),
+                        )
+                        .content(
+                            EmptyContent::new().child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("clear-search-hint")
+                                            .small()
+                                            .label(t!("status-clear-search"))
+                                            .tooltip(t!("status-clear-search-tip"))
+                                            .on_click(move |_, window, cx| {
+                                                hint_view.update(cx, |state, list_cx| {
+                                                    state.set_query("", window, list_cx);
+                                                });
+                                                if let Some(app) = hint_sync.clone() {
+                                                    AppView::sync_search_box(&app, "", window, cx);
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("clear-search-facets")
+                                            .small()
+                                            .label(t!("library-clear-all"))
+                                            .tooltip(t!("library-clear-all-tip"))
+                                            .on_click(move |_, window, cx| {
+                                                all_view.update(cx, |state, list_cx| {
+                                                    state.set_query("", window, list_cx);
+                                                    state.delegate_mut().clear_facets();
+                                                    list_cx.notify();
+                                                });
+                                                if let Some(app) = all_sync.clone() {
+                                                    AppView::sync_search_box(&app, "", window, cx);
+                                                }
+                                            }),
+                                    ),
+                            ),
                         ),
-                    ),
-            );
+                );
         }
 
         // F18: with no configurations the empty canvas carries the two

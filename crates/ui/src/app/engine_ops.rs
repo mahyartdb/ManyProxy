@@ -335,9 +335,9 @@ impl AppView {
         // Y dead`; the label carries no colon so the `·` grammar stays the
         // only separator the strip spends.
         if live == 0 && dead == 0 {
-            "health never tested".to_string()
+            t!("health-never-tested")
         } else {
-            format!("health {live} live · {dead} dead")
+            t!("health-count", live = live, dead = dead)
         }
     }
 

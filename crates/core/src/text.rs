@@ -4,21 +4,6 @@
 
 use crate::*;
 
-/// T-26: the one `· N running` suffix shared by the window title and the tray
-/// tooltip, so the two surfaces can never drift. Empty while nothing runs.
-pub fn running_title_suffix(running: usize) -> String {
-    if running == 0 {
-        String::new()
-    } else {
-        format!(" · {running} running")
-    }
-}
-/// T-26: composed window title for a running count — `ManyProxy` at zero,
-/// `ManyProxy · N running` above it. Consumed by the OS window title, the
-/// custom titlebar label, and (through `tray::tray_tooltip`) the tray tooltip.
-pub fn window_title_text(running: usize) -> String {
-    format!("{APP_TITLE}{}", running_title_suffix(running))
-}
 pub fn settings_clear_traffic_text(total: usize) -> String {
     format!("Clear traffic counters for all {total} configuration(s)? This cannot be undone.")
 }
@@ -530,52 +515,6 @@ pub fn start_all_partial_message(started: usize, failed_names: &[String]) -> Str
         "Started {started} endpoint(s), {failed} failed: {}",
         failed_names.join(", ")
     )
-}
-pub fn search_count_text(visible: usize, total: usize) -> String {
-    format!("{visible} of {total}")
-}
-/// K12/A5-1: the status strip's first segment — library totals, singular at 1.
-/// F6: the flag it counts means restore-on-launch, not "will start now".
-pub fn status_count_text(total: usize, enabled: usize) -> String {
-    format!(
-        "{} {} · {} set for launch",
-        total,
-        if total == 1 {
-            "configuration"
-        } else {
-            "configurations"
-        },
-        enabled
-    )
-}
-/// K12/A5-1: the sort header names its direction in words. The old `↑`/`↓`
-/// glyphs degrade to `1`/`T` at the small header size, so the marker is a word
-/// suffix that reads at any scale. `None` means "library order" and adds
-/// nothing; the retired toggle keeps its fixed direction label.
-pub fn sort_header_marker(sort: LibrarySort) -> &'static str {
-    match sort.key {
-        LibrarySortKey::None => "",
-        LibrarySortKey::TypeSecurity => " · fixed",
-        _ if sort.direction == SortDirection::Descending => " · desc",
-        _ => " · asc",
-    }
-}
-pub fn facet_tip_text(
-    dimension: &str,
-    active_display: &str,
-    visible: usize,
-    total: usize,
-) -> String {
-    format!("Filter by {dimension}: {active_display} · {visible} of {total} shown")
-}
-pub fn no_matches_text() -> String {
-    "No matches — Clear search".to_string()
-}
-pub fn empty_library_title() -> String {
-    "No proxy configurations yet".to_string()
-}
-pub fn empty_library_text() -> String {
-    "Add one proxy, or use Import for many at once.".to_string()
 }
 pub fn crash_notification_text(detail: &str) -> String {
     format!("Engine crashed ({detail}) — View logs")
