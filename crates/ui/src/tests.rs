@@ -25159,7 +25159,6 @@ fn settings_spine_lists_one_column_and_filters_it(cx: &mut TestAppContext) {
 
     // B17: every section renders in that one column — no rail, no hidden panes.
     assert_painted(cx, "settings-body-general");
-    assert_painted(cx, "settings-body-probing");
     for id in [
         "settings-row-appearance",
         "settings-appearance-group",
@@ -25169,6 +25168,19 @@ fn settings_spine_lists_one_column_and_filters_it(cx: &mut TestAppContext) {
     ] {
         assert_painted(cx, id);
     }
+    // The link-handler row makes General taller than one viewport; Probing is
+    // still there, one small scroll down.
+    scroll_settings_into_view(cx, "settings-body-probing");
+    assert_painted(cx, "settings-body-probing");
+    cx.update(|window, cx| {
+        window.scroll(
+            "settings-body",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(100_000.))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
     // T-04: the Routing and Preset summaries left Settings; the presets
     // manager is reached from the Routing menu and the inspector pane.
     for id in [
@@ -27919,6 +27931,9 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         "settings-row-autostart",
         "settings-autostart-switch",
         "settings-row-autostart-help",
+        "settings-row-link-handler",
+        "settings-link-handler-switch",
+        "settings-row-link-handler-help",
         "settings-row-restore",
         "settings-restore-switch",
         "settings-row-restore-help",

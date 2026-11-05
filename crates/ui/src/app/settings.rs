@@ -200,6 +200,7 @@ struct SettingsState {
     appearance: Rc<RefCell<String>>,
     text_size: Rc<RefCell<TextSize>>,
     autostart: Rc<RefCell<bool>>,
+    link_handler: Rc<RefCell<bool>>,
     restore: Rc<RefCell<bool>>,
     auto_restart: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
@@ -482,6 +483,37 @@ impl SettingsState {
                     let cell = autostart_cell.clone();
                     autostart_view.update(cx, |view, cx| {
                         if view.commit_autostart(next, window, cx) {
+                            *cell.borrow_mut() = next;
+                            cx.notify();
+                        }
+                    });
+                }),
+        ));
+
+        // Task 9: the manyproxy:// handler is one HKCU key, so the toggle's
+        // state is the registration itself — not a second stored flag that
+        // could drift from it.
+        let link_cell = self.link_handler.clone();
+        let link_view = self.view.clone();
+        let link_on = *link_cell.borrow();
+        body = body.child(settings_row(
+            self,
+            "settings-row-link-handler",
+            "Handle manyproxy:// links",
+            Some(if link_on {
+                "Registered for this exe — manyproxy:// links open in ManyProxy.".to_string()
+            } else {
+                "Not registered — apps have no handler for manyproxy:// links.".to_string()
+            }),
+            muted,
+            Switch::new("settings-link-handler-switch")
+                .checked(link_on)
+                .accessibility_label("Handle manyproxy:// links")
+                .on_change(move |next: &bool, window, cx| {
+                    let next = *next;
+                    let cell = link_cell.clone();
+                    link_view.update(cx, |view, cx| {
+                        if view.commit_link_handler(next, window, cx) {
                             *cell.borrow_mut() = next;
                             cx.notify();
                         }
@@ -1257,6 +1289,39 @@ impl AppView {
         }
     }
 
+    pub(crate) fn commit_link_handler(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let outcome = if enabled {
+            crate::os::scheme::register()
+        } else {
+            crate::os::scheme::unregister()
+        };
+        match outcome {
+            Ok(()) => {
+                let message = if enabled {
+                    "Link handler on — manyproxy:// links open in ManyProxy"
+                } else {
+                    "Link handler off — the manyproxy:// registration was removed"
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Link handler change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     pub(crate) fn commit_restore_opt_in(
         &mut self,
         enabled: bool,
@@ -1671,6 +1736,7 @@ impl AppView {
         let view = cx.entity();
 
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
+        let link_handler_state = Rc::new(RefCell::new(crate::os::scheme::is_registered()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
         let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
@@ -1842,6 +1908,7 @@ impl AppView {
             appearance: appearance_state.clone(),
             text_size: text_size_state.clone(),
             autostart: autostart_state.clone(),
+            link_handler: link_handler_state.clone(),
             restore: restore_state.clone(),
             auto_restart: auto_restart_state.clone(),
             close_action: close_action_state.clone(),
