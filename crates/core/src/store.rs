@@ -160,6 +160,74 @@ impl TextSize {
     }
 }
 
+/// Task 11: the accent hue that tints selection, focus, and checked controls.
+/// Blue is the kit's stock blue and applies as a no-op; every other preset is
+/// stamped over the theme's accent-bearing tokens after each `Theme::change`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Accent {
+    #[default]
+    Blue,
+    Indigo,
+    Violet,
+    Magenta,
+    Rose,
+    Teal,
+    Amber,
+}
+
+impl Accent {
+    pub const ALL: [Accent; 7] = [
+        Accent::Blue,
+        Accent::Indigo,
+        Accent::Violet,
+        Accent::Magenta,
+        Accent::Rose,
+        Accent::Teal,
+        Accent::Amber,
+    ];
+
+    /// The value written to the store's meta table.
+    pub fn stored(self) -> &'static str {
+        match self {
+            Accent::Blue => "blue",
+            Accent::Indigo => "indigo",
+            Accent::Violet => "violet",
+            Accent::Magenta => "magenta",
+            Accent::Rose => "rose",
+            Accent::Teal => "teal",
+            Accent::Amber => "amber",
+        }
+    }
+
+    /// Reads a stored value back. Anything unknown is `None`, so the caller
+    /// falls back to the default instead of guessing.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "blue" => Some(Accent::Blue),
+            "indigo" => Some(Accent::Indigo),
+            "violet" => Some(Accent::Violet),
+            "magenta" => Some(Accent::Magenta),
+            "rose" => Some(Accent::Rose),
+            "teal" => Some(Accent::Teal),
+            "amber" => Some(Accent::Amber),
+            _ => None,
+        }
+    }
+
+    /// The label the Settings swatch row shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Accent::Blue => "Blue",
+            Accent::Indigo => "Indigo",
+            Accent::Violet => "Violet",
+            Accent::Magenta => "Magenta",
+            Accent::Rose => "Rose",
+            Accent::Teal => "Teal",
+            Accent::Amber => "Amber",
+        }
+    }
+}
+
 /// T-04: which rows a "Test all" run covers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TestAllScope {
@@ -8183,6 +8251,21 @@ impl Store {
 
     pub const META_TEXT_SIZE: &str = "text_size";
 
+    pub const META_ACCENT: &str = "accent";
+
+    /// Task 11: the window's accent hue. A missing or corrupt value reads as
+    /// the stock blue, so a legacy library keeps the colors it shipped with.
+    pub fn accent(&self) -> Accent {
+        match self.get_meta(Self::META_ACCENT) {
+            Ok(Some(raw)) => Accent::from_stored(&raw).unwrap_or_default(),
+            _ => Accent::default(),
+        }
+    }
+
+    pub fn set_accent(&mut self, accent: Accent) -> Result<(), StoreError> {
+        self.set_meta(Self::META_ACCENT, accent.stored())
+    }
+
     /// K12: the window's reading scale. A missing or corrupt value reads as
     /// `Default`, so a legacy library opens at the stock size.
     pub fn text_size(&self) -> TextSize {
@@ -15405,6 +15488,20 @@ mod tests {
             .set_meta(Store::META_APPEARANCE, "midnight")
             .expect("raw write");
         assert_eq!(store.appearance(), "dark", "corrupt reads dark");
+    }
+
+    #[test]
+    fn accent_defaults_blue_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.accent(), Accent::Blue, "default blue");
+        for accent in Accent::ALL {
+            store.set_accent(accent).expect("every preset writes");
+            assert_eq!(store.accent(), accent, "{} reads back", accent.label());
+        }
+        store
+            .set_meta(Store::META_ACCENT, "chartreuse")
+            .expect("raw write");
+        assert_eq!(store.accent(), Accent::Blue, "corrupt reads blue");
     }
 
     #[test]

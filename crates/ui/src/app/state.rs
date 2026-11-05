@@ -359,7 +359,7 @@ impl AppView {
             cx,
         );
 
-        apply_appearance(&store.appearance(), Some(window), cx);
+        apply_appearance(&store.appearance(), store.accent(), Some(window), cx);
         apply_text_size(store.text_size(), cx);
         // K5: the toast park rides `apply_appearance` (bottom-right above the
         // status bar, max 2) so it survives every theme change for free.
