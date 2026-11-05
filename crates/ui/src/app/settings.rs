@@ -198,6 +198,7 @@ fn settings_field_row(
 struct SettingsState {
     view: Entity<AppView>,
     appearance: Rc<RefCell<String>>,
+    accent: Rc<RefCell<Accent>>,
     text_size: Rc<RefCell<TextSize>>,
     autostart: Rc<RefCell<bool>>,
     link_handler: Rc<RefCell<bool>>,
@@ -205,6 +206,7 @@ struct SettingsState {
     auto_restart: Rc<RefCell<bool>>,
     notify_from_tray: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
+    window_corners: Rc<RefCell<WindowCorners>>,
     test_all_scope: Rc<RefCell<TestAllScope>>,
     bind_hosts: Rc<RefCell<Vec<String>>>,
     bind_host_error: Rc<RefCell<Option<String>>>,
@@ -421,6 +423,61 @@ impl SettingsState {
                 .child(group),
         ));
 
+        // Task 11: one swatch per preset. A pick saves on click; the selected
+        // swatch wears the live focus ring so the current accent reads without
+        // a checkmark glyph. Health signal colors never follow this.
+        let accent_cell = self.accent.clone();
+        let accent_view = self.view.clone();
+        let current_accent = *accent_cell.borrow();
+        let mode = cx.theme().mode;
+        let mut swatches = div()
+            .id("settings-accent-swatches")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2();
+        for accent in Accent::ALL {
+            let selected = accent == current_accent;
+            let cell = accent_cell.clone();
+            let view = accent_view.clone();
+            swatches = swatches.child(
+                div()
+                    .id(format!("settings-accent-{}", accent.stored()))
+                    .test_support()
+                    .role(Role::RadioButton)
+                    .aria_label(format!("{} accent", accent.label()))
+                    .aria_selected(selected)
+                    .tab_stop(true)
+                    .size(px(22.))
+                    .rounded_full()
+                    .bg(crate::appearance::accent_swatch(accent, mode))
+                    .border_2()
+                    .border_color(if selected { cx.theme().ring } else { muted })
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        let cell = cell.clone();
+                        view.update(cx, |view, cx| {
+                            if view.commit_accent(accent, window, cx) {
+                                *cell.borrow_mut() = accent;
+                                cx.notify();
+                            }
+                        });
+                    }),
+            );
+        }
+        body = body.child(settings_row(
+            self,
+            "settings-row-accent",
+            "Accent color",
+            Some(
+                "Tints selection, checked controls, and the focus ring. Health and error colors stay fixed."
+                    .to_string(),
+            ),
+            muted,
+            swatches,
+        ));
+
         // K12: the reading scale. One preference for the whole window; the
         // two type roles keep their relationship.
         let text_size_cell = self.text_size.clone();
@@ -584,6 +641,45 @@ impl SettingsState {
             Some(close_action.explanation().to_string()),
             muted,
             group,
+        ));
+
+        // Task 12: the frame's outer corners are an OS preference, not app
+        // paint, so the radio saves and asks DWM; Windows 10 ignores it.
+        let corners_cell = self.window_corners.clone();
+        let corners_view = self.view.clone();
+        let corners = *corners_cell.borrow();
+        let mut corner_group = RadioGroup::horizontal("settings-window-corners-options")
+            .selected_index(
+                WindowCorners::ALL
+                    .iter()
+                    .position(|choice| *choice == corners),
+            )
+            .on_change(move |ix, window, cx| {
+                let Some(corners) = WindowCorners::ALL.get(*ix).copied() else {
+                    return;
+                };
+                let cell = corners_cell.clone();
+                corners_view.update(cx, |view, cx| {
+                    if view.commit_window_corners(corners, window, cx) {
+                        *cell.borrow_mut() = corners;
+                        cx.notify();
+                    }
+                });
+            });
+        for choice in WindowCorners::ALL {
+            corner_group = corner_group.child(
+                Radio::new(choice.label())
+                    .label(choice.label().to_string())
+                    .tooltip(choice.explanation()),
+            );
+        }
+        body = body.child(settings_row(
+            self,
+            "settings-row-window-corners",
+            "Window corners",
+            Some(corners.explanation().to_string()),
+            muted,
+            corner_group,
         ));
 
         // Task 10: failures that happen while the window is hidden reach the
@@ -1477,7 +1573,7 @@ impl AppView {
     ) -> bool {
         match self.store.set_appearance(value) {
             Ok(()) => {
-                apply_appearance(value, Some(window), cx);
+                apply_appearance(value, self.store.accent(), Some(window), cx);
                 apply_text_size(self.store.text_size(), cx);
                 window.push_notification(Notification::success(format!("Appearance: {value}")), cx);
                 cx.notify();
@@ -1486,6 +1582,37 @@ impl AppView {
             Err(error) => {
                 window.push_notification(
                     Notification::error(format!("Appearance change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Task 11: an accent pick saves and repaints at once. The full appearance
+    /// pass re-stamps the accent after `Theme::change` rebuilt the theme, then
+    /// restores the reading scale that same rebuild reset.
+    pub(crate) fn commit_accent(
+        &mut self,
+        accent: Accent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_accent(accent) {
+            Ok(()) => {
+                apply_appearance(&self.store.appearance(), accent, Some(window), cx);
+                apply_text_size(self.store.text_size(), cx);
+                window.push_notification(
+                    Notification::success(format!("Accent: {}", accent.label())),
+                    cx,
+                );
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Accent change failed: {error}")),
                     cx,
                 );
                 cx.notify();
@@ -1544,6 +1671,36 @@ impl AppView {
             Err(error) => {
                 window.push_notification(
                     Notification::error(format!("Close behaviour change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Task 12: save the frame style and hand it to DWM at once. The attribute
+    /// is unknown below Windows 11, so a failure there leaves stock corners and
+    /// is not a user error.
+    pub(crate) fn commit_window_corners(
+        &mut self,
+        corners: WindowCorners,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_window_corners(corners) {
+            Ok(()) => {
+                crate::os::window::apply_corner_preference(window, corners);
+                window.push_notification(
+                    Notification::success(format!("Window corners: {}", corners.label())),
+                    cx,
+                );
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Window corners change failed: {error}")),
                     cx,
                 );
                 cx.notify();
@@ -1810,8 +1967,10 @@ impl AppView {
         let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
         let notify_from_tray_state = Rc::new(RefCell::new(self.notify_from_tray_enabled()));
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
+        let accent_state = Rc::new(RefCell::new(self.store.accent()));
         let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
+        let window_corners_state = Rc::new(RefCell::new(self.store.window_corners()));
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
         let last_check_state = Rc::new(RefCell::new(self.store.last_update_check()));
 
@@ -1976,6 +2135,7 @@ impl AppView {
         let state = SettingsState {
             view: view.clone(),
             appearance: appearance_state.clone(),
+            accent: accent_state.clone(),
             text_size: text_size_state.clone(),
             autostart: autostart_state.clone(),
             link_handler: link_handler_state.clone(),
@@ -1983,6 +2143,7 @@ impl AppView {
             auto_restart: auto_restart_state.clone(),
             notify_from_tray: notify_from_tray_state.clone(),
             close_action: close_action_state.clone(),
+            window_corners: window_corners_state.clone(),
             test_all_scope: test_all_scope_state.clone(),
             bind_hosts: bind_hosts_cell.clone(),
             bind_host_error: bind_host_error_cell.clone(),

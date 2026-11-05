@@ -2,7 +2,7 @@ use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
-use crate::store::TextSize;
+use crate::store::{Accent, TextSize};
 
 pub(crate) const APPEARANCE_CHOICES: &[(&str, &str)] =
     &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
@@ -65,7 +65,137 @@ pub(crate) fn apply_text_size(size: TextSize, cx: &mut App) {
     cx.refresh_windows();
 }
 
-pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
+/// Task 11: the accent-bearing tokens a preset stamps over the kit theme. Blue
+/// has no entry: it is the kit's stock selection and re-stamping it would make
+/// the defaults differ from the palette the suite already pins.
+struct AccentPalette {
+    primary: Hsla,
+    primary_hover: Hsla,
+    primary_active: Hsla,
+    primary_foreground: Hsla,
+    ring: Hsla,
+    selection: Hsla,
+    wash: Hsla,
+    rim: Hsla,
+    solid: Hsla,
+}
+
+fn accent_hue(accent: Accent) -> Option<f32> {
+    match accent {
+        Accent::Blue => None,
+        Accent::Indigo => Some(0.66),
+        Accent::Violet => Some(0.75),
+        Accent::Magenta => Some(0.86),
+        Accent::Rose => Some(0.95),
+        Accent::Teal => Some(0.47),
+        Accent::Amber => Some(0.10),
+    }
+}
+
+fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
+    let hue = accent_hue(accent)?;
+    Some(if mode.is_dark() {
+        AccentPalette {
+            primary: hsla(hue, 0.62, 0.62, 1.),
+            primary_hover: hsla(hue, 0.62, 0.68, 1.),
+            primary_active: hsla(hue, 0.62, 0.73, 1.),
+            primary_foreground: hsla(0., 0., 0.10, 1.),
+            ring: hsla(hue, 0.65, 0.60, 1.),
+            selection: hsla(hue, 0.65, 0.45, 1.),
+            wash: hsla(hue, 0.70, 0.35, 0.22),
+            rim: hsla(hue, 0.70, 0.55, 1.),
+            solid: hsla(hue, 0.62, 0.62, 1.),
+        }
+    } else {
+        AccentPalette {
+            primary: hsla(hue, 0.72, 0.48, 1.),
+            primary_hover: hsla(hue, 0.72, 0.42, 1.),
+            primary_active: hsla(hue, 0.72, 0.37, 1.),
+            primary_foreground: hsla(0., 0., 1., 1.),
+            ring: hsla(hue, 0.72, 0.52, 1.),
+            selection: hsla(hue, 0.75, 0.60, 1.),
+            wash: hsla(hue, 0.80, 0.85, 0.22),
+            rim: hsla(hue, 0.75, 0.55, 1.),
+            solid: hsla(hue, 0.72, 0.48, 1.),
+        }
+    })
+}
+
+/// Task 11: the color a Settings swatch paints. Blue borrows the kit's stock
+/// selection rim so the default swatch matches what the window actually shows.
+pub(crate) fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
+    match accent_palette(accent, mode) {
+        Some(palette) => palette.solid,
+        None => {
+            if mode.is_dark() {
+                hsla(0.61, 0.72, 0.48, 1.)
+            } else {
+                hsla(0.60, 0.83, 0.60, 1.)
+            }
+        }
+    }
+}
+
+/// Task 11: re-stamp every accent-bearing token after `Theme::change` rebuilt
+/// the theme from its config. Health, danger, and warning tokens are never
+/// touched: those hues carry meaning, not preference.
+pub(crate) fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
+    let Some(palette) = accent_palette(accent, mode) else {
+        return;
+    };
+    let theme = Theme::global_mut(cx);
+    theme.primary = palette.primary;
+    theme.primary_hover = palette.primary_hover;
+    theme.primary_active = palette.primary_active;
+    theme.primary_foreground = palette.primary_foreground;
+    theme.ring = palette.ring;
+    theme.selection = palette.selection;
+    theme.list_active = palette.wash;
+    theme.list_active_border = palette.rim;
+    theme.table_active = palette.wash;
+    theme.table_active_border = palette.rim;
+    theme.accent = palette.rim;
+
+    let tokens = &mut theme.tokens;
+    tokens.primary.background = palette.primary.into();
+    tokens.primary.color = palette.primary;
+    tokens.primary_hover.background = palette.primary_hover.into();
+    tokens.primary_hover.color = palette.primary_hover;
+    tokens.primary_active.background = palette.primary_active.into();
+    tokens.primary_active.color = palette.primary_active;
+    tokens.primary_foreground.background = palette.primary_foreground.into();
+    tokens.primary_foreground.color = palette.primary_foreground;
+    tokens.button_primary.background = palette.primary.into();
+    tokens.button_primary.color = palette.primary;
+    tokens.button_primary_hover.background = palette.primary_hover.into();
+    tokens.button_primary_hover.color = palette.primary_hover;
+    tokens.button_primary_active.background = palette.primary_active.into();
+    tokens.button_primary_active.color = palette.primary_active;
+    tokens.button_primary_foreground.background = palette.primary_foreground.into();
+    tokens.button_primary_foreground.color = palette.primary_foreground;
+    tokens.ring.background = palette.ring.into();
+    tokens.ring.color = palette.ring;
+    tokens.selection.background = palette.selection.into();
+    tokens.selection.color = palette.selection;
+    tokens.list_active.background = palette.wash.into();
+    tokens.list_active.color = palette.wash;
+    tokens.list_active_border.background = palette.rim.into();
+    tokens.list_active_border.color = palette.rim;
+    tokens.table_active.background = palette.wash.into();
+    tokens.table_active.color = palette.wash;
+    tokens.table_active_border.background = palette.rim.into();
+    tokens.table_active_border.color = palette.rim;
+    tokens.accent.background = palette.rim.into();
+    tokens.accent.color = palette.rim;
+    cx.refresh_windows();
+}
+
+pub(crate) fn apply_appearance(
+    appearance: &str,
+    accent: Accent,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) {
     let mode = resolve_appearance_mode(appearance);
     Theme::change(mode, window, cx);
     if !mode.is_dark() {
@@ -73,9 +203,12 @@ pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx
         theme.overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
         let muted = theme.muted_foreground;
         theme.muted_foreground = muted.blend(hsla(0., 0., 0., LIGHT_MUTED_INK_DARKEN));
-        // Theme::change already refreshed the window; the override landed after.
-        cx.refresh_windows();
     }
+    // Task 11: the rebuild above reset every stamped accent token, so the
+    // accent rides every re-appearance exactly like the light-mode overrides.
+    apply_accent(accent, mode, cx);
+    // Theme::change already refreshed the window; the overrides landed after.
+    cx.refresh_windows();
     // F5: the kit has no per-scrollbar mode switch, only the theme's. Always
     // keeps the dialog body's scrollbar visible while it overflows instead of
     // fading out after two seconds.
@@ -87,14 +220,28 @@ pub(crate) fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx
 
 #[cfg(test)]
 mod tokens {
+    use crate::store::Accent;
     use gpui_kit::component::{Theme, ThemeMode};
 
     /// Read the theme the app actually paints: `apply_appearance` owns the
     /// light-mode token overrides, so a bare `Theme::change` would test a
     /// palette no window ever shows.
     fn theme_for(mode: ThemeMode, cx: &mut gpui_kit::TestAppContext) -> Theme {
+        theme_for_accent(mode, Accent::Blue, cx)
+    }
+
+    fn theme_for_accent(
+        mode: ThemeMode,
+        accent: Accent,
+        cx: &mut gpui_kit::TestAppContext,
+    ) -> Theme {
         cx.update(|cx| {
-            crate::apply_appearance(if mode.is_dark() { "dark" } else { "light" }, None, cx);
+            crate::apply_appearance(
+                if mode.is_dark() { "dark" } else { "light" },
+                accent,
+                None,
+                cx,
+            );
             Theme::global(cx).clone()
         })
     }
@@ -173,5 +320,74 @@ mod tokens {
         }
 
         assert_eq!(dark.radius, light.radius, "one radius across modes");
+    }
+
+    /// Task 11: the default preset must leave the kit palette byte-identical.
+    /// The suite pins the stock blue selection, so "blue" is a no-op rather
+    /// than a re-stamp that happens to look similar.
+    #[gpui_kit::test]
+    fn default_blue_leaves_the_stock_palette_untouched(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            Theme::change(ThemeMode::Dark, None, cx);
+            let stock = Theme::global(cx).clone();
+            crate::apply_appearance("dark", Accent::Blue, None, cx);
+            let painted = Theme::global(cx).clone();
+            for (name, stock, painted) in [
+                ("selection wash", stock.list_active, painted.list_active),
+                (
+                    "selection rim",
+                    stock.list_active_border,
+                    painted.list_active_border,
+                ),
+                ("focus ring", stock.ring, painted.ring),
+                ("primary fill", stock.primary, painted.primary),
+                ("accent surface", stock.accent, painted.accent),
+            ] {
+                assert_eq!(painted, stock, "blue leaves {name} on the kit's value");
+            }
+        });
+    }
+
+    /// Task 11: a preset stamps the tokens the brief names — selection wash,
+    /// checked/primary fills, and the focus ring — and the stamps survive the
+    /// `Theme::change` a later appearance swap performs.
+    #[gpui_kit::test]
+    fn accent_stamps_its_surfaces_and_survives_a_theme_swap(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let stock_dark = theme_for(ThemeMode::Dark, cx);
+        let dark = theme_for_accent(ThemeMode::Dark, Accent::Violet, cx);
+
+        for (name, color) in [
+            ("selection wash", dark.list_active),
+            ("selection rim", dark.list_active_border),
+            ("focus ring", dark.ring),
+            ("checked fill", dark.primary),
+            ("accent strip", dark.accent),
+        ] {
+            assert!(
+                (color.h - 0.75).abs() < 0.03,
+                "{name} takes the violet hue, got {color:?}"
+            );
+        }
+        assert!(dark.list_active.a < 0.3, "selection stays a wash");
+        assert_eq!(
+            (dark.success, dark.danger, dark.warning),
+            (stock_dark.success, stock_dark.danger, stock_dark.warning),
+            "signal hues never follow the accent"
+        );
+
+        // A real appearance swap is `apply_appearance` again; the stamp has to
+        // land after `Theme::change` rebuilt the config colors.
+        let light = theme_for_accent(ThemeMode::Light, Accent::Violet, cx);
+        assert!(
+            (light.list_active.h - 0.75).abs() < 0.03
+                && (light.list_active_border.h - 0.75).abs() < 0.03,
+            "light mode re-stamps the same accent: {light:?}"
+        );
+        assert!(
+            light.muted_foreground.l < 0.5,
+            "the light ink override still composes with the accent"
+        );
     }
 }

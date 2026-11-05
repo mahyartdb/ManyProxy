@@ -529,7 +529,7 @@ fn signal_and_muted_text_clear_aa_on_paper_and_quiet_surface(cx: &mut TestAppCon
 
     cx.update(gpui_kit::init);
     for appearance in ["light", "dark"] {
-        cx.update(|cx| crate::apply_appearance(appearance, None, cx));
+        cx.update(|cx| crate::apply_appearance(appearance, crate::store::Accent::Blue, None, cx));
         cx.update(|cx| {
             let theme = crate::Theme::global(cx);
             let surfaces = [
@@ -15606,7 +15606,7 @@ fn f5_scrollbar_mode_stays_visible(cx: &mut TestAppContext) {
 fn f17_light_modal_scrim_alpha(cx: &mut TestAppContext) {
     use gpui_kit::component::Theme;
     cx.update(gpui_kit::init);
-    cx.update(|cx| crate::apply_appearance("light", None, cx));
+    cx.update(|cx| crate::apply_appearance("light", crate::store::Accent::Blue, None, cx));
     cx.update(|cx| {
         let overlay = Theme::global(cx).overlay;
         assert_eq!(
@@ -15619,7 +15619,7 @@ fn f17_light_modal_scrim_alpha(cx: &mut TestAppContext) {
             "scrim stays black, got {overlay:?}"
         );
     });
-    cx.update(|cx| crate::apply_appearance("dark", None, cx));
+    cx.update(|cx| crate::apply_appearance("dark", crate::store::Accent::Blue, None, cx));
     cx.update(|cx| {
         let alpha = Theme::global(cx).overlay.a;
         assert!(
@@ -25176,12 +25176,23 @@ fn settings_spine_lists_one_column_and_filters_it(cx: &mut TestAppContext) {
     for id in [
         "settings-row-appearance",
         "settings-appearance-group",
+        "settings-row-accent",
+        "settings-accent-swatches",
+    ] {
+        assert_painted(cx, id);
+    }
+    // The accent row makes General taller than one viewport; the rest of the
+    // section is one small scroll down.
+    for id in [
         "settings-row-window-behaviour",
         "settings-row-autostart",
         "settings-row-restore",
     ] {
+        scroll_settings_into_view(cx, id);
         assert_painted(cx, id);
     }
+    scroll_settings_into_view(cx, "settings-row-window-corners");
+    assert_painted(cx, "settings-row-window-corners");
     // The link-handler row makes General taller than one viewport; Probing is
     // still there, one small scroll down.
     scroll_settings_into_view(cx, "settings-body-probing");
@@ -25730,6 +25741,127 @@ fn appearance_choice_persists_and_paints_live(cx: &mut TestAppContext) {
         view.read_with(cx, |view, _| view.store.appearance()),
         "dark",
         "failed write keeps the old choice"
+    );
+}
+
+#[gpui_kit::test]
+fn accent_choice_persists_paints_live_and_survives_a_theme_swap(cx: &mut TestAppContext) {
+    use crate::store::Accent;
+    use gpui_kit::component::ActiveTheme as _;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    assert_painted(cx, "settings-row-accent");
+    assert_painted(cx, "settings-accent-violet");
+
+    let before = notification_count(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_accent(Accent::Violet, window, cx),
+                "a preset commits"
+            );
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.accent()),
+        Accent::Violet,
+        "the pick persists"
+    );
+    cx.update(|_, cx| {
+        let theme = cx.theme();
+        assert!(
+            (theme.list_active.h - 0.75).abs() < 0.03,
+            "selection follows the accent: {:?}",
+            theme.list_active
+        );
+        assert!(
+            (theme.primary.h - 0.75).abs() < 0.03,
+            "checked controls follow the accent: {:?}",
+            theme.primary
+        );
+        assert!(
+            (theme.ring.h - 0.75).abs() < 0.03,
+            "the focus ring follows the accent: {:?}",
+            theme.ring
+        );
+    });
+    assert_eq!(notification_count(cx), before + 1, "each pick toasts once");
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_appearance("light", window, cx),
+                "the theme still swaps"
+            );
+        });
+    });
+    cx.update(|_, cx| {
+        assert!(
+            (cx.theme().list_active.h - 0.75).abs() < 0.03,
+            "the accent is re-stamped after Theme::change"
+        );
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_accent(Accent::Blue, window, cx),
+                "the default is reachable again"
+            );
+        });
+    });
+    cx.update(|_, cx| {
+        let selection = cx.theme().list_active;
+        assert!(
+            (0.55..0.70).contains(&selection.h) && selection.s > 0.5,
+            "blue restores the kit's selection, got {selection:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn window_corner_choice_persists_and_paints_in_settings(cx: &mut TestAppContext) {
+    use crate::store::WindowCorners;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-window-corners");
+    assert_painted(cx, "settings-row-window-corners");
+
+    let before = notification_count(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                view.commit_window_corners(WindowCorners::Square, window, cx),
+                "Square commits"
+            );
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.window_corners()),
+        WindowCorners::Square,
+        "the pick persists"
+    );
+    assert_eq!(notification_count(cx), before + 1, "the pick toasts once");
+
+    // The OS call is best-effort under the harness (no HWND); it must not
+    // panic, and the choice stays readable for the next boot's apply.
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.window_corners()),
+        WindowCorners::Square
     );
 }
 
@@ -27973,6 +28105,9 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         "settings-row-autostart",
         "settings-autostart-switch",
         "settings-row-autostart-help",
+        "settings-row-accent",
+        "settings-accent-blue",
+        "settings-accent-violet",
         "settings-row-link-handler",
         "settings-link-handler-switch",
         "settings-row-link-handler-help",

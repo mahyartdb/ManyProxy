@@ -6,3 +6,4 @@ mod icon;
 pub mod notify;
 pub mod scheme;
 pub mod taskbar;
+pub mod window;

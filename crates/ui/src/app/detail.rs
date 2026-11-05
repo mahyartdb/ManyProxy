@@ -1726,7 +1726,9 @@ impl AppView {
                 theme.tab_active_foreground,
                 theme.muted_foreground,
                 theme.tokens.tab_bar_segmented,
-                theme.tokens.background,
+                // Task 11: the selected tab is the inspector's active pill, so
+                // it wears the accent wash instead of a neutral surface.
+                theme.list_active,
                 theme.radius,
             )
         };

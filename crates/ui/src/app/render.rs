@@ -92,6 +92,14 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Task 12: restore-from-maximize is the one frame where DWM may have
+        // forgotten the corner style. Re-apply only on that transition.
+        let maximized = window.is_maximized();
+        if self.window_was_maximized && !maximized {
+            crate::os::window::apply_corner_preference(window, self.store.window_corners());
+        }
+        self.window_was_maximized = maximized;
+
         let app_entity = cx.entity();
         // T-03/F2: one geometry spec, computed once per frame and handed to
         // the header strip, the rows and the list pane's drawer reserve.
