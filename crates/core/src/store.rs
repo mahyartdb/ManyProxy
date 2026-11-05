@@ -105,58 +105,68 @@ impl CloseAction {
     }
 }
 
-/// K12: the reading scale for the whole window. Two steps only — the design's
-/// two-size rule governs type roles; this scales the rem those roles resolve
-/// against, so the hierarchy stays intact.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum TextSize {
-    #[default]
-    Default,
-    Large,
+/// K12/Task 13: the reading scale for the whole window, as a percentage of the
+/// kit's base rem. The design's two type roles keep their relationship — only
+/// the rem those roles resolve against moves, in 5% steps from 100 to 150.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TextSize(u32);
+
+impl Default for TextSize {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 impl TextSize {
-    pub const ALL: [TextSize; 2] = [TextSize::Default, TextSize::Large];
+    pub const MIN: u32 = 100;
+    pub const MAX: u32 = 150;
+    pub const STEP: u32 = 5;
+
+    pub const DEFAULT: TextSize = TextSize(100);
+    /// The palette's "Toggle large text" target; the old two-step setting's
+    /// `Large` also reads back as this.
+    pub const LARGE: TextSize = TextSize(125);
+
+    /// Clamps to the supported band and snaps to the nearest 5% step, so a
+    /// hand-edited database or a drifted slider value still lands on a stop.
+    pub fn from_percent(percent: u32) -> Self {
+        let clamped = percent.clamp(Self::MIN, Self::MAX);
+        let snapped = (clamped + Self::STEP / 2) / Self::STEP * Self::STEP;
+        TextSize(snapped.clamp(Self::MIN, Self::MAX))
+    }
+
+    pub fn percent(self) -> u32 {
+        self.0
+    }
 
     /// The value written to the store's meta table.
-    pub fn stored(self) -> &'static str {
-        match self {
-            TextSize::Default => "default",
-            TextSize::Large => "large",
-        }
+    pub fn stored(self) -> String {
+        self.0.to_string()
     }
 
-    /// Reads a stored value back. Anything unknown is `None`, so the caller
-    /// falls back to the default instead of guessing.
+    /// Reads a stored value back. The old `"default"`/`"large"` spellings
+    /// still map to 100/125; anything outside the band is `None`, so the
+    /// caller falls back to the default instead of guessing.
     pub fn from_stored(raw: &str) -> Option<Self> {
         match raw.trim() {
-            "default" => Some(TextSize::Default),
-            "large" => Some(TextSize::Large),
-            _ => None,
+            "default" => Some(Self::DEFAULT),
+            "large" => Some(Self::LARGE),
+            raw => {
+                let percent = raw.parse::<u32>().ok()?;
+                (Self::MIN..=Self::MAX)
+                    .contains(&percent)
+                    .then(|| Self::from_percent(percent))
+            }
         }
     }
 
-    /// The label the Settings radio shows.
-    pub fn label(self) -> &'static str {
-        match self {
-            TextSize::Default => "Default",
-            TextSize::Large => "Large",
-        }
-    }
-
-    /// The one-line explanation under the selected radio.
-    pub fn explanation(self) -> &'static str {
-        match self {
-            TextSize::Default => "The standard 100% reading scale.",
-            TextSize::Large => "The window's text scales to 125%.",
-        }
+    /// The current stop, e.g. `125%`.
+    pub fn label(self) -> String {
+        format!("{}%", self.0)
     }
 
     pub fn scale(self) -> f32 {
-        match self {
-            TextSize::Default => 1.0,
-            TextSize::Large => 1.125,
-        }
+        self.0 as f32 / 100.
     }
 }
 
@@ -8354,7 +8364,7 @@ impl Store {
     }
 
     pub fn set_text_size(&mut self, size: TextSize) -> Result<(), StoreError> {
-        self.set_meta(Self::META_TEXT_SIZE, size.stored())
+        self.set_meta(Self::META_TEXT_SIZE, &size.stored())
     }
 
     // K17: the old META_SKIP_DELETE_CONFIRM meta and its accessors are gone.
@@ -17632,28 +17642,54 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
-    /// K12: the reading scale rides the meta family; an absent or corrupt value
+    /// K12/Task 13: the reading scale rides the meta family as a percent; the
+    /// legacy two-step spellings still read, and an absent or corrupt value
     /// reads as the stock size so a hand-edited database never wedges boot.
     #[test]
     fn k12_text_size_meta_round_trip() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         assert_eq!(
             store.text_size(),
-            TextSize::Default,
+            TextSize::DEFAULT,
             "a fresh store reads at the stock scale"
         );
+        for percent in (TextSize::MIN..=TextSize::MAX).step_by(TextSize::STEP as usize) {
+            let size = TextSize::from_percent(percent);
+            store.set_text_size(size).expect("text size writes");
+            assert_eq!(store.text_size(), size, "{percent}% round-trips");
+        }
         store
-            .set_text_size(TextSize::Large)
-            .expect("text size writes");
-        assert_eq!(store.text_size(), TextSize::Large, "the scale round-trips");
+            .set_meta(Store::META_TEXT_SIZE, "large")
+            .expect("legacy meta writes");
+        assert_eq!(
+            store.text_size(),
+            TextSize::LARGE,
+            "the old Large setting maps to 125%"
+        );
+        store
+            .set_meta(Store::META_TEXT_SIZE, "default")
+            .expect("legacy meta writes");
+        assert_eq!(store.text_size(), TextSize::DEFAULT);
         store
             .set_meta(Store::META_TEXT_SIZE, "huge")
             .expect("corrupt meta writes");
         assert_eq!(
             store.text_size(),
-            TextSize::Default,
+            TextSize::DEFAULT,
             "an unknown scale falls back to the stock size"
         );
+    }
+
+    /// Task 13: slider values land on the 5% stops and never leave the band.
+    #[test]
+    fn k12_text_size_snaps_to_five_percent_stops() {
+        assert_eq!(TextSize::from_percent(103).percent(), 105);
+        assert_eq!(TextSize::from_percent(97).percent(), 100);
+        assert_eq!(TextSize::from_percent(149).percent(), 150);
+        assert_eq!(TextSize::from_percent(999).percent(), 150);
+        assert_eq!(TextSize::from_percent(100).scale(), 1.0);
+        assert_eq!(TextSize::from_percent(125).scale(), 1.25);
+        assert_eq!(TextSize::from_percent(150).scale(), 1.5);
     }
 
     /// T-31: `log_max_lines` rides the meta family with a `500..=50_000` window

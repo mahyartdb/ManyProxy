@@ -2,6 +2,7 @@
 //! Belongs: settings layout and the view state it edits.
 //! Not here: dialog chrome or unrelated feature panels.
 use crate::*;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
 use std::cell::Cell;
 
@@ -200,6 +201,7 @@ struct SettingsState {
     appearance: Rc<RefCell<String>>,
     accent: Rc<RefCell<Accent>>,
     text_size: Rc<RefCell<TextSize>>,
+    text_size_slider: Entity<SliderState>,
     autostart: Rc<RefCell<bool>>,
     link_handler: Rc<RefCell<bool>>,
     restore: Rc<RefCell<bool>>,
@@ -478,46 +480,64 @@ impl SettingsState {
             swatches,
         ));
 
-        // K12: the reading scale. One preference for the whole window; the
-        // two type roles keep their relationship.
-        let text_size_cell = self.text_size.clone();
-        let text_size_view = self.view.clone();
-        let current_size = *text_size_cell.borrow();
-        let selected = TextSize::ALL.iter().position(|size| *size == current_size);
-        let mut group = RadioGroup::horizontal("settings-text-size-options")
-            .selected_index(selected)
-            .on_change(move |ix, window, cx| {
-                let Some(size) = TextSize::ALL.get(*ix).copied() else {
-                    return;
-                };
-                let cell = text_size_cell.clone();
-                text_size_view.update(cx, |view, cx| {
-                    if view.commit_text_size(size, window, cx) {
-                        *cell.borrow_mut() = size;
-                        cx.notify();
-                    }
-                });
-            });
-        for size in TextSize::ALL {
-            group = group.child(
-                Radio::new(size.label())
-                    .label(size.label().to_string())
-                    .tooltip(size.explanation()),
+        // Task 13: one slider from 100 to 150 in 5% steps. The drag previews
+        // live; the release persists and toasts once — a drag across the whole
+        // band writes one value, not eleven.
+        let current_size = *self.text_size.borrow();
+        let text_size_control = div()
+            .id("settings-text-size-group")
+            .test_support()
+            .w(px(SETTINGS_CONTROL_WIDTH))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("settings-text-size-slider")
+                            .test_support()
+                            .flex_1()
+                            .child(Slider::new(&self.text_size_slider)),
+                    )
+                    .child(
+                        div()
+                            .id("settings-text-size-value")
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_label(current_size.label())
+                            .w(px(42.))
+                            .flex_shrink_0()
+                            .text_right()
+                            .text_sm()
+                            .child(current_size.label()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(TextSize::DEFAULT.label())
+                    .child(TextSize::LARGE.label())
+                    .child(TextSize::from_percent(TextSize::MAX).label()),
             );
-        }
         body = body.child(settings_row(
             self,
             "settings-row-text-size",
             "Text size",
             Some(
-                "Scales the window's text; the library row pitch and the minimum window size stay fixed."
+                "Scales the window's text from 100% to 150%; the library row pitch and the minimum window size stay fixed."
                     .to_string(),
             ),
             muted,
-            div()
-                .id("settings-text-size-group")
-                .test_support()
-                .child(group),
+            text_size_control,
         ));
 
         // Launch at login.
@@ -1969,6 +1989,13 @@ impl AppView {
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
         let accent_state = Rc::new(RefCell::new(self.store.accent()));
         let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
+        let text_size_slider = cx.new(|_| {
+            SliderState::new()
+                .min(TextSize::MIN as f32)
+                .max(TextSize::MAX as f32)
+                .step(TextSize::STEP as f32)
+                .default_value(self.store.text_size().percent() as f32)
+        });
         let close_action_state = Rc::new(RefCell::new(self.store.close_action()));
         let window_corners_state = Rc::new(RefCell::new(self.store.window_corners()));
         let test_all_scope_state = Rc::new(RefCell::new(self.store.test_all_scope()));
@@ -2119,6 +2146,37 @@ impl AppView {
                 let _ = weak.update(cx, |_, cx| cx.notify());
             }));
         }
+        {
+            // Task 13: the slider previews on every stop while it moves and
+            // commits on release. The cell carries the preview into the next
+            // frame so the value readout and the scale labels agree.
+            let weak = weak.clone();
+            let cell = text_size_state.clone();
+            subscriptions.push(window.subscribe(
+                &text_size_slider,
+                cx,
+                move |_, event, window, cx| {
+                    let (value, committed) = match event {
+                        SliderEvent::Change(value) => (*value, false),
+                        SliderEvent::Release(value) => (*value, true),
+                    };
+                    let size = TextSize::from_percent(value.start().round() as u32);
+                    let cell = cell.clone();
+                    let _ = weak.update(cx, |view, cx| {
+                        let current = *cell.borrow();
+                        if committed {
+                            if view.commit_text_size(size, window, cx) {
+                                *cell.borrow_mut() = size;
+                            }
+                        } else if size != current {
+                            apply_text_size(size, cx);
+                            *cell.borrow_mut() = size;
+                        }
+                        cx.notify();
+                    });
+                },
+            ));
+        }
         self.settings_subscriptions = subscriptions;
         self.settings_last_check = Some(last_check_state.clone());
 
@@ -2137,6 +2195,7 @@ impl AppView {
             appearance: appearance_state.clone(),
             accent: accent_state.clone(),
             text_size: text_size_state.clone(),
+            text_size_slider: text_size_slider.clone(),
             autostart: autostart_state.clone(),
             link_handler: link_handler_state.clone(),
             restore: restore_state.clone(),
