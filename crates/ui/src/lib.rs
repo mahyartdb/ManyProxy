@@ -7,6 +7,7 @@ mod dialog;
 mod forms;
 mod keys;
 mod library;
+mod os;
 mod pickers;
 mod preset;
 mod text;
@@ -260,6 +261,10 @@ struct AppView {
 
     tray: Option<crate::tray::TrayHandle>,
 
+    /// Taskbar progress + thumbnail toolbar. `None` until the main window's
+    /// handle exists; the install is a no-op under the test harness.
+    os_taskbar: Option<crate::os::taskbar::Taskbar>,
+
     last_snapshot: Vec<String>,
 
     start_in_flight: bool,
@@ -440,6 +445,7 @@ pub fn run() {
 
                 view.update(cx, |view, cx| {
                     view.create_tray(window, cx);
+                    view.install_os(window, cx);
                     view.restore_on_launch(window, cx);
 
                     if crate::tray::launched_minimized() {
@@ -479,29 +485,34 @@ pub fn run() {
                     .detach();
                 }
 
-                let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
-                if has_tray {
-                    let poll_view = view.clone();
-                    let poll_handle = window.window_handle();
-                    cx.spawn(async move |cx| loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
-                            .await;
+                // The same pump serves the tray menu and the taskbar's
+                // thumbnail buttons. It runs even without a tray because the
+                // thumbnail toolbar and hidden-window notifications still need
+                // a drain on a window that has no notification-area icon.
+                let poll_view = view.clone();
+                let poll_handle = window.window_handle();
+                cx.spawn(async move |cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
+                        .await;
 
-                        let tick = cx.update_window(poll_handle, |_, window, cx| {
-                            poll_view.update(cx, |view, cx| view.poll_tray_once(window, cx))
-                        });
-                        match tick {
-                            Ok(true) => {
-                                cx.update(|cx| cx.quit());
-                                break;
-                            }
-                            Ok(false) => {}
-                            Err(_) => break,
+                    let tick = cx.update_window(poll_handle, |_, window, cx| {
+                        poll_view.update(cx, |view, cx| {
+                            let quit = view.poll_tray_once(window, cx);
+                            view.poll_os_once(window, cx);
+                            quit
+                        })
+                    });
+                    match tick {
+                        Ok(true) => {
+                            cx.update(|cx| cx.quit());
+                            break;
                         }
-                    })
-                    .detach();
-                }
+                        Ok(false) => {}
+                        Err(_) => break,
+                    }
+                })
+                .detach();
 
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {

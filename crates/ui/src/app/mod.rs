@@ -12,6 +12,7 @@ pub(crate) mod focus;
 pub(crate) mod io_ops;
 pub(crate) mod kit_bits;
 pub(crate) mod open;
+pub(crate) mod os;
 pub(crate) mod render;
 pub(crate) mod search;
 pub(crate) mod settings;

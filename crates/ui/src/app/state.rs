@@ -6,13 +6,15 @@ use crate::*;
 use gpui_kit::base::VirtualListScrollHandle;
 use gpui_kit::component::list::ListState;
 
-/// Live completion count for the `Testing N…` toast. Probes run on worker
-/// threads, so the sweep writes here and a UI poller copies the snapshot into
-/// the ring at 10fps — no thread ever touches an entity.
+/// Live completion count for the `Testing N…` toast and the taskbar progress
+/// bar. Probes run on worker threads, so the sweep writes here and a UI poller
+/// copies the snapshot into the ring at 10fps — no thread ever touches an
+/// entity.
 #[derive(Clone, Copy)]
 struct ProbeProgress {
     done: usize,
     total: usize,
+    failed: usize,
 }
 
 struct CountingProber<'a> {
@@ -20,16 +22,34 @@ struct CountingProber<'a> {
     progress: Arc<std::sync::Mutex<ProbeProgress>>,
 }
 
-fn note_probe_complete(progress: &std::sync::Mutex<ProbeProgress>) {
+/// The group sweep reports done/total through its own callback; this wrapper
+/// only adds the failure counter, so the taskbar can turn red for a partial
+/// sweep without changing `test_group`'s progress shape.
+struct FailureCountingProber<'a> {
+    inner: &'a (dyn HealthProber + Sync),
+    progress: Arc<std::sync::Mutex<ProbeProgress>>,
+}
+
+fn note_probe_complete(progress: &std::sync::Mutex<ProbeProgress>, failed: bool) {
     let mut state = progress.lock().unwrap_or_else(|poison| poison.into_inner());
     state.done = (state.done + 1).min(state.total);
+    if failed {
+        state.failed = (state.failed + 1).min(state.total);
+    }
+}
+
+/// Group sweeps already count completion in their own callback, so this only
+/// raises the failure flag.
+fn note_probe_failure(progress: &std::sync::Mutex<ProbeProgress>) {
+    let mut state = progress.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.failed = (state.failed + 1).min(state.total);
 }
 
 impl HealthProber for CountingProber<'_> {
     fn supports(&self, config: &ProxyConfig) -> bool {
         let supported = self.inner.supports(config);
         if !supported {
-            note_probe_complete(&self.progress);
+            note_probe_complete(&self.progress, false);
         }
         supported
     }
@@ -42,7 +62,7 @@ impl HealthProber for CountingProber<'_> {
         url: &str,
     ) -> Result<ProbeSuccess, String> {
         let result = self.inner.url_test(config, bind, port, url);
-        note_probe_complete(&self.progress);
+        note_probe_complete(&self.progress, result.is_err());
         result
     }
 
@@ -53,26 +73,65 @@ impl HealthProber for CountingProber<'_> {
         port: u16,
     ) -> Result<ProbeSuccess, String> {
         let result = self.inner.tcp_ping(config, bind, port);
-        note_probe_complete(&self.progress);
+        note_probe_complete(&self.progress, result.is_err());
+        result
+    }
+}
+
+impl HealthProber for FailureCountingProber<'_> {
+    fn supports(&self, config: &ProxyConfig) -> bool {
+        self.inner.supports(config)
+    }
+
+    fn url_test(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+        url: &str,
+    ) -> Result<ProbeSuccess, String> {
+        let result = self.inner.url_test(config, bind, port, url);
+        if result.is_err() {
+            note_probe_failure(&self.progress);
+        }
+        result
+    }
+
+    fn tcp_ping(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+    ) -> Result<ProbeSuccess, String> {
+        let result = self.inner.tcp_ping(config, bind, port);
+        if result.is_err() {
+            note_probe_failure(&self.progress);
+        }
         result
     }
 }
 
 fn spawn_probe_progress_poller(
-    toast: ToastHandle,
+    toast: Option<ToastHandle>,
     progress: Arc<std::sync::Mutex<ProbeProgress>>,
     active: Arc<AtomicBool>,
-    handle: AnyWindowHandle,
     cx: &mut Context<AppView>,
 ) {
+    let weak = cx.entity().downgrade();
     cx.spawn(async move |_entity, cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(120))
             .await;
         let snapshot = *progress.lock().unwrap_or_else(|poison| poison.into_inner());
         let running = active.load(std::sync::atomic::Ordering::SeqCst);
-        let _ = handle.update(cx, |_, _, cx| {
-            update_probe_progress(toast, snapshot.done, snapshot.total, cx);
+        let _ = weak.update(cx, |view, cx| {
+            if let Some(toast) = toast {
+                update_probe_progress(toast, snapshot.done, snapshot.total, cx);
+            }
+            view.set_taskbar_progress(snapshot.done, snapshot.total, snapshot.failed);
+            if !running {
+                view.clear_taskbar_progress();
+            }
         });
         if !running {
             break;
@@ -385,6 +444,7 @@ impl AppView {
             import_cancel_epoch: None,
             close_confirmed: false,
             tray: None,
+            os_taskbar: None,
             last_snapshot,
             start_in_flight: false,
             ticks_started: false,
@@ -964,6 +1024,7 @@ impl AppView {
         let progress = Arc::new(std::sync::Mutex::new(ProbeProgress {
             done: 0,
             total: count,
+            failed: 0,
         }));
         let active = Arc::new(AtomicBool::new(true));
         let probe_key = self.probe_toast_key;
@@ -981,8 +1042,8 @@ impl AppView {
                 })
                 .ok()
         });
-        if let (Some(handle), Some(toast)) = (window, probe_toast) {
-            spawn_probe_progress_poller(toast, progress.clone(), active.clone(), handle, cx);
+        if window.is_some() {
+            spawn_probe_progress_poller(probe_toast, progress.clone(), active.clone(), cx);
         }
         let stop = self.probe_stop.clone();
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
@@ -995,7 +1056,11 @@ impl AppView {
                 .background_executor()
                 .spawn(async move {
                     let prober = prober;
-                    let outcomes = test_group(&rows, &url, &*prober, &stop, move |done, total| {
+                    let counting = FailureCountingProber {
+                        inner: &*prober,
+                        progress: sweep_progress.clone(),
+                    };
+                    let outcomes = test_group(&rows, &url, &counting, &stop, move |done, total| {
                         let mut state = sweep_progress
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner());
@@ -1287,6 +1352,7 @@ impl AppView {
         let progress = Arc::new(std::sync::Mutex::new(ProbeProgress {
             done: 0,
             total: count,
+            failed: 0,
         }));
         let active = Arc::new(AtomicBool::new(true));
         let probe_key = self.probe_toast_key;
@@ -1308,8 +1374,8 @@ impl AppView {
         } else {
             None
         };
-        if let (Some(handle), Some(toast)) = (window, probe_toast) {
-            spawn_probe_progress_poller(toast, progress.clone(), active.clone(), handle, cx);
+        if window.is_some() {
+            spawn_probe_progress_poller(probe_toast, progress.clone(), active.clone(), cx);
         }
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));

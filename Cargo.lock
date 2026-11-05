@@ -4304,6 +4304,7 @@ dependencies = [
  "serde_json",
  "tray-icon",
  "web-time",
+ "windows 0.58.0",
  "winreg",
 ]
 
