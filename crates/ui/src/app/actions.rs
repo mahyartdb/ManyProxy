@@ -679,9 +679,12 @@ fn sort_direction(view: &mut AppView, window: &mut Window, cx: &mut Context<AppV
 }
 
 fn text_size(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    let next = match view.store.text_size() {
-        TextSize::Default => TextSize::Large,
-        TextSize::Large => TextSize::Default,
+    // Task 13: the palette keeps its one-step toggle; "large" is the slider's
+    // 125% stop, and any custom stop toggles back to the stock 100%.
+    let next = if view.store.text_size() == TextSize::LARGE {
+        TextSize::DEFAULT
+    } else {
+        TextSize::LARGE
     };
     view.commit_text_size(next, window, cx);
 }

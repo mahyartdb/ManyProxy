@@ -36611,13 +36611,13 @@ fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         view.read_with(cx, |view, _| view.store.text_size()),
-        TextSize::Large,
+        TextSize::LARGE,
         "the palette persists the larger reading scale"
     );
     assert_eq!(
         cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
-        px(18.),
-        "the palette toggle scales the theme"
+        px(20.),
+        "the palette toggle scales to 125%"
     );
 
     cx.update(|window, cx| {
@@ -36628,7 +36628,7 @@ fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         view.read_with(cx, |view, _| view.store.text_size()),
-        TextSize::Default,
+        TextSize::DEFAULT,
         "the toggle returns to the stock scale"
     );
 }
@@ -36642,21 +36642,21 @@ fn k12_text_size_persists_and_survives_appearance(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
-        .set_text_size(TextSize::Large)
+        .set_text_size(TextSize::LARGE)
         .expect("text size writes");
-    assert_eq!(store.text_size(), TextSize::Large);
+    assert_eq!(store.text_size(), TextSize::LARGE);
 
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
         cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
-        px(18.),
-        "boot applies the stored scale"
+        px(20.),
+        "boot applies the stored 125% scale"
     );
     assert_eq!(
         cx.update(|window, _| window.rem_size()),
-        px(18.),
+        px(20.),
         "the root feeds the scaled rem to the window"
     );
 
@@ -36667,13 +36667,13 @@ fn k12_text_size_persists_and_survives_appearance(cx: &mut TestAppContext) {
     paint_frame(cx);
     assert_eq!(
         cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
-        px(18.),
+        px(20.),
         "an appearance swap keeps the reading scale"
     );
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.commit_text_size(TextSize::Default, window, cx)
+            view.commit_text_size(TextSize::DEFAULT, window, cx)
         });
     });
     cx.run_until_parked();
@@ -36685,9 +36685,117 @@ fn k12_text_size_persists_and_survives_appearance(cx: &mut TestAppContext) {
     );
     assert_eq!(
         view.read_with(cx, |view, _| view.store.text_size()),
-        TextSize::Default,
+        TextSize::DEFAULT,
         "the choice persists"
     );
+}
+
+/// Task 13: a click on the slider lands on a 5% stop, previews at once, and
+/// persists on release.
+#[gpui_kit::test]
+fn task13_text_size_slider_commits_a_stop_on_click(cx: &mut TestAppContext) {
+    use crate::store::TextSize;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-text-size");
+    assert_painted(cx, "settings-text-size-slider");
+    assert_eq!(label_of("settings-text-size-value", cx), "100%");
+
+    cx.update(|window, cx| {
+        window.click("settings-text-size-slider", cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.text_size()),
+        TextSize::LARGE,
+        "a center click lands on the 125% stop and persists"
+    );
+    assert_eq!(
+        cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
+        px(20.),
+        "the click paints the new scale live"
+    );
+    assert_eq!(label_of("settings-text-size-value", cx), "125%");
+}
+
+/// Task 13: the slider is the only Settings control for the reading scale,
+/// and its 150% stop keeps the list rows and the dialog itself intact.
+#[gpui_kit::test]
+fn task13_text_size_slider_holds_list_and_settings_at_150(cx: &mut TestAppContext) {
+    use crate::store::TextSize;
+    use crate::RowMetrics;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .set_text_size(TextSize::from_percent(TextSize::MAX))
+        .expect("text size writes");
+    let first = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let second = store
+        .add(row19_seed("Home", "b.example.com", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        cx.update(|_, cx| gpui_kit::component::Theme::global(cx).font_size),
+        px(24.),
+        "150% is 16px × 1.5"
+    );
+
+    for id in [&first.id, &second.id] {
+        let row = format!("library-row-{id}");
+        assert_painted(cx, &row);
+        assert_within_frame(cx, &row);
+    }
+    let tops = cx.update(|window, _| {
+        [&first.id, &second.id]
+            .iter()
+            .map(|id| {
+                window
+                    .try_find(format!("library-row-{id}"))
+                    .expect("row paints")
+                    .bounds()
+                    .origin
+                    .y
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        tops[1] - tops[0],
+        px(RowMetrics::ROW_PITCH),
+        "the row pitch stays fixed at 150%"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-text-size");
+    assert_painted(cx, "settings-row-text-size");
+    assert_painted(cx, "settings-text-size-slider");
+    assert_painted(cx, "settings-text-size-group");
+    assert_eq!(
+        label_of("settings-text-size-value", cx),
+        "150%",
+        "the readout shows the stored stop"
+    );
+    assert_painted(cx, "settings-dialog-save");
+    assert_within_frame(cx, "settings-dialog-save");
 }
 
 /// A click on a library row with modifiers held. The kit's own test helpers
