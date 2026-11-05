@@ -472,6 +472,9 @@ impl AppView {
             return;
         }
         self.probe_stop.store(true, Ordering::SeqCst);
+        // The sweep's poller clears on its own last tick; cancel must not wait
+        // for that tick when the user explicitly stopped it.
+        self.clear_taskbar_progress();
         window.push_notification(Notification::info("Stopping the group test…"), cx);
     }
 

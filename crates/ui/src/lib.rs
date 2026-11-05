@@ -7,6 +7,7 @@ mod dialog;
 mod forms;
 mod keys;
 mod library;
+mod os;
 mod pickers;
 mod preset;
 mod text;
@@ -260,6 +261,10 @@ struct AppView {
 
     tray: Option<crate::tray::TrayHandle>,
 
+    /// Taskbar progress. `None` until the main window's handle exists; the
+    /// install is a no-op under the test harness.
+    os_taskbar: Option<crate::os::taskbar::Taskbar>,
+
     last_snapshot: Vec<String>,
 
     start_in_flight: bool,
@@ -440,6 +445,7 @@ pub fn run() {
 
                 view.update(cx, |view, cx| {
                     view.create_tray(window, cx);
+                    view.install_os(window);
                     view.restore_on_launch(window, cx);
 
                     if crate::tray::launched_minimized() {
