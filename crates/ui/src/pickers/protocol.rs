@@ -30,7 +30,7 @@ pub(crate) fn protocol_choices() -> Vec<ProtocolChoice> {
         .map(|protocol| ProtocolChoice {
             id: format!("protocol-option-{protocol}"),
             title: protocol.to_string(),
-            display: format!("Protocol: {protocol}"),
+            display: t!("protocol-choice-display", protocol = *protocol),
             value: protocol.to_string(),
         })
         .collect()

@@ -33,7 +33,7 @@ impl AppView {
             Some(fallback),
         );
         view.notify_after_root(
-            Notification::warning(format!("Running without persistence: {error}")),
+            Notification::warning(t!("running-without-persistence", error = error.to_string())),
             window,
             cx,
         );
@@ -100,9 +100,7 @@ impl AppView {
             }
             Err(error) => {
                 self.notify_after_root(
-                    Notification::warning(format!(
-                        "Tray unavailable ({error}) — closing still confirms"
-                    )),
+                    Notification::warning(t!("tray-unavailable", error = error.to_string())),
                     window,
                     cx,
                 );
@@ -147,7 +145,7 @@ impl AppView {
     ) {
         if let Err(reason) = self.sync_presets_to_engine() {
             self.notify_after_root(
-                Notification::error(format!("Cannot restore: {reason}")),
+                Notification::error(t!("cannot-restore", reason = reason)),
                 window,
                 cx,
             );
@@ -170,7 +168,7 @@ impl AppView {
         self.reload(window, cx);
         if failed.is_empty() {
             self.notify_after_root(
-                Notification::success(format!("Restored {started} endpoint(s)")),
+                Notification::success(t!("restored-endpoints", started = started)),
                 window,
                 cx,
             );
@@ -194,9 +192,9 @@ impl AppView {
             .iter()
             .map(|row| (row.name.clone(), row.bind_ip.clone()))
             .collect();
-        let description = format!(
-            "{}\n\nThese were running before; confirm to restart them.",
-            lan_confirm_description(&lan)
+        let description = t!(
+            "lan-restore-description",
+            description = lan_confirm_description(&lan)
         );
         self.open_alert_dialog_after_root(window, cx, move |alert, _, _| {
             let view = view.clone();

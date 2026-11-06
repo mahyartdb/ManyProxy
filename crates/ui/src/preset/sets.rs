@@ -131,7 +131,7 @@ pub(crate) fn subscription_row(
                     cx.write_to_clipboard(ClipboardItem::new_string(redacted));
                     copy_view.update(cx, |_, cx| {
                         window.push_notification(
-                            Notification::success("Copied subscription URL (redacted)"),
+                            Notification::success(t!("copied-sub-url-redacted")),
                             cx,
                         );
                     });

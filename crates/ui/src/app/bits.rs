@@ -88,15 +88,15 @@ pub(crate) fn is_row_local_start_error(error: &EngineError) -> bool {
 pub(crate) fn normalize_test_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("test URL must not be empty".to_string());
+        return Err(t!("test-url-empty"));
     }
     let rest = trimmed
         .strip_prefix("http://")
         .or_else(|| trimmed.strip_prefix("https://"))
-        .ok_or_else(|| "test URL must start with http:// or https://".to_string())?;
+        .ok_or_else(|| t!("test-url-scheme"))?;
     let host = rest.split('/').next().unwrap_or("").trim();
     if host.is_empty() {
-        return Err("test URL needs a host".to_string());
+        return Err(t!("test-url-host"));
     }
     Ok(trimmed.to_string())
 }

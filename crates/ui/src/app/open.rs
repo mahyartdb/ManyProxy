@@ -10,16 +10,25 @@ const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
 
 /// F10: the footer hint the palette carries, in one place so the test pins the
 /// same string the user reads.
-pub(crate) const PALETTE_FOOTER_HINT: &str = "↑↓ move · Enter run · Esc close";
+pub(crate) fn palette_footer_hint() -> String {
+    t!("palette-footer-hint")
+}
+pub(crate) fn palette_group_label(group: usize) -> String {
+    match group {
+        0 => t!("palette-group-library"),
+        1 => t!("palette-group-manage"),
+        _ => t!("palette-group-sort"),
+    }
+}
 
 /// A palette row for one table action. The row carries the action's label,
 /// keywords and first shortcut chip; the table owns those, and the confirm
 /// handler resolves them through `run_action`, so a palette row cannot drift
 /// from the menus that show the same verb.
 fn palette_item(def: &'static ActionDef) -> CommandItem {
-    let label = def.label;
+    let label = def.label();
     let mut item = CommandItem::new()
-        .label(label)
+        .label(label.clone())
         .keywords(def.keywords.iter().copied());
     if let Some(&(keystroke, chip)) = def.shortcuts.first() {
         item = item.child(move |_, _| {
@@ -29,7 +38,7 @@ fn palette_item(def: &'static ActionDef) -> CommandItem {
                 .flex_1()
                 .items_center()
                 .gap_2()
-                .child(div().flex_1().min_w_0().child(label))
+                .child(div().flex_1().min_w_0().child(label.clone()))
                 .child(shortcut_kbd(keystroke, chip))
                 .into_any_element()
         });
@@ -66,7 +75,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_edit_dialog(config, window, cx);
@@ -79,7 +88,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_remove_confirm(config, window, cx);
@@ -92,7 +101,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_traffic_reset_confirm(config, window, cx);
@@ -105,7 +114,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_usage_reset_confirm(config, window, cx);
@@ -241,7 +250,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let link =
@@ -249,7 +258,7 @@ impl AppView {
         let title = t!("share-title", name = config.name.as_str());
         let commit: DialogCommit = Rc::new(move |window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
-            window.push_notification(Notification::success("Copied share link"), cx);
+            window.push_notification(Notification::success(t!("copied-share-link")), cx);
             true
         });
         let commit_key = commit.clone();
@@ -732,30 +741,29 @@ impl AppView {
         let view = cx.entity();
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let view = view.clone();
-            let mut command =
-                Command::new(&state)
-                    .placeholder("Type a command…")
-                    .footer(|_, _, cx| {
-                        div()
-                            .id("palette-footer")
-                            .test_support()
-                            .w_full()
-                            .px_2()
-                            .pt_2()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .aria_label(PALETTE_FOOTER_HINT)
-                            .child(PALETTE_FOOTER_HINT)
-                    });
-            for (section, (label, _)) in PALETTE_GROUPS.iter().enumerate() {
+            let mut command = Command::new(&state)
+                .placeholder(t!("palette-placeholder"))
+                .footer(|_, _, cx| {
+                    div()
+                        .id("palette-footer")
+                        .test_support()
+                        .w_full()
+                        .px_2()
+                        .pt_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .aria_label(palette_footer_hint())
+                        .child(palette_footer_hint())
+                });
+            for (section, _) in PALETTE_GROUPS.iter().enumerate() {
                 command = command.group(
                     CommandGroup::new()
-                        .label(*label)
+                        .label(palette_group_label(section))
                         .items(palette_items(section)),
                 );
             }
             dialog
-                .title("Command palette")
+                .title(t!("palette-title"))
                 .child(command.on_confirm(move |index, window, cx| {
                     view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
                 }))
@@ -773,10 +781,7 @@ impl AppView {
             "prune kinds stay the pinned four"
         );
         let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("no-group-focus")), cx);
             return;
         };
         let (title, description, ok) = match kind {
@@ -787,7 +792,7 @@ impl AppView {
                     .unwrap_or((0, Vec::new()));
                 if total == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no duplicates")),
+                        Notification::info(t!("group-no-duplicates", group = group.as_str())),
                         cx,
                     );
                     return;
@@ -810,7 +815,7 @@ impl AppView {
                     .unwrap_or(0);
                 if count == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no unavailable rows")),
+                        Notification::info(t!("group-no-unavailable", group = group.as_str())),
                         cx,
                     );
                     return;
@@ -833,7 +838,7 @@ impl AppView {
                     .unwrap_or(0);
                 if count == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no invalid rows")),
+                        Notification::info(t!("group-no-invalid", group = group.as_str())),
                         cx,
                     );
                     return;
@@ -848,7 +853,7 @@ impl AppView {
                 let count = self.group_test_sample_count(&group);
                 if count == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no test results")),
+                        Notification::info(t!("group-no-test-results", group = group.as_str())),
                         cx,
                     );
                     return;
@@ -2089,7 +2094,8 @@ impl AppView {
             let name = name_reader.read(cx).value().to_string();
             let url = url_reader.read(cx).value().to_string();
             if name.trim().is_empty() && url.trim().is_empty() {
-                window.push_notification(Notification::warning("Enter a rule set name or URL"), cx);
+                window
+                    .push_notification(Notification::warning(t!("enter-rule-set-name-or-url")), cx);
                 return false;
             }
             commit_view.update(cx, |view, cx| {
@@ -2155,7 +2161,7 @@ impl AppView {
         match store::subscription_fetch_policy(url.trim()) {
             store::SubscriptionFetchPolicy::Block { reason } => {
                 window.push_notification(
-                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    Notification::error(t!("invalid-rule-set-url", reason = reason)),
                     cx,
                 );
                 return false;
@@ -2168,7 +2174,7 @@ impl AppView {
             Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    Notification::error(t!("cannot-load-rule-sets", error = error.to_string())),
                     cx,
                 );
                 return false;
@@ -2195,9 +2201,7 @@ impl AppView {
             candidate = format!("{name}-{suffix}");
         }
         window.push_notification(
-            Notification::error(format!(
-                "no free staging name for \"{name}\" — remove stale rule sets first"
-            )),
+            Notification::error(t!("no-free-staging-name", name = name)),
             cx,
         );
         false
@@ -2214,7 +2218,7 @@ impl AppView {
         match store::subscription_fetch_policy(grant.url.trim()) {
             store::SubscriptionFetchPolicy::Block { reason } => {
                 window.push_notification(
-                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    Notification::error(t!("invalid-rule-set-url", reason = reason)),
                     cx,
                 );
                 return;
@@ -2281,7 +2285,7 @@ impl AppView {
             Ok(presets) => presets,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load routing presets: {error}")),
+                    Notification::error(t!("cannot-load-presets", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2291,7 +2295,7 @@ impl AppView {
             Ok(rows) => rows,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load library: {error}")),
+                    Notification::error(t!("cannot-load-library", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2310,7 +2314,7 @@ impl AppView {
             Ok(rule_sets) => rule_sets,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    Notification::error(t!("cannot-load-rule-sets", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2340,10 +2344,7 @@ impl AppView {
                 && boxes.is_empty()
                 && remote_url.is_empty()
             {
-                window.push_notification(
-                    Notification::warning("Enter a name, rules, or a remote URL"),
-                    cx,
-                );
+                window.push_notification(Notification::warning(t!("enter-name-rules-or-url")), cx);
                 return false;
             }
             commit_view.update(cx, |view, cx| {
@@ -2472,7 +2473,7 @@ impl AppView {
             Ok(presets) => presets,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load routing presets: {error}")),
+                    Notification::error(t!("cannot-load-presets", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2622,10 +2623,7 @@ impl AppView {
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
-                    window.push_notification(
-                        Notification::warning("Copied FULL subscription URL (carries the token)"),
-                        cx,
-                    );
+                    window.push_notification(Notification::warning(t!("copied-full-sub-url")), cx);
                     true
                 })
         });
@@ -2667,7 +2665,7 @@ impl AppView {
 
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load subscriptions: {error}")),
+                    Notification::error(t!("cannot-load-subscriptions", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2677,7 +2675,7 @@ impl AppView {
             Ok(rows) => rows,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load library: {error}")),
+                    Notification::error(t!("cannot-load-library", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2701,7 +2699,7 @@ impl AppView {
             let auto = *reader.auto_refresh.borrow();
             let interval = *reader.interval_secs.borrow();
             if label.trim().is_empty() && url.trim().is_empty() {
-                window.push_notification(Notification::warning("Enter a subscription URL"), cx);
+                window.push_notification(Notification::warning(t!("enter-subscription-url")), cx);
                 return false;
             }
             commit_view.update(cx, |view, cx| {
@@ -2961,12 +2959,9 @@ impl AppView {
         if included.is_empty() {
             window.push_notification(
                 Notification::info(if skipped.is_empty() {
-                    "No subscriptions to update".to_string()
+                    t!("no-subscriptions-to-update")
                 } else {
-                    format!(
-                        "No subscriptions to update — {} skipped (auto-refresh off for their group)",
-                        skipped.len()
-                    )
+                    t!("no-subs-to-update-skipped", count = skipped.len())
                 }),
                 cx,
             );

@@ -158,7 +158,7 @@ type ToastRun = Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub(crate) struct ToastAction {
     id: &'static str,
-    label: &'static str,
+    label: String,
     run: ToastRun,
 }
 
@@ -250,13 +250,13 @@ impl ToastSpec {
     pub(crate) fn action(
         mut self,
         id: &'static str,
-        label: &'static str,
+        label: impl Into<String>,
         run: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         if self.actions.len() < TOAST_MAX_ACTIONS {
             self.actions.push(ToastAction {
                 id,
-                label,
+                label: label.into(),
                 run: Rc::new(run),
             });
         }
@@ -300,8 +300,8 @@ impl ToastProgress {
 /// The one copy for "how much is left", shared by the ring and its tests.
 pub(crate) fn probe_remaining_label(done: usize, total: usize) -> String {
     match total.saturating_sub(done) {
-        1 => "1 remaining".to_string(),
-        remaining => format!("{remaining} remaining"),
+        1 => t!("probe-remaining-one"),
+        remaining => t!("probe-remaining", count = remaining),
     }
 }
 
@@ -511,7 +511,7 @@ fn forget_toast(key: u64, instance: u64) {
 fn action_button(action: &ToastAction) -> Button {
     let run = action.run.clone();
     Button::new(action.id)
-        .label(action.label)
+        .label(action.label.clone())
         .small()
         .on_click(move |_, window, cx| run(window, cx))
 }
@@ -740,7 +740,7 @@ impl AppView {
         let spec = note
             .key(batch)
             .lifetime(TOAST_UNDO_MS)
-            .action("k5-undo", "Undo", move |window, cx| {
+            .action("k5-undo", t!("toast-action-undo"), move |window, cx| {
                 let _ = view.update(cx, |view, cx| {
                     view.undo_expired_delete(batch, window, cx);
                 });

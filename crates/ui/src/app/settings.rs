@@ -1461,9 +1461,9 @@ impl AppView {
         match crate::tray::set_autostart_enabled(enabled) {
             Ok(()) => {
                 let message = if enabled {
-                    "Autostart on — ManyProxy starts with Windows (HKCU Run entry written)"
+                    t!("autostart-on-toast")
                 } else {
-                    "Autostart off — Run entry removed"
+                    t!("autostart-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1471,7 +1471,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Autostart change failed: {error}")),
+                    Notification::error(t!("autostart-failed", error = error)),
                     cx,
                 );
                 cx.notify();
@@ -1494,9 +1494,9 @@ impl AppView {
         match outcome {
             Ok(()) => {
                 let message = if enabled {
-                    "Link handler on — manyproxy:// links open in ManyProxy"
+                    t!("link-handler-on-toast")
                 } else {
-                    "Link handler off — the manyproxy:// registration was removed"
+                    t!("link-handler-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1504,7 +1504,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Link handler change failed: {error}")),
+                    Notification::error(t!("link-handler-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1522,9 +1522,9 @@ impl AppView {
         match self.store.set_restore_running(enabled) {
             Ok(()) => {
                 let message = if enabled {
-                    "Session restore on — the running set returns on next launch"
+                    t!("session-restore-on-toast")
                 } else {
-                    "Session restore off"
+                    t!("session-restore-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1532,7 +1532,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Restore setting failed: {error}")),
+                    Notification::error(t!("restore-setting-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1579,9 +1579,9 @@ impl AppView {
         {
             Ok(()) => {
                 let message = if enabled {
-                    "Tray notifications on — hidden windows report crashes, failed refreshes and taken ports"
+                    t!("tray-notify-on-toast")
                 } else {
-                    "Tray notifications off — failures stay in the app"
+                    t!("tray-notify-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1589,7 +1589,10 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Tray notification setting failed: {error}")),
+                    Notification::error(t!(
+                        "tray-notification-setting-failed",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
                 cx.notify();
@@ -1611,9 +1614,9 @@ impl AppView {
             Ok(()) => {
                 self.apply_engine_auto_restart();
                 let message = if enabled {
-                    "Auto-restart on — crashed cores restart with backoff (up to 3 tries)"
+                    t!("auto-restart-on-toast")
                 } else {
-                    "Auto-restart off — crashed cores stay down until you restart them"
+                    t!("auto-restart-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1621,7 +1624,10 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Auto-restart setting failed: {error}")),
+                    Notification::error(t!(
+                        "auto-restart-setting-failed",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
                 cx.notify();
@@ -1640,13 +1646,16 @@ impl AppView {
             Ok(()) => {
                 apply_appearance(value, self.store.accent(), Some(window), cx);
                 apply_text_size(self.store.text_size(), cx);
-                window.push_notification(Notification::success(format!("Appearance: {value}")), cx);
+                window.push_notification(
+                    Notification::success(t!("appearance-toast", value = value)),
+                    cx,
+                );
                 cx.notify();
                 true
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Appearance change failed: {error}")),
+                    Notification::error(t!("appearance-change-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1669,7 +1678,7 @@ impl AppView {
                 apply_appearance(&self.store.appearance(), accent, Some(window), cx);
                 apply_text_size(self.store.text_size(), cx);
                 window.push_notification(
-                    Notification::success(format!("Accent: {}", accent.label())),
+                    Notification::success(t!("accent-toast", label = accent_label(accent))),
                     cx,
                 );
                 cx.notify();
@@ -1677,7 +1686,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Accent change failed: {error}")),
+                    Notification::error(t!("accent-change-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1696,7 +1705,7 @@ impl AppView {
             Ok(()) => {
                 apply_text_size(size, cx);
                 window.push_notification(
-                    Notification::success(format!("Text size: {}", size.label())),
+                    Notification::success(t!("text-size-toast", label = text_size_label(size))),
                     cx,
                 );
                 cx.notify();
@@ -1704,7 +1713,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Text size change failed: {error}")),
+                    Notification::error(t!("text-size-change-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1724,10 +1733,8 @@ impl AppView {
         match self.store.set_close_action(action) {
             Ok(()) => {
                 let message = match action {
-                    CloseAction::Tray => {
-                        "Close behaviour: the window closes and the proxies keep running"
-                    }
-                    CloseAction::Quit => "Close behaviour: quitting stops every profile and exits",
+                    CloseAction::Tray => t!("close-behaviour-tray-toast"),
+                    CloseAction::Quit => t!("close-behaviour-quit-toast"),
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1735,7 +1742,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Close behaviour change failed: {error}")),
+                    Notification::error(t!("close-behaviour-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1757,7 +1764,10 @@ impl AppView {
             Ok(()) => {
                 crate::os::window::apply_corner_preference(window, corners);
                 window.push_notification(
-                    Notification::success(format!("Window corners: {}", corners.label())),
+                    Notification::success(t!(
+                        "window-corners-toast",
+                        label = window_corners_label(corners)
+                    )),
                     cx,
                 );
                 cx.notify();
@@ -1765,7 +1775,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Window corners change failed: {error}")),
+                    Notification::error(t!("window-corners-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1788,23 +1798,19 @@ impl AppView {
             Ok(()) => {
                 if show {
                     if self.create_tray(window, cx) {
-                        window.push_notification(Notification::success("Tray icon: shown"), cx);
+                        window.push_notification(Notification::success(t!("tray-icon-shown")), cx);
                     }
                 } else {
                     self.tray = None;
                     if self.store.seen_tray_disable_hint() {
-                        window.push_notification(
-                            Notification::info("Tray icon hidden — closing now quits"),
-                            cx,
-                        );
+                        window
+                            .push_notification(Notification::info(t!("tray-icon-hidden-info")), cx);
                     } else {
                         if let Err(error) = self.store.set_seen_tray_disable_hint(true) {
                             eprintln!("tray disable hint flag failed: {error}");
                         }
                         window.push_notification(
-                            Notification::warning(
-                                "Tray icon hidden — closing ManyProxy now quits. Turn Show tray icon back on to close to the tray again.",
-                            ),
+                            Notification::warning(t!("tray-icon-hidden-warning")),
                             cx,
                         );
                     }
@@ -1814,7 +1820,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Tray icon change failed: {error}")),
+                    Notification::error(t!("tray-icon-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1833,8 +1839,10 @@ impl AppView {
         let trimmed = raw.trim();
         let Ok(secs) = trimmed.parse::<u64>() else {
             window.push_notification(
-                Notification::warning(format!(
-                    "The probe timeout must be a whole number of seconds ({MIN_PROBE_TIMEOUT_SECS}–{MAX_PROBE_TIMEOUT_SECS})"
+                Notification::warning(t!(
+                    "probe-timeout-invalid",
+                    min = MIN_PROBE_TIMEOUT_SECS,
+                    max = MAX_PROBE_TIMEOUT_SECS
                 )),
                 cx,
             );
@@ -1845,7 +1853,7 @@ impl AppView {
                 // T-04: the live prober takes the new budget right away.
                 self.prober = Box::new(RealHealthProber::new(std::time::Duration::from_secs(secs)));
                 window.push_notification(
-                    Notification::success(format!("Probe timeout set to {secs} seconds")),
+                    Notification::success(t!("probe-timeout-set", secs = secs)),
                     cx,
                 );
                 cx.notify();
@@ -1853,7 +1861,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Probe timeout change failed: {error}")),
+                    Notification::error(t!("probe-timeout-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1872,8 +1880,8 @@ impl AppView {
         match self.store.set_test_all_scope(scope) {
             Ok(()) => {
                 let message = match scope {
-                    TestAllScope::Running => "Test all covers every running endpoint",
-                    TestAllScope::Checked => "Test all covers the checked endpoints only",
+                    TestAllScope::Running => t!("test-all-scope-running-toast"),
+                    TestAllScope::Checked => t!("test-all-scope-checked-toast"),
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1881,7 +1889,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Test-all scope change failed: {error}")),
+                    Notification::error(t!("test-all-scope-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1902,8 +1910,10 @@ impl AppView {
         match self.store.add_bind_host(raw) {
             Ok(hosts) => {
                 self.refresh_bind_hosts(cx);
-                window
-                    .push_notification(Notification::success(format!("Added {}", raw.trim())), cx);
+                window.push_notification(
+                    Notification::success(t!("bind-host-added", host = raw.trim())),
+                    cx,
+                );
                 Ok(hosts)
             }
             Err(error) => {
@@ -1925,7 +1935,10 @@ impl AppView {
         match self.store.remove_bind_host(host) {
             Ok(hosts) => {
                 self.refresh_bind_hosts(cx);
-                window.push_notification(Notification::success(format!("Removed {host}")), cx);
+                window.push_notification(
+                    Notification::success(t!("bind-host-removed", host = host)),
+                    cx,
+                );
                 Ok(hosts)
             }
             Err(error) => {
@@ -1954,13 +1967,16 @@ impl AppView {
         match open_folder_in_shell(&folder) {
             Ok(()) => {
                 window.push_notification(
-                    Notification::success(format!("Opened {}", folder.display())),
+                    Notification::success(t!(
+                        "data-folder-opened",
+                        path = folder.display().to_string()
+                    )),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot open the data folder: {error}")),
+                    Notification::error(t!("data-folder-failed", error = error.to_string())),
                     cx,
                 );
             }
@@ -1977,10 +1993,7 @@ impl AppView {
     ) {
         let count = self.store.list().map(|rows| rows.len()).unwrap_or(0);
         if count == 0 {
-            window.push_notification(
-                Notification::info("The library is already empty — nothing to reset"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("library-already-empty")), cx);
             return;
         }
         let view = cx.entity();
@@ -2015,7 +2028,11 @@ impl AppView {
                 Ok(false) => {}
                 Err(error) => {
                     window.push_notification(
-                        Notification::error(format!("Cannot remove \"{}\": {error}", row.name)),
+                        Notification::error(t!(
+                            "reset-remove-failed",
+                            name = row.name.as_str(),
+                            error = error.to_string()
+                        )),
                         cx,
                     );
                     return;
@@ -2031,9 +2048,7 @@ impl AppView {
         });
         self.reload(window, cx);
         window.push_notification(
-            Notification::success(format!(
-                "Library reset — {removed} configuration(s) removed"
-            )),
+            Notification::success(t!("library-reset-done", count = removed)),
             cx,
         );
         cx.notify();
@@ -2062,10 +2077,7 @@ impl AppView {
         if let Err(error) = self.store.set_seen_tray_hint(true) {
             eprintln!("tray hint flag failed: {error}");
         }
-        window.push_notification(
-            Notification::info("Still running in the tray — right-click the icon to quit."),
-            cx,
-        );
+        window.push_notification(Notification::info(t!("tray-hint")), cx);
         cx.notify();
         true
     }
@@ -2422,11 +2434,11 @@ fn open_folder_in_shell(folder: &std::path::Path) -> Result<(), String> {
     if instance > 32 {
         Ok(())
     } else {
-        Err(format!("the shell refused to open the folder ({instance})"))
+        Err(t!("shell-refused-folder", instance = instance))
     }
 }
 
 #[cfg(not(windows))]
 fn open_folder_in_shell(_folder: &std::path::Path) -> Result<(), String> {
-    Err("opening the data folder is not supported on this platform".to_string())
+    Err(t!("folder-open-unsupported"))
 }

@@ -6,22 +6,22 @@ impl AppView {
     /// control always copy the row they belong to — never the selection.
     pub(crate) fn copy_row_socks(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let (socks, _) = proxy_urls(&config.bind_ip, config.port);
         cx.write_to_clipboard(ClipboardItem::new_string(socks));
-        window.push_notification(Notification::success("Copied SOCKS URL"), cx);
+        window.push_notification(Notification::success(t!("copied-socks-url")), cx);
     }
 
     pub(crate) fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let (socks, http) = proxy_urls(&config.bind_ip, config.port);
         cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
-        window.push_notification(Notification::success("Copied proxy URLs"), cx);
+        window.push_notification(Notification::success(t!("copied-proxy-urls")), cx);
     }
 
     pub(crate) fn copy_selected_urls(
@@ -43,13 +43,13 @@ impl AppView {
             lines.push(format!("{}\t{socks}\t{http}", config.name));
         }
         if lines.is_empty() {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         }
         let count = lines.len();
         cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
         window.push_notification(
-            Notification::success(format!("Copied URLs for {count} configuration(s)")),
+            Notification::success(t!("copied-urls-count", count = count)),
             cx,
         );
     }
@@ -73,13 +73,13 @@ impl AppView {
             lines.push(format!("{}\t{socks}", config.name));
         }
         if lines.is_empty() {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         }
         let count = lines.len();
         cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
         window.push_notification(
-            Notification::success(format!("Copied SOCKS URLs for {count} configuration(s)")),
+            Notification::success(t!("copied-socks-urls-count", count = count)),
             cx,
         );
     }
@@ -123,7 +123,7 @@ impl AppView {
         let folder = crate::tray::config_folder();
         cx.write_to_clipboard(ClipboardItem::new_string(folder.clone()));
         window.push_notification(
-            Notification::success(format!("Copied config folder path ({folder})")),
+            Notification::success(t!("copied-config-folder", folder = folder)),
             cx,
         );
     }
@@ -135,8 +135,10 @@ impl AppView {
     ) -> Result<(), String> {
         let body = self.visible_log_lines(cx).join("\n");
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, body).map_err(|error| format!("Cannot save logs: {error}"))?;
-        std::fs::rename(&tmp, path).map_err(|error| format!("Cannot save logs: {error}"))?;
+        std::fs::write(&tmp, body)
+            .map_err(|error| t!("cannot-save-logs", error = error.to_string()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|error| t!("cannot-save-logs", error = error.to_string()))?;
         Ok(())
     }
 
@@ -171,12 +173,12 @@ impl AppView {
     pub(crate) fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lines = self.visible_log_lines(cx);
         if lines.is_empty() {
-            window.push_notification(Notification::warning("No log lines to copy"), cx);
+            window.push_notification(Notification::warning(t!("no-log-lines-to-copy")), cx);
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
         window.push_notification(
-            Notification::success(format!("Copied {} log line(s)", lines.len())),
+            Notification::success(t!("copied-log-lines", count = lines.len())),
             cx,
         );
     }
@@ -193,10 +195,10 @@ impl AppView {
         Ok(())
     }
 
-    pub(crate) fn paste_intake_refusal(text: &str) -> Option<&'static str> {
+    pub(crate) fn paste_intake_refusal(text: &str) -> Option<String> {
         use crate::preset::{is_remote_route_attempt, is_route_attempt, looks_like_preset_json};
         if text.trim().is_empty() {
-            return Some("Clipboard has no text to import");
+            return Some(t!("clipboard-no-text"));
         }
         if is_library_export(text) {
             return None;
@@ -213,7 +215,7 @@ impl AppView {
             return None;
         }
         if import_text(text).configs.is_empty() {
-            return Some("Nothing importable in clipboard");
+            return Some(t!("clipboard-nothing-importable"));
         }
         None
     }
@@ -280,12 +282,7 @@ impl AppView {
             self.import_form = None;
         }
         if overlay_open(window, cx) {
-            window.push_notification(
-                Notification::warning(
-                    "Close the open dialog first — dropped files were not imported",
-                ),
-                cx,
-            );
+            window.push_notification(Notification::warning(t!("close-dialog-first")), cx);
             return;
         }
         let (files, unreadable) = Self::read_dropped_import_files(paths);
@@ -340,7 +337,7 @@ impl AppView {
 
     fn drop_refusal_text(unreadable: &[String]) -> String {
         if unreadable.is_empty() {
-            "No readable files dropped".to_string()
+            t!("no-readable-files-dropped")
         } else {
             unreadable_drop_message(unreadable)
         }
@@ -411,17 +408,19 @@ impl AppView {
         if failed > 0 {
             self.os_notify(
                 crate::os::notify::NoticeKind::SubscriptionFailure,
-                "Subscription refresh failed",
-                &format!(
-                    "{failed} route(s) could not be refreshed. Open Subscriptions for details."
-                ),
+                &t!("subscription-refresh-failed-title"),
+                &t!("subscription-refresh-failed-count-body", failed = failed),
             );
             let view = cx.entity().downgrade();
-            spec = spec.action("toast-show-subscriptions", "Show", move |window, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    view.open_subscriptions_dialog(window, cx);
-                });
-            });
+            spec = spec.action(
+                "toast-show-subscriptions",
+                t!("toast-action-show"),
+                move |window, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        view.open_subscriptions_dialog(window, cx);
+                    });
+                },
+            );
         }
         self.push_toast(spec, window, cx);
     }
@@ -433,11 +432,21 @@ impl AppView {
         grant: &RuleSetDownloadGrant,
         bytes: Vec<u8>,
     ) -> Result<PathBuf, String> {
-        std::fs::create_dir_all(&grant.dir)
-            .map_err(|error| format!("cannot create {}: {error}", grant.dir.display()))?;
+        std::fs::create_dir_all(&grant.dir).map_err(|error| {
+            t!(
+                "rule-set-cannot-create",
+                path = grant.dir.display().to_string(),
+                error = error.to_string()
+            )
+        })?;
         let path = grant.dir.join(&grant.file_name);
-        std::fs::write(&path, &bytes)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        std::fs::write(&path, &bytes).map_err(|error| {
+            t!(
+                "rule-set-cannot-write",
+                path = path.display().to_string(),
+                error = error.to_string()
+            )
+        })?;
         let existing = self
             .store
             .list_rule_sets()
@@ -468,7 +477,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         if dest.is_empty() {
-            window.push_notification(Notification::warning("No destination to copy"), cx);
+            window.push_notification(Notification::warning(t!("no-destination-to-copy")), cx);
             return false;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(dest.to_string()));

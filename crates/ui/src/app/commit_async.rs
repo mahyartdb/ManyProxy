@@ -50,10 +50,7 @@ impl AppView {
         key_entity.update(cx, |state, cx| {
             state.set_value(content, window, cx);
         });
-        window.push_notification(
-            Notification::success(format!("Loaded SSH key from {path}")),
-            cx,
-        );
+        window.push_notification(Notification::success(t!("loaded-ssh-key", path = path)), cx);
     }
 
     pub(crate) fn finish_extra_exe_pick(
@@ -72,7 +69,7 @@ impl AppView {
             state.set_value(stored.clone(), window, cx);
         });
         window.push_notification(
-            Notification::success(format!("Picked extra-core executable {stored}")),
+            Notification::success(t!("picked-extra-core", stored = stored)),
             cx,
         );
     }
@@ -160,13 +157,13 @@ impl AppView {
                     let retry_group = retry_group.clone();
                     let view = view.clone();
                     self.push_toast(
-                        ToastSpec::error(format!(
-                            "Import failed: {}",
-                            format_import_failures(&outcome.failures)
+                        ToastSpec::error(t!(
+                            "import-failed",
+                            error = format_import_failures(&outcome.failures)
                         ))
                         .action(
                             "toast-retry-import",
-                            "Retry",
+                            t!("toast-action-retry"),
                             move |window, cx| {
                                 let _ = view.update(cx, |view, cx| {
                                     if view.finish_import_batch(
@@ -212,9 +209,9 @@ impl AppView {
             }
             Err(error) => {
                 self.push_toast(
-                    ToastSpec::error(format!("Import failed: {error}")).action(
+                    ToastSpec::error(t!("import-failed", error = error.to_string())).action(
                         "toast-retry-import",
-                        "Retry",
+                        t!("toast-action-retry"),
                         move |window, cx| {
                             let _ = view.update(cx, |view, cx| {
                                 if view.finish_import_batch(
@@ -265,7 +262,7 @@ impl AppView {
                 ));
                 self.route_refresh_completion(
                     sub_id,
-                    ToastSpec::error(format!("Cannot refresh subscription: {error}")),
+                    ToastSpec::error(t!("cannot-refresh-subscription", error = error.to_string())),
                     0,
                     0,
                     0,
@@ -294,13 +291,21 @@ impl AppView {
                     Ok(outcome) => {
                         self.reload(window, cx);
                         if let Some(error) = outcome.error {
-                            self.refresh.last_error = Some(format!("{label}: {error}"));
+                            self.refresh.last_error = Some(t!(
+                                "refresh-label-error",
+                                label = label,
+                                error = error.as_str()
+                            ));
                             self.push_refresh_log(&format!(
                                 "error subscription refresh \"{label}\": refresh failed ({error})"
                             ));
                             self.route_refresh_completion(
                                 sub_id,
-                                ToastSpec::error(format!("{label}: refresh failed ({error})")),
+                                ToastSpec::error(t!(
+                                    "refresh-label-failed",
+                                    label = label,
+                                    error = error
+                                )),
                                 0,
                                 0,
                                 0,
@@ -385,7 +390,11 @@ impl AppView {
                             ));
                             self.route_refresh_completion(
                                 sub_id,
-                                ToastSpec::error(format!("{label}: refresh failed ({error})")),
+                                ToastSpec::error(t!(
+                                    "refresh-label-failed",
+                                    label = label,
+                                    error = error.to_string()
+                                )),
                                 0,
                                 0,
                                 0,
@@ -410,13 +419,17 @@ impl AppView {
                     // is still there once the toast is gone. A subscription row
                     // that no longer exists is not a load failure — the empty
                     // copy tells the truth for that one.
-                    self.refresh.last_error = Some(format!("{label}: {error}"));
+                    self.refresh.last_error = Some(t!(
+                        "refresh-label-error",
+                        label = label,
+                        error = error.as_str()
+                    ));
                     self.push_refresh_log(&format!(
                         "error subscription refresh \"{label}\": {error}"
                     ));
                     self.route_refresh_completion(
                         sub_id,
-                        ToastSpec::error(format!("{label}: {error}")),
+                        ToastSpec::error(t!("refresh-label-error", label = label, error = error)),
                         0,
                         0,
                         0,
@@ -441,7 +454,10 @@ impl AppView {
                     ));
                     self.route_refresh_completion(
                         sub_id,
-                        ToastSpec::error(format!("Cannot refresh subscription: {db_error}")),
+                        ToastSpec::error(t!(
+                            "cannot-refresh-subscription",
+                            error = db_error.to_string()
+                        )),
                         0,
                         0,
                         0,
@@ -492,7 +508,11 @@ impl AppView {
                             .unwrap_or_else(|| sub_id.to_string());
                         let failed = outcome.failures.len();
                         if let Some(error) = outcome.error {
-                            self.refresh.last_error = Some(format!("{label}: {error}"));
+                            self.refresh.last_error = Some(t!(
+                                "refresh-label-error",
+                                label = label.as_str(),
+                                error = error.as_str()
+                            ));
                             self.push_refresh_log(&format!(
                                 "error subscription refresh \"{label}\": refresh failed ({error})"
                             ));
@@ -566,7 +586,8 @@ impl AppView {
             }
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
-                self.refresh.last_error = Some(format!("{sub_id}: {error}"));
+                self.refresh.last_error =
+                    Some(t!("refresh-label-error", label = sub_id, error = error));
                 self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
             }
         }
@@ -589,7 +610,7 @@ impl AppView {
             Ok(fetched) => fetched.body,
             Err(reason) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot refresh routing preset: {reason}")),
+                    Notification::error(t!("cannot-refresh-routing-preset", error = reason)),
                     cx,
                 );
                 return;
@@ -607,9 +628,10 @@ impl AppView {
                 let count = preset.rules().map(|rules| rules.len()).unwrap_or(0);
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Routing preset \"{}\" refreshed ({count} rule(s))",
-                        preset.name
+                    Notification::success(t!(
+                        "routing-preset-refreshed",
+                        name = preset.name.as_str(),
+                        count = count
                     )),
                     cx,
                 );
@@ -619,7 +641,10 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot refresh routing preset: {error}")),
+                    Notification::error(t!(
+                        "cannot-refresh-routing-preset",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
             }
@@ -664,10 +689,11 @@ impl AppView {
             Ok(bytes) => bytes,
             Err(reason) => {
                 window.push_notification(
-                    Notification::error(format!(
-                        "Cannot download rule set \"{}\" ({}): {reason}",
-                        grant.name,
-                        crate::import::redact_link(&grant.url),
+                    Notification::error(t!(
+                        "cannot-download-rule-set",
+                        name = grant.name.as_str(),
+                        url = crate::import::redact_link(&grant.url),
+                        reason = reason
                     )),
                     cx,
                 );
@@ -678,11 +704,11 @@ impl AppView {
         match self.stage_rule_set_bytes(grant, bytes) {
             Ok(path) => {
                 window.push_notification(
-                    Notification::success(format!(
-                        "Rule set \"{}\" staged ({} bytes) — {}",
-                        grant.name,
-                        bytes_len,
-                        crate::health::truncate(&path.display().to_string(), 160),
+                    Notification::success(t!(
+                        "rule-set-staged",
+                        name = grant.name.as_str(),
+                        bytes = bytes_len,
+                        path = crate::health::truncate(&path.display().to_string(), 160)
                     )),
                     cx,
                 );
@@ -692,10 +718,11 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!(
-                        "Cannot stage rule set \"{}\" ({}): {error}",
-                        grant.name,
-                        crate::import::redact_link(&grant.url),
+                    Notification::error(t!(
+                        "cannot-stage-rule-set",
+                        name = grant.name.as_str(),
+                        url = crate::import::redact_link(&grant.url),
+                        error = error
                     )),
                     cx,
                 );

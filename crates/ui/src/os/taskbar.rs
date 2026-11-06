@@ -25,25 +25,35 @@ pub mod button_id {
     pub const TEST_ALL: u32 = 3;
 }
 
-pub const THUMB_BUTTONS: [(u32, ThumbAction, &str); 3] = [
-    (button_id::START_ALL, ThumbAction::Start, "Start all"),
-    (button_id::STOP_ALL, ThumbAction::Stop, "Stop all"),
-    (button_id::TEST_ALL, ThumbAction::Test, "Test"),
+pub const THUMB_BUTTONS: [(u32, ThumbAction); 3] = [
+    (button_id::START_ALL, ThumbAction::Start),
+    (button_id::STOP_ALL, ThumbAction::Stop),
+    (button_id::TEST_ALL, ThumbAction::Test),
 ];
+
+/// Thumbnail-button tooltip copy. The button table stays ids and actions;
+/// only the tooltip needs a locale.
+pub fn thumb_label(action: ThumbAction) -> String {
+    match action {
+        ThumbAction::Start => crate::t!("thumb-start-all"),
+        ThumbAction::Stop => crate::t!("thumb-stop-all"),
+        ThumbAction::Test => crate::t!("thumb-test-all"),
+    }
+}
 
 pub fn action_for_button_id(id: u32) -> Option<ThumbAction> {
     THUMB_BUTTONS
         .iter()
-        .find(|(button, _, _)| *button == id)
-        .map(|(_, action, _)| *action)
+        .find(|(button, _)| *button == id)
+        .map(|(_, action)| *action)
 }
 
 #[cfg(test)]
 pub fn button_id_for_action(action: ThumbAction) -> u32 {
     THUMB_BUTTONS
         .iter()
-        .find(|(_, candidate, _)| *candidate == action)
-        .map(|(button, _, _)| *button)
+        .find(|(_, candidate)| *candidate == action)
+        .map(|(button, _)| *button)
         .unwrap_or(button_id::START_ALL)
 }
 
@@ -451,12 +461,12 @@ mod win {
             THUMB_BUTTONS
                 .iter()
                 .zip(self.icons.iter())
-                .map(|((id, action, label), icon)| THUMBBUTTON {
+                .map(|((id, action), icon)| THUMBBUTTON {
                     dwMask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
                     iId: *id,
                     iBitmap: 0,
                     hIcon: (*icon).unwrap_or(HICON(std::ptr::null_mut())),
-                    szTip: tip(label),
+                    szTip: tip(&thumb_label(*action)),
                     dwFlags: flags(states.is_enabled(*action)),
                 })
                 .collect()
@@ -573,7 +583,7 @@ mod tests {
 
     #[test]
     fn button_ids_round_trip_like_tray_menu_ids() {
-        for (id, action, _) in THUMB_BUTTONS {
+        for (id, action) in THUMB_BUTTONS {
             assert_eq!(action_for_button_id(id), Some(action));
             assert_eq!(button_id_for_action(action), id);
         }

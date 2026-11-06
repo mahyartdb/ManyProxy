@@ -149,8 +149,9 @@ pub(crate) fn engine_status_text(engine: &EngineController) -> String {
 
 /// T-34: one session-sourced notice — the previous run left a running
 /// snapshot behind without reaching any clean-exit path.
-pub(crate) const UNCLEAN_EXIT_NOTICE: &str =
-    "Previous run carried running endpoints and did not exit cleanly.";
+pub(crate) fn unclean_exit_notice_text() -> String {
+    t!("unclean-exit-notice")
+}
 pub(crate) fn unclean_exit_notice(
     previous_clean: bool,
     last_snapshot: &[String],
@@ -158,7 +159,7 @@ pub(crate) fn unclean_exit_notice(
     if previous_clean || last_snapshot.is_empty() {
         return None;
     }
-    Some(Notification::warning(UNCLEAN_EXIT_NOTICE))
+    Some(Notification::warning(unclean_exit_notice_text()))
 }
 /// K17: the bulk delete outcome toast — one tint per truth (clean = success,
 /// nothing removed = error, partial = warning) — and the sentence the Undo
@@ -354,6 +355,94 @@ pub(crate) fn export_count_message(total: usize, importable: usize, path: &str) 
         count = export_count_fragment(total, importable),
         path = path
     )
+}
+pub(crate) fn row_action_message(verb: &str, name: &str) -> String {
+    t!("row-action-message", verb = verb, name = name)
+}
+pub(crate) fn removed_message(name: &str, was_running: bool) -> String {
+    if was_running {
+        t!("removed-message-running", name = name)
+    } else {
+        t!("removed-message", name = name)
+    }
+}
+pub(crate) fn enabled_flag_message(name: &str, enabled: bool) -> String {
+    if enabled {
+        t!("enabled-flag-on", name = name)
+    } else {
+        t!("enabled-flag-off", name = name)
+    }
+}
+pub(crate) fn restore_done_message(outcome: &RestoreOutcome) -> String {
+    t!(
+        "restore-done",
+        configs = outcome.configs,
+        subscriptions = outcome.subscriptions
+    )
+}
+pub(crate) fn already_subscribed_message(label: &str) -> String {
+    t!("already-subscribed", label = label)
+}
+pub(crate) fn subscription_interval_failure_message(
+    action: &str,
+    label: &str,
+    error: &str,
+) -> String {
+    t!(
+        "subscription-interval-failure",
+        action = action,
+        label = label,
+        error = error
+    )
+}
+pub(crate) fn preset_error_message(error: &crate::preset::PresetError) -> String {
+    t!("preset-error", error = error.to_string())
+}
+pub(crate) fn preset_imported_message(name: &str, count: usize) -> String {
+    t!("preset-imported", name = name, count = count)
+}
+pub(crate) fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[String]) -> String {
+    if kept.is_empty() {
+        t!("auto-clear-toast", group = group, removed = removed)
+    } else {
+        t!(
+            "auto-clear-toast-kept",
+            group = group,
+            removed = removed,
+            kept = kept.join(", ")
+        )
+    }
+}
+pub(crate) fn inspector_tab_label(tab: InspectorTab) -> String {
+    match tab {
+        InspectorTab::Details => t!("inspector-tab-details"),
+        InspectorTab::Health => t!("inspector-tab-health"),
+        InspectorTab::Logs => t!("inspector-tab-logs"),
+        InspectorTab::Links => t!("inspector-tab-links"),
+        InspectorTab::Traffic => t!("inspector-tab-traffic"),
+    }
+}
+pub(crate) fn inspector_badge_text(
+    state: BadgeState,
+    bind: &str,
+    port: u16,
+    latency_ms: Option<u64>,
+) -> String {
+    let bind = bind.trim();
+    let endpoint = if bind.is_empty() {
+        format!(":{port}")
+    } else {
+        format!("{bind}:{port}")
+    };
+    let head = match state {
+        BadgeState::Stopped => t!("badge-stopped", endpoint = endpoint),
+        BadgeState::Running => t!("badge-running", endpoint = endpoint),
+        BadgeState::Failed => t!("badge-failed", endpoint = endpoint),
+    };
+    match (state, latency_ms) {
+        (BadgeState::Running, Some(ms)) => t!("badge-latency", head = head, ms = ms),
+        _ => head,
+    }
 }
 pub(crate) fn lan_confirm_title() -> String {
     t!("lan-confirm-title")
@@ -818,18 +907,353 @@ pub(crate) fn test_all_scope_label(scope: TestAllScope) -> String {
 pub(crate) fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
     let live = rows
         .iter()
-        .filter(|row| row.caption != Some(SHARD_NOT_RUNNING))
+        .filter(|row| row.caption != Some(ShardCaption::NotRunning))
         .count();
     if live == 0 {
-        return "no sidecar running".to_string();
+        return t!("shard-stats-none");
     }
     let sampled = rows.iter().filter(|row| row.caption.is_none()).count();
-    let mut summary = format!("{live} live shard(s), {sampled} charted");
+    let mut summary = t!("shard-stats-summary", live = live, sampled = sampled);
     if rows
         .iter()
-        .any(|row| row.caption == Some(SHARD_SAMPLING_UNAVAILABLE))
+        .any(|row| row.caption == Some(ShardCaption::SamplingUnavailable))
     {
-        summary.push_str(", sampling unavailable");
+        summary = t!(
+            "shard-stats-summary-sampling",
+            live = live,
+            sampled = sampled
+        );
     }
     summary
+}
+pub(crate) fn skipped_dirty_message(names: &[String]) -> String {
+    t!("skipped-dirty", names = names.join(", "))
+}
+pub(crate) fn bulk_start_unreadable_message(ids: &[String]) -> String {
+    t!(
+        "bulk-start-unreadable",
+        count = ids.len(),
+        names = ids.join(", ")
+    )
+}
+pub(crate) fn bulk_start_enable_flag_failed_message(names: &[String]) -> String {
+    t!(
+        "bulk-start-flag-failed",
+        count = names.len(),
+        names = names.join(", ")
+    )
+}
+pub(crate) fn bulk_start_failed_message(started: usize, failed: &[(String, String)]) -> String {
+    let joined = failed
+        .iter()
+        .map(|(name, reason)| format!("{name}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    t!(
+        "bulk-start-failed",
+        started = started,
+        count = failed.len(),
+        joined = joined
+    )
+}
+pub(crate) fn bulk_start_refused_message(
+    requested: usize,
+    reason: &str,
+    failed: &[(String, String)],
+) -> String {
+    let mut detail = vec![reason.to_string()];
+    detail.extend(failed.iter().map(|(name, why)| format!("{name}: {why}")));
+    t!(
+        "bulk-start-refused",
+        requested = requested,
+        detail = detail.join("; ")
+    )
+}
+pub(crate) fn bulk_copy_proxies_message(copied: usize, skipped: usize) -> String {
+    if skipped == 0 {
+        t!("bulk-copy-proxies-toast", copied = copied)
+    } else {
+        t!(
+            "bulk-copy-proxies-skipped",
+            copied = copied,
+            skipped = skipped
+        )
+    }
+}
+pub(crate) fn bulk_copy_nothing_message(skipped: usize) -> String {
+    if skipped == 0 {
+        t!("bulk-copy-nothing")
+    } else {
+        t!("bulk-copy-nothing-skipped", skipped = skipped)
+    }
+}
+pub(crate) fn no_selection_message() -> String {
+    t!("no-selection")
+}
+pub(crate) fn start_busy_message() -> String {
+    t!("start-busy")
+}
+pub(crate) fn already_running_message(name: &str) -> String {
+    t!("already-running-toast", name = name)
+}
+pub(crate) fn dirty_endpoint_message(name: &str) -> String {
+    t!("dirty-endpoint-toast", name = name)
+}
+pub(crate) fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
+    let failed = failed_names.len();
+    if failed == 0 {
+        return start_all_message(started);
+    }
+    t!(
+        "start-all-partial",
+        started = started,
+        failed = failed,
+        names = failed_names.join(", ")
+    )
+}
+pub(crate) fn addsub_error_message(error: &crate::import::ImportError) -> String {
+    t!("invalid-subscription-link", error = error.to_string())
+}
+pub(crate) fn db_list_error_message(error: &StoreError) -> String {
+    t!("cannot-load-library", error = error.to_string())
+}
+pub(crate) fn crash_notification_text(detail: &str) -> String {
+    t!("engine-crash-toast", detail = detail)
+}
+pub(crate) fn probe_start_toast(count: usize) -> String {
+    t!("probe-start-toast", count = count)
+}
+pub(crate) fn probe_batched_toast(count: usize, live: usize, dead: usize) -> String {
+    t!(
+        "probe-batched-toast",
+        count = count,
+        live = live,
+        dead = dead
+    )
+}
+pub(crate) fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) -> String {
+    let verb = if ping {
+        t!("probe-verb-ping")
+    } else {
+        t!("probe-verb-test")
+    };
+    match (outcome.sample.latency_ms, outcome.sample.error.as_deref()) {
+        (Some(ms), _) => t!("probe-result-live", verb = verb, name = name, ms = ms),
+        (None, Some(cause)) => t!(
+            "probe-result-dead-cause",
+            verb = verb,
+            name = name,
+            cause = cause
+        ),
+        (None, None) => t!("probe-result-dead", verb = verb, name = name),
+    }
+}
+pub(crate) fn group_test_summary_toast(
+    group: &str,
+    count: usize,
+    live: usize,
+    dead: usize,
+    stopped: bool,
+) -> String {
+    if stopped {
+        t!(
+            "group-test-summary-stopped",
+            group = group,
+            count = count,
+            live = live,
+            dead = dead
+        )
+    } else {
+        t!(
+            "group-test-summary",
+            group = group,
+            count = count,
+            live = live,
+            dead = dead
+        )
+    }
+}
+pub(crate) fn already_stopped_message(name: &str) -> String {
+    t!("already-stopped", name = name)
+}
+pub(crate) fn start_all_message(count: usize) -> String {
+    if count == 0 {
+        t!("start-all-empty")
+    } else {
+        t!("start-all-started", count = count)
+    }
+}
+pub(crate) fn stop_all_message(running: usize) -> String {
+    if running == 0 {
+        t!("stop-all-empty")
+    } else {
+        t!("stop-all-stopped", count = running)
+    }
+}
+pub(crate) fn undo_restored_message(names: &[String], restored: usize) -> String {
+    if restored == 1 {
+        if let [single] = names {
+            return t!("undo-restored-one", name = single);
+        }
+    }
+    t!("undo-restored-many", count = restored)
+}
+pub(crate) fn undo_failed_message(error: &StoreError) -> String {
+    t!("restore-failed", error = error.to_string())
+}
+pub(crate) fn update_feed_failure_message() -> String {
+    t!("update-feed-failure")
+}
+pub(crate) fn restart_to_apply_message(name: &str) -> String {
+    t!("restart-to-apply", name = name)
+}
+pub(crate) fn unreadable_drop_message(names: &[String]) -> String {
+    t!("unreadable-drop", names = names.join(", "))
+}
+pub(crate) fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> String {
+    const SHOWN: usize = 3;
+    fn listed(names: &[String]) -> String {
+        let shown = names
+            .iter()
+            .take(SHOWN)
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if names.len() > SHOWN {
+            t!("names-more", shown = shown, count = names.len() - SHOWN)
+        } else {
+            shown
+        }
+    }
+    if failed.is_empty() {
+        if removed.is_empty() {
+            return t!("bulk-delete-none");
+        }
+        return t!(
+            "bulk-delete-removed",
+            count = removed.len(),
+            names = listed(removed)
+        );
+    }
+    if removed.is_empty() {
+        return t!(
+            "bulk-delete-failed",
+            count = failed.len(),
+            names = listed(failed)
+        );
+    }
+    t!(
+        "bulk-delete-partial",
+        removed = removed.len(),
+        failed = failed.len(),
+        names = listed(failed)
+    )
+}
+pub(crate) fn chain_hop_rejection_message(rule: String) -> String {
+    match rule.as_str() {
+        "chain hops cannot nest a chain (v1 chains are flat — pick a non-chain row)" => {
+            t!("chain-reject-nested")
+        }
+        "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)" => {
+            t!("chain-reject-autoselector")
+        }
+        "hop index is out of range (pick the hop to replace)" => t!("chain-reject-index"),
+        "extracore hops must sit at index 0 (first hop only — off-index-0 rejected)" => {
+            t!("chain-reject-extra-index")
+        }
+        "at most one extracore hop per chain" => t!("chain-reject-extra-count"),
+        _ => rule,
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refresh_summary_text(
+    label: &str,
+    added: usize,
+    updated: usize,
+    removed: usize,
+    skipped: usize,
+    duplicates: usize,
+    failures: usize,
+    conflicts: usize,
+    in_use: usize,
+    added_names: &[String],
+    updated_names: &[String],
+    removed_names: &[String],
+    kept_in_use_names: &[String],
+) -> (bool, String) {
+    let mut summary = t!(
+        "refresh-summary",
+        label = label,
+        added = added,
+        updated = updated,
+        removed = removed
+    );
+    if in_use > 0 {
+        summary.push_str(&t!("refresh-summary-in-use", count = in_use));
+    }
+    if skipped > 0 {
+        summary.push_str(&t!("refresh-summary-skipped", count = skipped));
+    }
+    if duplicates > 0 {
+        summary.push_str(&t!("refresh-summary-duplicates", count = duplicates));
+    }
+    if failures > 0 {
+        summary.push_str(&t!("refresh-summary-failed", count = failures));
+    }
+    if conflicts > 0 {
+        summary.push_str(&t!("refresh-summary-conflicts", count = conflicts));
+    }
+    if let Some(report) =
+        localized_refresh_report_block(added_names, updated_names, removed_names, kept_in_use_names)
+    {
+        summary.push('\n');
+        summary.push_str(&report);
+    }
+    (failures > 0 || conflicts > 0, summary)
+}
+fn localized_refresh_report_block(
+    added_names: &[String],
+    updated_names: &[String],
+    removed_names: &[String],
+    kept_in_use_names: &[String],
+) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+    for (verb, marker, names) in [
+        (t!("refresh-report-added"), "[+]", added_names),
+        (t!("refresh-report-updated"), "[~]", updated_names),
+        (t!("refresh-report-deleted"), "[-]", removed_names),
+    ] {
+        if names.is_empty() {
+            continue;
+        }
+        let mut section = t!("refresh-report-section", verb = verb, count = names.len());
+        for name in names.iter().take(REFRESH_REPORT_NAME_CAP) {
+            section.push_str(&format!("\n{marker} {name}"));
+        }
+        let overflow = names.len().saturating_sub(REFRESH_REPORT_NAME_CAP);
+        if overflow > 0 {
+            section.push('\n');
+            section.push_str(&t!("refresh-report-more", count = overflow));
+        }
+        sections.push(section);
+    }
+    if !kept_in_use_names.is_empty() {
+        let mut section = t!("refresh-report-in-use");
+        for name in kept_in_use_names.iter().take(REFRESH_REPORT_NAME_CAP) {
+            section.push_str(&format!("\n[=] {name}"));
+        }
+        let overflow = kept_in_use_names
+            .len()
+            .saturating_sub(REFRESH_REPORT_NAME_CAP);
+        if overflow > 0 {
+            section.push('\n');
+            section.push_str(&t!("refresh-report-more", count = overflow));
+        }
+        sections.push(section);
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
 }

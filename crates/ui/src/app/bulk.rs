@@ -155,7 +155,7 @@ impl AppView {
         });
         if let Err(error) = self.store.set_latency_facet(LatencyFacet::default()) {
             window.push_notification(
-                Notification::error(format!("Could not save latency filter: {error}")),
+                Notification::error(t!("cannot-save-latency-filter", error = error.to_string())),
                 cx,
             );
         }
@@ -355,7 +355,7 @@ impl AppView {
         self.start_in_flight = true;
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
-            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
+            window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
             return;
         }
         let mut skipped_dirty: Vec<String> = Vec::new();
@@ -439,7 +439,7 @@ impl AppView {
             }
             None if failed.is_empty() => {
                 window.push_notification(
-                    Notification::success(format!("Started {started} configuration(s)")),
+                    Notification::success(t!("start-bulk-started", count = started)),
                     cx,
                 );
             }
@@ -555,19 +555,20 @@ impl AppView {
             }
             match self.store.set_enabled(id, false) {
                 Ok(_) => stopped.push(name),
-                Err(error) => failed.push(format!("{name}: stopped but flag not saved ({error})")),
+                Err(error) => failed.push(t!(
+                    "stopped-flag-not-saved",
+                    name = name,
+                    error = error.to_string()
+                )),
             }
         }
         self.reload(window, cx);
         if failed.is_empty() {
             if stopped.is_empty() {
-                window.push_notification(
-                    Notification::info("Nothing to stop — no checked endpoints are running"),
-                    cx,
-                );
+                window.push_notification(Notification::info(t!("stop-bulk-empty")), cx);
             } else {
                 window.push_notification(
-                    Notification::success(format!("Stopped {} configuration(s)", stopped.len())),
+                    Notification::success(t!("stop-bulk-stopped", count = stopped.len())),
                     cx,
                 );
             }
@@ -575,20 +576,20 @@ impl AppView {
         }
         if stopped.is_empty() {
             window.push_notification(
-                Notification::error(format!(
-                    "Stop failed for {} configuration(s): {}",
-                    failed.len(),
-                    failed.join("; ")
+                Notification::error(t!(
+                    "stop-bulk-failed",
+                    count = failed.len(),
+                    names = failed.join("; ")
                 )),
                 cx,
             );
         } else {
             window.push_notification(
-                Notification::warning(format!(
-                    "Stopped {}, {} failed: {}",
-                    stopped.len(),
-                    failed.len(),
-                    failed.join("; ")
+                Notification::warning(t!(
+                    "stop-bulk-partial",
+                    stopped = stopped.len(),
+                    failed = failed.len(),
+                    names = failed.join("; ")
                 )),
                 cx,
             );
@@ -768,7 +769,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let ids_for_commit = vec![config.id.clone()];
@@ -823,16 +824,20 @@ impl AppView {
 
                 self.sync_facet_pickers(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Moved {moved} configuration(s) to \"{}\"",
-                        group.trim()
+                    Notification::success(t!(
+                        "moved-to-group",
+                        count = moved,
+                        group = group.trim()
                     )),
                     cx,
                 );
                 true
             }
             Err(error) => {
-                window.push_notification(Notification::error(format!("Cannot move: {error}")), cx);
+                window.push_notification(
+                    Notification::error(t!("cannot-move", error = error.to_string())),
+                    cx,
+                );
                 false
             }
         }
@@ -1151,7 +1156,7 @@ impl AppView {
                 Ok(_) => {}
                 Err(error) => {
                     window.push_notification(
-                        Notification::error(format!("Cannot rename group: {error}")),
+                        Notification::error(t!("cannot-rename-group", error = error.to_string())),
                         cx,
                     );
                     return false;
@@ -1160,7 +1165,10 @@ impl AppView {
         }
         if let Err(error) = self.store.set_group_skip_refresh(&renamed, skip) {
             window.push_notification(
-                Notification::error(format!("Cannot change auto-refresh skip: {error}")),
+                Notification::error(t!(
+                    "cannot-change-auto-refresh-skip",
+                    error = error.to_string()
+                )),
                 cx,
             );
             return false;
@@ -1176,7 +1184,7 @@ impl AppView {
         });
         self.sync_facet_pickers(window, cx);
         window.push_notification(
-            Notification::success(format!("Updated group \"{renamed}\"")),
+            Notification::success(t!("group-updated", name = renamed)),
             cx,
         );
         window.close_all_dialogs(cx);
@@ -1195,7 +1203,7 @@ impl AppView {
         match self.store.rename_group(old, new) {
             Ok(outcome) if outcome.rows == 0 && outcome.subscriptions == 0 => {
                 window.push_notification(
-                    Notification::warning(format!("Group \"{old}\" holds no rows")),
+                    Notification::warning(t!("group-holds-no-rows", name = old)),
                     cx,
                 );
                 true
@@ -1214,15 +1222,17 @@ impl AppView {
                 self.sync_facet_pickers(window, cx);
                 let mut moved = Vec::new();
                 if outcome.rows > 0 {
-                    moved.push(format!("{} row(s)", outcome.rows));
+                    moved.push(t!("group-rows-count", count = outcome.rows));
                 }
                 if outcome.subscriptions > 0 {
-                    moved.push(format!("{} subscription(s)", outcome.subscriptions));
+                    moved.push(t!("group-subs-count", count = outcome.subscriptions));
                 }
                 window.push_notification(
-                    Notification::success(format!(
-                        "Renamed \"{old}\" to \"{renamed}\" ({})",
-                        moved.join(", ")
+                    Notification::success(t!(
+                        "group-renamed",
+                        old = old,
+                        new = renamed,
+                        moved = moved.join(", ")
                     )),
                     cx,
                 );
@@ -1232,7 +1242,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot rename group: {error}")),
+                    Notification::error(t!("cannot-rename-group", error = error.to_string())),
                     cx,
                 );
                 false
@@ -1258,13 +1268,13 @@ impl AppView {
                 });
                 self.sync_facet_pickers(window, cx);
                 window.push_notification(
-                    Notification::success(format!("Deleted empty group \"{name}\"")),
+                    Notification::success(t!("group-deleted-empty", name = name)),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot delete group: {error}")),
+                    Notification::error(t!("cannot-delete-group", error = error.to_string())),
                     cx,
                 );
             }

@@ -105,23 +105,23 @@ impl AppView {
     pub(crate) fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let crashed = self.engine.crashed_shards();
         if crashed.is_empty() {
-            window.push_notification(Notification::info("No crashed endpoints to restart"), cx);
+            window.push_notification(Notification::info(t!("no-crashed-to-restart")), cx);
             return;
         }
         match self.engine.restart_crashed() {
             Ok(()) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!("Restarted {}", crashed.join(", "))),
+                    Notification::success(t!("restarted-crashed", names = crashed.join(", "))),
                     cx,
                 );
             }
             Err(error) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::error(format!(
-                        "Restart failed: {}",
-                        redact_secrets(&error.to_string())
+                    Notification::error(t!(
+                        "restart-failed",
+                        error = redact_secrets(&error.to_string())
                     )),
                     cx,
                 );
@@ -139,7 +139,7 @@ impl AppView {
 
     pub(crate) fn start_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
 
@@ -173,7 +173,7 @@ impl AppView {
 
     pub(crate) fn stop_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let id = config.id.clone();
@@ -182,10 +182,10 @@ impl AppView {
             if let Some(error) = stop_error {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::error(format!(
-                        "Stop of \"{}\" failed: {}",
-                        config.name,
-                        redact_secrets(&error.to_string())
+                    Notification::error(t!(
+                        "stop-row-failed",
+                        name = config.name.as_str(),
+                        error = redact_secrets(&error.to_string())
                     )),
                     cx,
                 );
@@ -196,19 +196,17 @@ impl AppView {
                 Ok(_) => {
                     self.reload(window, cx);
                     window.push_notification(
-                        Notification::success(format!(
-                            "Stopped \"{}\" — flag cleared",
-                            config.name
-                        )),
+                        Notification::success(t!("stopped-row", name = config.name.as_str())),
                         cx,
                     );
                 }
                 Err(error) => {
                     self.reload(window, cx);
                     window.push_notification(
-                        Notification::error(format!(
-                            "Stopped \"{}\" but could not save its flag: {error}",
-                            config.name
+                        Notification::error(t!(
+                            "stopped-flag-failed",
+                            name = config.name.as_str(),
+                            error = error.to_string()
                         )),
                         cx,
                     );
@@ -370,11 +368,11 @@ impl AppView {
             rows
         };
         if rows.is_empty() {
-            window.push_notification(Notification::warning("No running endpoints to test"), cx);
+            window.push_notification(Notification::warning(t!("no-running-endpoints")), cx);
             return 0;
         }
         if self.probe_kind_in_flight(false) {
-            window.push_notification(Notification::info("A health test is already running"), cx);
+            window.push_notification(Notification::info(t!("health-test-running")), cx);
             return 0;
         }
         self.spawn_probe(rows, false, true, Some(window.window_handle()), cx)
@@ -390,18 +388,18 @@ impl AppView {
 
     pub(crate) fn test_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         if !self.engine.running_ids().contains(&config.id) {
             window.push_notification(
-                Notification::warning(format!("\"{}\" is not running", config.name)),
+                Notification::warning(t!("row-not-running", name = config.name)),
                 cx,
             );
             return;
         }
         if self.probe_kind_in_flight(false) {
-            window.push_notification(Notification::info("A health test is already running"), cx);
+            window.push_notification(Notification::info(t!("health-test-running")), cx);
             return;
         }
         self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
@@ -426,11 +424,11 @@ impl AppView {
             .filter(|row| running.contains(&row.id))
             .collect();
         if rows.is_empty() {
-            window.push_notification(Notification::warning("No running endpoints to test"), cx);
+            window.push_notification(Notification::warning(t!("no-running-endpoints")), cx);
             return;
         }
         if self.probe_kind_in_flight(false) {
-            window.push_notification(Notification::info("A health test is already running"), cx);
+            window.push_notification(Notification::info(t!("health-test-running")), cx);
             return;
         }
         self.spawn_probe(rows, false, true, Some(window.window_handle()), cx);
@@ -442,24 +440,19 @@ impl AppView {
     #[allow(dead_code)]
     pub(crate) fn test_group_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("no-group-focus")), cx);
             return;
         };
         let rows = self.group_running_rows(&group);
         if rows.is_empty() {
             window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no running endpoints to test"
-                )),
+                Notification::info(t!("group-no-running-endpoints", group = group)),
                 cx,
             );
             return;
         }
         if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
+            window.push_notification(Notification::info(t!("group-test-running")), cx);
             return;
         }
         self.spawn_group_probe(rows, group, Some(window.window_handle()), cx);
@@ -468,14 +461,14 @@ impl AppView {
     pub(crate) fn stop_group_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use std::sync::atomic::Ordering;
         if !self.group_test_in_flight {
-            window.push_notification(Notification::info("No group test is running"), cx);
+            window.push_notification(Notification::info(t!("no-group-test-running")), cx);
             return;
         }
         self.probe_stop.store(true, Ordering::SeqCst);
         // The sweep's poller clears on its own last tick; cancel must not wait
         // for that tick when the user explicitly stopped it.
         self.clear_taskbar_progress();
-        window.push_notification(Notification::info("Stopping the group test…"), cx);
+        window.push_notification(Notification::info(t!("stopping-group-test")), cx);
     }
 
     pub(crate) fn health_store_prune_group(&mut self, group: &str) {
@@ -553,9 +546,9 @@ impl AppView {
         self.logs.tail = !self.logs.tail;
         window.push_notification(
             Notification::info(if self.logs.tail {
-                "Log tail resumed"
+                t!("log-tail-resumed")
             } else {
-                "Log tail paused"
+                t!("log-tail-paused")
             }),
             cx,
         );
@@ -689,10 +682,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if self.rule_set_download_in_flight {
-            window.push_notification(
-                Notification::warning("A rule set download is already in flight — wait for it"),
-                cx,
-            );
+            window.push_notification(Notification::warning(t!("rule-set-download-busy")), cx);
             return;
         }
         self.rule_set_download_in_flight = true;

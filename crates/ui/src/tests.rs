@@ -9219,11 +9219,11 @@ fn t08_paste_binding_imports_direct_without_dialog(cx: &mut TestAppContext) {
 fn cua08_paste_intake_refusal_gates_prose_not_links() {
     assert_eq!(
         crate::AppView::paste_intake_refusal(""),
-        Some("Clipboard has no text to import")
+        Some("Clipboard has no text to import".to_string())
     );
     assert_eq!(
         crate::AppView::paste_intake_refusal("  \n "),
-        Some("Clipboard has no text to import")
+        Some("Clipboard has no text to import".to_string())
     );
     assert_eq!(
         crate::AppView::paste_intake_refusal(
@@ -16828,7 +16828,7 @@ fn action_table_is_the_single_source() {
         assert!(ids.insert(def.id), "duplicate action id {}", def.id);
         assert_eq!(action(def.id).id, def.id, "{} round-trips", def.id);
         assert!(
-            !def.label.is_empty(),
+            !def.label().is_empty(),
             "{} needs a label every surface can show",
             def.id
         );
@@ -16937,7 +16937,7 @@ fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
     let ctx_id = format!("rowctx-{}-{}", def.id, row.id);
     assert_eq!(
         label_of(&ctx_id, cx),
-        def.label,
+        def.label(),
         "the context menu shows the table's label"
     );
     let escape = || gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
@@ -16954,7 +16954,7 @@ fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
     let kebab = format!("kebab-{}", def.id);
     assert_eq!(
         label_of(&kebab, cx),
-        def.label,
+        def.label(),
         "the inspector menu shows the table's label"
     );
     cx.update(|window, cx| window.dispatch_keystroke(escape(), cx));
@@ -17105,11 +17105,11 @@ fn f10_palette_footer_and_bound_row_chips(cx: &mut TestAppContext) {
     assert_painted(cx, "palette-footer");
     assert_eq!(
         label_of("palette-footer", cx),
-        crate::app::open::PALETTE_FOOTER_HINT,
+        crate::app::open::palette_footer_hint(),
         "the footer spells the keys that move, run and close the palette"
     );
     assert_eq!(
-        crate::app::open::PALETTE_FOOTER_HINT,
+        crate::app::open::palette_footer_hint(),
         "↑↓ move · Enter run · Esc close"
     );
 
@@ -19200,15 +19200,15 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
     }
     // …and the tooltip is where the key lives.
     assert_eq!(
-        crate::app::detail::OPERATE_START_TOOLTIP,
+        crate::app::detail::operate_start_tooltip(),
         "Start the selected endpoint (F5)"
     );
     assert_eq!(
-        crate::app::detail::OPERATE_STOP_TOOLTIP,
+        crate::app::detail::operate_stop_tooltip(),
         "Stop the selected endpoint (Shift-F5)"
     );
     assert_eq!(
-        crate::app::detail::OPERATE_TEST_TOOLTIP,
+        crate::app::detail::operate_test_tooltip(),
         "Test the selected endpoint (Ctrl-T)"
     );
 
@@ -28345,7 +28345,7 @@ fn t84_unclean_boot_with_running_snapshot_toasts_once(cx: &mut TestAppContext) {
         "the unclean boot toasts exactly once"
     );
     assert_eq!(
-        crate::UNCLEAN_EXIT_NOTICE,
+        crate::unclean_exit_notice_text(),
         "Previous run carried running endpoints and did not exit cleanly.",
         "the toast carries the ticket's exact string"
     );
@@ -34381,9 +34381,12 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
     assert_eq!(rows[0].cpu, vec![4.5, 6.0], "series follow the shard label");
     assert_eq!(rows[0].ram, vec![31.0, 33.5]);
     assert_eq!(rows[0].caption, None, "samples mean charts");
-    assert_eq!(rows[1].caption, Some(crate::SHARD_NOT_RUNNING));
-    assert_eq!(rows[2].caption, Some(crate::SHARD_SAMPLING_UNAVAILABLE));
-    assert_eq!(rows[3].caption, Some(crate::SHARD_COLLECTING));
+    assert_eq!(rows[1].caption, Some(crate::ShardCaption::NotRunning));
+    assert_eq!(
+        rows[2].caption,
+        Some(crate::ShardCaption::SamplingUnavailable)
+    );
+    assert_eq!(rows[3].caption, Some(crate::ShardCaption::Collecting));
     assert_eq!(
         crate::shard_stats_summary(&rows),
         "3 live shard(s), 1 charted, sampling unavailable"
@@ -34886,7 +34889,7 @@ fn t06_refused_shortcut_toasts_instead_of_silence(cx: &mut TestAppContext) {
         "the refused shortcut toasts instead of doing nothing"
     );
     assert_eq!(
-        crate::OVERLAY_REFUSAL_NOTE,
+        crate::overlay_refusal_note(),
         "Close the open dialog first",
         "the refusal names the way out"
     );
@@ -35801,7 +35804,7 @@ fn k5_clipboard_refusal_is_one_liner() {
     );
     assert_eq!(
         crate::AppView::paste_intake_refusal(""),
-        Some("Clipboard has no text to import"),
+        Some("Clipboard has no text to import".to_string()),
         "the empty-clipboard case keeps naming itself"
     );
 }

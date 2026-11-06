@@ -8,9 +8,15 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 /// T-02: a key never rides inside a label or an accessible name. The operate
 /// row announces the action alone and keeps the key in its tooltip, so the
 /// key-bearing tooltip text is named here and pinned by the test suite.
-pub(crate) const OPERATE_START_TOOLTIP: &str = "Start the selected endpoint (F5)";
-pub(crate) const OPERATE_STOP_TOOLTIP: &str = "Stop the selected endpoint (Shift-F5)";
-pub(crate) const OPERATE_TEST_TOOLTIP: &str = "Test the selected endpoint (Ctrl-T)";
+pub(crate) fn operate_start_tooltip() -> String {
+    t!("detail-start-tip")
+}
+pub(crate) fn operate_stop_tooltip() -> String {
+    t!("detail-stop-tip")
+}
+pub(crate) fn operate_test_tooltip() -> String {
+    t!("detail-test-tip")
+}
 
 /// K20/D1 metrics for the inspector tab strip: one fixed text size for all
 /// five, pinned so `Details · Health · Logs · Links · Traffic` fit whole at the
@@ -159,8 +165,8 @@ impl AppView {
                     .child(
                         Button::new("inspector-drawer-close")
                             .small()
-                            .label("Close inspector")
-                            .tooltip("Close the inspector drawer (Esc)")
+                            .label(t!("detail-close"))
+                            .tooltip(t!("detail-close-tip"))
                             .on_click(move |_, window, cx| {
                                 close_view.update(cx, |view, cx| {
                                     view.close_inspector(window, cx);
@@ -228,12 +234,8 @@ impl AppView {
             .child(
                 Empty::new().header(
                     EmptyHeader::new()
-                        .title(EmptyTitle::new().child(
-                            "Select a configuration to inspect its endpoint, health, and usage",
-                        ))
-                        .description(EmptyDescription::new().child(
-                            "Pick a row in the library — its endpoints and controls appear here.",
-                        )),
+                        .title(EmptyTitle::new().child(t!("detail-empty-title")))
+                        .description(EmptyDescription::new().child(t!("detail-empty-description"))),
                 ),
             )
             .into_any_element()
@@ -349,29 +351,39 @@ impl AppView {
                 }
             });
         for label in LOG_LEVEL_LABELS {
+            let level = LogLevel::from_label(label);
             level_group = level_group.child(
                 Radio::new(label)
-                    .label(label)
-                    .tooltip(log_level_tooltip(LogLevel::from_label(label))),
+                    .label(log_level_label(level))
+                    .tooltip(log_level_tooltip(level)),
             );
         }
         let mut parts = Vec::new();
         if !self.logs.filter.trim().is_empty() {
-            parts.push(format!("include {:?}", self.logs.filter.trim()));
+            parts.push(t!(
+                "detail-log-filter-include",
+                value = self.logs.filter.trim()
+            ));
         }
         if !self.logs.exclude.trim().is_empty() {
-            parts.push(format!("exclude {:?}", self.logs.exclude.trim()));
+            parts.push(t!(
+                "detail-log-filter-exclude",
+                value = self.logs.exclude.trim()
+            ));
         }
         if !self.logs.regex.trim().is_empty() {
-            parts.push(format!("regex {:?}", self.logs.regex.trim()));
+            parts.push(t!(
+                "detail-log-filter-regex",
+                value = self.logs.regex.trim()
+            ));
         }
         if let Some(level) = self.logs.level {
-            parts.push(format!("level {}", level.as_str()));
+            parts.push(t!("detail-log-filter-level", value = level.as_str()));
         }
         let summary = if parts.is_empty() {
-            "No filters — showing everything.".to_string()
+            t!("detail-log-filters-none")
         } else {
-            format!("Filters: {}", parts.join(" · "))
+            t!("detail-log-filters", parts = parts.join(" · "))
         };
         let filter_active = !self.logs.filter.trim().is_empty()
             || !self.logs.exclude.trim().is_empty()
@@ -385,7 +397,7 @@ impl AppView {
             .gap_1()
             .child(
                 GroupBox::new()
-                    .title(format!("Logs ({})", lines.len()))
+                    .title(t!("detail-logs-title", count = lines.len()))
                     .gap_1()
                     .child(
                         div()
@@ -409,10 +421,8 @@ impl AppView {
                             .child(
                                 Button::new("log-pane-edit-filters")
                                     .small()
-                                    .label("Edit filters")
-                                    .tooltip(
-                                        "Open the logs sheet to edit include, exclude, and regex",
-                                    )
+                                    .label(t!("detail-edit-filters"))
+                                    .tooltip(t!("detail-edit-filters-tip"))
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.open_logs_dialog(window, cx);
                                     })),
@@ -420,8 +430,8 @@ impl AppView {
                             .child(
                                 Button::new("log-pane-copy")
                                     .small()
-                                    .label("Copy visible")
-                                    .tooltip("Copy the visible log lines (redacted)")
+                                    .label(t!("detail-copy-visible"))
+                                    .tooltip(t!("detail-copy-visible-tip"))
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.copy_visible_logs(window, cx);
                                     })),
@@ -433,13 +443,13 @@ impl AppView {
                 .id("log-pane-empty")
                 .test_support()
                 .text_sm()
-                .child("No log lines to show.");
+                .child(t!("detail-logs-empty"));
             if filter_active {
                 empty = empty.child(
                     Button::new("log-pane-clear")
                         .small()
-                        .label("Clear filter")
-                        .tooltip("Clear the log text filters and level")
+                        .label(t!("detail-clear-filter"))
+                        .tooltip(t!("detail-clear-filter-tip"))
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.clear_log_filter(window, cx);
                         })),
@@ -496,11 +506,9 @@ impl AppView {
             .gap_1()
             .child(
                 GroupBox::new()
-                    .title(format!("Links ({})", rows.len()))
+                    .title(t!("detail-links-title", count = rows.len()))
                     .gap_1()
-                    .child(div().text_sm().child(
-                        "Destination · Exit · Proto · Traffic ↓↑ · Session Δ — click a destination to copy it.",
-                    ))
+                    .child(div().text_sm().child(t!("detail-links-description")))
                     .child(
                         div()
                             .flex()
@@ -512,11 +520,11 @@ impl AppView {
                                 Button::new("conn-toggle-scope")
                                     .small()
                                     .label(if self.conn.selected_only {
-                                        "Selected row only: on"
+                                        t!("detail-scope-on")
                                     } else {
-                                        "Selected row only: off"
+                                        t!("detail-scope-off")
                                     })
-                                    .tooltip("Show only the selected row's flows (all when nothing is selected)")
+                                    .tooltip(t!("detail-scope-tip"))
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.conn.selected_only = !view.conn.selected_only;
                                         cx.notify();
@@ -526,22 +534,21 @@ impl AppView {
                                 Button::new("conn-toggle-sort")
                                     .small()
                                     .label(if self.conn.sort_desc {
-                                        "Sort: traffic ↓"
+                                        t!("detail-sort-desc")
                                     } else {
-                                        "Sort: traffic ↑"
+                                        t!("detail-sort-asc")
                                     })
-                                    .tooltip("Sort connections by cumulative traffic")
+                                    .tooltip(t!("detail-sort-tip"))
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.conn.sort_desc = !view.conn.sort_desc;
                                         cx.notify();
                                     })),
                             )
-
                             .child(
                                 Button::new("conn-columns-narrow")
                                     .small()
-                                    .label("Columns −")
-                                    .tooltip("Narrow every connections column by 20px (persisted)")
+                                    .label(t!("detail-columns-narrow"))
+                                    .tooltip(t!("detail-columns-narrow-tip"))
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.adjust_conn_column_widths(-20, window, cx);
                                     })),
@@ -549,8 +556,8 @@ impl AppView {
                             .child(
                                 Button::new("conn-columns-widen")
                                     .small()
-                                    .label("Columns +")
-                                    .tooltip("Widen every connections column by 20px (persisted)")
+                                    .label(t!("detail-columns-widen"))
+                                    .tooltip(t!("detail-columns-widen-tip"))
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.adjust_conn_column_widths(20, window, cx);
                                     })),
@@ -558,12 +565,12 @@ impl AppView {
                             .child(
                                 Button::new("conn-columns-refresh")
                                     .small()
-                                    .label("Refresh Column Widths")
-                                    .tooltip("Restore the default connections column widths")
+                                    .label(t!("detail-columns-reset"))
+                                    .tooltip(t!("detail-columns-reset-tip"))
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.refresh_conn_column_widths(window, cx);
                                     })),
-                            )
+                            ),
                     ),
             );
         if rows.is_empty() {
@@ -572,7 +579,7 @@ impl AppView {
                     .id("config-links-empty")
                     .test_support()
                     .text_sm()
-                    .child("No live connections yet — start an exit to see flows here. Health probes never appear."),
+                    .child(t!("detail-links-empty")),
             );
         } else {
             let count = rows.len();
@@ -592,7 +599,7 @@ impl AppView {
                     let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
                     let dest = row.dest.clone();
                     let dest_display = if dest.is_empty() {
-                        "(no destination)".to_string()
+                        t!("detail-no-destination")
                     } else {
                         redact_secrets(&dest)
                     };
@@ -613,7 +620,7 @@ impl AppView {
                             Button::new(format!("conn-copy-{ix}"))
                                 .small()
                                 .label(dest_display)
-                                .tooltip("Copy destination")
+                                .tooltip(t!("detail-copy-destination"))
                                 .on_click(cx.listener(move |view, _, window, cx| {
                                     view.copy_conn_cell(
                                         ConnCopyTarget::Dest(ix),
@@ -629,7 +636,7 @@ impl AppView {
                                 .id(format!("conn-copied-dest-{ix}"))
                                 .test_support()
                                 .text_sm()
-                                .child("Copied!"),
+                                .child(t!("detail-copied")),
                         );
                     }
 
@@ -641,17 +648,16 @@ impl AppView {
                         .small()
                         .label(bind);
                     if endpoint_claimed {
-                        endpoint_button =
-                            endpoint_button
-                                .tooltip("Copy endpoint")
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.copy_conn_cell(
-                                        ConnCopyTarget::Endpoint(ix),
-                                        &endpoint_value,
-                                        window,
-                                        cx,
-                                    );
-                                }));
+                        endpoint_button = endpoint_button
+                            .tooltip(t!("detail-copy-endpoint"))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.copy_conn_cell(
+                                    ConnCopyTarget::Endpoint(ix),
+                                    &endpoint_value,
+                                    window,
+                                    cx,
+                                );
+                            }));
                     }
                     let mut meta = div()
                         .id(format!("conn-meta-{ix}"))
@@ -671,14 +677,15 @@ impl AppView {
                             div()
                                 .id(format!("conn-copied-endpoint-{ix}"))
                                 .test_support()
-                                .child("Copied!"),
+                                .child(t!("detail-copied")),
                         );
                     }
-                    meta = meta.child(format!(
-                        "· {protocol} · ↓{} ↑{} · Δ{}",
-                        format_bytes(row.rx_bytes),
-                        format_bytes(row.tx_bytes),
-                        format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
+                    meta = meta.child(t!(
+                        "detail-conn-meta",
+                        protocol = protocol,
+                        down = format_bytes(row.rx_bytes),
+                        up = format_bytes(row.tx_bytes),
+                        delta = format_bytes(row.delta_rx.saturating_add(row.delta_tx))
                     ));
 
                     note_pane_row(PaneRows::Links);
@@ -716,15 +723,15 @@ impl AppView {
             .gap_1()
             .child(
                 GroupBox::new()
-                    .title("Traffic (per-exit)")
+                    .title(t!("detail-traffic-title"))
                     .gap_1()
-                    .child(div().text_sm().child(
-                        summed_traffic_text(&self.store)
-                            .unwrap_or_else(|| "usage unavailable".to_string()),
-                    ))
-                    .child(div().text_sm().child(
-                        "Per-exit aggregates from stored totals — no Direct line (presets emit no per-rule decisions).",
-                    )),
+                    .child(
+                        div().text_sm().child(
+                            summed_traffic_text(&self.store)
+                                .unwrap_or_else(|| t!("detail-usage-unavailable")),
+                        ),
+                    )
+                    .child(div().text_sm().child(t!("detail-traffic-description"))),
             );
         if exits.is_empty() {
             pane = pane.child(
@@ -732,7 +739,7 @@ impl AppView {
                     .id("config-traffic-empty")
                     .test_support()
                     .text_sm()
-                    .child("No traffic recorded yet — start an exit and pass data."),
+                    .child(t!("detail-traffic-empty")),
             );
         } else {
             let count = exits.len();
@@ -762,13 +769,13 @@ impl AppView {
                         .h(px(PANE_TRAFFIC_ROW_H))
                         .text_sm()
                         .truncate()
-                        .child(format!(
-                            "{} {} · {} ↓{} ↑{}",
-                            bar,
-                            exit.name,
-                            exit.bind,
-                            format_bytes(exit.rx_bytes),
-                            format_bytes(exit.tx_bytes),
+                        .child(t!(
+                            "detail-traffic-row",
+                            bar = bar,
+                            name = exit.name.as_str(),
+                            bind = exit.bind.as_str(),
+                            down = format_bytes(exit.rx_bytes),
+                            up = format_bytes(exit.tx_bytes)
                         ))
                         .into_any_element()
                 },
@@ -850,10 +857,7 @@ impl AppView {
                 if !dirty {
                     div().id("row-dirty-idle").test_support().into_any_element()
                 } else {
-                    let dirty_tip = format!(
-                        "\"{}\" has unapplied endpoint edits — Enter applies, Esc reverts",
-                        config.name
-                    );
+                    let dirty_tip = t!("detail-dirty-tip", name = config.name.as_str());
                     div()
                         .id(format!("row-dirty-{}", config.id))
                         .test_support()
@@ -912,60 +916,63 @@ impl AppView {
         let strip = self.render_row_editors(window, cx, config);
 
         div().id("config-endpoints").test_support().child(
-            GroupBox::new().title("Endpoints").gap_1().child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w_full()
-                    .min_w_0()
-                    .max_w(px(620.))
-                    .child(Self::endpoint_row(
-                        cx,
-                        "Upstream",
-                        upstream,
-                        "endpoint-value-upstream",
-                    ))
-                    .child(Self::endpoint_row(
-                        cx,
-                        "SOCKS",
-                        socks_display,
-                        "endpoint-value-socks",
-                    ))
-                    .child(Self::endpoint_row(
-                        cx,
-                        "HTTP",
-                        http_display,
-                        "endpoint-value-http",
-                    ))
-                    // K1/A4-4: one copy action for the whole block — the
-                    // per-row `[Copy]` buttons are gone.
-                    .child({
-                        let copy_id = config.id.clone();
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .w_full()
-                            .flex_shrink_0()
-                            .child(div().flex_1().min_w_0())
-                            .child(
-                                Button::new("copy-endpoints")
-                                    .small()
-                                    .label("Copy URLs")
-                                    .accessibility_label("Copy this endpoint's URLs")
-                                    .tooltip("Copy bind endpoints (no secrets)")
-                                    .on_click(cx.listener(move |view, _, window, cx| {
-                                        view.copy_row_urls(&copy_id, window, cx);
-                                    })),
-                            )
-                    })
-                    // K1/A4-7: the editor strip lives INSIDE the block it edits.
-                    .child(strip)
-                    // The draft's live warning rides the strip that caused it.
-                    .children(self.render_row_endpoint_warning(cx, config)),
-            ),
+            GroupBox::new()
+                .title(t!("detail-endpoints-title"))
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .w_full()
+                        .min_w_0()
+                        .max_w(px(620.))
+                        .child(Self::endpoint_row(
+                            cx,
+                            t!("detail-endpoint-upstream"),
+                            upstream,
+                            "endpoint-value-upstream",
+                        ))
+                        .child(Self::endpoint_row(
+                            cx,
+                            t!("detail-endpoint-socks"),
+                            socks_display,
+                            "endpoint-value-socks",
+                        ))
+                        .child(Self::endpoint_row(
+                            cx,
+                            t!("detail-endpoint-http"),
+                            http_display,
+                            "endpoint-value-http",
+                        ))
+                        // K1/A4-4: one copy action for the whole block — the
+                        // per-row `[Copy]` buttons are gone.
+                        .child({
+                            let copy_id = config.id.clone();
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .w_full()
+                                .flex_shrink_0()
+                                .child(div().flex_1().min_w_0())
+                                .child(
+                                    Button::new("copy-endpoints")
+                                        .small()
+                                        .label(t!("detail-copy-urls"))
+                                        .accessibility_label(t!("detail-copy-urls-aria"))
+                                        .tooltip(t!("detail-copy-urls-tip"))
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.copy_row_urls(&copy_id, window, cx);
+                                        })),
+                                )
+                        })
+                        // K1/A4-7: the editor strip lives INSIDE the block it edits.
+                        .child(strip)
+                        // The draft's live warning rides the strip that caused it.
+                        .children(self.render_row_endpoint_warning(cx, config)),
+                ),
         )
     }
 
@@ -974,7 +981,7 @@ impl AppView {
     /// K1/A4-4: the per-row Copy left — the block carries the single action.
     pub(crate) fn endpoint_row(
         cx: &mut Context<Self>,
-        label: &'static str,
+        label: String,
         value: String,
         value_id: &'static str,
     ) -> impl IntoElement {
@@ -1021,34 +1028,37 @@ impl AppView {
             crate::health::RowState::Unknown => div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Never tested — press Test to check")
+                .child(t!("detail-never-tested"))
                 .into_any_element(),
-            crate::health::RowState::Dead => div()
-                .text_sm()
-                .text_color(danger_text_color(cx.theme()))
-                .child(format!(
-                    "Failed — {}",
-                    status.cause.as_deref().unwrap_or("endpoint dead")
-                ))
-                .into_any_element(),
+            crate::health::RowState::Dead => {
+                let cause = status
+                    .cause
+                    .clone()
+                    .unwrap_or_else(|| t!("detail-endpoint-dead"));
+                div()
+                    .text_sm()
+                    .text_color(danger_text_color(cx.theme()))
+                    .child(t!("detail-failed", cause = cause))
+                    .into_any_element()
+            }
             crate::health::RowState::Live => {
-                let mut samples: Vec<(&str, String)> = Vec::new();
+                let mut samples: Vec<(String, String)> = Vec::new();
                 if let Some(ms) = self
                     .health_store
                     .latest_of(&config.id, HealthKind::UrlTest)
                     .and_then(|sample| sample.latency_ms)
                 {
-                    samples.push(("URL test", format!("{ms}ms")));
+                    samples.push((t!("detail-url-test"), format!("{ms}ms")));
                 }
                 if let Some(ms) = self
                     .health_store
                     .latest_of(&config.id, HealthKind::TcpPing)
                     .and_then(|sample| sample.latency_ms)
                 {
-                    samples.push(("TCP ping", format!("{ms}ms")));
+                    samples.push((t!("detail-tcp-ping"), format!("{ms}ms")));
                 }
                 if samples.is_empty() {
-                    samples.push(("State", "live".to_string()));
+                    samples.push((t!("detail-state"), t!("detail-live")));
                 }
                 let mut line = div()
                     .flex()
@@ -1061,7 +1071,7 @@ impl AppView {
                     if index > 0 {
                         line = line.child(mono_number("·".to_string()));
                     }
-                    line = line.child(*label).child(mono_number(value.clone()));
+                    line = line.child(label.clone()).child(mono_number(value.clone()));
                 }
                 line.into_any_element()
             }
@@ -1070,11 +1080,7 @@ impl AppView {
         // correctly pluralized probe count (never `1 probe(s)`).
         let traffic = self.health_store.traffic(&config.id);
         let probe_line = (traffic.probes > 0).then(|| {
-            let probes = if traffic.probes == 1 {
-                "1 probe".to_string()
-            } else {
-                format!("{} probes", traffic.probes)
-            };
+            let probes = t!("detail-probe-count", count = traffic.probes);
             div()
                 .flex()
                 .flex_row()
@@ -1083,17 +1089,23 @@ impl AppView {
                 .gap_1()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Probe traffic")
-                .child(mono_number(format!("{} ↓", format_bytes(traffic.rx_bytes))))
+                .child(t!("detail-probe-traffic"))
+                .child(mono_number(t!(
+                    "detail-probe-rx",
+                    bytes = format_bytes(traffic.rx_bytes)
+                )))
                 .child(mono_number("·".to_string()))
-                .child(mono_number(format!("{} ↑", format_bytes(traffic.tx_bytes))))
+                .child(mono_number(t!(
+                    "detail-probe-tx",
+                    bytes = format_bytes(traffic.tx_bytes)
+                )))
                 .child(mono_number("·".to_string()))
                 .child(mono_number(probes))
                 .into_any_element()
         });
         div().id("config-health").test_support().child(
             GroupBox::new()
-                .title("Health")
+                .title(t!("detail-health-title"))
                 .gap_1()
                 .child(state_line)
                 .children(probe_line),
@@ -1107,7 +1119,7 @@ impl AppView {
     ) -> impl IntoElement {
         div().id("config-usage").test_support().child(
             GroupBox::new()
-                .title("Usage")
+                .title(t!("detail-usage-title"))
                 .gap_1()
                 .child(match self.usage_parts(&config.id) {
                     Some((down, up)) => DescriptionList::new()
@@ -1115,8 +1127,8 @@ impl AppView {
                         .small()
                         .columns(2)
                         .label_width(px(72.))
-                        .item("Down", down, 1)
-                        .item("Up", up, 1)
+                        .item(t!("detail-usage-down"), down, 1)
+                        .item(t!("detail-usage-up"), up, 1)
                         .into_any_element(),
                     None => div()
                         .text_sm()
@@ -1149,16 +1161,18 @@ impl AppView {
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(if samples == 0 {
-                    "No health history yet — press Test to record a probe".to_string()
+                    t!("detail-history-empty")
                 } else {
-                    format!("History needs 3 samples — {samples} recorded")
+                    t!("detail-history-few", count = samples)
                 })
                 .into_any_element()
         };
-        div()
-            .id("config-history")
-            .test_support()
-            .child(GroupBox::new().title("History").gap_1().child(body))
+        div().id("config-history").test_support().child(
+            GroupBox::new()
+                .title(t!("detail-history-title"))
+                .gap_1()
+                .child(body),
+        )
     }
 
     /// The row's endpoint editors — K1/A4-4 now mounts this strip INSIDE the
@@ -1205,10 +1219,7 @@ impl AppView {
                 .test_support()
                 .w(px(118.))
                 .tooltip({
-                    let tip = format!(
-                        "Serve bind address for \"{name}\" — Enter commits, Esc reverts \
-                         (custom config: listens come from the JSON)"
-                    );
+                    let tip = t!("detail-bind-custom-tip", name = name.as_str());
                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                 })
                 .child(
@@ -1220,7 +1231,7 @@ impl AppView {
                                 .small()
                                 // K1/A4-7: every strip input is bordered + mono.
                                 .bordered(true)
-                                .aria_label(format!("Serve bind address for {name}")),
+                                .aria_label(t!("detail-bind-aria", name = name.as_str())),
                         ),
                 )
                 .into_any_element()
@@ -1230,10 +1241,7 @@ impl AppView {
                 .test_support()
                 .w(px(118.))
                 .tooltip({
-                    let tip = format!(
-                        "Serve bind address for \"{name}\" — pick one from the address list \
-                         (Settings → Addresses); port stays free-text"
-                    );
+                    let tip = t!("detail-bind-tip", name = name.as_str());
                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                 })
                 .child(
@@ -1244,8 +1252,8 @@ impl AppView {
                             Select::new(&bind_picker)
                                 .id(format!("row-bind-picker-{}", config.id))
                                 .small()
-                                .placeholder("pick address")
-                                .accessibility_label(format!("Serve bind address for {name}")),
+                                .placeholder(t!("detail-bind-placeholder"))
+                                .accessibility_label(t!("detail-bind-aria", name = name.as_str())),
                         ),
                 )
                 .into_any_element()
@@ -1254,12 +1262,9 @@ impl AppView {
             let add_view = cx.entity();
             Button::new(format!("row-bind-add-{}", config.id))
                 .small()
-                .label("Add…")
-                .accessibility_label("Add address…")
-                .tooltip(format!(
-                    "Add address… — opens Settings → Addresses; the list is the only source \
-                     for row binds, \"{name}\""
-                ))
+                .label(t!("detail-add-address"))
+                .accessibility_label(t!("detail-add-address-aria"))
+                .tooltip(t!("detail-add-address-tip", name = name.as_str()))
                 .on_click(move |_, window, cx| {
                     add_view.update(cx, |view, cx| {
                         view.open_settings_dialog(window, cx);
@@ -1321,9 +1326,10 @@ impl AppView {
                     .test_support()
                     .w(px(76.))
                     .tooltip({
-                        let tip = format!(
-                            "Local endpoint {}:{} — Enter commits, Esc reverts",
-                            config.bind_ip, config.port
+                        let tip = t!(
+                            "detail-port-tip",
+                            bind = config.bind_ip.as_str(),
+                            port = config.port
                         );
                         move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                     })
@@ -1337,7 +1343,7 @@ impl AppView {
                                     // K1/A4-7: the port field stopped being the
                                     // borderless one wedged between Add… and value.
                                     .bordered(true)
-                                    .aria_label(format!("Local port for {name}")),
+                                    .aria_label(t!("detail-port-aria", name = name.as_str())),
                             ),
                     ),
             )
@@ -1388,7 +1394,11 @@ impl AppView {
     ) -> impl IntoElement {
         let is_running = self.engine.is_running(&config.id);
         let failed = self.detail_failed(config);
-        let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
+        let phase = RowPhase::of(is_running, self.start_in_flight, failed);
+        let start_label = match phase {
+            RowPhase::Starting => t!("detail-starting"),
+            RowPhase::Stopped | RowPhase::Running | RowPhase::Failed => t!("detail-start"),
+        };
 
         // T-03: these three are direct children of the wrapping operate row.
         // A ButtonGroup is a single flex item and cannot break, so inside the
@@ -1397,9 +1407,9 @@ impl AppView {
         let mut start = Button::new("engine-start")
             .small()
             .label(start_label)
-            .accessibility_label("Start the selected endpoint")
+            .accessibility_label(t!("detail-start-aria"))
             .child(shortcut_kbd("f5", "(F5)"))
-            .tooltip(OPERATE_START_TOOLTIP)
+            .tooltip(operate_start_tooltip())
             .loading(self.start_in_flight)
             .on_click(cx.listener(|view, _, window, cx| {
                 view.start_selected_engine(window, cx);
@@ -1423,20 +1433,20 @@ impl AppView {
         // row and the commit path says there is nothing to do.
         let stop = Button::new("engine-stop")
             .small()
-            .label("Stop")
-            .accessibility_label("Stop")
+            .label(t!("detail-stop"))
+            .accessibility_label(t!("detail-stop-aria"))
             .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-            .tooltip(OPERATE_STOP_TOOLTIP)
+            .tooltip(operate_stop_tooltip())
             .on_click(cx.listener(|view, _, window, cx| {
                 view.stop_selected_engine(window, cx);
             }));
 
         let mut test = Button::new("health-test")
             .small()
-            .label("Test")
-            .accessibility_label("Test")
+            .label(t!("detail-test"))
+            .accessibility_label(t!("detail-test-aria"))
             .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-            .tooltip(OPERATE_TEST_TOOLTIP)
+            .tooltip(operate_test_tooltip())
             .loading(self.probe_kind_in_flight(false))
             .on_click(cx.listener(|view, _, window, cx| {
                 view.test_selected_health(window, cx);
@@ -1497,8 +1507,8 @@ impl AppView {
     ) -> PopupMenuItem {
         let def = action(id);
         let element_id = format!("rowctx-{}-{row_id}", def.id);
-        let label = label.unwrap_or_else(|| def.label.to_string());
-        let tip = def.tooltip.unwrap_or(def.label).to_string();
+        let label = label.unwrap_or_else(|| def.label());
+        let tip = def.tooltip().unwrap_or_else(|| def.label());
         let target = row_id.to_string();
         let view = view.clone();
         PopupMenuItem::element(move |_, _| {
@@ -1664,12 +1674,12 @@ impl AppView {
     ) -> PopupMenuItem {
         let def = action(id);
         let element_id = format!("kebab-{}", def.id);
-        let label = def.label.to_string();
+        let label = def.label();
         let text = match note {
             Some(note) => format!("{label} · {note}"),
             None => label.clone(),
         };
-        let tip = def.tooltip.unwrap_or(def.label).to_string();
+        let tip = def.tooltip().unwrap_or_else(|| def.label());
         let view = view.clone();
         PopupMenuItem::element(move |_, _| {
             let tip = tip.clone();
@@ -1751,15 +1761,15 @@ impl AppView {
 
         let mut buttons = Vec::with_capacity(tabs.len());
         for (index, tab) in tabs.into_iter().enumerate() {
-            let label = tab.a11y_label();
-            let slug = label.to_lowercase();
+            let label = inspector_tab_label(tab);
+            let slug = tab.a11y_label().to_lowercase();
             let selected = self.inspector_tab == tab;
             buttons.push(
                 div()
                     .id(format!("inspector-tab-button-{slug}"))
                     .test_support()
                     .role(Role::Tab)
-                    .aria_label(label)
+                    .aria_label(label.clone())
                     .aria_selected(selected)
                     // The drawer overlays the table, so a press must not leak
                     // through to the rows underneath it. Mirrors the kit Tab.
@@ -1850,7 +1860,7 @@ impl AppView {
                         "config-health-alert-box",
                         self.health_store.detail_line(&config.id),
                     )
-                    .title("Endpoint failed"),
+                    .title(t!("detail-endpoint-failed")),
                 ),
             );
         }

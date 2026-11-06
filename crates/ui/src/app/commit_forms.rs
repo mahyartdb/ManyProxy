@@ -17,7 +17,7 @@ impl AppView {
         }
         match self.store.add(input) {
             Ok(created) => {
-                let message = row_action_message("Added", &created.name);
+                let message = row_action_message(&t!("verb-added"), &created.name);
                 self.reload(window, cx);
                 window.push_notification(Notification::success(message), cx);
                 true
@@ -70,7 +70,7 @@ impl AppView {
         match self.store.add(input) {
             Ok(created) => {
                 *form_error.borrow_mut() = None;
-                let message = row_action_message("Added", &created.name);
+                let message = row_action_message(&t!("verb-added"), &created.name);
                 let created_id = created.id.clone();
                 self.reload(window, cx);
                 // F12: the new row is the confirmation. A filter that hides
@@ -107,7 +107,7 @@ impl AppView {
     ) -> bool {
         match self.store.get(id) {
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 true
             }
             Err(error) => {
@@ -133,7 +133,7 @@ impl AppView {
                         let message = if self.engine.is_running(id) {
                             restart_to_apply_message(&updated.name)
                         } else {
-                            row_action_message("Updated", &updated.name)
+                            row_action_message(&t!("verb-updated"), &updated.name)
                         };
                         self.reload(window, cx);
                         window.push_notification(Notification::success(message), cx);
@@ -165,7 +165,7 @@ impl AppView {
             (drafts.0, drafts.1, stored)
         });
         let Some((name, bind_stored, port_stored)) = stored else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return true;
         };
         if bind_raw.trim() == bind_stored && port_raw.trim() == port_stored {
@@ -224,7 +224,7 @@ impl AppView {
         match self.store.get(id) {
             Ok(None) => {
                 *form_error.borrow_mut() = None;
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 true
             }
             Err(error) => {
@@ -279,7 +279,7 @@ impl AppView {
                         let message = if self.engine.is_running(id) {
                             restart_to_apply_message(&updated.name)
                         } else {
-                            row_action_message("Updated", &updated.name)
+                            row_action_message(&t!("verb-updated"), &updated.name)
                         };
                         self.reload(window, cx);
                         window.push_notification(Notification::success(message), cx);
@@ -344,11 +344,13 @@ impl AppView {
                 }
             }
             Ok(false) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(error) => {
-                window
-                    .push_notification(Notification::error(format!("Cannot remove: {error}")), cx);
+                window.push_notification(
+                    Notification::error(t!("cannot-remove", error = error.to_string())),
+                    cx,
+                );
             }
         }
     }
@@ -362,7 +364,7 @@ impl AppView {
         let source = match self.store.get(id) {
             Ok(Some(row)) => row,
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 return;
             }
             Err(error) => {
@@ -388,9 +390,11 @@ impl AppView {
             Ok(created) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Duplicated \"{}\" as \"{}\" (disabled, port :{})",
-                        source.name, created.name, created.port
+                    Notification::success(t!(
+                        "duplicated-row",
+                        source = source.name.as_str(),
+                        name = created.name.as_str(),
+                        port = created.port
                     )),
                     cx,
                 );
@@ -412,9 +416,7 @@ impl AppView {
             match self.store.clear_test_url() {
                 Ok(()) => {
                     window.push_notification(
-                        Notification::success(format!(
-                            "Test URL cleared — probes use the default ({DEFAULT_TEST_URL})"
-                        )),
+                        Notification::success(t!("test-url-cleared", default = DEFAULT_TEST_URL)),
                         cx,
                     );
                     true
@@ -429,7 +431,7 @@ impl AppView {
                 Ok(url) => match self.store.set_test_url(&url) {
                     Ok(()) => {
                         window.push_notification(
-                            Notification::success(format!("Test URL set — probes use {url}")),
+                            Notification::success(t!("test-url-set", url = url)),
                             cx,
                         );
                         true
@@ -441,7 +443,7 @@ impl AppView {
                 },
                 Err(reason) => {
                     window.push_notification(
-                        Notification::error(format!("Invalid test URL: {reason}")),
+                        Notification::error(t!("invalid-test-url", reason = reason)),
                         cx,
                     );
                     false
@@ -461,8 +463,9 @@ impl AppView {
             match self.store.clear_update_feed_url() {
                 Ok(()) => {
                     window.push_notification(
-                        Notification::success(format!(
-                            "Feed URL cleared — updates check {UPDATE_FEED_URL_DEFAULT}"
+                        Notification::success(t!(
+                            "feed-url-cleared",
+                            default = UPDATE_FEED_URL_DEFAULT
                         )),
                         cx,
                     );
@@ -484,16 +487,12 @@ impl AppView {
                                 store::SubscriptionFetchPolicy::Warn { .. }
                             ) {
                                 window.push_notification(
-                                    Notification::warning(format!(
-                                        "Feed URL set over plaintext http — prefer https: {shown}"
-                                    )),
+                                    Notification::warning(t!("feed-url-http-warning", url = shown)),
                                     cx,
                                 );
                             } else {
                                 window.push_notification(
-                                    Notification::success(format!(
-                                        "Feed URL set — updates check {shown}"
-                                    )),
+                                    Notification::success(t!("feed-url-set", url = shown)),
                                     cx,
                                 );
                             }
@@ -507,7 +506,7 @@ impl AppView {
                 }
                 Err(reason) => {
                     window.push_notification(
-                        Notification::error(format!("Invalid feed URL: {reason}")),
+                        Notification::error(t!("invalid-feed-url", reason = reason)),
                         cx,
                     );
                     false
@@ -539,9 +538,7 @@ impl AppView {
             match self.store.clear_row_test_url(id) {
                 Ok(()) => {
                     window.push_notification(
-                        Notification::success(format!(
-                            "Test URL for \"{name}\" cleared — uses the global"
-                        )),
+                        Notification::success(t!("row-test-url-cleared", name = name.as_str())),
                         cx,
                     );
                     true
@@ -556,8 +553,10 @@ impl AppView {
                 Ok(url) => match self.store.set_row_test_url(id, &url) {
                     Ok(()) => {
                         window.push_notification(
-                            Notification::success(format!(
-                                "Test URL for \"{name}\" set — probes use {url}"
+                            Notification::success(t!(
+                                "row-test-url-set",
+                                name = name.as_str(),
+                                url = url
                             )),
                             cx,
                         );
@@ -570,7 +569,7 @@ impl AppView {
                 },
                 Err(reason) => {
                     window.push_notification(
-                        Notification::error(format!("Invalid test URL: {reason}")),
+                        Notification::error(t!("invalid-test-url", reason = reason)),
                         cx,
                     );
                     false
@@ -613,7 +612,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.commit_enabled_flag(&config.id, !config.enabled, window, cx);
@@ -643,8 +642,10 @@ impl AppView {
                 );
             }
             Err(error) => {
-                window
-                    .push_notification(Notification::error(format!("Cannot toggle: {error}")), cx);
+                window.push_notification(
+                    Notification::error(t!("cannot-toggle", error = error.to_string())),
+                    cx,
+                );
             }
         }
     }
@@ -656,10 +657,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("no-group-focus")), cx);
             return;
         };
 
@@ -678,8 +676,10 @@ impl AppView {
                     self.health_store_prune_group(&group);
                     self.reload(window, cx);
                     window.push_notification(
-                        Notification::success(format!(
-                            "Cleared {cleared} test result(s) in group \"{group}\""
+                        Notification::success(t!(
+                            "cleared-tests",
+                            count = cleared,
+                            group = group.as_str()
                         )),
                         cx,
                     );
@@ -718,9 +718,10 @@ impl AppView {
         self.reload(window, cx);
         if removed.is_empty() && skipped.is_empty() {
             window.push_notification(
-                Notification::info(format!(
-                    "{} in group \"{group}\": nothing removed — rows changed",
-                    kind.label()
+                Notification::info(t!(
+                    "prune-nothing-changed",
+                    kind = kind.label(),
+                    group = group.as_str()
                 )),
                 cx,
             );
@@ -728,34 +729,44 @@ impl AppView {
         }
         if removed.is_empty() {
             window.push_notification(
-                Notification::error(format!(
-                    "{} in group \"{group}\": nothing removed — {} row(s) could not be stopped ({})",
-                    kind.label(),
-                    skipped.len(),
-                    skipped.join(", ")
+                Notification::error(t!(
+                    "prune-nothing-stopped",
+                    kind = kind.label(),
+                    group = group.as_str(),
+                    count = skipped.len(),
+                    names = skipped.join(", ")
                 )),
                 cx,
             );
             return;
         }
         let shown: Vec<&str> = removed.iter().take(3).map(String::as_str).collect();
-        let mut text = format!(
-            "{} in group \"{group}\": {} removed ({})",
-            kind.label(),
-            removed.len(),
-            shown.join(", ")
+        let mut text = t!(
+            "prune-removed",
+            kind = kind.label(),
+            group = group.as_str(),
+            count = removed.len(),
+            names = shown.join(", ")
         );
         if removed.len() > shown.len() {
-            text.push_str(&format!(" (+{} more)", removed.len() - shown.len()));
+            text = t!(
+                "prune-removed-more",
+                kind = kind.label(),
+                group = group.as_str(),
+                count = removed.len(),
+                names = shown.join(", "),
+                more = removed.len() - shown.len()
+            );
         }
         if skipped.is_empty() {
             window.push_notification(Notification::success(text), cx);
         } else {
             window.push_notification(
-                Notification::warning(format!(
-                    "{text} — {} could not be stopped ({})",
-                    skipped.len(),
-                    skipped.join(", ")
+                Notification::warning(t!(
+                    "prune-removed-skipped",
+                    text = text,
+                    count = skipped.len(),
+                    names = skipped.join(", ")
                 )),
                 cx,
             );
@@ -779,15 +790,13 @@ impl AppView {
             Ok(()) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Auto-clear unavailable enabled for \"{group}\""
-                    )),
+                    Notification::success(t!("auto-clear-enabled", group = group)),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot enable auto-clear: {error}")),
+                    Notification::error(t!("cannot-enable-auto-clear", error = error.to_string())),
                     cx,
                 );
             }
@@ -813,15 +822,13 @@ impl AppView {
             Ok(()) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Auto-clear unavailable disabled for \"{group}\""
-                    )),
+                    Notification::success(t!("auto-clear-disabled", group = group)),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot disable auto-clear: {error}")),
+                    Notification::error(t!("cannot-disable-auto-clear", error = error.to_string())),
                     cx,
                 );
             }
@@ -840,15 +847,19 @@ impl AppView {
         });
         if let Err(error) = self.store.set_library_sort(sort) {
             window.push_notification(
-                Notification::error(format!("Could not save sort: {error}")),
+                Notification::error(t!("cannot-save-sort", error = error.to_string())),
                 cx,
             );
         }
         window.push_notification(
             Notification::info(if sort.is_none() {
-                "Sort: library order".to_string()
+                t!("sort-library-order")
             } else {
-                format!("Sort: {} · {}", sort.key.label(), sort.direction.label())
+                t!(
+                    "sort-with",
+                    key = sort.key.label(),
+                    direction = sort.direction.label()
+                )
             }),
             cx,
         );
@@ -859,7 +870,7 @@ impl AppView {
         let path = Store::default_logs_path();
         match self.write_visible_logs_to(&path, cx) {
             Ok(()) => window.push_notification(
-                Notification::success(format!("Logs saved to {}", path.display())),
+                Notification::success(t!("logs-saved-to", path = path.display().to_string())),
                 cx,
             ),
             Err(error) => window.push_notification(Notification::error(error), cx),
@@ -878,17 +889,14 @@ impl AppView {
     ) {
         let Some(cap) = parse_log_cap(raw) else {
             window.push_notification(
-                Notification::warning(format!(
-                    "Maximum kept log lines must be a whole number (500–50,000) — keeping {}",
-                    self.logs.store.cap()
-                )),
+                Notification::warning(t!("log-cap-invalid", cap = self.logs.store.cap())),
                 cx,
             );
             return;
         };
         if let Err(error) = self.store.set_log_max_lines(cap) {
             window.push_notification(
-                Notification::error(format!("Cannot save the log cap: {error}")),
+                Notification::error(t!("cannot-save-log-cap", error = error.to_string())),
                 cx,
             );
             return;
@@ -919,7 +927,7 @@ impl AppView {
     ) -> bool {
         let trimmed = path.trim();
         if trimmed.is_empty() {
-            window.push_notification(Notification::error("Export path must not be empty"), cx);
+            window.push_notification(Notification::error(t!("export-path-empty")), cx);
             return false;
         }
         if std::path::Path::new(trimmed).exists() {
@@ -974,15 +982,17 @@ impl AppView {
                         cx,
                     ),
                     Err(_) => window.push_notification(
-                        Notification::success(format!("Exported to {rendered}")),
+                        Notification::success(t!("exported-to", path = rendered)),
                         cx,
                     ),
                 }
             }
             Ok(None) => {}
             Err(error) => {
-                window
-                    .push_notification(Notification::error(format!("Export failed: {error}")), cx);
+                window.push_notification(
+                    Notification::error(t!("export-failed", error = error.to_string())),
+                    cx,
+                );
             }
         }
     }
@@ -998,8 +1008,10 @@ impl AppView {
         {
             Ok(()) => {}
             Err(error) => {
-                window
-                    .push_notification(Notification::error(format!("Restore failed: {error}")), cx);
+                window.push_notification(
+                    Notification::error(t!("restore-failed", error = error.to_string())),
+                    cx,
+                );
                 return;
             }
         }
@@ -1008,17 +1020,17 @@ impl AppView {
             match Store::restore_library_file(&live_path, payload, now_unix()) {
                 Ok((outcome, backup)) => {
                     let backup_text = backup.as_deref().map(|path| path.display().to_string());
-                    let backup_text = backup_text.as_deref().unwrap_or("(no prior library file)");
+                    let backup_text = backup_text.unwrap_or_else(|| t!("restore-no-backup"));
 
                     match Store::open_file(&live_path) {
                         Ok(fresh) => {
                             self.store = fresh;
                             self.reload(window, cx);
                             window.push_notification(
-                                Notification::success(format!(
-                                    "{} (backup {})",
-                                    restore_done_message(&outcome),
-                                    backup_text
+                                Notification::success(t!(
+                                    "restore-with-backup",
+                                    message = restore_done_message(&outcome),
+                                    backup = backup_text
                                 )),
                                 cx,
                             );
@@ -1026,8 +1038,10 @@ impl AppView {
                         Err(error) => {
                             self.reload(window, cx);
                             window.push_notification(
-                                Notification::error(format!(
-                                    "Restore swapped but reopen failed ({error}); backup at {backup_text}"
+                                Notification::error(t!(
+                                    "restore-reopen-failed",
+                                    error = error.to_string(),
+                                    backup = backup_text
                                 )),
                                 cx,
                             );
@@ -1037,7 +1051,7 @@ impl AppView {
                 }
                 Err(error) => {
                     window.push_notification(
-                        Notification::error(format!("Restore failed: {error}")),
+                        Notification::error(t!("restore-failed", error = error.to_string())),
                         cx,
                     );
                     return;
@@ -1046,9 +1060,7 @@ impl AppView {
         }
         if let Err(error) = self.wipe_library_for_restore() {
             window.push_notification(
-                Notification::error(format!(
-                    "Restore failed: cannot clear the library ({error})"
-                )),
+                Notification::error(t!("restore-failed-clear", error = error.to_string())),
                 cx,
             );
             return;
@@ -1061,8 +1073,9 @@ impl AppView {
             Err(error) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::error(format!(
-                        "Restore failed after clearing the library: {error}"
+                    Notification::error(t!(
+                        "restore-failed-after-clear",
+                        error = error.to_string()
                     )),
                     cx,
                 );
@@ -1079,14 +1092,14 @@ impl AppView {
         match self.store.reset_traffic_counters(id) {
             Ok(()) => {
                 self.reload(window, cx);
-                window.push_notification(Notification::success("Usage counters reset to zero"), cx);
+                window.push_notification(Notification::success(t!("usage-reset")), cx);
             }
             Err(StoreError::NotFound(_)) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot reset usage: {error}")),
+                    Notification::error(t!("cannot-reset-usage", error = error.to_string())),
                     cx,
                 );
             }
@@ -1272,10 +1285,7 @@ impl AppView {
                         cx,
                     ),
                     None => window.push_notification(
-                        Notification::success(format!(
-                            "Subscription \"{}\" added — refreshing",
-                            sub.label
-                        )),
+                        Notification::success(t!("subscription-added", label = sub.label.as_str())),
                         cx,
                     ),
                 }
@@ -1317,7 +1327,10 @@ impl AppView {
                         cx,
                     ),
                     None => window.push_notification(
-                        Notification::success(format!("Updated \"{}\"", updated.label)),
+                        Notification::success(t!(
+                            "subscription-updated",
+                            label = updated.label.as_str()
+                        )),
                         cx,
                     ),
                 }
@@ -1325,7 +1338,7 @@ impl AppView {
                 true
             }
             Err(StoreError::NotFound(_)) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 self.reopen_subscriptions_if_open(window, cx);
                 true
             }
@@ -1345,13 +1358,16 @@ impl AppView {
         let current = match self.store.get_subscription(sub_id) {
             Ok(Some(sub)) => sub.auto_refresh,
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 self.reopen_subscriptions_if_open(window, cx);
                 return;
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot change auto-refresh: {error}")),
+                    Notification::error(t!(
+                        "cannot-change-auto-refresh",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
                 self.reopen_subscriptions_if_open(window, cx);
@@ -1362,7 +1378,10 @@ impl AppView {
             Ok(_) => self.reload(window, cx),
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot change auto-refresh: {error}")),
+                    Notification::error(t!(
+                        "cannot-change-auto-refresh",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
             }
@@ -1408,10 +1427,7 @@ impl AppView {
             Err(()) => return false,
         }
         let create_name = if name.trim().is_empty() {
-            window.push_notification(
-                Notification::error("Invalid routing preset: preset needs a name"),
-                cx,
-            );
+            window.push_notification(Notification::error(t!("preset-needs-name")), cx);
             return false;
         } else {
             name.trim().to_string()
@@ -1498,7 +1514,7 @@ impl AppView {
         let renamed = match self.store.rename_preset(id, &name) {
             Ok(preset) => preset,
             Err(StoreError::NotFound(_)) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 return true;
             }
             Err(error) => {
@@ -1510,10 +1526,10 @@ impl AppView {
             Ok(_) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Preset \"{}\" updated ({} rule(s))",
-                        renamed.name,
-                        rules.len()
+                    Notification::success(t!(
+                        "preset-updated",
+                        name = renamed.name.as_str(),
+                        count = rules.len()
                     )),
                     cx,
                 );
@@ -1536,12 +1552,12 @@ impl AppView {
         let fresh = match self.store.get_preset(&preset.id) {
             Ok(Some(fresh)) => fresh,
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 return;
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot export routing preset: {error}")),
+                    Notification::error(t!("cannot-export-preset", error = error.to_string())),
                     cx,
                 );
                 return;
@@ -1552,7 +1568,7 @@ impl AppView {
                 let link = crate::preset::preset_share_link(&fresh.name, &rules);
                 cx.write_to_clipboard(ClipboardItem::new_string(link));
                 window.push_notification(
-                    Notification::success(format!("Copied preset link for \"{}\"", fresh.name)),
+                    Notification::success(t!("preset-link-copied", name = fresh.name.as_str())),
                     cx,
                 );
             }
@@ -1571,12 +1587,12 @@ impl AppView {
         let preset = match self.store.get_preset(id) {
             Ok(Some(preset)) => preset,
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 return;
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot duplicate routing preset: {error}")),
+                    Notification::error(t!("cannot-duplicate-preset", error = error.to_string())),
                     cx,
                 );
                 return;
@@ -1621,16 +1637,14 @@ impl AppView {
             Ok(_) => {
                 self.reload(window, cx);
                 if locked {
-                    window.push_notification(
-                        Notification::success("Routing preset locked — import a copy to modify"),
-                        cx,
-                    );
+                    window.push_notification(Notification::success(t!("preset-locked-toast")), cx);
                 } else {
-                    window.push_notification(Notification::success("Routing preset unlocked"), cx);
+                    window
+                        .push_notification(Notification::success(t!("preset-unlocked-toast")), cx);
                 }
             }
             Err(StoreError::NotFound(_)) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(error) => {
                 self.report_save_error(error, window, cx);
@@ -1648,10 +1662,10 @@ impl AppView {
         match self.store.delete_preset(id) {
             Ok(true) => {
                 self.reload(window, cx);
-                window.push_notification(Notification::success("Routing preset removed"), cx);
+                window.push_notification(Notification::success(t!("preset-removed-toast")), cx);
             }
             Ok(false) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(StoreError::Invalid(_)) => {
                 let (name, attached) = match self.store.get_preset(id) {
@@ -1673,7 +1687,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot remove routing preset: {error}")),
+                    Notification::error(t!("cannot-remove-preset", error = error.to_string())),
                     cx,
                 );
             }
@@ -1691,16 +1705,16 @@ impl AppView {
             Ok(true) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success("Routing preset removed (rows detached)"),
+                    Notification::success(t!("preset-removed-detached-toast")),
                     cx,
                 );
             }
             Ok(false) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot remove routing preset: {error}")),
+                    Notification::error(t!("cannot-remove-preset", error = error.to_string())),
                     cx,
                 );
             }
@@ -1726,9 +1740,13 @@ impl AppView {
                         let name = self
                             .preset_name_for(row.preset_id.as_deref())
                             .unwrap_or_else(|| "preset".to_string());
-                        format!("\"{}\" now routes with \"{name}\"", row.name)
+                        t!(
+                            "preset-attached-toast",
+                            row = row.name.as_str(),
+                            name = name.as_str()
+                        )
                     }
-                    None => format!("\"{}\" detached from its routing preset", row.name),
+                    None => t!("preset-detached-toast", row = row.name.as_str()),
                 };
                 window.push_notification(Notification::success(message), cx);
                 window.close_all_dialogs(cx);
@@ -1750,7 +1768,7 @@ impl AppView {
     ) {
         let existing = self.store.get_rule_set(id).ok().flatten();
         let Some(row) = existing else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         match self.store.delete_rule_set(id) {
@@ -1758,26 +1776,24 @@ impl AppView {
                 self.report_save_error(error, window, cx);
             }
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Ok(Some(file_name)) => {
                 let path = crate::store::staged_rule_set_path(&file_name);
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         window.push_notification(
-                            Notification::success(format!(
-                                "Rule set \"{}\" removed (staged file deleted)",
-                                row.name
-                            )),
+                            Notification::success(t!("rule-set-removed", name = row.name.as_str())),
                             cx,
                         );
                     }
                     Err(error) => {
                         window.push_notification(
-                            Notification::error(format!(
-                                "Rule set \"{}\" removed, but the staged file could not be deleted: {} ({error}) — delete it manually",
-                                row.name,
-                                path.display()
+                            Notification::error(t!(
+                                "rule-set-removed-file-failed",
+                                name = row.name.as_str(),
+                                path = path.display().to_string(),
+                                error = error.to_string()
                             )),
                             cx,
                         );
@@ -1801,11 +1817,14 @@ impl AppView {
                 self.reload(window, cx);
             }
             Ok(false) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot remove subscription: {error}")),
+                    Notification::error(t!(
+                        "cannot-remove-subscription",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
             }
@@ -1821,7 +1840,7 @@ impl AppView {
     ) {
         if let Err(error) = self.store.set_subs_auto_refresh_enabled(on) {
             window.push_notification(
-                Notification::error(format!("Cannot change auto-refresh: {error}")),
+                Notification::error(t!("cannot-change-auto-refresh", error = error.to_string())),
                 cx,
             );
         }

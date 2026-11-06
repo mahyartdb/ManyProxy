@@ -1,8 +1,21 @@
 use crate::*;
 
-pub(crate) const SHARD_NOT_RUNNING: &str = "not running";
-pub(crate) const SHARD_SAMPLING_UNAVAILABLE: &str = "(sampling unavailable)";
-pub(crate) const SHARD_COLLECTING: &str = "collecting first sample";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShardCaption {
+    NotRunning,
+    SamplingUnavailable,
+    Collecting,
+}
+
+impl ShardCaption {
+    pub(crate) fn label(self) -> String {
+        match self {
+            ShardCaption::NotRunning => t!("shard-not-running"),
+            ShardCaption::SamplingUnavailable => t!("shard-sampling-unavailable"),
+            ShardCaption::Collecting => t!("shard-collecting"),
+        }
+    }
+}
 
 /// One row of the Runtime-stats per-shard section: either two plottable series
 /// or a caption saying why there is nothing to plot.
@@ -11,7 +24,7 @@ pub(crate) struct ShardStatRow {
     pub(crate) label: String,
     pub(crate) cpu: Vec<f32>,
     pub(crate) ram: Vec<f32>,
-    pub(crate) caption: Option<&'static str>,
+    pub(crate) caption: Option<ShardCaption>,
 }
 
 pub(crate) fn shard_stat_rows(
@@ -24,11 +37,11 @@ pub(crate) fn shard_stat_rows(
         .map(|(label, pid)| {
             let ring = rings.get(label);
             let caption = if pid.is_none() {
-                Some(SHARD_NOT_RUNNING)
+                Some(ShardCaption::NotRunning)
             } else if denied.contains(label) {
-                Some(SHARD_SAMPLING_UNAVAILABLE)
+                Some(ShardCaption::SamplingUnavailable)
             } else if ring.is_none_or(|ring| ring.cpu.len() < 2) {
-                Some(SHARD_COLLECTING)
+                Some(ShardCaption::Collecting)
             } else {
                 None
             };
@@ -80,7 +93,7 @@ pub(crate) fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
                     .id(format!("shard-caption-{}", row.label))
                     .test_support()
                     .text_xs()
-                    .child(format!("{}: {caption}", row.label)),
+                    .child(format!("{}: {}", row.label, caption.label())),
             );
         }
         None => {
@@ -92,9 +105,11 @@ pub(crate) fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
                         .id(format!("shard-label-{}", row.label))
                         .test_support()
                         .text_xs()
-                        .child(format!(
-                            "{} · CPU {latest_cpu:.1}% of one core · RAM {latest_ram:.1} MB",
-                            row.label
+                        .child(t!(
+                            "shard-stat-line",
+                            label = row.label.as_str(),
+                            cpu = format!("{latest_cpu:.1}"),
+                            ram = format!("{latest_ram:.1}")
                         )),
                 )
                 .child(

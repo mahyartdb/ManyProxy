@@ -66,9 +66,9 @@ impl PresetForm {
     pub(crate) fn element(self, cx: &App) -> impl IntoElement {
         use crate::preset::SimpleRulesBox;
         let example = |r#box: SimpleRulesBox| match r#box {
-            SimpleRulesBox::Direct => "domain:example.com, suffix:cn",
-            SimpleRulesBox::Block => "keyword:ads, processName:updater.exe",
-            SimpleRulesBox::Proxy => "ruleset:streaming, domain:netflix.com",
+            SimpleRulesBox::Direct => t!("preset-simple-example-direct"),
+            SimpleRulesBox::Block => t!("preset-simple-example-block"),
+            SimpleRulesBox::Proxy => t!("preset-simple-example-proxy"),
         };
         let mut simple = div()
             .id("preset-simple-rules")

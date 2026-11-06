@@ -141,19 +141,32 @@ use text::*;
 // The UI's localized copy shadows the core crate's plain builders of the same
 // name. An explicit import wins over both globs, so every call site below
 // resolves to the copy that can reach the Fluent bundle.
+#[allow(unused_imports)]
+pub(crate) use text::bulk_delete_result_message;
 pub(crate) use text::{
-    about_body, auto_clear_opt_in_note, bind_port_collision_warning,
-    clear_group_tests_confirm_text, close_confirm_description, export_confirm_description,
-    export_count_message, export_overwrite_confirm_description, export_preview_description,
-    group_delete_confirm_description, group_row_views, http_subscription_warning,
-    import_files_label, import_preview_message, lan_confirm_description, lan_confirm_text,
-    lan_confirm_title, lan_exposure_warning, lan_hint_for_bind, log_level_tooltip,
-    logs_overwrite_text, logs_save_path_text, preset_delete_confirm_description,
-    preset_row_summary, preset_summary_text, prune_duplicates_confirm_text,
-    prune_invalid_confirm_text, prune_unavailable_confirm_text, rule_set_summary,
+    about_body, addsub_error_message, already_running_message, already_stopped_message,
+    already_subscribed_message, auto_clear_opt_in_note, auto_clear_summary_toast,
+    bind_port_collision_warning, bulk_copy_nothing_message, bulk_copy_proxies_message,
+    bulk_start_enable_flag_failed_message, bulk_start_failed_message, bulk_start_refused_message,
+    bulk_start_unreadable_message, clear_group_tests_confirm_text, close_confirm_description,
+    crash_notification_text, db_list_error_message, dirty_endpoint_message, enabled_flag_message,
+    export_confirm_description, export_count_message, export_overwrite_confirm_description,
+    export_preview_description, group_delete_confirm_description, group_row_views,
+    group_test_summary_toast, http_subscription_warning, import_files_label,
+    import_preview_message, inspector_badge_text, inspector_tab_label, lan_confirm_description,
+    lan_confirm_text, lan_confirm_title, lan_exposure_warning, lan_hint_for_bind,
+    log_level_tooltip, logs_overwrite_text, logs_save_path_text, no_selection_message,
+    preset_delete_confirm_description, preset_error_message, preset_imported_message,
+    preset_row_summary, preset_summary_text, probe_batched_toast, probe_result_toast,
+    probe_start_toast, prune_duplicates_confirm_text, prune_invalid_confirm_text,
+    prune_unavailable_confirm_text, refresh_summary_text, removed_message,
+    restart_to_apply_message, restore_done_message, row_action_message, rule_set_summary,
     settings_clear_health_text, settings_clear_snapshot_text, settings_clear_traffic_text,
-    sidecar_presence_line, stop_all_confirm_description, subscription_failures_text,
-    traffic_other_line, traffic_stats_summary_text, update_all_confirm_text,
+    sidecar_presence_line, skipped_dirty_message, start_all_message, start_all_partial_message,
+    start_busy_message, stop_all_confirm_description, stop_all_message, subscription_failures_text,
+    subscription_interval_failure_message, traffic_other_line, traffic_stats_summary_text,
+    undo_failed_message, undo_restored_message, unreadable_drop_message, update_all_confirm_text,
+    update_feed_failure_message,
 };
 use update::*;
 

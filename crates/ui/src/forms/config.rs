@@ -1707,7 +1707,7 @@ impl ConfigForm {
                                         });
                                     });
                                     window.push_notification(
-                                        Notification::info("Generated a new UUID"),
+                                        Notification::info(t!("generated-new-uuid")),
                                         cx,
                                     );
                                 }),
@@ -2377,7 +2377,7 @@ impl ConfigForm {
         block = block.child(Self::panel_select_row(
             t!("config-packet-encoding"),
             "vmess-packet-encoding-tip",
-            t!("config-vmess-packet-encoding-aria"),
+            t!("config-vmess-packet-encoding-tip"),
             "vmess-packet-encoding",
             t!("config-vmess-packet-encoding-aria"),
             &self.vmess_packet_encoding,
@@ -2539,9 +2539,7 @@ impl ConfigForm {
                                                 });
                                             });
                                             window.push_notification(
-                                                Notification::info(
-                                                    "Generated a new WireGuard private key",
-                                                ),
+                                                Notification::info(t!("generated-new-wg-key")),
                                                 cx,
                                             );
                                         }),
@@ -2632,12 +2630,14 @@ impl ConfigForm {
             },
         ));
 
-        block = block.child(field().label_indent(false).child(
-            div().id("wg-notes").test_support().child(
-                "WireGuard rows become endpoints[] at generate. Blank AllowedIPs defaults to \
-                 0.0.0.0/0; DNS is stored but never emitted; udp_timeout stays JSON-only.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("wg-notes")
+                    .test_support()
+                    .child(t!("config-wg-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -2807,12 +2807,14 @@ impl ConfigForm {
             );
         }
 
-        block = block.child(field().label_indent(false).child(
-            div().id("awg-notes").test_support().child(
-                "AmneziaWG rows run in the fork sidecar (sing-box-awg). v3-only keys on a 2.0 row \
-                 fail generate naming the field; udp_timeout stays JSON-only.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("awg-notes")
+                    .test_support()
+                    .child(t!("config-awg-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -2962,12 +2964,14 @@ impl ConfigForm {
             ));
         }
 
-        block = block.child(field().label_indent(false).child(
-            div().id("hy-notes").test_support().child(
-                "Hysteria v1 rows require up/down (blank refuses naming up_mbps/down_mbps); \
-                 v2 omits them for BBR. v1-only keys on a v2 row fail generate naming the field.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("hy-notes")
+                    .test_support()
+                    .child(t!("config-hy-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3117,12 +3121,14 @@ impl ConfigForm {
             ),
         );
 
-        block = block.child(field().label_indent(false).child(
-            div().id("socks-notes").test_support().child(
-                "SOCKS serves version 5 stock (blank leaves the default); 4 fails generate \
-                 naming version. Blank network leaves tcp.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("socks-notes")
+                    .test_support()
+                    .child(t!("config-socks-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3165,12 +3171,14 @@ impl ConfigForm {
                 ),
             );
 
-        block = block.child(field().label_indent(false).child(
-            div().id("http-notes").test_support().child(
-                "HTTPS rows serve TLS-on (security=tls) even with the panel off. \
-                 Path/headers ride the http outbound — check judges the headers shape.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("http-notes")
+                    .test_support()
+                    .child(t!("config-http-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3219,12 +3227,14 @@ impl ConfigForm {
                 ),
             );
 
-        block = block.child(field().label_indent(false).child(
-            div().id("anytls-notes").test_support().child(
-                "AnyTLS runs TLS always-on (security locked tls). Interval/timeout are \
-                 durations (e.g. 30s); min is a session count.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("anytls-notes")
+                    .test_support()
+                    .child(t!("config-anytls-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3300,12 +3310,14 @@ impl ConfigForm {
             &self.naive_cc,
         ));
 
-        block = block.child(field().label_indent(false).child(
-            div().id("naive-notes").test_support().child(
-                "Naïve runs TLS always-on (security locked tls). Blank congestion control \
-                 leaves the default (cubic).",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("naive-notes")
+                    .test_support()
+                    .child(t!("config-naive-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3414,12 +3426,14 @@ impl ConfigForm {
                         )),
                 );
 
-        block = block.child(field().label_indent(false).child(
-            div().id("ssh-notes").test_support().child(
-                "Browse fills the path and loads the key file (no hand-paste). Host key \
-                 lists are comma-separated; cipher/mac/kex stay JSON-only.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("ssh-notes")
+                    .test_support()
+                    .child(t!("config-ssh-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3510,12 +3524,14 @@ impl ConfigForm {
             ),
         );
 
-        block = block.child(field().label_indent(false).child(
-            div().id("snell-notes").test_support().child(
-                "Snell serves version 4 when blank; 6 needs a v6 peer. \
-                 Obfs/userkey/reuse/network/mode ride the snell outbound — check judges their shapes.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("snell-notes")
+                    .test_support()
+                    .child(t!("config-snell-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3542,12 +3558,14 @@ impl ConfigForm {
                 cx,
             ));
 
-        block = block.child(field().label_indent(false).child(
-            div().id("shadowtls-notes").test_support().child(
-                "ShadowTLS runs TLS always-on (security locked tls). Version blank takes \
-                 the schema default 1; v1 rows omit the password.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("shadowtls-notes")
+                    .test_support()
+                    .child(t!("config-shadowtls-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3655,12 +3673,14 @@ impl ConfigForm {
                 t!("config-xray-mux-aria"),
                 &self.xray_mux,
             ));
-        block = block.child(field().label_indent(false).child(
-            div().id("xray-notes").test_support().child(
-                "Ph1 subset only — XHTTP/xmux/session keys (xPaddingBytes, maxConcurrency, \
-                 downloadSettings…) stay JSON-only and are preserved, never stripped.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("xray-notes")
+                    .test_support()
+                    .child(t!("config-xray-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3803,12 +3823,14 @@ impl ConfigForm {
             }
             block = block.child(list);
         }
-        block = block.child(field().label_indent(false).child(
-            div().id("chain-notes").test_support().child(
-                "V1 chains are flat: no chain hops; at most one extra-core hop, first only. \
-                 Extra/Custom/Xray hops must be last — the engine names violations at start.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("chain-notes")
+                    .test_support()
+                    .child(t!("config-chain-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3869,13 +3891,14 @@ impl ConfigForm {
                     labelled_textarea(t!("config-config-label"), &self.extra_config).h(px(96.)),
                 ),
             ));
-        block = block.child(field().label_indent(false).child(
-            div().id("extra-notes").test_support().child(
-                "Spawned unprivileged as <exe> -c <config-file> (v1 convention — extra flags \
-                 ride args with the row). Validate checks exe + config shape before commit; \
-                 there is no logs toggle by design.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("extra-notes")
+                    .test_support()
+                    .child(t!("config-extra-note")),
             ),
-        ));
+        );
         block
     }
 
