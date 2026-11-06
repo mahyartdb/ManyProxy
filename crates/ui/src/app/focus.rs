@@ -5,12 +5,14 @@ pub(crate) fn overlay_open(window: &mut Window, cx: &mut App) -> bool {
 }
 
 /// T-06: the copy a refused shortcut shows, so the key never looks dead.
-pub(crate) const OVERLAY_REFUSAL_NOTE: &str = "Close the open dialog first";
+pub(crate) fn overlay_refusal_note() -> String {
+    t!("overlay-refusal-note")
+}
 
 /// T-06: a shortcut that cannot run because an overlay owns the keyboard says
 /// so out loud instead of looking like a dead key.
 pub(crate) fn refuse_shortcut_under_overlay(window: &mut Window, cx: &mut App) {
-    window.push_notification(Notification::warning(OVERLAY_REFUSAL_NOTE), cx);
+    window.push_notification(Notification::warning(overlay_refusal_note()), cx);
 }
 
 /// T-06: the shell's focus handle, published once per window, so every

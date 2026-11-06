@@ -13,14 +13,14 @@ pub(crate) fn preset_row(
         .child(Label::new(preset.name.clone()))
         .child(preset_row_summary(&preset, &attached));
     if preset.locked {
-        row = row.child(Label::new("Locked"));
+        row = row.child(Label::new(t!("preset-locked")));
     }
     if preset.source == "url" && preset.source_url.is_some() {
         let refresh_view = view.clone();
         let refresh_id = preset.id.clone();
         row = row.child(
             Button::new(format!("preset-refresh-{}", preset.id))
-                .label("Refresh")
+                .label(t!("sub-refresh"))
                 .on_click(move |_, window, cx| {
                     let id = refresh_id.clone();
                     refresh_view.update(cx, |view, cx| {
@@ -40,11 +40,15 @@ pub(crate) fn preset_row(
     let export_preset = preset.clone();
     row = row.child(
         Button::new(format!("preset-lock-{}", preset.id))
-            .label(if preset.locked { "Unlock" } else { "Lock" })
-            .tooltip(if preset.locked {
-                "Allow modifications again (the rules gain an editor)"
+            .label(if preset.locked {
+                t!("preset-unlock")
             } else {
-                "Prevent modifications: the rules stay byte-stable; attach/detach unaffected"
+                t!("preset-lock")
+            })
+            .tooltip(if preset.locked {
+                t!("preset-unlock-tip")
+            } else {
+                t!("preset-lock-tip")
             })
             .on_click(move |_, window, cx| {
                 let id = lock_id.clone();
@@ -56,8 +60,8 @@ pub(crate) fn preset_row(
     );
     row = row.child(
         Button::new(format!("preset-export-{}", preset.id))
-            .label("Export link")
-            .tooltip("Copy this preset's throne://route share link")
+            .label(t!("preset-export-link"))
+            .tooltip(t!("preset-export-link-tip"))
             .on_click(move |_, window, cx| {
                 let preset = export_preset.clone();
                 export_view.update(cx, |view, cx| {
@@ -67,7 +71,7 @@ pub(crate) fn preset_row(
     );
     row = row.child(
         Button::new(format!("preset-edit-{}", preset.id))
-            .label("Edit")
+            .label(t!("preset-edit"))
             .on_click(move |_, window, cx| {
                 let preset = edit_preset.clone();
                 edit_view.update(cx, |view, cx| {
@@ -79,7 +83,7 @@ pub(crate) fn preset_row(
     let duplicate_id = preset.id.clone();
     row = row.child(
         Button::new(format!("preset-duplicate-{}", preset.id))
-            .label("Duplicate")
+            .label(t!("preset-duplicate"))
             .on_click(move |_, window, cx| {
                 let id = duplicate_id.clone();
                 duplicate_view.update(cx, |view, cx| {
@@ -89,7 +93,7 @@ pub(crate) fn preset_row(
     );
     row.child(
         Button::new(format!("preset-remove-{}", preset.id))
-            .label("Remove")
+            .label(t!("preset-remove"))
             .on_click(move |_, window, cx| {
                 let id = remove_id.clone();
                 remove_view.update(cx, |view, cx| {
@@ -108,15 +112,28 @@ pub(crate) enum PresetRulesOp {
 
 /// T-09 attribute fold keys, rendered per rule as JSON-shape fields. The
 /// rules JSON box stays the single editing surface; no per-key input state.
-pub(crate) const PRESET_FOLD_KEYS: &[(&str, &str)] = &[
-    ("source_ip_cidr", "Source CIDR"),
-    ("source_ip_is_private", "Source is private"),
-    ("source_port", "Source port"),
-    ("source_port_range", "Source port range"),
-    ("ip_version", "IP version"),
-    ("invert", "Invert"),
-    ("process_path_regex", "Process path regex"),
+pub(crate) const PRESET_FOLD_KEYS: &[&str] = &[
+    "source_ip_cidr",
+    "source_ip_is_private",
+    "source_port",
+    "source_port_range",
+    "ip_version",
+    "invert",
+    "process_path_regex",
 ];
+
+fn preset_fold_label(key: &str) -> String {
+    match key {
+        "source_ip_cidr" => t!("preset-fold-source-cidr"),
+        "source_ip_is_private" => t!("preset-fold-source-private"),
+        "source_port" => t!("preset-fold-source-port"),
+        "source_port_range" => t!("preset-fold-source-port-range"),
+        "ip_version" => t!("preset-fold-ip-version"),
+        "invert" => t!("preset-fold-invert"),
+        "process_path_regex" => t!("preset-fold-process-path"),
+        _ => key.to_string(),
+    }
+}
 
 pub(crate) fn preset_rule_attribute_folds(
     preset_id: &str,
@@ -125,16 +142,17 @@ pub(crate) fn preset_rule_attribute_folds(
 ) -> Vec<AnyElement> {
     PRESET_FOLD_KEYS
         .iter()
-        .filter_map(|(key, label)| {
+        .filter_map(|key| {
             let value = rule.get(*key)?;
             Some(
                 div()
                     .id(format!("preset-rule-fold-{preset_id}-{index}-{key}"))
                     .test_support()
                     .text_sm()
-                    .child(format!(
-                        "{label}: {}",
-                        serde_json::to_string(value).unwrap_or_default()
+                    .child(t!(
+                        "preset-rule-fold",
+                        label = preset_fold_label(key),
+                        value = serde_json::to_string(value).unwrap_or_default()
                     ))
                     .into_any_element(),
             )
@@ -153,7 +171,7 @@ pub(crate) fn preset_advanced_section(
             .id(format!("preset-advanced-{}", preset.id))
             .test_support()
             .text_sm()
-            .child("Advanced"),
+            .child(t!("preset-advanced")),
     );
     let rules = match preset.rules() {
         Ok(rules) => rules,
@@ -179,8 +197,19 @@ pub(crate) fn preset_advanced_section(
             .and_then(serde_json::Value::as_str)
             .filter(|name| !name.trim().is_empty());
         let label = match name {
-            Some(name) => format!("Rule {index} — \"{name}\" — {action} · {tabs}"),
-            None => format!("Rule {index} — {action} · {tabs}"),
+            Some(name) => t!(
+                "preset-rule-label-named",
+                index = index as i64,
+                name = name,
+                action = action,
+                tabs = tabs.as_str()
+            ),
+            None => t!(
+                "preset-rule-label",
+                index = index as i64,
+                action = action,
+                tabs = tabs.as_str()
+            ),
         };
         let mut row = div().flex().flex_row().items_center().gap_2().child(
             div()
@@ -191,8 +220,8 @@ pub(crate) fn preset_advanced_section(
         );
         if crate::preset::action_carries_outbound(action) {
             let outbound_text = match rule.get("outbound").and_then(serde_json::Value::as_str) {
-                Some(tag) => format!("Outbound: {tag}"),
-                None => "Outbound: serving row".to_string(),
+                Some(tag) => t!("preset-rule-outbound", tag = tag),
+                None => t!("preset-rule-outbound-serving"),
             };
             row = row.child(
                 div()
@@ -207,9 +236,9 @@ pub(crate) fn preset_advanced_section(
                         .id(format!("preset-rule-exits-{}-{index}", preset.id))
                         .test_support()
                         .text_sm()
-                        .child(format!(
-                            "Exits: {}",
-                            crate::preset::preset_exit_suggestions(exits).join(" · ")
+                        .child(t!(
+                            "preset-rule-exits",
+                            exits = crate::preset::preset_exit_suggestions(exits).join(" · ")
                         )),
                 );
             }
@@ -223,8 +252,8 @@ pub(crate) fn preset_advanced_section(
                 .child(
                     Button::new(format!("preset-rule-action-{}-{index}", preset.id))
                         .small()
-                        .label(format!("Action: {action}"))
-                        .tooltip("Cycle this rule's action (direct → proxy → block)")
+                        .label(t!("preset-rule-action", action = action))
+                        .tooltip(t!("preset-rule-action-tip"))
                         .on_click(move |_, window, cx| {
                             cycle_view.update(cx, |_, cx| {
                                 AppView::rewrite_preset_rules_box(
@@ -239,8 +268,8 @@ pub(crate) fn preset_advanced_section(
                 .child(
                     Button::new(format!("preset-rule-delete-{}-{index}", preset.id))
                         .small()
-                        .label("Delete rule")
-                        .tooltip("Remove this rule from the rules box")
+                        .label(t!("preset-rule-delete"))
+                        .tooltip(t!("preset-rule-delete-tip"))
                         .on_click(move |_, window, cx| {
                             remove_view.update(cx, |_, cx| {
                                 AppView::rewrite_preset_rules_box(
@@ -264,8 +293,8 @@ pub(crate) fn preset_advanced_section(
             section.child(
                 Button::new(format!("preset-rule-add-{}", preset.id))
                     .small()
-                    .label("Add rule")
-                    .tooltip("Append a fresh direct rule to the rules box")
+                    .label(t!("preset-rule-add"))
+                    .tooltip(t!("preset-rule-add-tip"))
                     .on_click(move |_, window, cx| {
                         add_view.update(cx, |_, cx| {
                             AppView::rewrite_preset_rules_box(

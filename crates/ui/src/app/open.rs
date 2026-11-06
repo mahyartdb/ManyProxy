@@ -10,16 +10,25 @@ const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
 
 /// F10: the footer hint the palette carries, in one place so the test pins the
 /// same string the user reads.
-pub(crate) const PALETTE_FOOTER_HINT: &str = "↑↓ move · Enter run · Esc close";
+pub(crate) fn palette_footer_hint() -> String {
+    t!("palette-footer-hint")
+}
+pub(crate) fn palette_group_label(group: usize) -> String {
+    match group {
+        0 => t!("palette-group-library"),
+        1 => t!("palette-group-manage"),
+        _ => t!("palette-group-sort"),
+    }
+}
 
 /// A palette row for one table action. The row carries the action's label,
 /// keywords and first shortcut chip; the table owns those, and the confirm
 /// handler resolves them through `run_action`, so a palette row cannot drift
 /// from the menus that show the same verb.
 fn palette_item(def: &'static ActionDef) -> CommandItem {
-    let label = def.label;
+    let label = def.label();
     let mut item = CommandItem::new()
-        .label(label)
+        .label(label.clone())
         .keywords(def.keywords.iter().copied());
     if let Some(&(keystroke, chip)) = def.shortcuts.first() {
         item = item.child(move |_, _| {
@@ -29,7 +38,7 @@ fn palette_item(def: &'static ActionDef) -> CommandItem {
                 .flex_1()
                 .items_center()
                 .gap_2()
-                .child(div().flex_1().min_w_0().child(label))
+                .child(div().flex_1().min_w_0().child(label.clone()))
                 .child(shortcut_kbd(keystroke, chip))
                 .into_any_element()
         });
@@ -66,7 +75,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_edit_dialog(config, window, cx);
@@ -79,7 +88,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_remove_confirm(config, window, cx);
@@ -92,7 +101,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_traffic_reset_confirm(config, window, cx);
@@ -105,7 +114,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         self.open_usage_reset_confirm(config, window, cx);
@@ -125,12 +134,11 @@ impl AppView {
             .ok()
             .and_then(|map| map.get(&config.id).copied())
             .unwrap_or((0, 0));
-        let description = format!(
-            "Reset traffic counters for \"{}\"? Current totals: ↓{} ↑{}. \
-             This zeroes the stored counters.",
-            config.name,
-            format_bytes(totals.0),
-            format_bytes(totals.1)
+        let description = t!(
+            "confirm-reset-traffic-description",
+            name = config.name,
+            down = format_bytes(totals.0),
+            up = format_bytes(totals.1)
         );
         open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
@@ -141,10 +149,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Reset")
+                        .ok_text(t!("confirm-reset"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Reset traffic")
+                .title(t!("confirm-reset-traffic-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_reset_traffic(&id, window, cx));
@@ -169,10 +177,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Clear")
+                        .ok_text(t!("confirm-clear"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Clear traffic counters")
+                .title(t!("confirm-clear-traffic-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_clear_traffic(window, cx));
@@ -196,10 +204,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Clear")
+                        .ok_text(t!("confirm-clear"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Clear health snapshots")
+                .title(t!("confirm-clear-health-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_clear_health(window, cx));
@@ -223,10 +231,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Reset")
+                        .ok_text(t!("confirm-reset"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Reset running snapshot")
+                .title(t!("confirm-reset-snapshot-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_clear_snapshot(window, cx));
@@ -242,15 +250,15 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let link =
             crate::import::share_link_for_config(&config.protocol, &config.name, &config.params);
-        let title = format!("Share \"{}\"", config.name);
+        let title = t!("share-title", name = config.name.as_str());
         let commit: DialogCommit = Rc::new(move |window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
-            window.push_notification(Notification::success("Copied share link"), cx);
+            window.push_notification(Notification::success(t!("copied-share-link")), cx);
             true
         });
         let commit_key = commit.clone();
@@ -269,8 +277,8 @@ impl AppView {
                         .gap_2()
                         .child(
                             div().id("share-warning").test_support().child(
-                                Alert::error("share-warning-box", SHARE_WARNING.to_string())
-                                    .title("Share links carry credentials"),
+                                Alert::error("share-warning-box", share_warning())
+                                    .title(t!("share-credentials-title")),
                             ),
                         )
                         .child(
@@ -292,7 +300,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "share-dialog-ok",
                     "share-dialog-cancel",
-                    footer_commit_label("share"),
+                    &footer_commit_label("share"),
                     commit_click,
                 ))
         });
@@ -316,9 +324,9 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Start"),
+                        .ok_text(t!("confirm-start")),
                 )
-                .title(LAN_CONFIRM_TITLE)
+                .title(lan_confirm_title())
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_start_selected(&id, window, cx));
@@ -357,7 +365,7 @@ impl AppView {
             .map(|row| format!("{}:{}", row.bind_ip, row.port))
             .collect();
         let traffic_line =
-            summed_traffic_text(&self.store).unwrap_or_else(|| "usage unavailable".to_string());
+            summed_traffic_text(&self.store).unwrap_or_else(|| t!("stats-usage-unavailable"));
         let conns = self.conn.snapshot.len();
         let (delta_rx, delta_tx) = self
             .conn
@@ -373,30 +381,27 @@ impl AppView {
             .filter(|sub| due_for_refresh_for(sub, now))
             .count();
         let subs_line = if self.store.subs_auto_refresh_enabled() {
-            format!("{} subscription(s), {due} due", subs.len())
+            t!("stats-subs-due", count = subs.len(), due = due)
         } else {
-            format!(
-                "{} subscription(s), {due} due (auto-refresh off)",
-                subs.len()
-            )
+            t!("stats-subs-due-off", count = subs.len(), due = due)
         };
         let db_line = self
             .store
             .db_path()
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|meta| format_bytes(meta.len()))
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| t!("stats-unknown"));
         let selected_line = match self.selected_config(cx) {
             Some(config) => {
                 let health = self.health_store.row_summary(&config.id);
                 let health = health.trim();
                 if health.is_empty() {
-                    format!("{} (no probes this session)", config.name)
+                    t!("stats-selected-no-probes", name = config.name)
                 } else {
-                    format!("{} ({health})", config.name)
+                    t!("stats-selected-health", name = config.name, health = health)
                 }
             }
-            None => "none selected".to_string(),
+            None => t!("stats-none-selected"),
         };
         let shard_rows = shard_stat_rows(
             &self.engine.shard_processes(),
@@ -404,28 +409,31 @@ impl AppView {
             &self.shard_denied,
         );
         let mut lines = vec![
-            format!("Uptime: {uptime}"),
-            format!("Endpoints: {running} running / {total} stored"),
-            format!(
-                "Running: {}",
-                if running_binds.is_empty() {
+            t!("stats-uptime", uptime = uptime),
+            t!("stats-endpoints", running = running, total = total),
+            t!(
+                "stats-running",
+                list = if running_binds.is_empty() {
                     "—".to_string()
                 } else {
                     running_binds.join(", ")
                 }
             ),
-            format!("Traffic: {traffic_line}"),
-            format!("Connections: {conns} live"),
-            format!(
-                "Session Δ: ↓{} ↑{}",
-                format_bytes(delta_rx),
-                format_bytes(delta_tx)
+            t!("stats-traffic", line = traffic_line),
+            t!("stats-connections", conns = conns),
+            t!(
+                "stats-session-delta",
+                down = format_bytes(delta_rx),
+                up = format_bytes(delta_tx)
             ),
-            format!("Subscriptions: {subs_line}"),
-            format!("Database: {db_line}"),
-            format!("Selected: {selected_line}"),
+            t!("stats-subscriptions", line = subs_line),
+            t!("stats-database", line = db_line),
+            t!("stats-selected", line = selected_line),
         ];
-        lines.push(format!("Processes: {}", shard_stats_summary(&shard_rows)));
+        lines.push(t!(
+            "stats-processes",
+            line = shard_stats_summary(&shard_rows)
+        ));
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let mut body = div().flex().flex_col().gap_1();
             for (ix, line) in lines.iter().enumerate() {
@@ -437,30 +445,27 @@ impl AppView {
                         .child(line.clone()),
                 );
             }
-            body =
-                body.child(
-                    div()
-                        .id("runtime-shard-stats")
-                        .test_support()
-                        .mt_2()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(div().text_xs().child(
-                            "Sidecar processes — CPU % of one core, RAM in MB, last 60 ticks",
-                        )),
-                );
+            body = body.child(
+                div()
+                    .id("runtime-shard-stats")
+                    .test_support()
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_xs().child(t!("stats-sidecar-tip"))),
+            );
             for row in shard_rows.iter() {
                 body = body.child(shard_stat_row_view(row));
             }
             dialog
-                .title("Runtime stats")
+                .title(t!("stats-runtime-title"))
                 .child(body)
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "runtime-stats-ok",
                     "runtime-stats-cancel",
-                    footer_commit_label("runtime-stats"),
+                    &footer_commit_label("runtime-stats"),
                     Rc::new(|_, _| true),
                 ))
         });
@@ -494,8 +499,8 @@ impl AppView {
             body = body.child(
                 Button::new("traffic-stats-period")
                     .small()
-                    .label(format!("Period: {}", period.label()))
-                    .tooltip("Cycle 24h → 7d → 30d → 90d (all-time totals throughout)")
+                    .label(t!("stats-period", label = period.label()))
+                    .tooltip(t!("stats-period-tip"))
                     .on_click(move |_, window, cx| {
                         cycle_view.update(cx, |view, cx| {
                             let next = match view.traffic_period {
@@ -517,7 +522,7 @@ impl AppView {
                         .id("traffic-stats-empty")
                         .test_support()
                         .text_sm()
-                        .child("No traffic recorded yet — start an exit and pass data."),
+                        .child(t!("stats-empty")),
                 );
             }
             for exit in &split.top {
@@ -526,17 +531,17 @@ impl AppView {
                         .id(format!("traffic-stat-{}", exit.row_id))
                         .test_support()
                         .text_sm()
-                        .child(format!(
-                            "{} {} · {} ↓{} ↑{}",
-                            traffic_stacked_bar(exit.rx_bytes, exit.tx_bytes, max),
-                            exit.name,
-                            exit.bind,
-                            format_bytes(exit.rx_bytes),
-                            format_bytes(exit.tx_bytes),
+                        .child(t!(
+                            "stats-exit-row",
+                            bar = traffic_stacked_bar(exit.rx_bytes, exit.tx_bytes, max),
+                            name = exit.name.as_str(),
+                            bind = exit.bind.as_str(),
+                            down = format_bytes(exit.rx_bytes),
+                            up = format_bytes(exit.tx_bytes),
                         )),
                 );
             }
-            if let Some(other) = split.other_line() {
+            if let Some(other) = traffic_other_line(&split) {
                 body = body.child(
                     div()
                         .id("traffic-stats-other")
@@ -546,13 +551,13 @@ impl AppView {
                 );
             }
             dialog
-                .title("Traffic stats")
+                .title(t!("stats-traffic-title"))
                 .child(body)
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "traffic-stats-ok",
                     "traffic-stats-cancel",
-                    footer_commit_label("traffic-stats"),
+                    &footer_commit_label("traffic-stats"),
                     Rc::new(|_, _| true),
                 ))
         });
@@ -571,7 +576,7 @@ impl AppView {
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let check_view = about_view.clone();
             dialog
-                .title(format!("About {APP_TITLE}"))
+                .title(t!("about-title", app = APP_TITLE))
                 .child(
                     div()
                         .flex()
@@ -587,8 +592,8 @@ impl AppView {
                         .child(
                             Button::new("about-check-for-updates")
                                 .small()
-                                .label("Check for updates")
-                                .tooltip("Fetch the release feed once (JSON only — nothing downloads or runs)")
+                                .label(t!("about-check-updates"))
+                                .tooltip(t!("about-check-updates-tip"))
                                 .on_click(move |_, window, cx| {
                                     window.close_all_dialogs(cx);
                                     reclaim_shell_focus(window, cx);
@@ -602,7 +607,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "about-dialog-ok",
                     "about-dialog-cancel",
-                    "Close",
+                    &t!("dialog-close"),
                     Rc::new(|_, _| true),
                 ))
         });
@@ -638,10 +643,8 @@ impl AppView {
                 body = body.child(
                     Button::new("update-open-releases")
                         .small()
-                        .label("Open releases in browser")
-                        .tooltip(format!(
-                            "Opens {url} in your own browser — the app downloads nothing"
-                        ))
+                        .label(t!("about-open-releases"))
+                        .tooltip(t!("about-open-releases-tip", url = url.as_str()))
                         .on_click(move |_, window, cx| {
                             if let Err(why) = open_release_in_browser(&url) {
                                 window.push_notification(Notification::error(why), cx);
@@ -650,13 +653,13 @@ impl AppView {
                 );
             }
             dialog
-                .title("Check for updates")
+                .title(t!("update-title"))
                 .child(body)
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "update-dialog-ok",
                     "update-dialog-cancel",
-                    "Close",
+                    &t!("dialog-close"),
                     Rc::new(|_, _| true),
                 ))
         });
@@ -675,20 +678,17 @@ impl AppView {
                 .flex_col()
                 .gap_2()
                 .text_sm()
-                .child(format!(
-                    "ManyProxy runs executables you place beside ManyProxy.exe — {} (stock), {} (AmneziaWG fork, only AmneziaWG/Noise/XHTTP rows need it) and {} (only Xray-only rows).",
-                    engine_binary_file_name(),
-                    fork_binary_file_name(),
-                    xray_binary_file_name(),
+                .child(t!(
+                    "cores-body",
+                    stock = engine_binary_file_name(),
+                    fork = fork_binary_file_name(),
+                    xray = xray_binary_file_name(),
                 ))
                 .child(
                     Button::new("cores-help-open-sing-box")
                         .small()
-                        .label("Open sing-box releases in browser")
-                        .tooltip(format!(
-                            "Opens {} in your own browser — the app downloads nothing",
-                            SING_BOX_RELEASES_URL
-                        ))
+                        .label(t!("cores-open-singbox"))
+                        .tooltip(t!("cores-open-singbox-tip", url = SING_BOX_RELEASES_URL))
                         .on_click({
                             let url = SING_BOX_RELEASES_URL.to_string();
                             move |_, window, cx| {
@@ -701,11 +701,8 @@ impl AppView {
                 .child(
                     Button::new("cores-help-open-xray")
                         .small()
-                        .label("Open Xray-core releases in browser")
-                        .tooltip(format!(
-                            "Opens {} in your own browser — the app downloads nothing",
-                            XRAY_RELEASES_URL
-                        ))
+                        .label(t!("cores-open-xray"))
+                        .tooltip(t!("cores-open-xray-tip", url = XRAY_RELEASES_URL))
                         .on_click({
                             let url = XRAY_RELEASES_URL.to_string();
                             move |_, window, cx| {
@@ -720,18 +717,16 @@ impl AppView {
                         .id("cores-help-note")
                         .test_support()
                         .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "Engines are read from the app folder only; PATH is never searched. ManyProxy never downloads executables silently — you download and install them yourself.",
-                        ),
+                        .child(t!("cores-note")),
                 );
             dialog
-                .title("Where do I get cores?")
+                .title(t!("cores-title"))
                 .child(body)
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "cores-help-dialog-close",
                     "cores-help-dialog-cancel",
-                    "Close",
+                    &t!("dialog-close"),
                     Rc::new(|_, _| true),
                 ))
         });
@@ -746,30 +741,29 @@ impl AppView {
         let view = cx.entity();
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let view = view.clone();
-            let mut command =
-                Command::new(&state)
-                    .placeholder("Type a command…")
-                    .footer(|_, _, cx| {
-                        div()
-                            .id("palette-footer")
-                            .test_support()
-                            .w_full()
-                            .px_2()
-                            .pt_2()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .aria_label(PALETTE_FOOTER_HINT)
-                            .child(PALETTE_FOOTER_HINT)
-                    });
-            for (section, (label, _)) in PALETTE_GROUPS.iter().enumerate() {
+            let mut command = Command::new(&state)
+                .placeholder(t!("palette-placeholder"))
+                .footer(|_, _, cx| {
+                    div()
+                        .id("palette-footer")
+                        .test_support()
+                        .w_full()
+                        .px_2()
+                        .pt_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .aria_label(palette_footer_hint())
+                        .child(palette_footer_hint())
+                });
+            for (section, _) in PALETTE_GROUPS.iter().enumerate() {
                 command = command.group(
                     CommandGroup::new()
-                        .label(*label)
+                        .label(palette_group_label(section))
                         .items(palette_items(section)),
                 );
             }
             dialog
-                .title("Command palette")
+                .title(t!("palette-title"))
                 .child(command.on_confirm(move |index, window, cx| {
                     view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
                 }))
@@ -787,10 +781,7 @@ impl AppView {
             "prune kinds stay the pinned four"
         );
         let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("no-group-focus")), cx);
             return;
         };
         let (title, description, ok) = match kind {
@@ -801,15 +792,19 @@ impl AppView {
                     .unwrap_or((0, Vec::new()));
                 if total == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no duplicates")),
+                        Notification::info(t!("group-no-duplicates", group = group.as_str())),
                         cx,
                     );
                     return;
                 }
                 (
-                    format!("Remove {total} duplicate(s) in group \"{group}\"?"),
+                    t!(
+                        "prune-duplicates-title",
+                        group = group.as_str(),
+                        total = total
+                    ),
                     prune_duplicates_confirm_text(&group, total, &preview),
-                    "Remove",
+                    t!("prune-remove"),
                 )
             }
             GroupPruneKind::Unavailable => {
@@ -820,15 +815,19 @@ impl AppView {
                     .unwrap_or(0);
                 if count == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no unavailable rows")),
+                        Notification::info(t!("group-no-unavailable", group = group.as_str())),
                         cx,
                     );
                     return;
                 }
                 (
-                    format!("Remove {count} unavailable row(s) in group \"{group}\"?"),
+                    t!(
+                        "prune-unavailable-title",
+                        group = group.as_str(),
+                        count = count
+                    ),
                     prune_unavailable_confirm_text(&group, count),
-                    "Remove",
+                    t!("prune-remove"),
                 )
             }
             GroupPruneKind::Invalid => {
@@ -839,30 +838,34 @@ impl AppView {
                     .unwrap_or(0);
                 if count == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no invalid rows")),
+                        Notification::info(t!("group-no-invalid", group = group.as_str())),
                         cx,
                     );
                     return;
                 }
                 (
-                    format!("Remove {count} invalid row(s) in group \"{group}\"?"),
+                    t!("prune-invalid-title", group = group.as_str(), count = count),
                     prune_invalid_confirm_text(&group, count),
-                    "Remove",
+                    t!("prune-remove"),
                 )
             }
             GroupPruneKind::ClearTests => {
                 let count = self.group_test_sample_count(&group);
                 if count == 0 {
                     window.push_notification(
-                        Notification::info(format!("Group \"{group}\" has no test results")),
+                        Notification::info(t!("group-no-test-results", group = group.as_str())),
                         cx,
                     );
                     return;
                 }
                 (
-                    format!("Clear {count} test result(s) in group \"{group}\"?"),
+                    t!(
+                        "prune-clear-tests-title",
+                        group = group.as_str(),
+                        count = count
+                    ),
                     clear_group_tests_confirm_text(&group, count),
-                    "Clear",
+                    t!("confirm-clear"),
                 )
             }
         };
@@ -876,7 +879,7 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text(ok)
+                        .ok_text(ok.as_str())
                         .ok_variant(ButtonVariant::Danger),
                 )
                 .title(title)
@@ -900,7 +903,7 @@ impl AppView {
     ) {
         let view = cx.entity();
         let group = group.to_string();
-        let title = format!("Enable auto-clear in group \"{group}\"?");
+        let title = t!("auto-clear-opt-in-title", group = group.as_str());
         let description = auto_clear_opt_in_note(&group);
         focus_shell_before_overlay(window, cx);
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -912,7 +915,7 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Enable"),
+                        .ok_text(t!("prune-enable")),
                 )
                 .title(title.clone())
                 .description(description.clone())
@@ -974,18 +977,18 @@ impl AppView {
             });
         let filter_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Filter logs")
+                .placeholder(t!("logs-filter-placeholder"))
                 .default_value(current)
         });
 
         let exclude_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Exclude keyword")
+                .placeholder(t!("logs-exclude-placeholder"))
                 .default_value(current_exclude)
         });
         let pattern_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Regex (empty = off)")
+                .placeholder(t!("logs-regex-placeholder"))
                 .default_value(current_pattern)
         });
         self.logs.inputs = Some((
@@ -1011,8 +1014,8 @@ impl AppView {
         }));
         let log_list_state = self.logs.list.clone();
         let title = match self.selected_config(cx) {
-            Some(config) => format!("Logs — {}", config.name),
-            None => "Logs".to_string(),
+            Some(config) => t!("logs-title", name = config.name),
+            None => t!("logs-title-plain"),
         };
 
         let commit_view = view.clone();
@@ -1040,30 +1043,32 @@ impl AppView {
 
             let (current_level, tail_on) = (chrome_level, chrome_tail);
 
-            const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
-            let selected_level = LOG_LEVEL_LABELS
-                .iter()
-                .position(|label| LogLevel::from_label(label) == current_level);
+            let levels = [
+                None,
+                Some(LogLevel::Debug),
+                Some(LogLevel::Info),
+                Some(LogLevel::Warn),
+                Some(LogLevel::Error),
+            ];
+            let selected_level = levels.iter().position(|level| *level == current_level);
             let mut level_group = RadioGroup::horizontal("log-level-options")
                 .selected_index(selected_level)
                 .on_change({
                     let group_view = chrome_view.clone();
                     move |ix, window, cx| {
-                        let level = LOG_LEVEL_LABELS
-                            .get(*ix)
-                            .map(|label| LogLevel::from_label(label))
-                            .unwrap_or(current_level);
+                        let level = levels.get(*ix).copied().flatten().or(current_level);
                         let level_view = group_view.clone();
                         level_view.update(cx, |view, cx| {
                             view.set_log_level(level, window, cx);
                         });
                     }
                 });
-            for label in LOG_LEVEL_LABELS {
+            for level in levels {
+                let label = log_level_label(level);
                 level_group = level_group.child(
-                    Radio::new(label)
+                    Radio::new(label.clone())
                         .label(label)
-                        .tooltip(log_level_tooltip(label)),
+                        .tooltip(log_level_tooltip(level)),
                 );
             }
             let level_row = div().id("log-level-row").test_support().child(level_group);
@@ -1082,8 +1087,8 @@ impl AppView {
                 .child(
                     Button::new("log-copy-visible")
                         .small()
-                        .label("Copy visible")
-                        .tooltip("Copy the visible log lines (redacted)")
+                        .label(t!("logs-copy-visible"))
+                        .tooltip(t!("logs-copy-tip"))
                         .on_click(move |_, window, cx| {
                             copy_view.update(cx, |view, cx| {
                                 view.copy_visible_logs(window, cx);
@@ -1103,11 +1108,15 @@ impl AppView {
                     Button::new("log-tail-toggle")
                         .small()
                         .min_w(px(120.))
-                        .label(if tail_on { "Pause tail" } else { "Resume tail" })
-                        .tooltip(if tail_on {
-                            "Pause the live tail"
+                        .label(if tail_on {
+                            t!("logs-pause-tail")
                         } else {
-                            "Resume the live tail"
+                            t!("logs-resume-tail")
+                        })
+                        .tooltip(if tail_on {
+                            t!("logs-pause-tip")
+                        } else {
+                            t!("logs-resume-tip")
                         })
                         .on_click(move |_, window, cx| {
                             tail_view.update(cx, |view, cx| {
@@ -1118,8 +1127,8 @@ impl AppView {
                 .child(
                     Button::new("logs-save")
                         .small()
-                        .label("Save")
-                        .tooltip("Save the visible redacted lines to the logs file")
+                        .label(t!("dialog-save"))
+                        .tooltip(t!("logs-save-tip"))
                         .on_click(move |_, window, cx| {
                             save_view.update(cx, |view, cx| {
                                 view.save_visible_logs(window, cx);
@@ -1127,39 +1136,41 @@ impl AppView {
                         }),
                 );
             let save_path_text = logs_save_path_text();
-            let mut body =
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(level_row)
-                    .child(action_row)
-
-                    .child(div().id("log-redact-note").test_support().text_sm().child(
-                        "Copy and Save carry redacted lines — secrets never leave this dialog.",
-                    ))
-                    .child(
-                        div()
-                            .id("log-save-path")
-                            .test_support()
-                            .text_sm()
-                            .child(save_path_text),
-                    )
-                    .child(dialog_field(
-                        "field-log-filter",
-                        "Filter",
-                        filter_state.clone(),
-                    ))
-                    .child(dialog_field(
-                        "field-log-exclude",
-                        "Exclude",
-                        exclude_state.clone(),
-                    ))
-                    .child(dialog_field(
-                        "field-log-regex",
-                        "Regex",
-                        pattern_state.clone(),
-                    ));
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(level_row)
+                .child(action_row)
+                .child(
+                    div()
+                        .id("log-redact-note")
+                        .test_support()
+                        .text_sm()
+                        .child(t!("logs-redaction-note")),
+                )
+                .child(
+                    div()
+                        .id("log-save-path")
+                        .test_support()
+                        .text_sm()
+                        .child(save_path_text),
+                )
+                .child(dialog_field(
+                    "field-log-filter",
+                    t!("logs-filter"),
+                    filter_state.clone(),
+                ))
+                .child(dialog_field(
+                    "field-log-exclude",
+                    t!("logs-exclude"),
+                    exclude_state.clone(),
+                ))
+                .child(dialog_field(
+                    "field-log-regex",
+                    t!("logs-regex"),
+                    pattern_state.clone(),
+                ));
             let mut list = div().id("log-lines").test_support().w_full();
 
             let log_list_viewport = log_list_state.as_ref();
@@ -1169,12 +1180,12 @@ impl AppView {
                     Empty::new()
                         .header(
                             EmptyHeader::new()
-                                .title(EmptyTitle::new().child("No log lines to show"))
+                                .title(EmptyTitle::new().child(t!("logs-empty-title")))
                                 .description(EmptyDescription::new().child(
                                     if chrome_filter_active || current_level.is_some() {
-                                        "No lines match the current filter — clear it to see everything."
+                                        t!("logs-empty-filtered")
                                     } else {
-                                        "No log lines recorded yet."
+                                        t!("logs-empty")
                                     },
                                 )),
                         )
@@ -1189,8 +1200,8 @@ impl AppView {
                                     .child(
                                         Button::new("log-clear-filter")
                                             .small()
-                                            .label("Clear filter")
-                                            .tooltip("Clear the log text filter and level")
+                                            .label(t!("logs-clear-filter"))
+                                            .tooltip(t!("logs-clear-filter-tip"))
                                             .on_click(move |_, window, cx| {
                                                 clear_filter_view.update(cx, |view, cx| {
                                                     view.clear_log_filter(window, cx);
@@ -1222,8 +1233,7 @@ impl AppView {
                 .footer(sheet_footer(
                     "logs-dialog-ok",
                     Some("logs-dialog-cancel"),
-
-                    footer_commit_label("logs"),
+                    &footer_commit_label("logs"),
                     commit_click,
                 ))
         });
@@ -1238,7 +1248,7 @@ impl AppView {
         let default_path = Store::default_export_path().display().to_string();
         let path_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Export file path")
+                .placeholder(t!("export-path-placeholder"))
                 .default_value(default_path)
         });
         let preview = export_preview_description(
@@ -1260,7 +1270,7 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title("Export library")
+                .title(t!("export-title"))
                 .child(
                     div()
                         .flex()
@@ -1269,12 +1279,15 @@ impl AppView {
                         .child(
                             div().id("export-warning").test_support().child(
                                 Alert::error("export-warning-box", warning.clone())
-                                    .title("Secrets leave in plaintext"),
+                                    .title(t!("export-secrets-title")),
                             ),
                         )
-                        .child(div().id("export-safer-path").test_support().child(
-                            "Safer: share one endpoint with Copy URLs — it never carries secrets.",
-                        ))
+                        .child(
+                            div()
+                                .id("export-safer-path")
+                                .test_support()
+                                .child(t!("export-secrets-note")),
+                        )
                         .child(
                             div()
                                 .id("export-preview")
@@ -1283,7 +1296,7 @@ impl AppView {
                         )
                         .child(dialog_field(
                             "field-export-path",
-                            "Export file path",
+                            t!("export-path-placeholder"),
                             path_state.clone(),
                         )),
                 )
@@ -1295,7 +1308,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "export-dialog-ok",
                     "export-dialog-cancel",
-                    footer_commit_label("export"),
+                    &footer_commit_label("export"),
                     commit_click,
                 ))
         });
@@ -1316,15 +1329,13 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Restore")
+                        .ok_text(t!("restore-ok"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Restore library")
-                .description(format!(
-                    "This replaces the current library with the exported backup \
-                     (row ids, groups, enabled flags, subscriptions, and deletions \
-                     are restored exactly). {}",
-                    crate::store::RESTORE_REQUIRES_CLAUSE
+                .title(t!("restore-title"))
+                .description(t!(
+                    "restore-description",
+                    clause = t!("restore-requires-clause")
                 ))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
@@ -1345,26 +1356,26 @@ impl AppView {
             for (id, label, tip, enabled) in [
                 (
                     "columns-upstream",
-                    "Upstream",
-                    "Show the upstream host:port on each row",
+                    t!("columns-upstream"),
+                    t!("columns-upstream-tip"),
                     current.upstream,
                 ),
                 (
                     "columns-health",
-                    "Health",
-                    "Show serving state and probe evidence on each row",
+                    t!("columns-health"),
+                    t!("columns-health-tip"),
                     current.health,
                 ),
                 (
                     "columns-group",
-                    "Group",
-                    "Show the group tag on each row",
+                    t!("columns-group"),
+                    t!("columns-group-tip"),
                     current.group,
                 ),
                 (
                     "columns-traffic",
-                    "Traffic",
-                    "Show data-plane totals on serving rows",
+                    t!("columns-traffic"),
+                    t!("columns-traffic-tip"),
                     current.traffic,
                 ),
             ] {
@@ -1379,8 +1390,8 @@ impl AppView {
                 body = body.child(
                     Switch::new(id)
                         .checked(enabled)
-                        .label(label)
-                        .accessibility_label(label)
+                        .label(label.as_str())
+                        .accessibility_label(label.as_str())
                         .tooltip(tip)
                         .on_change(move |enabled: &bool, window, cx| {
                             let enabled = *enabled;
@@ -1404,8 +1415,8 @@ impl AppView {
                 div().flex().justify_end().pt_1().child(
                     Button::new("columns-dialog-reset")
                         .small()
-                        .label("Reset columns")
-                        .tooltip("Restore the default column widths and order")
+                        .label(t!("columns-reset-button"))
+                        .tooltip(t!("columns-reset-tip"))
                         .on_click(move |_, window, cx| {
                             reset_view.update(cx, |view, cx| {
                                 view.reset_all_columns(window, cx);
@@ -1415,12 +1426,12 @@ impl AppView {
             );
             let close: DialogCommit = Rc::new(|_, _| true);
             dialog
-                .title("Row columns")
+                .title(t!("columns-title"))
                 .child(body)
                 .footer(dialog_footer(
                     "columns-dialog-close",
                     "columns-dialog-cancel",
-                    "Close",
+                    &t!("dialog-close"),
                     close,
                 ))
         });
@@ -1467,7 +1478,7 @@ impl AppView {
             let collision = bind_port_collision_warning(&rows, None, &bind, &port);
             let inline = form_error.borrow().clone();
             dialog
-                .title("Add proxy configuration")
+                .title(t!("add-dialog-title"))
                 // The guided two-column form needs more than the kit's 448px
                 // default: at 448 the Server sub-field clipped even the short
                 // `example.com` placeholder. 560 keeps both columns whole at
@@ -1490,7 +1501,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "add-dialog-ok",
                     "add-dialog-cancel",
-                    footer_commit_label("add"),
+                    &footer_commit_label("add"),
                     commit_click,
                 ))
         });
@@ -1514,7 +1525,7 @@ impl AppView {
         // ends with one of the dialog's exits (commit success, footer Cancel,
         // Esc close) plus the reload guard for anything that slips past.
         self.edit_form_open = Some(id.clone());
-        let title = format!("Edit {}", config.name);
+        let title = t!("edit-dialog-title", name = config.name.as_str());
 
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
         let error_for_commit = form_error.clone();
@@ -1601,7 +1612,7 @@ impl AppView {
                         .child(
                             Button::new("edit-dialog-cancel")
                                 .small()
-                                .label("Cancel")
+                                .label(t!("dialog-cancel"))
                                 .on_click({
                                     let track_view = track_source.clone();
                                     move |_, window, cx| {
@@ -1661,13 +1672,11 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Reset")
+                        .ok_text(t!("confirm-reset"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Reset usage counters")
-                .description(format!(
-                    "Reset usage counters for \"{name}\" to zero? This cannot be undone."
-                ))
+                .title(t!("usage-reset-title"))
+                .description(t!("usage-reset-description", name = name.as_str()))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_usage_reset(&id, window, cx));
                     true
@@ -1748,7 +1757,7 @@ impl AppView {
                 .child(
                     Button::new("import-dialog-cancel")
                         .small()
-                        .label("Cancel")
+                        .label(t!("dialog-cancel"))
                         .on_click(move |_, window, cx| {
                             cancel_view.update(cx, |view, cx| {
                                 view.import_form = None;
@@ -1765,7 +1774,7 @@ impl AppView {
                         // accent-filled like the other dialog footers.
                         .primary()
                         .label(if in_flight {
-                            "Importing…"
+                            t!("dialog-importing")
                         } else {
                             footer_commit_label("import")
                         })
@@ -1791,7 +1800,7 @@ impl AppView {
                     import_ok
                 });
             dialog
-                .title("Import proxy configurations")
+                .title(t!("import-dialog-title"))
                 .close_button(false)
                 .child(form.clone().element(element_view.clone(), cx))
                 .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
@@ -1841,59 +1850,48 @@ impl AppView {
             let sub_view = sub_view.clone();
             let sub_url = sub_url.clone();
             dialog
-                .title("Add HTTP link")
+                .title(t!("bare-url-title"))
                 .child(
                     div()
                         .id("bare-url-chooser")
                         .test_support()
-                        .child(format!(
-                            "\"{url}\" can be a subscription feed or a proxy — choose how to add it:"
-                        ))
-                        .child(
-                            {
-                                let view = proxy_view.clone();
-                                let url = proxy_url.clone();
-                                Button::new("bare-url-import-proxy")
-                                    .label("Import as proxy here")
-                                    .on_click(move |_, window, cx| {
-                                        window.close_all_dialogs(cx);
-                                        reclaim_shell_focus(window, cx);
-                                        view.update(cx, |view, cx| {
-                                            view.open_import_dialog(
-                                                &url,
-                                                DEFAULT_GROUP,
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    })
-                            },
-                        )
-                        .child(
-                            {
-                                let view = sub_view.clone();
-                                let url = sub_url.clone();
-                                Button::new("bare-url-add-subscription")
-                                    .label("Add as subscription")
-                                    .on_click(move |_, window, cx| {
-                                        view.update(cx, |view, cx| {
-                                            view.commit_bare_url_subscription(
-                                                url.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    })
-                            },
-                        ),
+                        .child(t!("bare-url-prompt", url = url.as_str()))
+                        .child({
+                            let view = proxy_view.clone();
+                            let url = proxy_url.clone();
+                            Button::new("bare-url-import-proxy")
+                                .label(t!("bare-url-proxy"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_all_dialogs(cx);
+                                    reclaim_shell_focus(window, cx);
+                                    view.update(cx, |view, cx| {
+                                        view.open_import_dialog(
+                                            &url,
+                                            DEFAULT_GROUP,
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                })
+                        })
+                        .child({
+                            let view = sub_view.clone();
+                            let url = sub_url.clone();
+                            Button::new("bare-url-add-subscription")
+                                .label(t!("bare-url-subscription"))
+                                .on_click(move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.commit_bare_url_subscription(url.clone(), window, cx);
+                                    });
+                                })
+                        }),
                 )
-
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "bare-url-close",
                     "bare-url-cancel",
-                    footer_commit_label("bare-url"),
+                    &footer_commit_label("bare-url"),
                     Rc::new(|_, _| true),
                 ))
         });
@@ -1946,7 +1944,7 @@ impl AppView {
             .rules()
             .map(|rules| serde_json::Value::Array(rules).to_string())
             .unwrap_or_default();
-        let title = format!("Edit preset {}", preset.name);
+        let title = t!("preset-edit-title", name = preset.name.as_str());
         if preset.locked {
             // T-10: a locked preset renders a readonly editor — view-only
             // rows, no inputs, no save/copy-edit path.
@@ -1967,14 +1965,14 @@ impl AppView {
                                     .id(format!("preset-locked-hint-{id}"))
                                     .test_support()
                                     .text_sm()
-                                    .child("Locked — import a copy to modify"),
+                                    .child(t!("preset-locked-hint")),
                             )
                             .child(
                                 div()
                                     .id(format!("preset-locked-name-{id}"))
                                     .test_support()
                                     .text_sm()
-                                    .child(format!("Name: {name}")),
+                                    .child(t!("preset-locked-name", name = name.as_str())),
                             )
                             .child(
                                 div()
@@ -1994,7 +1992,7 @@ impl AppView {
                     .footer(dialog_footer(
                         "preset-locked-close",
                         "preset-locked-close",
-                        "Close",
+                        &t!("dialog-close"),
                         Rc::new(|_, _| true),
                     ))
             });
@@ -2044,7 +2042,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "preset-edit-ok",
                     "preset-edit-cancel",
-                    footer_commit_label("preset-edit"),
+                    &footer_commit_label("preset-edit"),
                     commit_click,
                 ))
         });
@@ -2070,10 +2068,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Delete")
+                        .ok_text(t!("preset-delete-ok"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Delete routing preset")
+                .title(t!("preset-delete-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
@@ -2086,8 +2084,8 @@ impl AppView {
 
     pub(crate) fn open_rule_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name_state = cx.new(|cx| InputState::new(window, cx));
-        let url_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("https://host.example/set.srs"));
+        let url_state = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t!("preset-remote-url-placeholder")));
         let view = cx.entity();
         let name_reader = name_state.clone();
         let url_reader = url_state.clone();
@@ -2096,7 +2094,8 @@ impl AppView {
             let name = name_reader.read(cx).value().to_string();
             let url = url_reader.read(cx).value().to_string();
             if name.trim().is_empty() && url.trim().is_empty() {
-                window.push_notification(Notification::warning("Enter a rule set name or URL"), cx);
+                window
+                    .push_notification(Notification::warning(t!("enter-rule-set-name-or-url")), cx);
                 return false;
             }
             commit_view.update(cx, |view, cx| {
@@ -2109,7 +2108,7 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit_click.clone();
             dialog
-                .title("Add rule set by URL")
+                .title(t!("rule-set-add-title"))
                 .child(
                     div()
                         .flex()
@@ -2117,17 +2116,15 @@ impl AppView {
                         .gap_2()
                         .child(dialog_field(
                             "field-rule-set-name",
-                            "Name",
+                            t!("field-name"),
                             name_state.clone(),
                         ))
                         .child(dialog_field(
                             "field-rule-set-url",
-                            "Rule set URL",
+                            t!("rule-set-url-label"),
                             url_state.clone(),
                         ))
-                        .child(Label::new(
-                            "The download runs only after you confirm it below — each download is one explicit confirmation",
-                        )),
+                        .child(Label::new(t!("rule-set-add-note"))),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -2137,7 +2134,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "rule-set-add-dialog-ok",
                     "rule-set-add-dialog-cancel",
-                    footer_commit_label("rule-set-add-dialog"),
+                    &footer_commit_label("rule-set-add-dialog"),
                     commit_click,
                 ))
         });
@@ -2164,7 +2161,7 @@ impl AppView {
         match store::subscription_fetch_policy(url.trim()) {
             store::SubscriptionFetchPolicy::Block { reason } => {
                 window.push_notification(
-                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    Notification::error(t!("invalid-rule-set-url", reason = reason)),
                     cx,
                 );
                 return false;
@@ -2177,7 +2174,7 @@ impl AppView {
             Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    Notification::error(t!("cannot-load-rule-sets", error = error.to_string())),
                     cx,
                 );
                 return false;
@@ -2204,9 +2201,7 @@ impl AppView {
             candidate = format!("{name}-{suffix}");
         }
         window.push_notification(
-            Notification::error(format!(
-                "no free staging name for \"{name}\" — remove stale rule sets first"
-            )),
+            Notification::error(t!("no-free-staging-name", name = name)),
             cx,
         );
         false
@@ -2223,7 +2218,7 @@ impl AppView {
         match store::subscription_fetch_policy(grant.url.trim()) {
             store::SubscriptionFetchPolicy::Block { reason } => {
                 window.push_notification(
-                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    Notification::error(t!("invalid-rule-set-url", reason = reason)),
                     cx,
                 );
                 return;
@@ -2239,13 +2234,12 @@ impl AppView {
             _ => String::new(),
         };
         let overwrites = grant.dir.join(&grant.file_name).exists();
-        let description = format!(
-            "Download this rule set? {}\n{}\
-             Staged file: {}\\{}",
-            grant.url,
-            warn,
-            grant.dir.display(),
-            grant.file_name,
+        let description = t!(
+            "rule-set-download-description",
+            url = grant.url.as_str(),
+            warn = warn,
+            dir = grant.dir.display().to_string(),
+            file = grant.file_name.as_str()
         );
         open_app_alert_dialog(window, cx, move |alert, _, _| {
             let grant = grant.clone();
@@ -2253,14 +2247,14 @@ impl AppView {
             let description = description.clone();
             let mut props = DialogButtonProps::default()
                 .show_cancel(true)
-                .ok_text("Download");
+                .ok_text(t!("rule-set-download-ok"));
             if overwrites {
                 props = props.ok_variant(ButtonVariant::Danger);
             }
             alert
                 .confirm()
                 .button_props(props)
-                .title("Download rule set?")
+                .title(t!("rule-set-download-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
@@ -2291,7 +2285,7 @@ impl AppView {
             Ok(presets) => presets,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load routing presets: {error}")),
+                    Notification::error(t!("cannot-load-presets", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2301,7 +2295,7 @@ impl AppView {
             Ok(rows) => rows,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load library: {error}")),
+                    Notification::error(t!("cannot-load-library", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2320,7 +2314,7 @@ impl AppView {
             Ok(rule_sets) => rule_sets,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    Notification::error(t!("cannot-load-rule-sets", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2350,10 +2344,7 @@ impl AppView {
                 && boxes.is_empty()
                 && remote_url.is_empty()
             {
-                window.push_notification(
-                    Notification::warning("Enter a name, rules, or a remote URL"),
-                    cx,
-                );
+                window.push_notification(Notification::warning(t!("enter-name-rules-or-url")), cx);
                 return false;
             }
             commit_view.update(cx, |view, cx| {
@@ -2379,9 +2370,7 @@ impl AppView {
                     .child(preset_summary_text(Some(presets.len()))),
             );
             if presets.is_empty() {
-                body = body.child(
-                    "No routing presets yet — paste a throne://route link in Import, or create one below",
-                );
+                body = body.child(t!("preset-manager-empty"));
             }
             for preset in &presets {
                 body = body.child(preset_row(
@@ -2398,12 +2387,10 @@ impl AppView {
                     .id("rule-sets-section-title")
                     .test_support()
                     .text_sm()
-                    .child("Rule sets"),
+                    .child(t!("rule-set-section-title")),
             );
             if rule_sets.is_empty() {
-                body = body.child(Label::new(
-                    "No rule sets staged — Add by URL downloads an .srs file into data\\rule-sets after you confirm each download",
-                ));
+                body = body.child(Label::new(t!("rule-set-empty")));
             }
             for rule_set in &rule_sets {
                 body = body.child(rule_set_row(
@@ -2420,8 +2407,8 @@ impl AppView {
                 body = body.child(
                     div().flex().flex_row().items_center().gap_2().child(
                         Button::new("rule-set-add")
-                            .label("Add by URL")
-                            .tooltip("Download an .srs rule set from an https URL (you confirm each download)")
+                            .label(t!("rule-set-add"))
+                            .tooltip(t!("rule-set-add-tip"))
                             .on_click(move |_, window, cx| {
                                 value.update(cx, |view, cx| {
                                     view.open_rule_set_add_dialog(window, cx);
@@ -2433,7 +2420,7 @@ impl AppView {
 
             body = body.child(form.clone().element(cx));
             dialog
-                .title("Routing presets")
+                .title(t!("preset-manager-title"))
                 .close_button(false)
                 .child(body)
                 .button_props(
@@ -2450,8 +2437,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "presets-dialog-ok",
                     "presets-dialog-cancel",
-
-                    footer_commit_label("presets"),
+                    &footer_commit_label("presets"),
                     commit_click,
                 ))
         });
@@ -2487,7 +2473,7 @@ impl AppView {
             Ok(presets) => presets,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load routing presets: {error}")),
+                    Notification::error(t!("cannot-load-presets", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2544,19 +2530,18 @@ impl AppView {
                         .id("preset-attach-exits")
                         .test_support()
                         .text_sm()
-                        .child(format!(
-                            "Route exits for \"{config_name}\": {}",
-                            crate::preset::preset_exit_suggestions(&[crate::engine::outbound_tag(
-                                &config_id
-                            )])
+                        .child(t!(
+                            "preset-attach-exits",
+                            name = config_name.as_str(),
+                            exits = crate::preset::preset_exit_suggestions(&[
+                                crate::engine::outbound_tag(&config_id)
+                            ])
                             .join(" · ")
                         )),
                 );
             }
             if presets.is_empty() {
-                body = body.child(
-                    "No routing presets yet — import one first (throne://route link or preset JSON)",
-                );
+                body = body.child(t!("preset-attach-empty"));
             }
             for preset in &presets {
                 let attach_view = view.clone();
@@ -2569,11 +2554,11 @@ impl AppView {
                     .gap_2()
                     .child(Label::new(preset.name.clone()));
                 if current.as_deref() == Some(preset.id.as_str()) {
-                    line = line.child("attached");
+                    line = line.child(t!("preset-attach-current"));
                 } else {
                     line = line.child(
                         Button::new(format!("preset-attach-{}", preset.id))
-                            .label("Attach")
+                            .label(t!("preset-attach-action"))
                             .on_click(move |_, window, cx| {
                                 let config = attach_config.clone();
                                 let preset = attach_preset.clone();
@@ -2588,17 +2573,19 @@ impl AppView {
             if current.is_some() {
                 let detach_view = view.clone();
                 let detach_config = config_id.clone();
-                body = body.child(Button::new("preset-detach").label("Detach").on_click(
-                    move |_, window, cx| {
-                        let config = detach_config.clone();
-                        detach_view.update(cx, |view, cx| {
-                            view.commit_preset_attach(&config, None, window, cx);
-                        });
-                    },
-                ));
+                body = body.child(
+                    Button::new("preset-detach")
+                        .label(t!("preset-detach-action"))
+                        .on_click(move |_, window, cx| {
+                            let config = detach_config.clone();
+                            detach_view.update(cx, |view, cx| {
+                                view.commit_preset_attach(&config, None, window, cx);
+                            });
+                        }),
+                );
             }
             dialog
-                .title(format!("Routing preset for \"{config_name}\""))
+                .title(t!("preset-attach-title", name = config_name.as_str()))
                 .child(body)
                 .button_props(
                     DialogButtonProps::default().on_ok(move |_, window, cx| commit_key(window, cx)),
@@ -2606,7 +2593,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "preset-attach-ok",
                     "preset-attach-cancel",
-                    footer_commit_label("preset-attach"),
+                    &footer_commit_label("preset-attach"),
                     commit_click,
                 ))
         });
@@ -2620,10 +2607,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let full = url.to_string();
-        let description = format!(
-            "The full URL for \"{label}\" carries its token in plaintext — anyone holding it can \
-             use the subscription. Prefer the redacted copy. Copy the full URL anyway?"
-        );
+        let description = t!("sub-full-url-description", label = label);
         open_app_alert_dialog(window, cx, move |alert, _, _| {
             let full = full.clone();
             let description = description.clone();
@@ -2632,17 +2616,14 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Copy URL")
+                        .ok_text(t!("sub-full-url-ok"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Copy full subscription URL?")
+                .title(t!("sub-full-url-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
-                    window.push_notification(
-                        Notification::warning("Copied FULL subscription URL (carries the token)"),
-                        cx,
-                    );
+                    window.push_notification(Notification::warning(t!("copied-full-sub-url")), cx);
                     true
                 })
         });
@@ -2684,7 +2665,7 @@ impl AppView {
 
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load subscriptions: {error}")),
+                    Notification::error(t!("cannot-load-subscriptions", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2694,7 +2675,7 @@ impl AppView {
             Ok(rows) => rows,
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot load library: {error}")),
+                    Notification::error(t!("cannot-load-library", error = error.to_string())),
                     cx,
                 );
                 Vec::new()
@@ -2718,7 +2699,7 @@ impl AppView {
             let auto = *reader.auto_refresh.borrow();
             let interval = *reader.interval_secs.borrow();
             if label.trim().is_empty() && url.trim().is_empty() {
-                window.push_notification(Notification::warning("Enter a subscription URL"), cx);
+                window.push_notification(Notification::warning(t!("enter-subscription-url")), cx);
                 return false;
             }
             commit_view.update(cx, |view, cx| {
@@ -2763,14 +2744,9 @@ impl AppView {
                     .child(
                         Switch::new("subs-auto-all")
                             .checked(kill_now)
-                            .label("Auto-refresh all")
-
-                            .tooltip(
-                                "Automatic background refresh of all subscriptions. Manual Refresh always works.",
-                            )
-                            .accessibility_label(
-                                "Auto-refresh all subscriptions automatically. Manual Refresh always works.",
-                            )
+                            .label(t!("subs-auto-all"))
+                            .tooltip(t!("subs-auto-all-tip"))
+                            .accessibility_label(t!("subs-auto-all-aria"))
                             .on_change(move |next: &bool, window, cx| {
                                 let next = *next;
                                 kill_buttons.update(cx, |view, cx| {
@@ -2780,7 +2756,7 @@ impl AppView {
                     )
                     .child(
                         Button::new("subs-refresh-all-due")
-                            .label(format!("Refresh all due ({due_count})"))
+                            .label(t!("subs-refresh-due", count = due_count))
                             .on_click(move |_, window, cx| {
                                 due_buttons.update(cx, |view, cx| {
                                     view.refresh_all_due(window, cx);
@@ -2789,12 +2765,11 @@ impl AppView {
                     ),
             );
             if subs.is_empty() {
-                body = body.child("No subscriptions yet — paste a subscription URL below");
+                body = body.child(t!("subs-empty"));
             }
 
             if let Some((done, total)) = batch_progress {
-                let percent =
-                    (done as f32 / total.max(1) as f32 * 100.0).clamp(0.0, 100.0);
+                let percent = (done as f32 / total.max(1) as f32 * 100.0).clamp(0.0, 100.0);
                 body = body.child(
                     div()
                         .id("subs-refresh-progress")
@@ -2806,11 +2781,13 @@ impl AppView {
                             Progress::new("subs-refresh-progress-bar")
                                 .small()
                                 .value(percent)
-                                .accessibility_label(format!(
-                                    "Refreshing subscriptions: {done} of {total}"
+                                .accessibility_label(t!(
+                                    "subs-refresh-progress-aria",
+                                    done = done,
+                                    total = total
                                 )),
                         )
-                        .child(format!("Refreshing {done} of {total} subscriptions")),
+                        .child(t!("subs-refresh-progress", done = done, total = total)),
                 );
             }
             for sub in &subs {
@@ -2825,7 +2802,7 @@ impl AppView {
             }
             body = body.child(form.clone().element(view_for_rows.clone(), cx));
             sheet
-                .title("Subscriptions")
+                .title(t!("subs-title"))
                 .child(body)
                 .size(px(520.))
                 .on_close(move |_, window, cx| {
@@ -2837,8 +2814,7 @@ impl AppView {
                 .footer(sheet_footer(
                     "subscriptions-dialog-ok",
                     Some("subscriptions-dialog-cancel"),
-
-                    footer_commit_label("subscriptions"),
+                    &footer_commit_label("subscriptions"),
                     commit_click,
                 ))
         });
@@ -2853,13 +2829,13 @@ impl AppView {
         let label_state = cx.new(|cx| InputState::new(window, cx).default_value(sub.label.clone()));
         let url_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("https://…")
+                .placeholder(t!("sub-url-placeholder"))
                 .default_value(sub.url.expose().to_string())
         });
         let group_state = cx.new(|cx| InputState::new(window, cx).default_value(sub.group.clone()));
         let view = cx.entity();
         let id = sub.id.clone();
-        let title = format!("Edit {}", sub.label);
+        let title = t!("sub-edit-title", label = sub.label);
         let read_label = label_state.clone();
         let read_url = url_state.clone();
         let read_group = group_state.clone();
@@ -2898,12 +2874,12 @@ impl AppView {
                 .small()
                 .child(dialog_field(
                     "field-sub-edit-label",
-                    "Label",
+                    t!("field-label"),
                     label_state.clone(),
                 ))
                 .child(dialog_field(
                     "field-sub-edit-url",
-                    "Subscription URL",
+                    t!("field-subscription-url"),
                     url_state.clone(),
                 ));
             if let Some(warning) = edit_warning {
@@ -2912,7 +2888,7 @@ impl AppView {
             form = form
                 .child(dialog_field(
                     "field-sub-edit-group",
-                    "Group",
+                    t!("field-group"),
                     group_state.clone(),
                 ))
                 .child(field().label_indent(false).child(
@@ -2934,7 +2910,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "subscription-edit-dialog-ok",
                     "subscription-edit-dialog-cancel",
-                    footer_commit_label("subscription-edit"),
+                    &footer_commit_label("subscription-edit"),
                     commit_click,
                 ))
         });
@@ -2957,13 +2933,11 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Remove")
+                        .ok_text(t!("sub-remove"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Remove subscription")
-                .description(format!(
-                    "Remove \"{label}\"? Its configs stay in the library."
-                ))
+                .title(t!("sub-remove-title"))
+                .description(t!("sub-remove-description", label = label.as_str()))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.commit_subscription_remove(&id, window, cx);
@@ -2985,12 +2959,9 @@ impl AppView {
         if included.is_empty() {
             window.push_notification(
                 Notification::info(if skipped.is_empty() {
-                    "No subscriptions to update".to_string()
+                    t!("no-subscriptions-to-update")
                 } else {
-                    format!(
-                        "No subscriptions to update — {} skipped (auto-refresh off for their group)",
-                        skipped.len()
-                    )
+                    t!("no-subs-to-update-skipped", count = skipped.len())
                 }),
                 cx,
             );
@@ -3007,9 +2978,9 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Update all"),
+                        .ok_text(t!("subs-update-all-ok")),
                 )
-                .title("Update all subscriptions?")
+                .title(t!("subs-update-all-title"))
                 .description(description.clone())
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {

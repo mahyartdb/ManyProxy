@@ -150,8 +150,8 @@ impl AppView {
                 .child(
                     Button::new("write-banner-open-folder")
                         .small()
-                        .label("Open data folder")
-                        .tooltip("Open the folder that holds the library")
+                        .label(t!("write-banner-open-folder"))
+                        .tooltip(t!("write-banner-open-folder-tip"))
                         .on_click(move |_, window, cx| {
                             view.update(cx, |view, cx| {
                                 view.open_data_folder(window, cx);
@@ -174,7 +174,7 @@ fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
     // silently cut off the only part that matters. The OS reason rides the
     // tooltip (`write_blocked`), so it is never lost either.
     match open_failure {
-        Some(_) => format!("Changes will not be saved — cannot use the data folder ({folder})."),
-        None => format!("Changes will not be saved — cannot write to the data folder ({folder})."),
+        Some(_) => t!("write-banner-cannot-use", folder = folder),
+        None => t!("write-banner-cannot-write", folder = folder),
     }
 }

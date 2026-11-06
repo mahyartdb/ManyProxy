@@ -44,7 +44,7 @@ fn resizable_header(
         .on_drag(ColumnDrag { column }, move |drag: &ColumnDrag, _, _, cx| {
             drag_view.update(cx, |view, cx| view.clear_column_drop(cx));
             cx.new(|_| ColumnDragPreview {
-                label: drag.column.label(),
+                label: library_column_label(drag.column),
             })
         })
         .on_drag_move(
@@ -119,7 +119,7 @@ pub(crate) fn column_header_label(
         .truncate()
         .text_sm()
         .text_color(cx.theme().muted_foreground)
-        .child(column.label())
+        .child(library_column_label(column))
         .context_menu(move |menu, _, _| AppView::width_header_menu(menu, column, &menu_view))
         .into_any_element();
     resizable_header("header", column, width, drop_side, view, cx, label)
@@ -139,7 +139,7 @@ pub(crate) fn sort_header_cell(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let column_id = column.id();
-    let label = column.label();
+    let label = library_column_label(column);
     let focus_handle = window
         .use_keyed_state(format!("sort-header-focus-{column_id}"), cx, |_, cx| {
             cx.focus_handle()
@@ -149,15 +149,20 @@ pub(crate) fn sort_header_cell(
     let focused = focus_handle.is_focused(window);
     let active =
         sort.key != LibrarySortKey::None && sort_header_keys(column_id).contains(&sort.key);
-    let marker = if active { sort_header_marker(sort) } else { "" };
+    let marker = if active {
+        sort_header_marker(sort)
+    } else {
+        String::new()
+    };
     let tip = if active {
-        format!(
-            "{label} — sorted by {} ({}) — click to reverse, right-click to change",
-            sort.key.label(),
-            sort.direction.label()
+        t!(
+            "sort-header-active-tip",
+            label = &label,
+            key = library_sort_key_label(sort.key),
+            direction = sort_direction_label(sort.direction)
         )
     } else {
-        format!("{label} — click to sort, right-click to pick a sort key")
+        t!("sort-header-idle-tip", label = &label)
     };
     let tooltip_text = tip.clone();
     let menu_view = view.clone();

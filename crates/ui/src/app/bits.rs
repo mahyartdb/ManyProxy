@@ -2,11 +2,14 @@ use crate::*;
 
 pub(crate) fn topbar_menu_row(
     id: &'static str,
-    label: &'static str,
-    accessible: &'static str,
-    tip: &'static str,
+    label: impl Into<SharedString>,
+    accessible: impl Into<SharedString>,
+    tip: impl Into<SharedString>,
     shortcut: Option<(&'static str, &'static str, &'static str)>,
 ) -> AnyElement {
+    let label = label.into();
+    let accessible = accessible.into();
+    let tip = tip.into();
     // A6-5/K8: the label flexes and the chip is parked on the row's right
     // edge, so every chipped item in a menu reads as one aligned column and
     // the chip keeps its full width (never "Ctrl+…").
@@ -21,7 +24,10 @@ pub(crate) fn topbar_menu_row(
             .flex_row()
             .items_center()
             .gap_2()
-            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
+            .tooltip(move |_, cx| {
+                let tip = tip.clone();
+                cx.new(move |_| Tooltip::new(tip)).into()
+            })
             .child(div().flex_1().min_w_0().child(label))
             .child(shortcut_kbd(parse, chip))
             .into_any_element(),
@@ -34,18 +40,24 @@ pub(crate) fn topbar_menu_row(
             .flex_row()
             .items_center()
             .gap_2()
-            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
+            .tooltip(move |_, cx| {
+                let tip = tip.clone();
+                cx.new(move |_| Tooltip::new(tip)).into()
+            })
             .child(label)
             .into_any_element(),
     }
 }
 
-pub(crate) const SEARCH_PLACEHOLDER: &str = "Search configurations";
+pub(crate) fn search_placeholder() -> String {
+    t!("search-placeholder")
+}
 
 /// T-23: the one hint that the `port=` grammar exists — a tooltip on the search
 /// box, because the pinned placeholder is too narrow to carry it.
-pub(crate) const SEARCH_HINT: &str =
-    "port=N or port=N:M filters by listen port (port=10801, port=10800:10900, port=10801:, port=:10900)";
+pub(crate) fn search_hint() -> String {
+    t!("search-hint")
+}
 
 /// Store meta key for "Automatically restart crashed cores"; a missing or corrupt
 /// value reads as enabled, matching the engine's default.
@@ -76,15 +88,15 @@ pub(crate) fn is_row_local_start_error(error: &EngineError) -> bool {
 pub(crate) fn normalize_test_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("test URL must not be empty".to_string());
+        return Err(t!("test-url-empty"));
     }
     let rest = trimmed
         .strip_prefix("http://")
         .or_else(|| trimmed.strip_prefix("https://"))
-        .ok_or_else(|| "test URL must start with http:// or https://".to_string())?;
+        .ok_or_else(|| t!("test-url-scheme"))?;
     let host = rest.split('/').next().unwrap_or("").trim();
     if host.is_empty() {
-        return Err("test URL needs a host".to_string());
+        return Err(t!("test-url-host"));
     }
     Ok(trimmed.to_string())
 }
@@ -99,9 +111,9 @@ pub(crate) fn effective_probe_url(row_override: Option<&str>, global: Option<&st
 
 pub(crate) fn format_params_json(text: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|error| format!("params are not valid JSON: {error}"))?;
+        .map_err(|error| t!("params-invalid-json", error = error.to_string()))?;
     serde_json::to_string_pretty(&value)
-        .map_err(|error| format!("params cannot be formatted: {error}"))
+        .map_err(|error| t!("params-format-failed", error = error.to_string()))
 }
 
 pub(crate) fn validate_params_json(text: &str) -> Result<(), String> {
@@ -110,13 +122,13 @@ pub(crate) fn validate_params_json(text: &str) -> Result<(), String> {
     }
     serde_json::from_str::<serde_json::Value>(text)
         .map(|_| ())
-        .map_err(|error| format!("params are not valid JSON: {error}"))
+        .map_err(|error| t!("params-invalid-json", error = error.to_string()))
 }
 
 pub(crate) fn guided_identity_label(protocol_raw: &str) -> String {
     match guided_identity_fields(protocol_raw).and_then(|guided| guided.key) {
-        Some(key) => format!("Identity ({key})"),
-        None => "Identity".to_string(),
+        Some(key) => t!("guided-identity-key", key = key),
+        None => t!("guided-identity"),
     }
 }
 
@@ -127,9 +139,9 @@ pub(crate) fn guided_hint_line(protocol_raw: &str) -> Option<String> {
         return None;
     }
     match guided.key {
-        Some(_) => Some(format!("{name} needs {}.", guided.needs)),
-        None if guided.needs == "custom JSON" => Some(format!("{name} takes custom JSON.")),
-        None => Some(format!("No secret needed for {name}.")),
+        Some(_) => Some(t!("guided-needs", name = name, needs = guided.needs)),
+        None if guided.needs == "custom JSON" => Some(t!("guided-custom-json", name = name)),
+        None => Some(t!("guided-no-secret", name = name)),
     }
 }
 
@@ -204,10 +216,10 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
     // K12/A5-1: words instead of the tiny `↓`/`↑` pair, which the UI video
     // showed degrading to a serif "T". `out` is what the endpoints sent
     // (tx), `in` is what came back (rx).
-    Some(format!(
-        "out {} · in {}",
-        format_bytes(tx),
-        format_bytes(rx)
+    Some(t!(
+        "traffic-totals",
+        tx = format_bytes(tx),
+        rx = format_bytes(rx)
     ))
 }
 
@@ -229,11 +241,11 @@ pub(crate) fn interval_picker_row(
             repaint(window, cx);
         });
     for preset in INTERVAL_PRESETS {
-        let label = format_interval_secs(*preset);
+        let label = format_interval_label(*preset);
         group = group.child(
             Radio::new(label.clone())
                 .label(label.clone())
-                .tooltip(format!("Refresh every {label}")),
+                .tooltip(t!("interval-tip", label = label.clone())),
         );
     }
     div()
@@ -244,7 +256,7 @@ pub(crate) fn interval_picker_row(
             div()
                 .id(format!("{id_prefix}-caption"))
                 .test_support()
-                .child(Label::new("Refresh interval")),
+                .child(Label::new(t!("interval-caption"))),
         )
         .child(
             div()

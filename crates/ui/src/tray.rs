@@ -1,15 +1,12 @@
 include!(concat!(env!("OUT_DIR"), "/tray_icon_rgba.rs"));
 
 use crate::store::ProxyConfig;
+use crate::t;
 
-/// T-26: the tray tooltip shares the window title's `· N running` suffix
-/// helper (`crate::running_title_suffix`), so the two surfaces cannot drift.
+/// T-26: the tray tooltip shares the window title helper, so the two surfaces
+/// cannot drift.
 pub fn tray_tooltip(running: usize) -> String {
-    format!(
-        "{}{}",
-        crate::APP_TITLE,
-        crate::running_title_suffix(running)
-    )
+    crate::window_title_text(running)
 }
 
 pub mod menu_id {
@@ -113,14 +110,14 @@ pub fn set_autostart_at(key_path: &str, command: &str) -> Result<(), String> {
     use winreg::RegKey;
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
         .create_subkey(key_path)
-        .map_err(|error| format!("cannot open autostart key ({error})"))?;
+        .map_err(|error| t!("autostart-open-key-failed", error = error.to_string()))?;
     key.set_value(AUTOSTART_VALUE_NAME, &command.to_string())
-        .map_err(|error| format!("cannot write autostart value ({error})"))
+        .map_err(|error| t!("autostart-write-failed", error = error.to_string()))
 }
 
 #[cfg(not(windows))]
 pub fn set_autostart_at(_key_path: &str, _command: &str) -> Result<(), String> {
-    Err("autostart is Windows-only".to_string())
+    Err(t!("autostart-windows-only"))
 }
 
 #[cfg(windows)]
@@ -133,23 +130,23 @@ pub fn clear_autostart_at(key_path: &str) -> Result<(), String> {
         Ok(key) => key,
 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("cannot open autostart key ({error})")),
+        Err(error) => return Err(t!("autostart-open-key-failed", error = error.to_string())),
     };
     match key.get_value::<String, _>(AUTOSTART_VALUE_NAME) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => key
             .delete_value(AUTOSTART_VALUE_NAME)
-            .map_err(|error| format!("cannot clear autostart value ({error})")),
+            .map_err(|error| t!("autostart-clear-failed", error = error.to_string())),
 
         Err(_) => key
             .delete_value(AUTOSTART_VALUE_NAME)
-            .map_err(|error| format!("cannot clear autostart value ({error})")),
+            .map_err(|error| t!("autostart-clear-failed", error = error.to_string())),
     }
 }
 
 #[cfg(not(windows))]
 pub fn clear_autostart_at(_key_path: &str) -> Result<(), String> {
-    Err("autostart is Windows-only".to_string())
+    Err(t!("autostart-windows-only"))
 }
 
 pub fn autostart_enabled() -> bool {
@@ -205,14 +202,13 @@ pub fn clear_dead_autostart_target() -> bool {
 
 pub fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
-        let command = autostart_command()
-            .ok_or_else(|| "cannot determine the app path for autostart".to_string())?;
+        let command = autostart_command().ok_or_else(|| t!("autostart-app-path-failed"))?;
         set_autostart_at(AUTOSTART_RUN_KEY, &command)?;
 
         if read_autostart_at(AUTOSTART_RUN_KEY).as_deref() == Some(command.as_str()) {
             Ok(())
         } else {
-            Err("autostart write did not stick".to_string())
+            Err(t!("autostart-write-not-stuck"))
         }
     } else {
         clear_autostart_at(AUTOSTART_RUN_KEY)
@@ -322,16 +318,16 @@ impl TrayHandle {
             Icon, TrayIconBuilder,
         };
         let icon = Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), TRAY_ICON_WIDTH, TRAY_ICON_HEIGHT)
-            .map_err(|error| format!("tray icon invalid ({error:?})"))?;
+            .map_err(|error| t!("tray-icon-invalid", error = format!("{error:?}")))?;
         let menu = Menu::new();
         for (action, title) in [
-            (TrayAction::Show, "Show"),
-            (TrayAction::SelectExit, "Select exit"),
-            (TrayAction::SelectPreset, "Select preset"),
-            (TrayAction::StartAll, "Start all"),
-            (TrayAction::StopAll, "Stop all"),
-            (TrayAction::OpenConfig, "Open config folder"),
-            (TrayAction::Quit, "Quit"),
+            (TrayAction::Show, t!("tray-show")),
+            (TrayAction::SelectExit, t!("tray-select-exit")),
+            (TrayAction::SelectPreset, t!("tray-select-preset")),
+            (TrayAction::StartAll, t!("tray-start-all")),
+            (TrayAction::StopAll, t!("tray-stop-all")),
+            (TrayAction::OpenConfig, t!("tray-open-config")),
+            (TrayAction::Quit, t!("tray-quit")),
         ] {
             menu.append(&MenuItem::with_id(
                 menu_id_for_action(action),
@@ -339,7 +335,7 @@ impl TrayHandle {
                 true,
                 None,
             ))
-            .map_err(|error| format!("tray menu invalid ({error:?})"))?;
+            .map_err(|error| t!("tray-menu-invalid", error = format!("{error:?}")))?;
         }
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -347,7 +343,7 @@ impl TrayHandle {
             .with_tooltip(tray_tooltip(0))
             .with_menu_on_left_click(false)
             .build()
-            .map_err(|error| format!("cannot create tray icon ({error:?})"))?;
+            .map_err(|error| t!("tray-create-failed", error = format!("{error:?}")))?;
         Ok(Self { icon })
     }
 

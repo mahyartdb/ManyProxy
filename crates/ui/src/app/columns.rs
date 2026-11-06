@@ -67,7 +67,7 @@ impl AppView {
         layout.reset_width(column);
         self.commit_column_layout(layout, window, cx);
         window.push_notification(
-            Notification::info(format!("{} column restored to default", column.label())),
+            Notification::info(t!("column-restored", column = library_column_label(column))),
             cx,
         );
     }
@@ -79,7 +79,7 @@ impl AppView {
         let mut layout = self.libraries.read(cx).delegate().layout;
         layout.reset();
         self.commit_column_layout(layout, window, cx);
-        window.push_notification(Notification::info("Columns reset to defaults"), cx);
+        window.push_notification(Notification::info(t!("columns-reset")), cx);
     }
 
     fn commit_column_layout(
@@ -104,7 +104,7 @@ impl AppView {
     ) {
         if let Err(error) = self.store.set_library_column_layout(layout) {
             window.push_notification(
-                Notification::error(format!("Could not save column layout: {error}")),
+                Notification::error(t!("column-layout-save-failed", error = error.to_string())),
                 cx,
             );
         }
@@ -135,11 +135,11 @@ impl WidthAction {
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> String {
         match self {
-            WidthAction::Wider => "Wider",
-            WidthAction::Narrower => "Narrower",
-            WidthAction::Reset => "Reset",
+            WidthAction::Wider => t!("column-width-wider"),
+            WidthAction::Narrower => t!("column-width-narrower"),
+            WidthAction::Reset => t!("column-width-reset"),
         }
     }
 
@@ -161,7 +161,7 @@ impl WidthAction {
 /// T-04: the chip under the pointer while a header is dragged. It names the
 /// column being moved so the drop result is obvious before release.
 pub(crate) struct ColumnDragPreview {
-    pub(crate) label: &'static str,
+    pub(crate) label: String,
 }
 
 impl Render for ColumnDragPreview {
@@ -175,7 +175,7 @@ impl Render for ColumnDragPreview {
             .bg(cx.theme().background)
             .text_sm()
             .text_color(cx.theme().foreground)
-            .child(self.label)
+            .child(self.label.clone())
     }
 }
 

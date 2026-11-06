@@ -9,7 +9,7 @@ use crate::*;
 /// once — no blocking confirm — and the Undo toast is the safety net.
 fn bulk_menu_item(
     id: &'static str,
-    label: &'static str,
+    label: String,
     danger: bool,
     view: Entity<AppView>,
     act: impl Fn(&mut AppView, &mut Window, &mut Context<AppView>) + 'static,
@@ -19,12 +19,12 @@ fn bulk_menu_item(
             .id(id)
             .test_support()
             .role(Role::MenuItem)
-            .aria_label(label)
+            .aria_label(label.clone())
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .child(label);
+            .child(label.clone());
         if danger {
             row.text_color(danger_text_color(cx.theme()))
         } else {
@@ -73,21 +73,14 @@ impl AppView {
                         // B19: the count is the bar's only status text, so it
                         // names itself like every other bar segment does.
                         .aria_label(label.clone())
-                        .tooltip(|_, cx| {
-                            cx.new(|_| {
-                                Tooltip::new(
-                                    "Blue wash = selected (F5). Blue bar + filled checkbox = checked (bulk).",
-                                )
-                            })
-                            .into()
-                        })
+                        .tooltip(|_, cx| cx.new(|_| Tooltip::new(t!("bulk-tooltip"))).into())
                         .child(label),
                 )
                 .child(
                     Button::new("bulk-start")
                         .small()
-                        .label("Start")
-                        .tooltip("Start every checked endpoint")
+                        .label(t!("bulk-start"))
+                        .tooltip(t!("bulk-start-tip"))
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_start(window, cx);
                         })),
@@ -95,8 +88,8 @@ impl AppView {
                 .child(
                     Button::new("bulk-stop")
                         .small()
-                        .label("Stop")
-                        .tooltip("Stop every checked endpoint")
+                        .label(t!("bulk-stop"))
+                        .tooltip(t!("bulk-stop-tip"))
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_stop(window, cx);
                         })),
@@ -104,21 +97,21 @@ impl AppView {
                 .child(
                     Button::new("bulk-more")
                         .small()
-                        .label("More")
+                        .label(t!("bulk-more"))
                         .dropdown_caret(true)
-                        .accessibility_label("More bulk actions")
-                        .tooltip("Move, copy, or delete the checked rows")
+                        .accessibility_label(t!("bulk-more-aria"))
+                        .tooltip(t!("bulk-more-tip"))
                         .dropdown_menu(move |menu, _, _| {
                             menu.item(bulk_menu_item(
                                 "bulk-more-select-visible",
-                                "Check all visible",
+                                t!("bulk-check-visible"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.select_visible_checked(window, cx),
                             ))
                             .item(bulk_menu_item(
                                 "bulk-more-clear",
-                                "Uncheck all",
+                                t!("bulk-uncheck-all"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.clear_checked(window, cx),
@@ -126,14 +119,14 @@ impl AppView {
                             .separator()
                             .item(bulk_menu_item(
                                 "bulk-more-move",
-                                "Move to group",
+                                t!("bulk-move"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.open_bulk_move_dialog(window, cx),
                             ))
                             .item(bulk_menu_item(
                                 "bulk-more-copy",
-                                "Copy proxies",
+                                t!("bulk-copy-proxies"),
                                 false,
                                 more_view.clone(),
                                 |view, window, cx| view.commit_bulk_copy_proxies(window, cx),
@@ -141,7 +134,7 @@ impl AppView {
                             .separator()
                             .item(bulk_menu_item(
                                 "bulk-more-delete",
-                                "Delete",
+                                t!("bulk-delete"),
                                 true,
                                 more_view.clone(),
                                 |view, window, cx| view.bulk_delete_checked(window, cx),
@@ -162,7 +155,7 @@ impl AppView {
         });
         if let Err(error) = self.store.set_latency_facet(LatencyFacet::default()) {
             window.push_notification(
-                Notification::error(format!("Could not save latency filter: {error}")),
+                Notification::error(t!("cannot-save-latency-filter", error = error.to_string())),
                 cx,
             );
         }
@@ -312,9 +305,9 @@ impl AppView {
                     .button_props(
                         DialogButtonProps::default()
                             .show_cancel(true)
-                            .ok_text("Start"),
+                            .ok_text(t!("confirm-start")),
                     )
-                    .title(LAN_CONFIRM_TITLE)
+                    .title(lan_confirm_title())
                     .description(description)
                     .on_ok(move |_, window, cx| {
                         let ids = ids.clone();
@@ -362,7 +355,7 @@ impl AppView {
         self.start_in_flight = true;
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
-            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
+            window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
             return;
         }
         let mut skipped_dirty: Vec<String> = Vec::new();
@@ -446,7 +439,7 @@ impl AppView {
             }
             None if failed.is_empty() => {
                 window.push_notification(
-                    Notification::success(format!("Started {started} configuration(s)")),
+                    Notification::success(t!("start-bulk-started", count = started)),
                     cx,
                 );
             }
@@ -562,19 +555,20 @@ impl AppView {
             }
             match self.store.set_enabled(id, false) {
                 Ok(_) => stopped.push(name),
-                Err(error) => failed.push(format!("{name}: stopped but flag not saved ({error})")),
+                Err(error) => failed.push(t!(
+                    "stopped-flag-not-saved",
+                    name = name,
+                    error = error.to_string()
+                )),
             }
         }
         self.reload(window, cx);
         if failed.is_empty() {
             if stopped.is_empty() {
-                window.push_notification(
-                    Notification::info("Nothing to stop — no checked endpoints are running"),
-                    cx,
-                );
+                window.push_notification(Notification::info(t!("stop-bulk-empty")), cx);
             } else {
                 window.push_notification(
-                    Notification::success(format!("Stopped {} configuration(s)", stopped.len())),
+                    Notification::success(t!("stop-bulk-stopped", count = stopped.len())),
                     cx,
                 );
             }
@@ -582,20 +576,20 @@ impl AppView {
         }
         if stopped.is_empty() {
             window.push_notification(
-                Notification::error(format!(
-                    "Stop failed for {} configuration(s): {}",
-                    failed.len(),
-                    failed.join("; ")
+                Notification::error(t!(
+                    "stop-bulk-failed",
+                    count = failed.len(),
+                    names = failed.join("; ")
                 )),
                 cx,
             );
         } else {
             window.push_notification(
-                Notification::warning(format!(
-                    "Stopped {}, {} failed: {}",
-                    stopped.len(),
-                    failed.len(),
-                    failed.join("; ")
+                Notification::warning(t!(
+                    "stop-bulk-partial",
+                    stopped = stopped.len(),
+                    failed = failed.len(),
+                    names = failed.join("; ")
                 )),
                 cx,
             );
@@ -745,14 +739,14 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Move {count} configuration(s) to group"))
+                .title(t!("bulk-move-title", count = count))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(Label::new("Group"))
-                        .child(labelled_input("Group", &group_state)),
+                        .child(Label::new(t!("field-group")))
+                        .child(labelled_input(t!("field-group"), &group_state)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -762,7 +756,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "bulk-move-ok",
                     "bulk-move-cancel",
-                    footer_commit_label("bulk-move"),
+                    &footer_commit_label("bulk-move"),
                     commit_click,
                 ))
         });
@@ -775,7 +769,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         let ids_for_commit = vec![config.id.clone()];
@@ -794,14 +788,14 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Move \"{name}\" to group"))
+                .title(t!("bulk-move-one-title", name = name.as_str()))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(Label::new("Group"))
-                        .child(labelled_input("Group", &group_state)),
+                        .child(Label::new(t!("field-group")))
+                        .child(labelled_input(t!("field-group"), &group_state)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -811,7 +805,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "row-move-ok",
                     "row-move-cancel",
-                    footer_commit_label("bulk-move"),
+                    &footer_commit_label("bulk-move"),
                     commit_click,
                 ))
         });
@@ -830,16 +824,20 @@ impl AppView {
 
                 self.sync_facet_pickers(window, cx);
                 window.push_notification(
-                    Notification::success(format!(
-                        "Moved {moved} configuration(s) to \"{}\"",
-                        group.trim()
+                    Notification::success(t!(
+                        "moved-to-group",
+                        count = moved,
+                        group = group.trim()
                     )),
                     cx,
                 );
                 true
             }
             Err(error) => {
-                window.push_notification(Notification::error(format!("Cannot move: {error}")), cx);
+                window.push_notification(
+                    Notification::error(t!("cannot-move", error = error.to_string())),
+                    cx,
+                );
                 false
             }
         }
@@ -884,40 +882,31 @@ impl AppView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                        .child(
-                            Button::new("groups-update-current")
-                                .label("Update current")
-                                .tooltip(
-                                    "Refresh the subscriptions feeding the focused group \
-                                     (facet filter, else selected row) — Ctrl-R",
-                                )
-                                .on_click(move |_, window, cx| {
-                                    current_view.update(cx, |view, cx| {
-                                        view.update_current_group(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("groups-update-all")
-                                .label("Update all")
-                                .tooltip(
-                                    "Refresh every subscription outside auto-skipped groups (asks first)",
-                                )
-                                .on_click(move |_, window, cx| {
-                                    all_view.update(cx, |view, cx| {
-                                        view.open_update_all_confirm(window, cx);
-                                    });
-                                }),
-                        ),
+                            .child(
+                                Button::new("groups-update-current")
+                                    .label(t!("group-update-current"))
+                                    .tooltip(t!("group-update-current-tip"))
+                                    .on_click(move |_, window, cx| {
+                                        current_view.update(cx, |view, cx| {
+                                            view.update_current_group(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("groups-update-all")
+                                    .label(t!("group-update-all"))
+                                    .tooltip(t!("group-update-all-tip"))
+                                    .on_click(move |_, window, cx| {
+                                        all_view.update(cx, |view, cx| {
+                                            view.open_update_all_confirm(window, cx);
+                                        });
+                                    }),
+                            ),
                     ),
                 );
             }
             if rows.is_empty() {
-                form = form.child(
-                    field()
-                        .label_indent(false)
-                        .child("No groups yet — groups appear when rows use them"),
-                );
+                form = form.child(field().label_indent(false).child(t!("groups-empty")));
             }
             for row in &rows {
                 let rename_view = view.clone();
@@ -931,7 +920,7 @@ impl AppView {
                 let slug = slugify_group_id(&row.name);
                 let mut buttons = div().flex().flex_row().items_center().gap_2().child(
                     Button::new(format!("group-rename-{slug}"))
-                        .label("Rename")
+                        .label(t!("group-rename"))
                         .on_click(move |_, window, cx| {
                             let group = rename_group.clone();
                             rename_view.update(cx, |view, cx| {
@@ -941,8 +930,8 @@ impl AppView {
                 );
                 buttons = buttons.child(
                     Button::new(format!("group-edit-{slug}"))
-                        .label("Edit")
-                        .tooltip("Rename + auto-refresh skip for this group")
+                        .label(t!("group-edit"))
+                        .tooltip(t!("group-edit-tip"))
                         .on_click(move |_, window, cx| {
                             let group = edit_group.clone();
                             edit_view.update(cx, |view, cx| {
@@ -954,10 +943,8 @@ impl AppView {
                 if !row.sub_ids.is_empty() {
                     buttons = buttons.child(
                         Button::new(format!("group-update-{slug}"))
-                            .label("Update")
-                            .tooltip(
-                                "Refresh this group's subscription(s) now (manual — runs even when auto-skipped)"
-                            )
+                            .label(t!("group-update"))
+                            .tooltip(t!("group-update-tip"))
                             .on_click(move |_, window, cx| {
                                 let group = update_group.clone();
                                 update_view.update(cx, |view, cx| {
@@ -968,7 +955,7 @@ impl AppView {
                 }
                 buttons = buttons.child(
                     Button::new(format!("group-delete-{slug}"))
-                        .label("Delete")
+                        .label(t!("group-delete"))
                         .on_click(move |_, window, cx| {
                             let group = delete_group.clone();
                             delete_view.update(cx, |view, cx| {
@@ -984,16 +971,9 @@ impl AppView {
                 let auto_group = row.name.clone();
                 let auto_switch = Switch::new(format!("group-auto-clear-{slug}"))
                     .checked(row.auto_clear)
-                    .label("Auto-clear unavailable")
-                    .tooltip(
-                        "Opt-in per group: after this group's URL test ends, its unavailable \
-                         rows are removed automatically. Running rows and the row being edited \
-                         are never removed; enabling asks its own confirmation.",
-                    )
-                    .accessibility_label(format!(
-                        "Auto-clear unavailable rows in group \"{}\" after group tests",
-                        row.name
-                    ))
+                    .label(t!("group-auto-clear"))
+                    .tooltip(t!("group-auto-clear-tip"))
+                    .accessibility_label(t!("group-auto-clear-aria", group = row.name.as_str()))
                     .on_change(move |next: &bool, window, cx| {
                         let group = auto_group.clone();
                         let view = auto_view.clone();
@@ -1040,13 +1020,13 @@ impl AppView {
                 );
             }
             sheet
-                .title("Groups")
+                .title(t!("groups-title"))
                 .child(form)
                 .size(px(520.))
                 .footer(sheet_footer(
                     "groups-dialog-ok",
                     None,
-                    footer_commit_label("groups"),
+                    &footer_commit_label("groups"),
                     commit_click,
                 ))
         });
@@ -1074,10 +1054,10 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Rename group \"{old_name}\""))
+                .title(t!("group-rename-title", name = old_name.as_str()))
                 .child(v_form().small().child(dialog_field(
                     "field-group-rename-name",
-                    "New group name",
+                    t!("group-new-name"),
                     name_state.clone(),
                 )))
                 .button_props(
@@ -1088,7 +1068,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-rename-ok",
                     "group-rename-cancel",
-                    footer_commit_label("group-rename"),
+                    &footer_commit_label("group-rename"),
                     commit_click,
                 ))
         });
@@ -1121,36 +1101,32 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Edit group \"{old_name}\""))
+                .title(t!("group-edit-title", name = old_name.as_str()))
                 .child(
                     v_form()
                         .small()
                         .child(dialog_field(
                             "field-group-edit-name",
-                            "Group name",
+                            t!("group-name"),
                             name_state.clone(),
                         ))
-                        .child(field().label_indent(false).child(
-                            div().id("field-group-edit-skip").test_support().child(
-                                Switch::new("group-edit-skip")
-                                    .checked(skip_checked)
-                                    .label("Skip automatic refresh")
-                                    .tooltip(
-                                        "Skip this group's subscriptions on ticks and Update-all. \
-                                         Manual Update still works.",
-                                    )
-                                    .accessibility_label(
-                                        "Skip automatic refresh of this group's subscriptions. \
-                                         Manual Update still works.",
-                                    )
-                                    .on_change({
-                                        let skip_for_change = skip_for_change.clone();
-                                        move |next: &bool, _, _| {
-                                            *skip_for_change.borrow_mut() = *next;
-                                        }
-                                    }),
+                        .child(
+                            field().label_indent(false).child(
+                                div().id("field-group-edit-skip").test_support().child(
+                                    Switch::new("group-edit-skip")
+                                        .checked(skip_checked)
+                                        .label(t!("group-skip-refresh"))
+                                        .tooltip(t!("group-skip-refresh-tip"))
+                                        .accessibility_label(t!("group-skip-refresh-aria"))
+                                        .on_change({
+                                            let skip_for_change = skip_for_change.clone();
+                                            move |next: &bool, _, _| {
+                                                *skip_for_change.borrow_mut() = *next;
+                                            }
+                                        }),
+                                ),
                             ),
-                        )),
+                        ),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -1160,8 +1136,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-edit-ok",
                     "group-edit-cancel",
-
-                    footer_commit_label("group-edit"),
+                    &footer_commit_label("group-edit"),
                     commit_click,
                 ))
         });
@@ -1181,7 +1156,7 @@ impl AppView {
                 Ok(_) => {}
                 Err(error) => {
                     window.push_notification(
-                        Notification::error(format!("Cannot rename group: {error}")),
+                        Notification::error(t!("cannot-rename-group", error = error.to_string())),
                         cx,
                     );
                     return false;
@@ -1190,7 +1165,10 @@ impl AppView {
         }
         if let Err(error) = self.store.set_group_skip_refresh(&renamed, skip) {
             window.push_notification(
-                Notification::error(format!("Cannot change auto-refresh skip: {error}")),
+                Notification::error(t!(
+                    "cannot-change-auto-refresh-skip",
+                    error = error.to_string()
+                )),
                 cx,
             );
             return false;
@@ -1206,7 +1184,7 @@ impl AppView {
         });
         self.sync_facet_pickers(window, cx);
         window.push_notification(
-            Notification::success(format!("Updated group \"{renamed}\"")),
+            Notification::success(t!("group-updated", name = renamed)),
             cx,
         );
         window.close_all_dialogs(cx);
@@ -1225,7 +1203,7 @@ impl AppView {
         match self.store.rename_group(old, new) {
             Ok(outcome) if outcome.rows == 0 && outcome.subscriptions == 0 => {
                 window.push_notification(
-                    Notification::warning(format!("Group \"{old}\" holds no rows")),
+                    Notification::warning(t!("group-holds-no-rows", name = old)),
                     cx,
                 );
                 true
@@ -1244,15 +1222,17 @@ impl AppView {
                 self.sync_facet_pickers(window, cx);
                 let mut moved = Vec::new();
                 if outcome.rows > 0 {
-                    moved.push(format!("{} row(s)", outcome.rows));
+                    moved.push(t!("group-rows-count", count = outcome.rows));
                 }
                 if outcome.subscriptions > 0 {
-                    moved.push(format!("{} subscription(s)", outcome.subscriptions));
+                    moved.push(t!("group-subs-count", count = outcome.subscriptions));
                 }
                 window.push_notification(
-                    Notification::success(format!(
-                        "Renamed \"{old}\" to \"{renamed}\" ({})",
-                        moved.join(", ")
+                    Notification::success(t!(
+                        "group-renamed",
+                        old = old,
+                        new = renamed,
+                        moved = moved.join(", ")
                     )),
                     cx,
                 );
@@ -1262,7 +1242,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot rename group: {error}")),
+                    Notification::error(t!("cannot-rename-group", error = error.to_string())),
                     cx,
                 );
                 false
@@ -1288,13 +1268,13 @@ impl AppView {
                 });
                 self.sync_facet_pickers(window, cx);
                 window.push_notification(
-                    Notification::success(format!("Deleted empty group \"{name}\"")),
+                    Notification::success(t!("group-deleted-empty", name = name)),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot delete group: {error}")),
+                    Notification::error(t!("cannot-delete-group", error = error.to_string())),
                     cx,
                 );
             }
@@ -1334,10 +1314,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Delete")
+                        .ok_text(t!("group-delete"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Delete group")
+                .title(t!("group-delete-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {

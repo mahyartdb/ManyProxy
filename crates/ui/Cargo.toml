@@ -12,6 +12,9 @@ raw-window-handle = "0.6"
 qrcodegen = "1.8.0"
 serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+sys-locale = "0.3"
 futures = "0.3"
 web-time = "1"
 

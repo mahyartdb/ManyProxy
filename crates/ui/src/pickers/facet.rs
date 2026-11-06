@@ -140,11 +140,14 @@ impl FacetMenu {
         if *self == FacetMenu::Latency {
             let choices = LatencyBucket::ALL
                 .into_iter()
-                .map(|bucket| FacetChoice {
-                    id: format!("facet-latency-{}", bucket.token()),
-                    title: bucket.label().to_string(),
-                    display: format!("Latency: {}", bucket.label()),
-                    value: Some(bucket.token().to_string()),
+                .map(|bucket| {
+                    let label = latency_bucket_label(bucket);
+                    FacetChoice {
+                        id: format!("facet-latency-{}", bucket.token()),
+                        display: t!("facet-latency-choice", bucket = label.clone()),
+                        title: label,
+                        value: Some(bucket.token().to_string()),
+                    }
                 })
                 .collect();
             return (
@@ -155,8 +158,8 @@ impl FacetMenu {
         let total = delegate.rows.len();
         let mut choices = vec![FacetChoice {
             id: "facet-group-all".to_string(),
-            title: format!("All groups ({total})"),
-            display: "Group: All".to_string(),
+            title: t!("facet-all-groups", total = total),
+            display: t!("facet-group-all"),
             value: None,
         }];
         choices.extend(
@@ -165,8 +168,8 @@ impl FacetMenu {
                 .into_iter()
                 .map(|(group, count)| FacetChoice {
                     id: format!("facet-group-{}", slugify_group_id(&group)),
-                    title: format!("{group} ({count})"),
-                    display: format!("Group: {group}"),
+                    title: t!("facet-group-choice", group = group.clone(), count = count),
+                    display: t!("facet-group-display", group = &group),
                     value: Some(group),
                 }),
         );
@@ -180,10 +183,11 @@ impl FacetMenu {
                 disabled_count,
             ),
         ] {
+            let label = status.label();
             choices.push(FacetChoice {
                 id: id.to_string(),
-                title: format!("{} ({count})", status.label()),
-                display: format!("Status: {}", status.label()),
+                title: t!("facet-status-choice", status = label.clone(), count = count),
+                display: t!("facet-status-display", status = label),
                 value: Some(status_value(status)),
             });
         }
@@ -199,10 +203,11 @@ impl FacetMenu {
                     status.matches(row, &delegate.running, &delegate.health, &delegate.crashed)
                 })
                 .count();
+            let label = status.label();
             choices.push(FacetChoice {
                 id: id.to_string(),
-                title: format!("{} ({count})", status.label()),
-                display: format!("Status: {}", status.label()),
+                title: t!("facet-status-choice", status = label.clone(), count = count),
+                display: t!("facet-status-display", status = label),
                 value: Some(status_value(status)),
             });
         }
@@ -219,7 +224,7 @@ impl FacetMenu {
             .into_iter()
             .find(|choice| choice.value == current)
             .map(|choice| choice.display)
-            .unwrap_or_else(|| "All".to_string())
+            .unwrap_or_else(|| t!("facet-all"))
     }
 
     pub(crate) fn apply(

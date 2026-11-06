@@ -52,9 +52,9 @@ impl AppView {
                 Button::new("empty-add")
                     .small()
                     .primary()
-                    .label("+ Add configuration")
-                    .accessibility_label("Add configuration")
-                    .tooltip("Add a proxy configuration (Ctrl-N)")
+                    .label(t!("action-add-config"))
+                    .accessibility_label(t!("action-add-config-accessible"))
+                    .tooltip(t!("action-add-config-tip"))
                     .on_click(move |_, window, cx| {
                         add_view.update(cx, |view, cx| view.open_add_config(window, cx));
                     }),
@@ -62,9 +62,9 @@ impl AppView {
             .child(
                 Button::new("empty-import")
                     .small()
-                    .label("Import")
-                    .accessibility_label("Import")
-                    .tooltip("Import share links or files (Ctrl-O)")
+                    .label(t!("action-import"))
+                    .accessibility_label(t!("action-import"))
+                    .tooltip(t!("toolbar-import-tip"))
                     .on_click(move |_, window, cx| {
                         import_view.update(cx, |view, cx| view.open_import_config(window, cx));
                     }),

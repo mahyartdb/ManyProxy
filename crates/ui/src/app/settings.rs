@@ -38,7 +38,9 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
     ];
 
-    /// The section's name — the column header.
+    /// The section's name — the column header. Test-only: the live header
+    /// reads `settings_section_label`, which can reach the Fluent bundle.
+    #[cfg(test)]
     pub(crate) fn title(self) -> &'static str {
         match self {
             SettingsSection::General => "General",
@@ -112,12 +114,13 @@ fn settings_body_max_height(window: &Window) -> f32 {
 fn settings_row(
     state: &SettingsState,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<String>,
     help: Option<String>,
     muted: Hsla,
     control: impl IntoElement,
 ) -> impl IntoElement {
-    let shown = state.note_row(id, label);
+    let label = label.into();
+    let shown = state.note_row(id, &label);
     div()
         .id(id)
         .flex()
@@ -159,12 +162,13 @@ fn settings_row(
 fn settings_field_row(
     state: &SettingsState,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<String>,
     help: Option<String>,
     muted: Hsla,
     control: impl IntoElement,
 ) -> impl IntoElement {
-    let shown = state.note_row(id, label);
+    let label = label.into();
+    let shown = state.note_row(id, &label);
     div()
         .id(id)
         .flex()
@@ -288,7 +292,7 @@ impl SettingsState {
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
-                    .child(section.title().to_uppercase()),
+                    .child(settings_section_label(section).to_uppercase()),
             )
             .child(Separator::horizontal())
             .into_any_element()
@@ -312,7 +316,7 @@ impl SettingsState {
                         .id("settings-filter")
                         .appearance(false)
                         .cleanable(true)
-                        .aria_label("Filter settings"),
+                        .aria_label(t!("settings-filter-placeholder")),
                 ),
             )
             .child(
@@ -365,7 +369,7 @@ impl SettingsState {
                     .test_support()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No setting matches that — clear the filter to see them all."),
+                    .child(t!("settings-filter-empty")),
             );
         }
         column.into_any_element()
@@ -403,22 +407,19 @@ impl SettingsState {
                     }
                 });
             });
-        for (value, label) in APPEARANCE_CHOICES {
-            let tip = match *value {
-                "system" => "Follow the Windows app theme",
-                "light" => "Light theme",
-                _ => "Dark theme",
-            };
-            group = group.child(Radio::new(*label).label(label.to_string()).tooltip(tip));
+        for (value, _) in APPEARANCE_CHOICES {
+            let label = appearance_choice_label(value);
+            group = group.child(
+                Radio::new(label.clone())
+                    .label(label)
+                    .tooltip(appearance_choice_tip(value)),
+            );
         }
         body = body.child(settings_row(
             self,
             "settings-row-appearance",
-            "Appearance",
-            Some(
-                "System follows the Windows app theme; a change paints at once — no restart."
-                    .to_string(),
-            ),
+            t!("settings-appearance"),
+            Some(t!("settings-appearance-help")),
             muted,
             div()
                 .id("settings-appearance-group")
@@ -449,7 +450,7 @@ impl SettingsState {
                     .id(format!("settings-accent-{}", accent.stored()))
                     .test_support()
                     .role(Role::RadioButton)
-                    .aria_label(format!("{} accent", accent.label()))
+                    .aria_label(t!("settings-accent-aria", accent = accent_label(accent)))
                     .aria_selected(selected)
                     .tab_stop(true)
                     .size(px(22.))
@@ -472,11 +473,8 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-accent",
-            "Accent color",
-            Some(
-                "Tints selection, checked controls, and the focus ring. Health and error colors stay fixed."
-                    .to_string(),
-            ),
+            t!("settings-accent"),
+            Some(t!("settings-accent-help")),
             muted,
             swatches,
         ));
@@ -510,12 +508,12 @@ impl SettingsState {
                             .id("settings-text-size-value")
                             .test_support()
                             .role(Role::Label)
-                            .aria_label(current_size.label())
+                            .aria_label(text_size_label(current_size))
                             .w(px(42.))
                             .flex_shrink_0()
                             .text_right()
                             .text_sm()
-                            .child(current_size.label()),
+                            .child(text_size_label(current_size)),
                     ),
             )
             .child(
@@ -525,18 +523,15 @@ impl SettingsState {
                     .justify_between()
                     .text_xs()
                     .text_color(muted)
-                    .child(TextSize::DEFAULT.label())
-                    .child(TextSize::LARGE.label())
-                    .child(TextSize::from_percent(TextSize::MAX).label()),
+                    .child(text_size_label(TextSize::DEFAULT))
+                    .child(text_size_label(TextSize::LARGE))
+                    .child(text_size_label(TextSize::from_percent(TextSize::MAX))),
             );
         body = body.child(settings_row(
             self,
             "settings-row-text-size",
-            "Text size",
-            Some(
-                "Scales the window's text from 100% to 150%; the library row pitch and the minimum window size stay fixed."
-                    .to_string(),
-            ),
+            t!("settings-text-size"),
+            Some(t!("settings-text-size-help")),
             muted,
             text_size_control,
         ));
@@ -548,15 +543,12 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-autostart",
-            "Launch at login",
-            Some(
-                "Writes an HKCU Run entry for this exe; turning it off removes the entry."
-                    .to_string(),
-            ),
+            t!("settings-launch-at-login"),
+            Some(t!("settings-launch-at-login-help")),
             muted,
             Switch::new("settings-autostart-switch")
                 .checked(autostart_on)
-                .accessibility_label("Launch at login")
+                .accessibility_label(t!("settings-launch-at-login"))
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = autostart_cell.clone();
@@ -578,16 +570,16 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-link-handler",
-            "Handle manyproxy:// links",
+            t!("settings-handle-links"),
             Some(if link_on {
-                "Registered for this exe — manyproxy:// links open in ManyProxy.".to_string()
+                t!("settings-handle-links-on")
             } else {
-                "Not registered — apps have no handler for manyproxy:// links.".to_string()
+                t!("settings-handle-links-off")
             }),
             muted,
             Switch::new("settings-link-handler-switch")
                 .checked(link_on)
-                .accessibility_label("Handle manyproxy:// links")
+                .accessibility_label(t!("settings-handle-links"))
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = link_cell.clone();
@@ -607,12 +599,12 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-restore",
-            "Restore on launch",
-            Some("Relauch the rows that were running when ManyProxy last exited.".to_string()),
+            t!("settings-restore"),
+            Some(t!("settings-restore-help")),
             muted,
             Switch::new("settings-restore-switch")
                 .checked(restore_on)
-                .accessibility_label("Restore on launch")
+                .accessibility_label(t!("settings-restore"))
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = restore_cell.clone();
@@ -658,21 +650,21 @@ impl SettingsState {
                 });
             });
         for action in [CloseAction::Tray, CloseAction::Quit] {
+            let label = close_action_label(action);
             group = group.child(
-                Radio::new(action.label())
-                    .label(action.label().to_string())
-                    .tooltip(action.explanation()),
+                Radio::new(label.clone())
+                    .label(label)
+                    .tooltip(close_action_explanation(action)),
             );
         }
         body = body.child(settings_row(
             self,
             "settings-row-window-behaviour",
-            "Window behaviour",
+            t!("settings-window-behaviour"),
             Some(if tray_on {
-                close_action.explanation().to_string()
+                close_action_explanation(close_action)
             } else {
-                "Show tray icon is off, so closing quits. The saved choice returns when the icon is back."
-                    .to_string()
+                t!("settings-window-behaviour-no-tray")
             }),
             muted,
             group,
@@ -686,18 +678,16 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-show-tray",
-            "Show tray icon",
+            t!("settings-show-tray"),
             Some(if show_tray {
-                "Keeps an icon in the notification area so the window can close while proxies keep running."
-                    .to_string()
+                t!("settings-show-tray-help-on")
             } else {
-                "The icon is hidden, so closing ManyProxy quits. Turn this on to close to the tray again."
-                    .to_string()
+                t!("settings-show-tray-help-off")
             }),
             muted,
             Switch::new("settings-show-tray-switch")
                 .checked(show_tray)
-                .accessibility_label("Show tray icon")
+                .accessibility_label(t!("settings-show-tray"))
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = show_tray_cell.clone();
@@ -734,17 +724,18 @@ impl SettingsState {
                 });
             });
         for choice in WindowCorners::ALL {
+            let label = window_corners_label(choice);
             corner_group = corner_group.child(
-                Radio::new(choice.label())
-                    .label(choice.label().to_string())
-                    .tooltip(choice.explanation()),
+                Radio::new(label.clone())
+                    .label(label)
+                    .tooltip(window_corners_explanation(choice)),
             );
         }
         body = body.child(settings_row(
             self,
             "settings-row-window-corners",
-            "Window corners",
-            Some(corners.explanation().to_string()),
+            t!("settings-window-corners"),
+            Some(window_corners_explanation(corners)),
             muted,
             corner_group,
         ));
@@ -757,15 +748,12 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-notify-from-tray",
-            "Notify from the tray",
-            Some(
-                "Shows a Windows notification for a crash, a failed subscription refresh or a taken port while the window is hidden."
-                    .to_string(),
-            ),
+            t!("settings-notify-from-tray"),
+            Some(t!("settings-notify-from-tray-help")),
             muted,
             Switch::new("settings-notify-from-tray-switch")
                 .checked(notify_on)
-                .accessibility_label("Notify from the tray")
+                .accessibility_label(t!("settings-notify-from-tray"))
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = notify_cell.clone();
@@ -798,31 +786,30 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-test-url",
-            "Test URL",
-            Some(format!(
-                "Probes GET this URL through each endpoint. Default: {DEFAULT_TEST_URL}"
-            )),
+            t!("settings-test-url"),
+            Some(t!("settings-test-url-help", default = DEFAULT_TEST_URL)),
             muted,
             div()
                 .w(px(SETTINGS_CONTROL_WIDTH))
                 .id("field-settings-test-url")
                 .test_support()
-                .child(labelled_input("Test URL", &self.test_url)),
+                .child(labelled_input(t!("settings-test-url"), &self.test_url)),
         ));
 
         body = body.child(settings_row(
             self,
             "settings-row-probe-timeout",
-            "Timeout",
-            Some(format!(
-                "Seconds a single probe may take. Default: {DEFAULT_PROBE_TIMEOUT_SECS}."
+            t!("settings-timeout"),
+            Some(t!(
+                "settings-timeout-help",
+                default = DEFAULT_PROBE_TIMEOUT_SECS
             )),
             muted,
             div()
                 .w(px(SETTINGS_CONTROL_WIDTH))
                 .id("field-settings-probe-timeout")
                 .test_support()
-                .child(labelled_input("Timeout", &self.timeout_input)),
+                .child(labelled_input(t!("settings-timeout"), &self.timeout_input)),
         ));
 
         let scope_cell = self.test_all_scope.clone();
@@ -848,17 +835,18 @@ impl SettingsState {
                 });
             });
         for option in [TestAllScope::Running, TestAllScope::Checked] {
+            let label = test_all_scope_label(option);
             group = group.child(
-                Radio::new(option.label())
-                    .label(option.label().to_string())
-                    .tooltip(option.label()),
+                Radio::new(label.clone())
+                    .label(label.clone())
+                    .tooltip(label),
             );
         }
         body = body.child(settings_row(
             self,
             "settings-row-test-all-scope",
-            "Test all scope",
-            Some("The rows a Test all run covers.".to_string()),
+            t!("settings-test-all-scope"),
+            Some(t!("settings-test-all-scope-help")),
             muted,
             group,
         ));
@@ -876,11 +864,13 @@ impl SettingsState {
             .flex_col()
             .gap_4();
 
-        body = body.child(settings_field_row(self,
+        body = body.child(settings_field_row(
+            self,
             "settings-row-feed-url",
-            "Update feed URL",
-            Some(format!(
-                "A JSON feed of releases; checking only reads it. Default: {UPDATE_FEED_URL_DEFAULT}"
+            t!("settings-update-feed"),
+            Some(t!(
+                "settings-update-feed-help",
+                default = UPDATE_FEED_URL_DEFAULT
             )),
             muted,
             div()
@@ -888,12 +878,12 @@ impl SettingsState {
                 .min_w_0()
                 .id("field-settings-update-feed")
                 .test_support()
-                .child(labelled_input("Update feed URL", &self.feed_url)),
+                .child(labelled_input(t!("settings-update-feed"), &self.feed_url)),
         ));
 
         let last = match *self.last_check.borrow() {
-            Some(at) => format!("Last checked at {}.", format_check_time(at)),
-            None => "Never checked.".to_string(),
+            Some(at) => t!("settings-last-checked-at", time = format_check_time(at)),
+            None => t!("settings-never-checked"),
         };
         // K9: `Check now` is a row action, not a commit. It rides beside the
         // timestamp so the section keeps one commit row: the dialog footer.
@@ -901,7 +891,7 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-last-check",
-            "Last checked",
+            t!("settings-last-checked"),
             None,
             muted,
             div()
@@ -914,8 +904,8 @@ impl SettingsState {
                     Button::new("settings-check-updates")
                         .small()
                         .ghost()
-                        .label("Check now")
-                        .tooltip("Read the update feed now")
+                        .label(t!("settings-check-now"))
+                        .tooltip(t!("settings-check-now-tip"))
                         .on_click(move |_, window, cx| {
                             check_view.update(cx, |view, cx| view.check_for_updates(window, cx));
                         }),
@@ -971,7 +961,7 @@ impl SettingsState {
                             Button::new(format!("settings-engine-details-{name}"))
                                 .small()
                                 .ghost()
-                                .label("Details")
+                                .label(t!("settings-engine-details"))
                                 .tooltip(engine_details_tooltip(name, path.as_deref())),
                         ),
                 ),
@@ -981,42 +971,42 @@ impl SettingsState {
         // F4: the durable "where do I get cores" entry point — the status line
         // names the missing core, this names the source.
         let cores_view = self.view.clone();
-        body = body.child(self.filtered("settings-engine-cores-help-row", "Where do I get cores?",
-            div()
-                .id("settings-engine-cores-help-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
-                    Button::new("settings-engine-cores-help")
-                        .small()
-                        .label("Where do I get cores?")
-                        .tooltip(
-                            "Opens the guide to installing sing-box, sing-box-awg and xray yourself",
-                        )
-                        .on_click(move |_, window, cx| {
-                            cores_view
-                                .update(cx, |view, cx| view.open_cores_help_dialog(window, cx));
-                        }),
-                ),
-        ));
+        body = body.child(
+            self.filtered(
+                "settings-engine-cores-help-row",
+                &t!("settings-cores-help"),
+                div()
+                    .id("settings-engine-cores-help-row")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("settings-engine-cores-help")
+                            .small()
+                            .label(t!("settings-cores-help"))
+                            .tooltip(t!("settings-cores-help-tip"))
+                            .on_click(move |_, window, cx| {
+                                cores_view
+                                    .update(cx, |view, cx| view.open_cores_help_dialog(window, cx));
+                            }),
+                    ),
+            ),
+        );
 
         let auto_restart_cell = self.auto_restart.clone();
         let auto_restart_view = self.view.clone();
         let auto_restart_on = *auto_restart_cell.borrow();
-        body = body.child(settings_row(self,
+        body = body.child(settings_row(
+            self,
             "settings-row-auto-restart",
-            "Restart crashed engines",
-            Some(
-                "On restarts a crashed core with backoff (up to 3 tries) and tells you when it recovers."
-                    .to_string(),
-            ),
+            t!("settings-auto-restart"),
+            Some(t!("settings-auto-restart-help")),
             muted,
             Switch::new("settings-auto-restart-switch")
                 .checked(auto_restart_on)
-                .accessibility_label("Restart crashed engines")
+                .accessibility_label(t!("settings-auto-restart"))
                 .on_change(move |next: &bool, window, cx| {
                     let next = *next;
                     let cell = auto_restart_cell.clone();
@@ -1037,16 +1027,14 @@ impl SettingsState {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(div().child("Bind addresses"))
+                .child(div().child(t!("settings-bind-addresses")))
                 .child(
                     div()
                         .id("settings-addresses-note")
                         .test_support()
                         .text_sm()
                         .text_color(muted)
-                        .child(
-                            "Rows pick their serve address from this list. 127.0.0.1 and 0.0.0.0 are built in.",
-                        ),
+                        .child(t!("settings-bind-addresses-note")),
                 )
                 .child(self.render_bind_hosts(cx))
                 .child(
@@ -1062,16 +1050,15 @@ impl SettingsState {
                                 .id("field-settings-bind-host")
                                 .test_support()
                                 .w(px(SETTINGS_CONTROL_WIDTH))
-                                .child(labelled_input("Bind host", &self.bind_host_input)),
+                                .child(labelled_input(
+                                    t!("settings-bind-host"),
+                                    &self.bind_host_input,
+                                )),
                         )
                         .child(self.render_add_bind_host()),
                 )
                 .child({
-                    let error_text = self
-                        .bind_host_error
-                        .borrow()
-                        .clone()
-                        .unwrap_or_default();
+                    let error_text = self.bind_host_error.borrow().clone().unwrap_or_default();
                     div()
                         .id("settings-bind-host-error")
                         .test_support()
@@ -1115,7 +1102,7 @@ impl SettingsState {
                         .test_support()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("built in"),
+                        .child(t!("settings-built-in")),
                 );
             } else {
                 let remove_view = self.view.clone();
@@ -1125,8 +1112,8 @@ impl SettingsState {
                 host_row = host_row.child(
                     Button::new(format!("settings-bind-host-remove-{host}"))
                         .small()
-                        .label("Remove")
-                        .accessibility_label(format!("Remove {host}"))
+                        .label(t!("settings-remove"))
+                        .accessibility_label(t!("settings-remove-host", host = host.as_str()))
                         .on_click(move |_, window, cx| {
                             let remove_host = remove_host.clone();
                             let remove_cell = remove_cell.clone();
@@ -1146,7 +1133,11 @@ impl SettingsState {
                         }),
                 );
             }
-            list = list.child(self.filtered(&row_id, &format!("Bind address {host}"), host_row));
+            list = list.child(self.filtered(
+                &row_id,
+                &t!("settings-bind-address-filter", host = host.as_str()),
+                host_row,
+            ));
         }
         list.into_any_element()
     }
@@ -1159,7 +1150,7 @@ impl SettingsState {
         let error = self.bind_host_error.clone();
         Button::new("settings-bind-host-add")
             .small()
-            .label("Add address")
+            .label(t!("settings-add-address"))
             .on_click(move |_, window, cx| {
                 let raw = input.read(cx).value().to_string();
                 let input = input.clone();
@@ -1198,13 +1189,13 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-data-folder",
-            "Data folder",
-            Some("Where the library and the logs live.".to_string()),
+            t!("settings-data-folder"),
+            Some(t!("settings-data-folder-help")),
             muted,
             Button::new("settings-open-data-folder")
                 .small()
-                .label("Open")
-                .tooltip(format!("Open {folder}"))
+                .label(t!("settings-open"))
+                .tooltip(t!("settings-open-folder", folder = folder))
                 .on_click(move |_, window, cx| {
                     view.update(cx, |view, cx| view.open_data_folder(window, cx));
                 }),
@@ -1215,12 +1206,12 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-save-logs",
-            "Visible logs",
-            Some("Write the session log to a file.".to_string()),
+            t!("settings-visible-logs"),
+            Some(t!("settings-visible-logs-help")),
             muted,
             Button::new("settings-save-logs")
                 .small()
-                .label("Save logs")
+                .label(t!("settings-save-logs"))
                 .tooltip(logs_path)
                 .on_click(move |_, window, cx| {
                     view.update(cx, |view, cx| view.save_visible_logs(window, cx));
@@ -1230,17 +1221,14 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-log-cap",
-            "Maximum kept log lines",
-            Some("500–50,000 lines; saving rebuilds the ring.".to_string()),
+            t!("settings-log-cap"),
+            Some(t!("settings-log-cap-help")),
             muted,
             div()
                 .w(px(SETTINGS_CONTROL_WIDTH))
                 .id("field-log-cap")
                 .test_support()
-                .child(labelled_input(
-                    "Maximum kept log lines",
-                    &self.log_cap_input,
-                )),
+                .child(labelled_input(t!("settings-log-cap"), &self.log_cap_input)),
         ));
 
         // K9/A7-4: four upkeep ops as one neutral 2×2 grid. The buttons carry
@@ -1253,7 +1241,7 @@ impl SettingsState {
                 .test_support()
                 .text_sm()
                 .text_color(muted)
-                .child("Each action asks before it runs; nothing here is undone by Cancel."),
+                .child(t!("settings-maintenance-note")),
         );
         let mut grid = div()
             .id("settings-maintenance-grid")
@@ -1264,17 +1252,17 @@ impl SettingsState {
         for (id, label, action) in [
             (
                 "settings-clear-traffic",
-                "Clear traffic counters",
+                t!("settings-clear-traffic"),
                 MaintenanceAction::Traffic,
             ),
             (
                 "settings-clear-health",
-                "Clear health snapshots",
+                t!("settings-clear-health"),
                 MaintenanceAction::Health,
             ),
             (
                 "settings-clear-snapshot",
-                "Reset running snapshot",
+                t!("settings-clear-snapshot"),
                 MaintenanceAction::Snapshot,
             ),
         ] {
@@ -1293,7 +1281,7 @@ impl SettingsState {
         grid = grid.child(
             Button::new("settings-reset-library")
                 .small()
-                .label("Reset library")
+                .label(t!("settings-reset-library"))
                 .w_full()
                 .on_click(move |_, window, cx| {
                     view.update(cx, |view, cx| view.open_reset_library_confirm(window, cx));
@@ -1301,7 +1289,7 @@ impl SettingsState {
         );
         body = body.child(self.filtered(
             "settings-maintenance-grid",
-            "Clear traffic counters, clear health snapshots, clear sessions, reset library",
+            &t!("settings-maintenance-filter"),
             grid,
         ));
 
@@ -1324,7 +1312,7 @@ impl SettingsState {
                 .test_support()
                 .text_sm()
                 .text_color(muted)
-                .child("Every key bound in ManyProxy."),
+                .child(t!("settings-shortcuts-note")),
         );
         let mut list = div()
             .id("settings-shortcuts-list")
@@ -1333,6 +1321,7 @@ impl SettingsState {
             .flex_col()
             .gap_1();
         for (action, keys) in SHORTCUT_LINES.iter() {
+            let action = shortcut_action_label(action);
             let id = format!("settings-shortcut-{}", keys.to_lowercase().replace('.', ""));
             let row = div()
                 .id(id.clone())
@@ -1341,7 +1330,7 @@ impl SettingsState {
                 .flex_row()
                 .justify_between()
                 .gap_4()
-                .child(*action)
+                .child(action.clone())
                 .child(div().text_sm().text_color(muted).child(*keys));
             list = list.child(self.filtered(&id, &format!("{action} {keys}"), row));
         }
@@ -1377,17 +1366,23 @@ fn data_folder_text() -> String {
 /// state, no path. The path rides behind `Details` so a long install path is
 /// never truncated mid-directory in the row.
 pub(crate) fn engine_summary(name: &str, ready: bool) -> String {
-    format!("{name} · {}", if ready { "ready" } else { "not found" })
+    if ready {
+        t!("settings-engine-ready", name = name)
+    } else {
+        t!("settings-engine-missing", name = name)
+    }
 }
 
 /// K9/A7-5: the one `Details` tooltip. A resolved engine names its exe; a
 /// missing one states the lookup rule instead of inventing a path.
 pub(crate) fn engine_details_tooltip(name: &str, path: Option<&std::path::Path>) -> String {
     match path {
-        Some(path) => format!("{name}: {}", path.display()),
-        None => format!(
-            "{name} is not beside ManyProxy.exe — engines are read from the app folder only; PATH is never searched."
+        Some(path) => t!(
+            "settings-engine-details-path",
+            name = name,
+            path = path.display().to_string()
         ),
+        None => t!("settings-engine-details-missing", name = name),
     }
 }
 
@@ -1406,7 +1401,10 @@ fn format_check_time(at: i64) -> String {
     let seconds = at.rem_euclid(86_400);
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
-    format!("{hours:02}:{minutes:02} UTC")
+    t!(
+        "settings-check-time",
+        time = format!("{hours:02}:{minutes:02}")
+    )
 }
 
 impl AppView {
@@ -1463,9 +1461,9 @@ impl AppView {
         match crate::tray::set_autostart_enabled(enabled) {
             Ok(()) => {
                 let message = if enabled {
-                    "Autostart on — ManyProxy starts with Windows (HKCU Run entry written)"
+                    t!("autostart-on-toast")
                 } else {
-                    "Autostart off — Run entry removed"
+                    t!("autostart-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1473,7 +1471,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Autostart change failed: {error}")),
+                    Notification::error(t!("autostart-failed", error = error)),
                     cx,
                 );
                 cx.notify();
@@ -1496,9 +1494,9 @@ impl AppView {
         match outcome {
             Ok(()) => {
                 let message = if enabled {
-                    "Link handler on — manyproxy:// links open in ManyProxy"
+                    t!("link-handler-on-toast")
                 } else {
-                    "Link handler off — the manyproxy:// registration was removed"
+                    t!("link-handler-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1506,7 +1504,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Link handler change failed: {error}")),
+                    Notification::error(t!("link-handler-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1524,9 +1522,9 @@ impl AppView {
         match self.store.set_restore_running(enabled) {
             Ok(()) => {
                 let message = if enabled {
-                    "Session restore on — the running set returns on next launch"
+                    t!("session-restore-on-toast")
                 } else {
-                    "Session restore off"
+                    t!("session-restore-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1534,7 +1532,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Restore setting failed: {error}")),
+                    Notification::error(t!("restore-setting-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1581,9 +1579,9 @@ impl AppView {
         {
             Ok(()) => {
                 let message = if enabled {
-                    "Tray notifications on — hidden windows report crashes, failed refreshes and taken ports"
+                    t!("tray-notify-on-toast")
                 } else {
-                    "Tray notifications off — failures stay in the app"
+                    t!("tray-notify-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1591,7 +1589,10 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Tray notification setting failed: {error}")),
+                    Notification::error(t!(
+                        "tray-notification-setting-failed",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
                 cx.notify();
@@ -1613,9 +1614,9 @@ impl AppView {
             Ok(()) => {
                 self.apply_engine_auto_restart();
                 let message = if enabled {
-                    "Auto-restart on — crashed cores restart with backoff (up to 3 tries)"
+                    t!("auto-restart-on-toast")
                 } else {
-                    "Auto-restart off — crashed cores stay down until you restart them"
+                    t!("auto-restart-off-toast")
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1623,7 +1624,10 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Auto-restart setting failed: {error}")),
+                    Notification::error(t!(
+                        "auto-restart-setting-failed",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
                 cx.notify();
@@ -1642,13 +1646,16 @@ impl AppView {
             Ok(()) => {
                 apply_appearance(value, self.store.accent(), Some(window), cx);
                 apply_text_size(self.store.text_size(), cx);
-                window.push_notification(Notification::success(format!("Appearance: {value}")), cx);
+                window.push_notification(
+                    Notification::success(t!("appearance-toast", value = value)),
+                    cx,
+                );
                 cx.notify();
                 true
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Appearance change failed: {error}")),
+                    Notification::error(t!("appearance-change-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1671,7 +1678,7 @@ impl AppView {
                 apply_appearance(&self.store.appearance(), accent, Some(window), cx);
                 apply_text_size(self.store.text_size(), cx);
                 window.push_notification(
-                    Notification::success(format!("Accent: {}", accent.label())),
+                    Notification::success(t!("accent-toast", label = accent_label(accent))),
                     cx,
                 );
                 cx.notify();
@@ -1679,7 +1686,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Accent change failed: {error}")),
+                    Notification::error(t!("accent-change-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1698,7 +1705,7 @@ impl AppView {
             Ok(()) => {
                 apply_text_size(size, cx);
                 window.push_notification(
-                    Notification::success(format!("Text size: {}", size.label())),
+                    Notification::success(t!("text-size-toast", label = text_size_label(size))),
                     cx,
                 );
                 cx.notify();
@@ -1706,7 +1713,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Text size change failed: {error}")),
+                    Notification::error(t!("text-size-change-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1726,10 +1733,8 @@ impl AppView {
         match self.store.set_close_action(action) {
             Ok(()) => {
                 let message = match action {
-                    CloseAction::Tray => {
-                        "Close behaviour: the window closes and the proxies keep running"
-                    }
-                    CloseAction::Quit => "Close behaviour: quitting stops every profile and exits",
+                    CloseAction::Tray => t!("close-behaviour-tray-toast"),
+                    CloseAction::Quit => t!("close-behaviour-quit-toast"),
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1737,7 +1742,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Close behaviour change failed: {error}")),
+                    Notification::error(t!("close-behaviour-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1759,7 +1764,10 @@ impl AppView {
             Ok(()) => {
                 crate::os::window::apply_corner_preference(window, corners);
                 window.push_notification(
-                    Notification::success(format!("Window corners: {}", corners.label())),
+                    Notification::success(t!(
+                        "window-corners-toast",
+                        label = window_corners_label(corners)
+                    )),
                     cx,
                 );
                 cx.notify();
@@ -1767,7 +1775,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Window corners change failed: {error}")),
+                    Notification::error(t!("window-corners-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1790,23 +1798,19 @@ impl AppView {
             Ok(()) => {
                 if show {
                     if self.create_tray(window, cx) {
-                        window.push_notification(Notification::success("Tray icon: shown"), cx);
+                        window.push_notification(Notification::success(t!("tray-icon-shown")), cx);
                     }
                 } else {
                     self.tray = None;
                     if self.store.seen_tray_disable_hint() {
-                        window.push_notification(
-                            Notification::info("Tray icon hidden — closing now quits"),
-                            cx,
-                        );
+                        window
+                            .push_notification(Notification::info(t!("tray-icon-hidden-info")), cx);
                     } else {
                         if let Err(error) = self.store.set_seen_tray_disable_hint(true) {
                             eprintln!("tray disable hint flag failed: {error}");
                         }
                         window.push_notification(
-                            Notification::warning(
-                                "Tray icon hidden — closing ManyProxy now quits. Turn Show tray icon back on to close to the tray again.",
-                            ),
+                            Notification::warning(t!("tray-icon-hidden-warning")),
                             cx,
                         );
                     }
@@ -1816,7 +1820,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Tray icon change failed: {error}")),
+                    Notification::error(t!("tray-icon-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1835,8 +1839,10 @@ impl AppView {
         let trimmed = raw.trim();
         let Ok(secs) = trimmed.parse::<u64>() else {
             window.push_notification(
-                Notification::warning(format!(
-                    "The probe timeout must be a whole number of seconds ({MIN_PROBE_TIMEOUT_SECS}–{MAX_PROBE_TIMEOUT_SECS})"
+                Notification::warning(t!(
+                    "probe-timeout-invalid",
+                    min = MIN_PROBE_TIMEOUT_SECS,
+                    max = MAX_PROBE_TIMEOUT_SECS
                 )),
                 cx,
             );
@@ -1847,7 +1853,7 @@ impl AppView {
                 // T-04: the live prober takes the new budget right away.
                 self.prober = Box::new(RealHealthProber::new(std::time::Duration::from_secs(secs)));
                 window.push_notification(
-                    Notification::success(format!("Probe timeout set to {secs} seconds")),
+                    Notification::success(t!("probe-timeout-set", secs = secs)),
                     cx,
                 );
                 cx.notify();
@@ -1855,7 +1861,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Probe timeout change failed: {error}")),
+                    Notification::error(t!("probe-timeout-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1874,8 +1880,8 @@ impl AppView {
         match self.store.set_test_all_scope(scope) {
             Ok(()) => {
                 let message = match scope {
-                    TestAllScope::Running => "Test all covers every running endpoint",
-                    TestAllScope::Checked => "Test all covers the checked endpoints only",
+                    TestAllScope::Running => t!("test-all-scope-running-toast"),
+                    TestAllScope::Checked => t!("test-all-scope-checked-toast"),
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();
@@ -1883,7 +1889,7 @@ impl AppView {
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Test-all scope change failed: {error}")),
+                    Notification::error(t!("test-all-scope-failed", error = error.to_string())),
                     cx,
                 );
                 cx.notify();
@@ -1904,8 +1910,10 @@ impl AppView {
         match self.store.add_bind_host(raw) {
             Ok(hosts) => {
                 self.refresh_bind_hosts(cx);
-                window
-                    .push_notification(Notification::success(format!("Added {}", raw.trim())), cx);
+                window.push_notification(
+                    Notification::success(t!("bind-host-added", host = raw.trim())),
+                    cx,
+                );
                 Ok(hosts)
             }
             Err(error) => {
@@ -1927,7 +1935,10 @@ impl AppView {
         match self.store.remove_bind_host(host) {
             Ok(hosts) => {
                 self.refresh_bind_hosts(cx);
-                window.push_notification(Notification::success(format!("Removed {host}")), cx);
+                window.push_notification(
+                    Notification::success(t!("bind-host-removed", host = host)),
+                    cx,
+                );
                 Ok(hosts)
             }
             Err(error) => {
@@ -1956,13 +1967,16 @@ impl AppView {
         match open_folder_in_shell(&folder) {
             Ok(()) => {
                 window.push_notification(
-                    Notification::success(format!("Opened {}", folder.display())),
+                    Notification::success(t!(
+                        "data-folder-opened",
+                        path = folder.display().to_string()
+                    )),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot open the data folder: {error}")),
+                    Notification::error(t!("data-folder-failed", error = error.to_string())),
                     cx,
                 );
             }
@@ -1979,10 +1993,7 @@ impl AppView {
     ) {
         let count = self.store.list().map(|rows| rows.len()).unwrap_or(0);
         if count == 0 {
-            window.push_notification(
-                Notification::info("The library is already empty — nothing to reset"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("library-already-empty")), cx);
             return;
         }
         let view = cx.entity();
@@ -1993,13 +2004,11 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Reset library")
+                        .ok_text(t!("settings-reset-ok"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Reset the library?")
-                .description(format!(
-                    "This deletes all {count} configuration(s) from the ManyProxy library. It cannot be undone."
-                ))
+                .title(t!("settings-reset-title"))
+                .description(t!("settings-reset-description", count = count))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_reset_library(window, cx));
                     true
@@ -2019,7 +2028,11 @@ impl AppView {
                 Ok(false) => {}
                 Err(error) => {
                     window.push_notification(
-                        Notification::error(format!("Cannot remove \"{}\": {error}", row.name)),
+                        Notification::error(t!(
+                            "reset-remove-failed",
+                            name = row.name.as_str(),
+                            error = error.to_string()
+                        )),
                         cx,
                     );
                     return;
@@ -2035,9 +2048,7 @@ impl AppView {
         });
         self.reload(window, cx);
         window.push_notification(
-            Notification::success(format!(
-                "Library reset — {removed} configuration(s) removed"
-            )),
+            Notification::success(t!("library-reset-done", count = removed)),
             cx,
         );
         cx.notify();
@@ -2066,10 +2077,7 @@ impl AppView {
         if let Err(error) = self.store.set_seen_tray_hint(true) {
             eprintln!("tray hint flag failed: {error}");
         }
-        window.push_notification(
-            Notification::info("Still running in the tray — right-click the icon to quit."),
-            cx,
-        );
+        window.push_notification(Notification::info(t!("tray-hint")), cx);
         cx.notify();
         true
     }
@@ -2124,33 +2132,35 @@ impl AppView {
         let current_test_url = self.store.test_url().unwrap_or_default();
         let test_url_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("https://…")
+                .placeholder(t!("settings-url-placeholder"))
                 .default_value(current_test_url)
         });
         let current_feed_url = self.store.update_feed_url().unwrap_or_default();
         let feed_url_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("https://…")
+                .placeholder(t!("settings-url-placeholder"))
                 .default_value(current_feed_url)
         });
         let timeout_text = self.store.probe_timeout_secs().to_string();
         let timeout_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("3")
+                .placeholder(t!("settings-timeout-placeholder"))
                 .default_value(timeout_text)
         });
         let cap_text = self.logs.store.cap().to_string();
         let cap_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("500–50,000")
+                .placeholder(t!("settings-log-cap-placeholder"))
                 .default_value(cap_text)
         });
         self.logs.cap_input = Some(cap_state.clone());
-        let bind_host_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20 or fd00::7"));
+        let bind_host_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("settings-bind-host-placeholder"))
+        });
         // B17: the spine's filter. It commits nothing — it narrows the column
         // while it is typed and leaves every stored value alone.
-        let filter_state = cx.new(|cx| InputState::new(window, cx).placeholder("Filter settings"));
+        let filter_state =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("settings-filter-placeholder")));
 
         // T-04/K9: Enter commits a text field; the dialog's one footer `Save`
         // commits the same value. A field never commits on blur.
@@ -2325,7 +2335,7 @@ impl AppView {
             let band = state.render_filter_band(cx);
             let body_max_height = settings_body_max_height(window);
             dialog
-                .title("Settings")
+                .title(t!("settings-dialog-title"))
                 .w(px(SETTINGS_DIALOG_WIDTH))
                 .child(
                     div()
@@ -2357,13 +2367,13 @@ impl AppView {
                                 .items_center()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Esc cancels without saving"),
+                                .child(t!("settings-footer-esc")),
                         )
                         .child(
                             Button::new("settings-dialog-cancel")
                                 .small()
-                                .label("Cancel")
-                                .tooltip("Close without saving (Esc)")
+                                .label(t!("dialog-cancel"))
+                                .tooltip(t!("settings-cancel-tooltip"))
                                 .on_click(|_, window, cx| {
                                     window.close_all_dialogs(cx);
                                     reclaim_shell_focus(window, cx);
@@ -2373,8 +2383,8 @@ impl AppView {
                             Button::new("settings-dialog-save")
                                 .small()
                                 .primary()
-                                .label("Save")
-                                .tooltip("Save the text fields and close")
+                                .label(t!("dialog-save"))
+                                .tooltip(t!("settings-save-tooltip"))
                                 .on_click(move |_, window, cx| {
                                     let draft = SettingsTextDraft {
                                         test_url: save_test_url.read(cx).value().to_string(),
@@ -2424,11 +2434,11 @@ fn open_folder_in_shell(folder: &std::path::Path) -> Result<(), String> {
     if instance > 32 {
         Ok(())
     } else {
-        Err(format!("the shell refused to open the folder ({instance})"))
+        Err(t!("shell-refused-folder", instance = instance))
     }
 }
 
 #[cfg(not(windows))]
 fn open_folder_in_shell(_folder: &std::path::Path) -> Result<(), String> {
-    Err("opening the data folder is not supported on this platform".to_string())
+    Err(t!("folder-open-unsupported"))
 }

@@ -19,16 +19,16 @@ impl AppView {
                 self.health_store.set_data_traffic(id, 0, 0);
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!("Reset traffic for \"{name}\"")),
+                    Notification::success(t!("reset-traffic-toast", name = name)),
                     cx,
                 );
             }
             Err(StoreError::NotFound(_)) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot reset traffic: {error}")),
+                    Notification::error(t!("cannot-reset-traffic", error = error.to_string())),
                     cx,
                 );
             }
@@ -41,13 +41,13 @@ impl AppView {
                 self.traffic_last_seen.clear();
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!("Cleared traffic for {count} row(s)")),
+                    Notification::success(t!("cleared-traffic-toast", count = count)),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot clear traffic: {error}")),
+                    Notification::error(t!("cannot-clear-traffic", error = error.to_string())),
                     cx,
                 );
             }
@@ -59,13 +59,13 @@ impl AppView {
             Ok(count) => {
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(format!("Cleared {count} health snapshot(s)")),
+                    Notification::success(t!("cleared-health-toast", count = count)),
                     cx,
                 );
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot clear health: {error}")),
+                    Notification::error(t!("cannot-clear-health", error = error.to_string())),
                     cx,
                 );
             }
@@ -76,14 +76,11 @@ impl AppView {
         match self.store.clear_running_snapshot() {
             Ok(()) => {
                 self.last_snapshot = Vec::new();
-                window.push_notification(
-                    Notification::success("Running snapshot cleared — next launch starts clean"),
-                    cx,
-                );
+                window.push_notification(Notification::success(t!("snapshot-cleared-toast")), cx);
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot clear snapshot: {error}")),
+                    Notification::error(t!("cannot-clear-snapshot", error = error.to_string())),
                     cx,
                 );
             }
@@ -108,7 +105,7 @@ impl AppView {
 
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
-            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
+            window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
             return;
         };
         let was_running = self.engine.is_running(id);
@@ -122,16 +119,17 @@ impl AppView {
                     let message = if was_running {
                         already_running_message(&config.name)
                     } else {
-                        format!("Started \"{}\"", config.name)
+                        t!("started-row-toast", name = config.name.as_str())
                     };
                     window.push_notification(Notification::success(message), cx);
                 }
                 Err(error) => {
                     self.reload(window, cx);
                     window.push_notification(
-                        Notification::error(format!(
-                            "Started \"{}\" but could not save its flag: {error}",
-                            config.name
+                        Notification::error(t!(
+                            "started-flag-failed",
+                            name = config.name.as_str(),
+                            error = error.to_string()
                         )),
                         cx,
                     );
@@ -142,7 +140,7 @@ impl AppView {
                 if is_port_bind_error(&error) {
                     self.os_notify(
                         crate::os::notify::NoticeKind::PortConflict,
-                        "Cannot bind the endpoint",
+                        &t!("cannot-bind-endpoint"),
                         &text,
                     );
                 }
@@ -171,7 +169,7 @@ impl AppView {
         if rows.iter().all(|row| self.engine.is_running(&row.id)) {
             self.start_in_flight = false;
             window.push_notification(
-                Notification::info(format!("All {} endpoint(s) already running", rows.len())),
+                Notification::info(t!("all-already-running", count = rows.len())),
                 cx,
             );
             return;
@@ -179,7 +177,7 @@ impl AppView {
 
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
-            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
+            window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
             return;
         }
         match self.engine.start_all_confirmed(&rows) {
@@ -204,9 +202,11 @@ impl AppView {
                     );
                 } else {
                     window.push_notification(
-                        Notification::error(format!(
-                            "Started {} endpoint(s) but {flag_errors} flag(s) failed to save: {first_error}",
-                            rows.len()
+                        Notification::error(t!(
+                            "start-flag-failed",
+                            count = rows.len(),
+                            errors = flag_errors,
+                            error = first_error.as_str()
                         )),
                         cx,
                     );
@@ -216,7 +216,7 @@ impl AppView {
                 if is_port_bind_error(&fast_error) {
                     self.os_notify(
                         crate::os::notify::NoticeKind::PortConflict,
-                        "Cannot bind an endpoint",
+                        &t!("cannot-bind-an-endpoint"),
                         &redact_secrets(&fast_error.to_string()),
                     );
                 }
@@ -274,9 +274,11 @@ impl AppView {
                 self.start_in_flight = false;
                 if flag_errors > 0 {
                     window.push_notification(
-                        Notification::error(format!(
-                            "Started {} endpoint(s) but {flag_errors} flag(s) failed to save: {first_error}",
-                            started.len()
+                        Notification::error(t!(
+                            "start-flag-failed",
+                            count = started.len(),
+                            errors = flag_errors,
+                            error = first_error.as_str()
                         )),
                         cx,
                     );
@@ -301,7 +303,7 @@ impl AppView {
         if let Some(error) = stop_error {
             self.reload(window, cx);
             window.push_notification(
-                Notification::error(format!("Stop-all failed: {}", redact_secrets(&error))),
+                Notification::error(t!("stop-all-failed", error = redact_secrets(&error))),
                 cx,
             );
             return;
@@ -322,8 +324,10 @@ impl AppView {
                 self.reload(window, cx);
                 if flag_errors > 0 {
                     window.push_notification(
-                        Notification::error(format!(
-                            "Stopped all endpoints but {flag_errors} flag(s) failed to save: {first_error}"
+                        Notification::error(t!(
+                            "stop-all-flag-failed",
+                            errors = flag_errors,
+                            error = first_error.as_str()
                         )),
                         cx,
                     );

@@ -40,7 +40,6 @@ Ratified never-builds. Do not ticket them, do not build them, and do not present
 - Front and landing per-group chain hops.
 - QR screen scan. The typed refusal stays.
 - Per-app process dashboard. The stock clash API has no process attribution, and faking it is banned.
-- i18n and language packs.
 - Installers. ZIP only.
 - Scheduler-task autostart. HKCU Run stays the only autostart.
 - System proxy, TUN, DNS hijack, and insecure fake-IP machinery.
@@ -52,7 +51,7 @@ Ratified never-builds. Do not ticket them, do not build them, and do not present
 - A `running.marker` file.
 - Consolidating on Mihomo.
 
-Parked candidates, each needs its own decision before work starts: a Download Profiles country menu, remote-preset auto-update with per-preset `last_update` stamps, a traffic hour-bucket history database, a beta-channel update setting, and a QR share-link variant behind the Share confirm.
+Parked candidates, each needs its own decision before work starts: a language picker plus the first translated locale (the Fluent catalog and English extraction have landed; a translation is now pure `.ftl` authoring plus a Settings row), a Download Profiles country menu, remote-preset auto-update with per-preset `last_update` stamps, a traffic hour-bucket history database, a beta-channel update setting, and a QR share-link variant behind the Share confirm.
 
 Parked with a written decision (B10): a signed in-app update download. An honest version is a detached Ed25519 signature over the artifact with the public key compiled in, verified before the published hash, refusing a tampered file with the signer's fingerprint in the message, and rotating keys without a new binary. It cannot land as written: it overturns two ratified rules on this page — "no auto-update replacing binaries" and "Installers. ZIP only" — and the rotation requirement forces a user-visible trust root that does not exist yet (a data-folder trusted-keys file, a Settings row for it, and a refuse-an-unknown-signer flow), which is a policy decision, not a dependency choice. Reviving it needs the owner to overturn those two rules and ratify the trust root first; the shape to build is recorded here so the analysis is not lost. The updater stays check-only: a JSON feed read, a newer release opened in the user's own browser, no asset fetched and nothing executed.
 

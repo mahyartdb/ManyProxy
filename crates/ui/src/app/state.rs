@@ -307,6 +307,10 @@ impl AppView {
         fallback: Option<WriteFallback>,
     ) -> Self {
         let mut store = store;
+        // The locale seam is reserved for a future language picker. Reading it
+        // before the first copy is built keeps this session's strings coherent.
+        let locale_override = store.get_meta(crate::i18n::LOCALE_META_KEY).ok().flatten();
+        crate::i18n::set_locale(&crate::i18n::resolve_locale(locale_override.as_deref()));
         // T-34: read the previous session's verdict first, then assume this
         // session is dirty. The write lands before any restore logic, so a
         // kill/crash leaves "0" (unclean) for the next boot.
@@ -329,7 +333,7 @@ impl AppView {
         let last_query = store.library_last_query().unwrap_or_default();
         let search_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(SEARCH_PLACEHOLDER)
+                .placeholder(crate::search_placeholder())
                 .default_value(last_query.clone())
         });
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
@@ -560,9 +564,7 @@ impl AppView {
             .delegate()
             .upstream_for(&config.id)
             .map(str::to_string)
-            .unwrap_or_else(|| {
-                upstream_host_port(config).unwrap_or_else(|| "no upstream".to_string())
-            })
+            .unwrap_or_else(|| upstream_host_port(config).unwrap_or_else(|| t!("no-upstream")))
     }
 
     /// T-08: one probe, one state write. Returns true when the standing
@@ -599,7 +601,10 @@ impl AppView {
             cx.notify();
             return;
         }
-        window.push_notification(Notification::error(format!("Cannot save: {error}")), cx);
+        window.push_notification(
+            Notification::error(t!("cannot-save", error = error.to_string())),
+            cx,
+        );
     }
 
     pub(crate) fn list_or_notify(
@@ -637,10 +642,7 @@ impl AppView {
     ) {
         let current = params.read(cx).value().to_string();
         if current.trim().is_empty() {
-            window.push_notification(
-                Notification::info("Params are blank — the protocol default applies"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("params-blank-info")), cx);
             return;
         }
         match format_params_json(&current) {
@@ -668,11 +670,13 @@ impl AppView {
             state.set_value(template, window, cx);
         });
         let shown = name.trim();
+        let template_name = if shown.is_empty() {
+            t!("template-default")
+        } else {
+            shown.to_string()
+        };
         window.push_notification(
-            Notification::info(format!(
-                "Loaded {} template — fill the blank fields",
-                if shown.is_empty() { "default" } else { shown }
-            )),
+            Notification::info(t!("loaded-template", name = template_name)),
             cx,
         );
     }
@@ -701,9 +705,9 @@ impl AppView {
         }
         window.push_notification(
             Notification::success(if current.trim().is_empty() {
-                "Params blank — the protocol default applies"
+                t!("params-blank-success")
             } else {
-                "Params are valid JSON"
+                t!("params-valid-json")
             }),
             cx,
         );
@@ -724,13 +728,13 @@ impl AppView {
         if self.engine.auto_restart_due(now) {
             self.engine.note_auto_restart_attempt(now);
             let notification = match self.engine.restart_crashed() {
-                Ok(()) => Notification::success(format!(
-                    "Engine recovered ({})",
-                    detail.unwrap_or_else(|| "crashed cores restarted".to_string())
+                Ok(()) => Notification::success(t!(
+                    "engine-recovered",
+                    detail = detail.unwrap_or_else(|| t!("engine-recovered-fallback"))
                 )),
-                Err(error) => Notification::error(format!(
-                    "Engine auto-restart failed: {}",
-                    redact_secrets(&error.to_string())
+                Err(error) => Notification::error(t!(
+                    "engine-autorestart-failed",
+                    error = redact_secrets(&error.to_string())
                 )),
             };
             self.engine.clear_pending_crash();
@@ -741,7 +745,7 @@ impl AppView {
         let text = crash_notification_text(&detail);
         self.os_notify(
             crate::os::notify::NoticeKind::EngineCrash,
-            "Engine crashed",
+            &t!("engine-crashed-title"),
             &redact_secrets(&text),
         );
         Some(Notification::error(text))
@@ -876,7 +880,7 @@ impl AppView {
     /// besides this one JSON read).
     pub(crate) fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.update_check_in_flight {
-            window.push_notification(Notification::info("An update check is already running"), cx);
+            window.push_notification(Notification::info(t!("update-check-running")), cx);
             return;
         }
         let configured = self
@@ -1132,7 +1136,7 @@ impl AppView {
                                     let retry_group = retry_group.clone();
                                     summary = summary.action(
                                         "toast-retry-test",
-                                        "Retry",
+                                        t!("toast-action-retry"),
                                         move |window, cx| {
                                             let _ = retry_view.update(cx, |view, cx| {
                                                 view.retry_group_probe(&retry_group, window, cx);
@@ -1237,7 +1241,11 @@ impl AppView {
         let kept: Vec<String> = ["running", "editing", "in-flight batch"]
             .iter()
             .filter(|reason| reasons_seen.contains(**reason))
-            .map(|reason| (*reason).to_string())
+            .map(|reason| match *reason {
+                "running" => t!("kept-reason-running"),
+                "editing" => t!("kept-reason-editing"),
+                _ => t!("kept-reason-in-flight-batch"),
+            })
             .collect();
         if removed == 0 && kept.is_empty() {
             return None;
@@ -1260,18 +1268,18 @@ impl AppView {
 
     pub(crate) fn ping_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
-            window.push_notification(Notification::warning("Already removed"), cx);
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
         if !self.engine.running_ids().contains(&config.id) {
             window.push_notification(
-                Notification::warning(format!("\"{}\" is not running", config.name)),
+                Notification::warning(t!("row-not-running", name = config.name)),
                 cx,
             );
             return;
         }
         if self.probe_kind_in_flight(true) {
-            window.push_notification(Notification::info("A health test is already running"), cx);
+            window.push_notification(Notification::info(t!("health-test-running")), cx);
             return;
         }
         self.spawn_probe(vec![config], true, false, None, cx);
@@ -1303,7 +1311,7 @@ impl AppView {
             .filter(|row| running.contains(&row.id))
             .collect();
         if rows.is_empty() {
-            window.push_notification(Notification::warning("No running endpoints to test"), cx);
+            window.push_notification(Notification::warning(t!("no-running-endpoints")), cx);
             return;
         }
         self.spawn_probe(rows, ping, true, Some(window.window_handle()), cx);
@@ -1318,15 +1326,13 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if self.group_test_in_flight {
-            window.push_notification(Notification::info("A group test is already running"), cx);
+            window.push_notification(Notification::info(t!("group-test-running")), cx);
             return;
         }
         let rows = self.group_running_rows(group);
         if rows.is_empty() {
             window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no running endpoints to test"
-                )),
+                Notification::info(t!("group-no-running-endpoints", group = group)),
                 cx,
             );
             return;
@@ -1459,12 +1465,16 @@ impl AppView {
                     if !failed_ids.is_empty() {
                         let retry_ids = if count == 1 { ids.clone() } else { failed_ids };
                         let retry_view = view.downgrade();
-                        spec = spec.action("toast-retry-test", "Retry", move |window, cx| {
-                            let retry_ids = retry_ids.clone();
-                            let _ = retry_view.update(cx, |view, cx| {
-                                view.retry_probe(retry_ids, toast_ping, window, cx);
-                            });
-                        });
+                        spec = spec.action(
+                            "toast-retry-test",
+                            t!("toast-action-retry"),
+                            move |window, cx| {
+                                let retry_ids = retry_ids.clone();
+                                let _ = retry_view.update(cx, |view, cx| {
+                                    view.retry_probe(retry_ids, toast_ping, window, cx);
+                                });
+                            },
+                        );
                     }
                     if let Some(handle) = window {
                         if handle
@@ -1617,7 +1627,7 @@ impl AppView {
         });
         if let Err(error) = self.store.set_library_columns(&columns.display()) {
             window.push_notification(
-                Notification::error(format!("Could not save column choice: {error}")),
+                Notification::error(t!("row-columns-save-failed", error = error.to_string())),
                 cx,
             );
         }
@@ -1728,17 +1738,14 @@ impl AppView {
             .find(|entry| entry.id == picked_id)
             .cloned();
         let Some(entry) = entry else {
-            window.push_notification(
-                Notification::warning("Pick a library row first — hops reference rows by id"),
-                cx,
-            );
+            window.push_notification(Notification::warning(t!("pick-library-row-first")), cx);
             return false;
         };
         let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
         if let Some(rule) =
             chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), kinds.len(), false)
         {
-            window.push_notification(Notification::warning(rule), cx);
+            window.push_notification(Notification::warning(chain_hop_rejection_message(rule)), cx);
             return false;
         }
         hops.borrow_mut()
@@ -1747,7 +1754,7 @@ impl AppView {
             state.set_selected_value(&String::new(), window, cx);
         });
         window.push_notification(
-            Notification::success(format!("Added {} to the chain", entry.name)),
+            Notification::success(t!("chain-hop-added", name = entry.name)),
             cx,
         );
         true
@@ -1771,17 +1778,14 @@ impl AppView {
             .find(|entry| entry.id == picked_id)
             .cloned();
         let Some(entry) = entry else {
-            window.push_notification(
-                Notification::warning("Pick a library row first — hops reference rows by id"),
-                cx,
-            );
+            window.push_notification(Notification::warning(t!("pick-library-row-first")), cx);
             return false;
         };
         let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
         if let Some(rule) =
             chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), index, true)
         {
-            window.push_notification(Notification::warning(rule), cx);
+            window.push_notification(Notification::warning(chain_hop_rejection_message(rule)), cx);
             return false;
         }
         hops.borrow_mut()[index] = serde_json::Value::String(entry.id.clone());
@@ -1789,7 +1793,11 @@ impl AppView {
             state.set_selected_value(&String::new(), window, cx);
         });
         window.push_notification(
-            Notification::success(format!("Replaced hop {} with {}", index + 1, entry.name)),
+            Notification::success(t!(
+                "chain-hop-replaced",
+                index = index + 1,
+                name = entry.name
+            )),
             cx,
         );
         true
@@ -1972,15 +1980,19 @@ impl AppView {
             let notice = if failed > 0 {
                 self.os_notify(
                     crate::os::notify::NoticeKind::SubscriptionFailure,
-                    "Subscription refresh failed",
-                    "A subscription could not be refreshed. Open Subscriptions for details.",
+                    &t!("subscription-refresh-failed-title"),
+                    &t!("subscription-refresh-failed-body"),
                 );
                 let view = cx.entity().downgrade();
-                notice.action("toast-show-subscriptions", "Show", move |window, cx| {
-                    let _ = view.update(cx, |view, cx| {
-                        view.open_subscriptions_dialog(window, cx);
-                    });
-                })
+                notice.action(
+                    "toast-show-subscriptions",
+                    t!("toast-action-show"),
+                    move |window, cx| {
+                        let _ = view.update(cx, |view, cx| {
+                            view.open_subscriptions_dialog(window, cx);
+                        });
+                    },
+                )
             } else {
                 notice
             };
@@ -2000,21 +2012,22 @@ impl AppView {
         let started = match self.store.get_subscription(sub_id) {
             Ok(Some(sub)) => self.start_subscription_refresh(sub, true, cx),
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 false
             }
             Err(error) => {
                 let view = cx.entity().downgrade();
                 self.push_toast(
-                    ToastSpec::error(format!("Cannot refresh subscription: {error}")).action(
-                        "toast-show-subscriptions",
-                        "Show",
-                        move |window, cx| {
-                            let _ = view.update(cx, |view, cx| {
-                                view.open_subscriptions_dialog(window, cx);
-                            });
-                        },
-                    ),
+                    ToastSpec::error(t!("cannot-refresh-subscription", error = error.to_string()))
+                        .action(
+                            "toast-show-subscriptions",
+                            t!("toast-action-show"),
+                            move |window, cx| {
+                                let _ = view.update(cx, |view, cx| {
+                                    view.open_subscriptions_dialog(window, cx);
+                                });
+                            },
+                        ),
                     window,
                     cx,
                 );
@@ -2036,7 +2049,7 @@ impl AppView {
     /// so the list learns it is waiting from one place and never has to read
     /// the app's in-flight set while a frame is borrowing it.
     pub(crate) fn mark_library_loading(&mut self, cx: &mut App) {
-        let load = LibraryLoad::Loading("Fetching subscriptions…".to_string());
+        let load = LibraryLoad::Loading(t!("library-loading-subscriptions"));
         self.libraries.update(cx, |state, cx| {
             if state.delegate_mut().set_load(load) {
                 cx.notify();
@@ -2080,7 +2093,12 @@ impl AppView {
             Ok(map) => {
                 self.engine.set_preset_rules(map);
             }
-            Err(error) => return Err(format!("cannot load routing presets: {error}")),
+            Err(error) => {
+                return Err(t!(
+                    "cannot-load-routing-presets-lower",
+                    error = error.to_string()
+                ))
+            }
         }
         self.sync_rule_sets_to_engine()
     }
@@ -2128,9 +2146,9 @@ impl AppView {
                         Ok(preset) => {
                             self.reload(window, cx);
                             window.push_notification(
-                                Notification::success(format!(
-                                    "Routing preset \"{}\" added — fetching rules",
-                                    preset.name
+                                Notification::success(t!(
+                                    "routing-preset-added-fetching",
+                                    name = preset.name.as_str()
                                 )),
                                 cx,
                             );
@@ -2201,22 +2219,20 @@ impl AppView {
                 continue;
             }
             let parsed = crate::preset::parse_simple_rules(r#box, r#box.action(), text);
-            invalid.extend(
-                parsed
-                    .invalid
-                    .into_iter()
-                    .map(|line| format!("{} box: {}", r#box.label(), line)),
-            );
+            invalid.extend(parsed.invalid.into_iter().map(|line| {
+                t!(
+                    "simple-box-invalid-line",
+                    box_name = simple_rules_box_label(r#box),
+                    line = line
+                )
+            }));
             rules.extend(parsed.rules);
         }
         if invalid.is_empty() {
             return Ok(rules);
         }
         window.push_notification(
-            Notification::error(format!(
-                "Invalid simple-rules lines block saving — fix or remove them (shown under \"Invalid lines\"): {}",
-                invalid.join(" | ")
-            )),
+            Notification::error(t!("invalid-simple-rules", lines = invalid.join(" | "))),
             cx,
         );
         Err(())
@@ -2245,7 +2261,7 @@ impl AppView {
         match op {
             PresetRulesOp::CycleAction(index) => {
                 let Some(rule) = parsed.get_mut(*index) else {
-                    window.push_notification(Notification::warning("Already removed"), cx);
+                    window.push_notification(Notification::warning(t!("already-removed")), cx);
                     return;
                 };
                 let current = rule
@@ -2264,7 +2280,7 @@ impl AppView {
             }
             PresetRulesOp::Remove(index) => {
                 if *index >= parsed.len() {
-                    window.push_notification(Notification::warning("Already removed"), cx);
+                    window.push_notification(Notification::warning(t!("already-removed")), cx);
                     return;
                 }
                 parsed.remove(*index);
@@ -2298,7 +2314,7 @@ impl AppView {
             Ok(Some(preset)) => {
                 if preset.source != "url" || preset.source_url.is_none() {
                     window.push_notification(
-                        Notification::warning("Only URL presets can refresh"),
+                        Notification::warning(t!("only-url-presets-refresh")),
                         cx,
                     );
                     return false;
@@ -2307,12 +2323,15 @@ impl AppView {
                 true
             }
             Ok(None) => {
-                window.push_notification(Notification::warning("Already removed"), cx);
+                window.push_notification(Notification::warning(t!("already-removed")), cx);
                 false
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Cannot refresh routing preset: {error}")),
+                    Notification::error(t!(
+                        "cannot-refresh-routing-preset",
+                        error = error.to_string()
+                    )),
                     cx,
                 );
                 false
@@ -2327,7 +2346,7 @@ impl AppView {
         let files: HashMap<String, PathBuf> = self
             .store
             .list_rule_sets()
-            .map_err(|error| format!("cannot load rule sets: {error}"))?
+            .map_err(|error| t!("cannot-load-rule-sets-lower", error = error.to_string()))?
             .into_iter()
             .map(|row| (row.name, dir.join(row.file_name)))
             .collect();
@@ -2384,10 +2403,7 @@ impl AppView {
     pub(crate) fn refresh_all_due(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let due = self.due_for_manual_refresh();
         if due.is_empty() {
-            window.push_notification(
-                Notification::success("No subscriptions due for refresh"),
-                cx,
-            );
+            window.push_notification(Notification::success(t!("no-subs-due")), cx);
             return 0;
         }
         let ids: Vec<String> = due.iter().map(|sub| sub.id.clone()).collect();
@@ -2411,10 +2427,7 @@ impl AppView {
 
     pub(crate) fn update_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
-            window.push_notification(
-                Notification::info("No group in focus — select a row or filter by group"),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("no-group-focus")), cx);
             return;
         };
         let subs = self
@@ -2423,12 +2436,7 @@ impl AppView {
             .map(|subs| update_target_subs(&subs, &group))
             .unwrap_or_default();
         if subs.is_empty() {
-            window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no subscriptions — nothing to update"
-                )),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("group-no-subs", group = group)), cx);
             return;
         }
         self.start_explicit_refresh(subs, window, cx);
@@ -2446,12 +2454,7 @@ impl AppView {
             .map(|subs| update_target_subs(&subs, group))
             .unwrap_or_default();
         if subs.is_empty() {
-            window.push_notification(
-                Notification::info(format!(
-                    "Group \"{group}\" has no subscriptions — nothing to update"
-                )),
-                cx,
-            );
+            window.push_notification(Notification::info(t!("group-no-subs", group = group)), cx);
             return;
         }
         self.start_explicit_refresh(subs, window, cx);
@@ -2520,14 +2523,14 @@ impl AppView {
     pub(crate) fn usage_line(&self, config_id: &str) -> String {
         match self.store.traffic_totals() {
             Ok(totals) => match totals.get(config_id) {
-                Some((rx, tx)) => format!(
-                    "usage down {} · up {}",
-                    format_bytes(*rx),
-                    format_bytes(*tx)
+                Some((rx, tx)) => t!(
+                    "usage-line",
+                    down = format_bytes(*rx),
+                    up = format_bytes(*tx)
                 ),
-                None => "usage unavailable".to_string(),
+                None => t!("stats-usage-unavailable"),
             },
-            Err(_) => "usage unavailable".to_string(),
+            Err(_) => t!("stats-usage-unavailable"),
         }
     }
 
@@ -2544,7 +2547,11 @@ impl AppView {
         let since = now_unix().saturating_sub(90 * 86_400);
         let entries = match self.store.load_health_history(config_id, Some(since)) {
             Ok(entries) => entries,
-            Err(_) => return div().child("history unavailable").into_any_element(),
+            Err(_) => {
+                return div()
+                    .child(t!("detail-history-unavailable"))
+                    .into_any_element()
+            }
         };
         let latencies = url_test_sparkline(&entries, 120);
         let caption_tone = sparkline_caption_tone(&entries);
@@ -2556,8 +2563,8 @@ impl AppView {
                 .min_w_0()
                 .text_color(health_tone_color(caption_tone, cx.theme()))
                 .child(match latencies.len() {
-                    1 => format!("1 probe recorded — no trend yet ({})", latencies[0]),
-                    _ => "no health history yet — press Test to record a probe".to_string(),
+                    1 => t!("detail-history-one", latency = latencies[0]),
+                    _ => t!("detail-history-none"),
                 })
                 .into_any_element();
         }
@@ -2574,7 +2581,11 @@ impl AppView {
             .child(
                 div()
                     .text_color(health_tone_color(caption_tone, cx.theme()))
-                    .child(format!("{} samples · latest {}ms", latencies.len(), latest)),
+                    .child(t!(
+                        "detail-history-samples",
+                        count = latencies.len(),
+                        latest = latest
+                    )),
             )
             .child(Self::latency_sparkline(&latencies))
             .into_any_element()
@@ -2687,7 +2698,7 @@ impl AppView {
             let next = (*width as i32 + delta).clamp(40, 600) as u32;
             if let Err(error) = self.store.set_conn_column_width(index, next) {
                 window.push_notification(
-                    Notification::error(format!("Column width failed: {error}")),
+                    Notification::error(t!("column-width-failed", error = error.to_string())),
                     cx,
                 );
                 return;
@@ -2703,15 +2714,12 @@ impl AppView {
     ) {
         match self.store.reset_conn_column_widths() {
             Ok(()) => {
-                window.push_notification(
-                    Notification::success("Column widths reset to defaults"),
-                    cx,
-                );
+                window.push_notification(Notification::success(t!("column-widths-reset")), cx);
                 cx.notify();
             }
             Err(error) => {
                 window.push_notification(
-                    Notification::error(format!("Column width reset failed: {error}")),
+                    Notification::error(t!("column-width-reset-failed", error = error.to_string())),
                     cx,
                 );
             }
