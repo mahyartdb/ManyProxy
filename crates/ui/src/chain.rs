@@ -9,7 +9,7 @@ pub struct ChainLibraryEntry {
 
 pub fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
     let mut owned: Vec<(String, String)> = Vec::with_capacity(library.len() + 1);
-    owned.push((String::new(), "Select a row…".to_string()));
+    owned.push((String::new(), t!("chain-hop-select")));
     for entry in library {
         owned.push((
             entry.id.clone(),
@@ -82,9 +82,13 @@ pub fn chain_hop_label(
                 .map(str::trim)
                 .filter(|marker| !marker.is_empty())
                 .unwrap_or("outbound");
-            format!("{}. {marker} (inline)", index + 1)
+            t!(
+                "chain-hop-inline",
+                index = (index + 1) as i64,
+                marker = marker
+            )
         }
-        _ => format!("{}. hop", index + 1),
+        _ => t!("chain-hop-plain", index = (index + 1) as i64),
     }
 }
 

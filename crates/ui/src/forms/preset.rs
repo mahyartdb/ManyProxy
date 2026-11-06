@@ -39,26 +39,27 @@ impl PresetForm {
             name: cx.new(|cx| InputState::new(window, cx).default_value(name.to_string())),
             rules: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("Optional rules JSON (preset object or rules array)")
+                    .placeholder(t!("preset-rules-placeholder"))
                     .default_value(rules.to_string())
             }),
             simple_direct: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("domain:example.com, suffix:cn — one rule per line")
+                    .placeholder(t!("preset-direct-placeholder"))
                     .default_value(boxes.direct.clone())
             }),
             simple_block: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("keyword:ads, processName:updater.exe")
+                    .placeholder(t!("preset-block-placeholder"))
                     .default_value(boxes.block.clone())
             }),
             simple_proxy: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("ruleset:streaming, domain:netflix.com")
+                    .placeholder(t!("preset-proxy-placeholder"))
                     .default_value(boxes.proxy.clone())
             }),
-            remote_url: cx
-                .new(|cx| InputState::new(window, cx).placeholder("https://host.example/set.srs")),
+            remote_url: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t!("preset-remote-url-placeholder"))
+            }),
         }
     }
 
@@ -80,8 +81,9 @@ impl PresetForm {
             (SimpleRulesBox::Block, &self.simple_block),
             (SimpleRulesBox::Proxy, &self.simple_proxy),
         ] {
-            let tip = format!("One rule per line — e.g. {}", example(r#box));
+            let tip = t!("preset-simple-tip", example = example(r#box));
             let action = r#box.action();
+            let label = simple_rules_box_label(r#box);
             simple = simple
                 .child(
                     div()
@@ -89,7 +91,7 @@ impl PresetForm {
                         .test_support()
                         .text_sm()
                         .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                        .child(r#box.label()),
+                        .child(label.clone()),
                 )
                 .child(
                     div()
@@ -98,7 +100,7 @@ impl PresetForm {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(labelled_textarea(r#box.label(), state).h(px(56.))),
+                        .child(labelled_textarea(&label, state).h(px(56.))),
                 );
         }
         let invalid_lines = simple_rules_invalid_rows(&self, cx);
@@ -114,7 +116,7 @@ impl PresetForm {
                         .id("preset-simple-invalid-header")
                         .test_support()
                         .text_sm()
-                        .child("Invalid lines"),
+                        .child(t!("preset-invalid-lines")),
                 );
             for (index, (r#box, line)) in invalid_lines.into_iter().enumerate() {
                 fold = fold.child(
@@ -122,7 +124,11 @@ impl PresetForm {
                         .id(format!("preset-simple-invalid-{index}"))
                         .test_support()
                         .text_sm()
-                        .child(format!("{} box: {}", r#box.label(), line)),
+                        .child(t!(
+                            "preset-invalid-line",
+                            box = simple_rules_box_label(r#box),
+                            line = line
+                        )),
                 );
             }
             simple = simple.child(fold);
@@ -136,13 +142,17 @@ impl PresetForm {
                     .id("preset-new-caption")
                     .test_support()
                     .text_sm()
-                    .child("New preset"),
+                    .child(t!("preset-new-caption")),
             )
-            .child(dialog_field("field-preset-name", "Name", self.name))
+            .child(dialog_field(
+                "field-preset-name",
+                t!("field-name"),
+                self.name,
+            ))
             .child(simple)
             .child(dialog_field(
                 "field-preset-remote-url",
-                "Add remote ruleset (URL)",
+                t!("field-add-remote-ruleset"),
                 self.remote_url,
             ))
     }

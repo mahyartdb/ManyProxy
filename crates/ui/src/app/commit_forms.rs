@@ -598,10 +598,7 @@ impl AppView {
             self.edit_form_open = None;
             return true;
         }
-        *form_error.borrow_mut() = Some((
-            "test_url".to_string(),
-            "Test URL rejected — fix it or clear the field".to_string(),
-        ));
+        *form_error.borrow_mut() = Some(("test_url".to_string(), t!("config-test-url-rejected")));
         form.focus_field("test_url", window, cx);
         cx.notify();
         false
@@ -938,10 +935,10 @@ impl AppView {
                     .button_props(
                         DialogButtonProps::default()
                             .show_cancel(true)
-                            .ok_text("Overwrite")
+                            .ok_text(t!("dialog-overwrite"))
                             .ok_variant(ButtonVariant::Danger),
                     )
-                    .title("Overwrite export?")
+                    .title(t!("export-overwrite-title"))
                     .description(description)
                     .on_ok(move |_, window, cx| {
                         view.update(cx, |view, cx| {

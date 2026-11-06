@@ -352,7 +352,7 @@ impl AppView {
             level_group = level_group.child(
                 Radio::new(label)
                     .label(label)
-                    .tooltip(log_level_tooltip(label)),
+                    .tooltip(log_level_tooltip(LogLevel::from_label(label))),
             );
         }
         let mut parts = Vec::new();

@@ -207,9 +207,9 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Restart"),
+                        .ok_text(t!("confirm-restart")),
                 )
-                .title(LAN_CONFIRM_TITLE)
+                .title(lan_confirm_title())
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_restore_subset(&rows, window, cx));

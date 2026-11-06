@@ -83,13 +83,14 @@ pub(crate) fn dialog_protocol_choices() -> Vec<DialogProtocolChoice> {
 }
 
 pub(crate) fn password_row(
-    label: &str,
+    label: impl Into<String>,
     id: &'static str,
     secret: &Entity<InputState>,
     cx: &App,
 ) -> Field {
+    let label = label.into();
     let presence = secret_state_caption(secret.read(cx).value().as_ref()).to_string();
-    field().label(label.to_string()).child(
+    field().label(label.clone()).child(
         div()
             .flex()
             .flex_col()
@@ -107,7 +108,7 @@ pub(crate) fn password_row(
 
 pub(crate) fn panel_toggle_button(
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     view: &Entity<AppView>,
     open: &Rc<RefCell<bool>>,
 ) -> impl IntoElement {
@@ -357,9 +358,10 @@ impl ConfigForm {
     pub(crate) fn field(
         window: &mut Window,
         cx: &mut Context<AppView>,
-        placeholder: &str,
+        placeholder: impl Into<String>,
         default: Option<&str>,
     ) -> Entity<InputState> {
+        let placeholder = placeholder.into();
         cx.new(|cx| {
             let state = InputState::new(window, cx).placeholder(placeholder);
             match default {
@@ -372,9 +374,10 @@ impl ConfigForm {
     pub(crate) fn secret_field(
         window: &mut Window,
         cx: &mut Context<AppView>,
-        placeholder: &str,
+        placeholder: impl Into<String>,
         default: Option<&str>,
     ) -> Entity<InputState> {
+        let placeholder = placeholder.into();
         cx.new(|cx| {
             let state = InputState::new(window, cx)
                 .placeholder(placeholder)
@@ -402,9 +405,10 @@ impl ConfigForm {
     pub(crate) fn area(
         window: &mut Window,
         cx: &mut Context<AppView>,
-        placeholder: &str,
+        placeholder: impl Into<String>,
         default: Option<&str>,
     ) -> Entity<TextareaState> {
+        let placeholder = placeholder.into();
         cx.new(|cx| {
             let state = TextareaState::new(window, cx).placeholder(placeholder);
             match default {
@@ -458,7 +462,7 @@ impl ConfigForm {
             .position(|choice| choice.value == DEFAULT_PROTOCOL)
             .map(IndexPath::new);
         Self {
-            name: Self::field(window, cx, "Name", None),
+            name: Self::field(window, cx, t!("config-name"), None),
             protocol_select: cx.new(|cx| {
                 SelectState::new(
                     DialogProtocolChoiceList(dialog_protocol_choices()),
@@ -470,183 +474,178 @@ impl ConfigForm {
             last_protocol: Rc::new(RefCell::new(DEFAULT_PROTOCOL.to_string())),
             protocol_locked: false,
             locked_protocol: DEFAULT_PROTOCOL.to_string(),
-            params: Self::area(
-                window,
-                cx,
-                "Protocol params JSON (multiline)",
-                Some(&template),
-            ),
-            group: Self::field(window, cx, "Group", Some(DEFAULT_GROUP)),
-            bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
+            params: Self::area(window, cx, t!("config-params-placeholder"), Some(&template)),
+            group: Self::field(window, cx, t!("config-group"), Some(DEFAULT_GROUP)),
+            bind: Self::field(window, cx, t!("config-bind"), Some(DEFAULT_BIND)),
             port: Self::field(window, cx, "auto", None),
-            test_url: Self::field(window, cx, "Test URL (blank = global)", None),
-            guided_server: Self::field(window, cx, "example.com", None),
-            guided_port: Self::field(window, cx, "443", None),
-            guided_identity: Self::secret_field(window, cx, "Identity secret", None),
+            test_url: Self::field(window, cx, t!("config-test-url"), None),
+            guided_server: Self::field(window, cx, t!("config-server-placeholder"), None),
+            guided_port: Self::field(window, cx, t!("config-port-placeholder"), None),
+            guided_identity: Self::secret_field(window, cx, t!("config-identity-secret"), None),
 
-            vless_uuid: Self::secret_field(window, cx, "UUID", None),
+            vless_uuid: Self::secret_field(window, cx, t!("config-uuid"), None),
             vless_flow: Self::panel_select(window, cx, flow_choices(), ""),
             vless_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
             s1_network: Self::panel_select(window, cx, network_choices(), "tcp"),
-            s1_path: Self::field(window, cx, "Path", None),
-            s1_host: Self::field(window, cx, "Host", None),
-            s1_method: Self::field(window, cx, "Method", None),
-            s1_service_name: Self::field(window, cx, "Service name", None),
+            s1_path: Self::field(window, cx, t!("config-path"), None),
+            s1_host: Self::field(window, cx, t!("config-host"), None),
+            s1_method: Self::field(window, cx, t!("config-method"), None),
+            s1_service_name: Self::field(window, cx, t!("config-service-name"), None),
             s1_open: Rc::new(RefCell::new(false)),
             s2_enable: Rc::new(RefCell::new(false)),
-            s2_sni: Self::field(window, cx, "SNI", None),
-            s2_alpn: Self::field(window, cx, "ALPN (comma list)", None),
+            s2_sni: Self::field(window, cx, t!("config-sni"), None),
+            s2_alpn: Self::field(window, cx, t!("config-alpn"), None),
             s2_fp: Self::panel_select(window, cx, fp_choices(), ""),
             s2_insecure: Rc::new(RefCell::new(false)),
-            s2_pbk: Self::field(window, cx, "Reality public key", None),
-            s2_sid: Self::field(window, cx, "Reality short id", None),
+            s2_pbk: Self::field(window, cx, t!("config-reality-public-key"), None),
+            s2_sid: Self::field(window, cx, t!("config-reality-short-id"), None),
             s2_open: Rc::new(RefCell::new(false)),
             s3_mode: Rc::new(RefCell::new(String::new())),
             s3_brutal: Rc::new(RefCell::new(false)),
-            s3_up: Self::field(window, cx, "Brutal up Mbps", None),
-            s3_down: Self::field(window, cx, "Brutal down Mbps", None),
+            s3_up: Self::field(window, cx, t!("config-brutal-up"), None),
+            s3_down: Self::field(window, cx, t!("config-brutal-down"), None),
             s3_open: Rc::new(RefCell::new(false)),
             s4_reuse: Rc::new(RefCell::new(false)),
             s4_fastopen: Rc::new(RefCell::new(false)),
             s4_fragment: Rc::new(RefCell::new(false)),
             s4_multipath: Rc::new(RefCell::new(false)),
-            s4_timeout: Self::field(window, cx, "Connect timeout (e.g. 5s)", None),
-            s4_bind: Self::field(window, cx, "Bind interface", None),
-            s4_inet4: Self::field(window, cx, "IPv4 bind address", None),
-            s4_inet6: Self::field(window, cx, "IPv6 bind address", None),
+            s4_timeout: Self::field(window, cx, t!("config-connect-timeout-placeholder"), None),
+            s4_bind: Self::field(window, cx, t!("config-bind-interface"), None),
+            s4_inet4: Self::field(window, cx, t!("config-ipv4-bind"), None),
+            s4_inet6: Self::field(window, cx, t!("config-ipv6-bind"), None),
 
-            vmess_uuid: Self::secret_field(window, cx, "UUID", None),
-            vmess_aid: Self::field(window, cx, "Alter ID (aid)", None),
+            vmess_uuid: Self::secret_field(window, cx, t!("config-uuid"), None),
+            vmess_aid: Self::field(window, cx, t!("config-alter-id-placeholder"), None),
             vmess_security: Self::panel_select(window, cx, vmess_security_choices(), "auto"),
             vmess_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
-            trojan_password: Self::secret_field(window, cx, "Password", None),
+            trojan_password: Self::secret_field(window, cx, t!("config-password"), None),
             ss_method: Self::panel_select(window, cx, ss_method_choices(), ""),
-            ss_password: Self::secret_field(window, cx, "Password", None),
+            ss_password: Self::secret_field(window, cx, t!("config-password"), None),
             ss_plugin: Self::panel_select(window, cx, ss_plugin_choices(), ""),
-            ss_plugin_opts: Self::field(window, cx, "Plugin options", None),
+            ss_plugin_opts: Self::field(window, cx, t!("config-plugin-options"), None),
             ss_uot: Rc::new(RefCell::new(false)),
 
-            wg_private: Self::secret_field(window, cx, "Private key", None),
-            wg_public: Self::field(window, cx, "Peer public key", None),
-            wg_preshared: Self::secret_field(window, cx, "Preshared key", None),
-            wg_reserved: Self::field(window, cx, "Reserved (comma ints)", None),
-            wg_keepalive: Self::field(window, cx, "Keepalive (seconds)", None),
-            wg_local_addr: Self::field(window, cx, "Local address (comma CIDRs)", None),
-            wg_dns: Self::field(window, cx, "DNS", None),
-            wg_mtu: Self::field(window, cx, "MTU", None),
-            wg_workers: Self::field(window, cx, "Workers", None),
+            wg_private: Self::secret_field(window, cx, t!("config-private-key"), None),
+            wg_public: Self::field(window, cx, t!("config-peer-public-key"), None),
+            wg_preshared: Self::secret_field(window, cx, t!("config-preshared-key"), None),
+            wg_reserved: Self::field(window, cx, t!("config-reserved"), None),
+            wg_keepalive: Self::field(window, cx, t!("config-keepalive"), None),
+            wg_local_addr: Self::field(window, cx, t!("config-local-address"), None),
+            wg_dns: Self::field(window, cx, t!("config-dns"), None),
+            wg_mtu: Self::field(window, cx, t!("config-mtu"), None),
+            wg_workers: Self::field(window, cx, t!("config-workers"), None),
             wg_sys_ifc: Rc::new(RefCell::new(false)),
-            awg_private: Self::secret_field(window, cx, "Private key", None),
-            awg_public: Self::field(window, cx, "Peer public key", None),
-            awg_preshared: Self::secret_field(window, cx, "Preshared key", None),
-            awg_reserved: Self::field(window, cx, "Reserved (comma ints)", None),
-            awg_keepalive: Self::field(window, cx, "Keepalive (seconds)", None),
-            awg_local_addr: Self::field(window, cx, "Local address (comma CIDRs)", None),
-            awg_dns: Self::field(window, cx, "DNS", None),
-            awg_mtu: Self::field(window, cx, "MTU", None),
-            awg_workers: Self::field(window, cx, "Workers", None),
+            awg_private: Self::secret_field(window, cx, t!("config-private-key"), None),
+            awg_public: Self::field(window, cx, t!("config-peer-public-key"), None),
+            awg_preshared: Self::secret_field(window, cx, t!("config-preshared-key"), None),
+            awg_reserved: Self::field(window, cx, t!("config-reserved"), None),
+            awg_keepalive: Self::field(window, cx, t!("config-keepalive"), None),
+            awg_local_addr: Self::field(window, cx, t!("config-local-address"), None),
+            awg_dns: Self::field(window, cx, t!("config-dns"), None),
+            awg_mtu: Self::field(window, cx, t!("config-mtu"), None),
+            awg_workers: Self::field(window, cx, t!("config-workers"), None),
             awg_sys_ifc: Rc::new(RefCell::new(false)),
             awg_version: Self::panel_select(window, cx, awg_version_choices(), ""),
             awg_enable: Rc::new(RefCell::new(false)),
-            awg_jc: Self::field(window, cx, "Jc", None),
-            awg_jmin: Self::field(window, cx, "Jmin", None),
-            awg_jmax: Self::field(window, cx, "Jmax", None),
-            awg_s1: Self::field(window, cx, "S1", None),
-            awg_s2: Self::field(window, cx, "S2", None),
-            awg_s3: Self::field(window, cx, "S3", None),
-            awg_s4: Self::field(window, cx, "S4", None),
-            awg_h1: Self::field(window, cx, "H1", None),
-            awg_h2: Self::field(window, cx, "H2", None),
-            awg_h3: Self::field(window, cx, "H3", None),
-            awg_h4: Self::field(window, cx, "H4", None),
-            awg_i1: Self::field(window, cx, "I1", None),
-            awg_i2: Self::field(window, cx, "I2", None),
-            awg_i3: Self::field(window, cx, "I3", None),
-            awg_i4: Self::field(window, cx, "I4", None),
-            awg_i5: Self::field(window, cx, "I5", None),
-            awg_hpk: Self::field(window, cx, "Header protection key", None),
-            awg_pad: Self::field(window, cx, "Content padding addition", None),
-            awg_rekey_after: Self::field(window, cx, "Rekey after time", None),
-            awg_rekey_timeout: Self::field(window, cx, "Rekey timeout", None),
-            awg_reject_after: Self::field(window, cx, "Reject after time", None),
-            awg_keepalive_timeout: Self::field(window, cx, "Keepalive timeout", None),
-            awg_max_handshake: Self::field(window, cx, "Max handshake attempts", None),
+            awg_jc: Self::field(window, cx, t!("config-jc"), None),
+            awg_jmin: Self::field(window, cx, t!("config-jmin"), None),
+            awg_jmax: Self::field(window, cx, t!("config-jmax"), None),
+            awg_s1: Self::field(window, cx, t!("config-s1"), None),
+            awg_s2: Self::field(window, cx, t!("config-s2"), None),
+            awg_s3: Self::field(window, cx, t!("config-s3"), None),
+            awg_s4: Self::field(window, cx, t!("config-s4"), None),
+            awg_h1: Self::field(window, cx, t!("config-h1"), None),
+            awg_h2: Self::field(window, cx, t!("config-h2"), None),
+            awg_h3: Self::field(window, cx, t!("config-h3"), None),
+            awg_h4: Self::field(window, cx, t!("config-h4"), None),
+            awg_i1: Self::field(window, cx, t!("config-i1"), None),
+            awg_i2: Self::field(window, cx, t!("config-i2"), None),
+            awg_i3: Self::field(window, cx, t!("config-i3"), None),
+            awg_i4: Self::field(window, cx, t!("config-i4"), None),
+            awg_i5: Self::field(window, cx, t!("config-i5"), None),
+            awg_hpk: Self::field(window, cx, t!("config-header-protection-key"), None),
+            awg_pad: Self::field(window, cx, t!("config-content-padding"), None),
+            awg_rekey_after: Self::field(window, cx, t!("config-rekey-after"), None),
+            awg_rekey_timeout: Self::field(window, cx, t!("config-rekey-timeout"), None),
+            awg_reject_after: Self::field(window, cx, t!("config-reject-after"), None),
+            awg_keepalive_timeout: Self::field(window, cx, t!("config-keepalive-timeout"), None),
+            awg_max_handshake: Self::field(window, cx, t!("config-max-handshake"), None),
             awg_trailers: Rc::new(RefCell::new(false)),
             awg_cookies: Rc::new(RefCell::new(false)),
 
-            hy_server_ports: Self::field(window, cx, "Server ports (e.g. 9000-9010)", None),
-            hy_hop_interval: Self::field(window, cx, "Hop interval (e.g. 30s)", None),
-            hy_up: Self::field(window, cx, "Up Mbps", None),
-            hy_down: Self::field(window, cx, "Down Mbps", None),
-            hy_obfs: Self::field(window, cx, "Obfs", None),
+            hy_server_ports: Self::field(window, cx, t!("config-server-ports-placeholder"), None),
+            hy_hop_interval: Self::field(window, cx, t!("config-hop-interval-placeholder"), None),
+            hy_up: Self::field(window, cx, t!("config-up"), None),
+            hy_down: Self::field(window, cx, t!("config-down"), None),
+            hy_obfs: Self::field(window, cx, t!("config-obfs"), None),
             hy_auth_type: Self::panel_select(window, cx, hy_auth_type_choices(), ""),
-            hy_auth: Self::secret_field(window, cx, "Auth secret", None),
-            hy_recv_conn: Self::field(window, cx, "Recv window conn", None),
-            hy_recv: Self::field(window, cx, "Recv window", None),
+            hy_auth: Self::secret_field(window, cx, t!("config-auth-secret"), None),
+            hy_recv_conn: Self::field(window, cx, t!("config-recv-window-conn"), None),
+            hy_recv: Self::field(window, cx, t!("config-recv-window"), None),
             hy_mtu: Rc::new(RefCell::new(false)),
-            hy_password: Self::secret_field(window, cx, "Password", None),
-            tuic_uuid: Self::secret_field(window, cx, "UUID", None),
-            tuic_password: Self::secret_field(window, cx, "Password", None),
+            hy_password: Self::secret_field(window, cx, t!("config-password"), None),
+            tuic_uuid: Self::secret_field(window, cx, t!("config-uuid"), None),
+            tuic_password: Self::secret_field(window, cx, t!("config-password"), None),
             tuic_cc: Self::panel_select(window, cx, tuic_cc_choices(), ""),
             tuic_relay: Self::panel_select(window, cx, tuic_relay_choices(), ""),
             tuic_uot: Rc::new(RefCell::new(false)),
             tuic_zero_rtt: Rc::new(RefCell::new(false)),
-            tuic_heartbeat: Self::field(window, cx, "Heartbeat (e.g. 10s)", None),
+            tuic_heartbeat: Self::field(window, cx, t!("config-heartbeat-placeholder"), None),
 
             socks_version: Self::panel_select(window, cx, socks_version_choices(), ""),
-            socks_username: Self::field(window, cx, "Username", None),
-            socks_password: Self::secret_field(window, cx, "Password", None),
+            socks_username: Self::field(window, cx, t!("config-username"), None),
+            socks_password: Self::secret_field(window, cx, t!("config-password"), None),
             socks_network: Self::panel_select(window, cx, socks_network_choices(), "tcp"),
             socks_uot: Rc::new(RefCell::new(false)),
-            http_username: Self::field(window, cx, "Username", None),
-            http_password: Self::secret_field(window, cx, "Password", None),
-            http_path: Self::field(window, cx, "Path", None),
-            http_headers: Self::field(window, cx, "Headers", None),
-            anytls_password: Self::secret_field(window, cx, "Password", None),
-            anytls_interval: Self::field(window, cx, "Idle check interval (e.g. 30s)", None),
-            anytls_timeout: Self::field(window, cx, "Idle timeout (e.g. 30s)", None),
-            anytls_min: Self::field(window, cx, "Min idle sessions", None),
-            naive_username: Self::field(window, cx, "Username", None),
-            naive_password: Self::secret_field(window, cx, "Password", None),
+            http_username: Self::field(window, cx, t!("config-username"), None),
+            http_password: Self::secret_field(window, cx, t!("config-password"), None),
+            http_path: Self::field(window, cx, t!("config-path"), None),
+            http_headers: Self::field(window, cx, t!("config-headers"), None),
+            anytls_password: Self::secret_field(window, cx, t!("config-password"), None),
+            anytls_interval: Self::field(window, cx, t!("config-idle-check-placeholder"), None),
+            anytls_timeout: Self::field(window, cx, t!("config-idle-timeout-placeholder"), None),
+            anytls_min: Self::field(window, cx, t!("config-min-idle"), None),
+            naive_username: Self::field(window, cx, t!("config-username"), None),
+            naive_password: Self::secret_field(window, cx, t!("config-password"), None),
             naive_uot: Rc::new(RefCell::new(false)),
             naive_quic: Rc::new(RefCell::new(false)),
             naive_cc: Self::panel_select(window, cx, naive_cc_choices(), ""),
-            ssh_user: Self::field(window, cx, "User", None),
-            ssh_password: Self::secret_field(window, cx, "Password", None),
-            ssh_private_key: Self::area(window, cx, "Private key (paste or Browse…)", None),
-            ssh_key_path: Self::field(window, cx, "Private key path", None),
-            ssh_key_pass: Self::secret_field(window, cx, "Private key passphrase", None),
-            ssh_host_key: Self::field(window, cx, "Host key (comma list)", None),
-            ssh_host_key_algs: Self::field(window, cx, "Host key algorithms (comma list)", None),
-            ssh_client_version: Self::field(window, cx, "Client version", None),
-            snell_psk: Self::secret_field(window, cx, "PSK", None),
+            ssh_user: Self::field(window, cx, t!("config-user"), None),
+            ssh_password: Self::secret_field(window, cx, t!("config-password"), None),
+            ssh_private_key: Self::area(window, cx, t!("config-private-key-paste"), None),
+            ssh_key_path: Self::field(window, cx, t!("config-private-key-path"), None),
+            ssh_key_pass: Self::secret_field(window, cx, t!("config-private-key-passphrase"), None),
+            ssh_host_key: Self::field(window, cx, t!("config-host-key"), None),
+            ssh_host_key_algs: Self::field(window, cx, t!("config-host-key-algs"), None),
+            ssh_client_version: Self::field(window, cx, t!("config-client-version"), None),
+            snell_psk: Self::secret_field(window, cx, t!("config-psk"), None),
             snell_version: Self::panel_select(window, cx, snell_version_choices(), ""),
-            snell_obfs_mode: Self::field(window, cx, "Obfs mode", None),
-            snell_obfs_host: Self::field(window, cx, "Obfs host", None),
-            snell_userkey: Self::field(window, cx, "User key", None),
+            snell_obfs_mode: Self::field(window, cx, t!("config-obfs-mode"), None),
+            snell_obfs_host: Self::field(window, cx, t!("config-obfs-host"), None),
+            snell_userkey: Self::field(window, cx, t!("config-user-key"), None),
             snell_reuse: Rc::new(RefCell::new(false)),
-            snell_network: Self::field(window, cx, "Network", None),
-            snell_mode: Self::field(window, cx, "Mode", None),
+            snell_network: Self::field(window, cx, t!("config-network"), None),
+            snell_mode: Self::field(window, cx, t!("config-mode"), None),
             shadowtls_version: Self::panel_select(window, cx, shadowtls_version_choices(), ""),
-            shadowtls_password: Self::secret_field(window, cx, "Password", None),
-            xray_uuid: Self::secret_field(window, cx, "UUID", None),
-            xray_enc: Self::field(window, cx, "Encryption (default none)", None),
+            shadowtls_password: Self::secret_field(window, cx, t!("config-password"), None),
+            xray_uuid: Self::secret_field(window, cx, t!("config-uuid"), None),
+            xray_enc: Self::field(window, cx, t!("config-encryption-placeholder"), None),
             xray_flow: Self::panel_select(window, cx, xray_flow_choices(), ""),
-            xray_sni: Self::field(window, cx, "SNI", None),
+            xray_sni: Self::field(window, cx, t!("config-sni"), None),
             xray_fp: Self::panel_select(window, cx, fp_choices(), ""),
-            xray_alpn: Self::field(window, cx, "ALPN (comma list)", None),
-            xray_pbk: Self::field(window, cx, "REALITY public key (pbk)", None),
-            xray_sid: Self::field(window, cx, "REALITY short id (sid)", None),
-            xray_spiderx: Self::field(window, cx, "REALITY spiderX path", None),
+            xray_alpn: Self::field(window, cx, t!("config-alpn"), None),
+            xray_pbk: Self::field(window, cx, t!("config-reality-pbk"), None),
+            xray_sid: Self::field(window, cx, t!("config-reality-sid"), None),
+            xray_spiderx: Self::field(window, cx, t!("config-reality-spiderx"), None),
             xray_network: Self::panel_select(window, cx, xray_network_choices(), ""),
-            xray_mode: Self::field(window, cx, "Mode", None),
+            xray_mode: Self::field(window, cx, t!("config-mode"), None),
             xray_mux: Self::panel_select(window, cx, xray_mux_choices(), ""),
             chain_hops: Rc::new(RefCell::new(Vec::new())),
             chain_pick: Self::panel_select(window, cx, chain_pick_choices(&[]), ""),
             chain_library: Rc::new(RefCell::new(Vec::new())),
-            extra_exe: Self::field(window, cx, "Executable (app dir file name)", None),
-            extra_args: Self::field(window, cx, "Args", None),
-            extra_config: Self::area(window, cx, "Config JSON (passed as -c <file>)", None),
+            extra_exe: Self::field(window, cx, t!("config-executable-placeholder"), None),
+            extra_args: Self::field(window, cx, t!("config-args"), None),
+            extra_config: Self::area(window, cx, t!("config-config-json-placeholder"), None),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -683,7 +682,7 @@ impl ConfigForm {
             )
         };
         Self {
-            name: Self::field(window, cx, "Name", Some(config.name.as_str())),
+            name: Self::field(window, cx, t!("config-name"), Some(config.name.as_str())),
             protocol_select: cx.new(|cx| {
                 SelectState::new(
                     DialogProtocolChoiceList(dialog_protocol_choices()),
@@ -698,17 +697,17 @@ impl ConfigForm {
             params: Self::area(
                 window,
                 cx,
-                "Protocol params JSON (multiline)",
+                t!("config-params-placeholder"),
                 Some(config.params.as_str()),
             ),
-            group: Self::field(window, cx, "Group", Some(config.group.as_str())),
-            bind: Self::field(window, cx, "Bind address", Some(config.bind_ip.as_str())),
+            group: Self::field(window, cx, t!("config-group"), Some(config.group.as_str())),
+            bind: Self::field(window, cx, t!("config-bind"), Some(config.bind_ip.as_str())),
             port: Self::field(window, cx, "auto", Some(&config.port.to_string())),
-            test_url: Self::field(window, cx, "Test URL (blank = global)", test_url),
+            test_url: Self::field(window, cx, t!("config-test-url"), test_url),
             guided_server: Self::field(
                 window,
                 cx,
-                "example.com",
+                t!("config-server-placeholder"),
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server", "address"],
@@ -717,7 +716,7 @@ impl ConfigForm {
             guided_port: Self::field(
                 window,
                 cx,
-                "443",
+                t!("config-port-placeholder"),
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server_port", "port"],
@@ -726,13 +725,13 @@ impl ConfigForm {
             guided_identity: Self::secret_field(
                 window,
                 cx,
-                "Identity secret",
+                t!("config-identity-secret"),
                 Some(&guided_prefill_value(&config.params, read_keys)),
             ),
             vless_uuid: Self::secret_field(
                 window,
                 cx,
-                "UUID",
+                t!("config-uuid"),
                 Some(&guided_prefill_value(params, &["uuid", "id"])),
             ),
             vless_flow: Self::panel_select(
@@ -751,25 +750,25 @@ impl ConfigForm {
             s1_path: Self::field(
                 window,
                 cx,
-                "Path",
+                t!("config-path"),
                 Some(&guided_prefill_value(params, &["path"])),
             ),
             s1_host: Self::field(
                 window,
                 cx,
-                "Host",
+                t!("config-host"),
                 Some(&guided_prefill_value(params, &["host"])),
             ),
             s1_method: Self::field(
                 window,
                 cx,
-                "Method",
+                t!("config-method"),
                 Some(&guided_prefill_value(params, &["method"])),
             ),
             s1_service_name: Self::field(
                 window,
                 cx,
-                "Service name",
+                t!("config-service-name"),
                 Some(&guided_prefill_value(
                     params,
                     &["service_name", "serviceName"],
@@ -780,13 +779,13 @@ impl ConfigForm {
             s2_sni: Self::field(
                 window,
                 cx,
-                "SNI",
+                t!("config-sni"),
                 Some(&guided_prefill_value(params, &["sni", "peer"])),
             ),
             s2_alpn: Self::field(
                 window,
                 cx,
-                "ALPN (comma list)",
+                t!("config-alpn"),
                 Some(&guided_prefill_value(params, &["alpn"])),
             ),
             s2_fp: Self::panel_select(
@@ -807,13 +806,13 @@ impl ConfigForm {
             s2_pbk: Self::field(
                 window,
                 cx,
-                "Reality public key",
+                t!("config-reality-public-key"),
                 Some(&guided_prefill_value(params, &["pbk"])),
             ),
             s2_sid: Self::field(
                 window,
                 cx,
-                "Reality short id",
+                t!("config-reality-short-id"),
                 Some(&guided_prefill_value(params, &["sid"])),
             ),
             s2_open: Rc::new(RefCell::new(false)),
@@ -825,7 +824,7 @@ impl ConfigForm {
             s3_up: Self::field(
                 window,
                 cx,
-                "Brutal up Mbps",
+                t!("config-brutal-up"),
                 Some(&guided_prefill_value(
                     params,
                     &["brutal_up_mbps", "brutal_up"],
@@ -834,7 +833,7 @@ impl ConfigForm {
             s3_down: Self::field(
                 window,
                 cx,
-                "Brutal down Mbps",
+                t!("config-brutal-down"),
                 Some(&guided_prefill_value(
                     params,
                     &["brutal_down_mbps", "brutal_down"],
@@ -854,38 +853,38 @@ impl ConfigForm {
             s4_timeout: Self::field(
                 window,
                 cx,
-                "Connect timeout (e.g. 5s)",
+                t!("config-connect-timeout-placeholder"),
                 Some(&guided_prefill_value(params, &["connect_timeout"])),
             ),
             s4_bind: Self::field(
                 window,
                 cx,
-                "Bind interface",
+                t!("config-bind-interface"),
                 Some(&guided_prefill_value(params, &["bind_interface"])),
             ),
             s4_inet4: Self::field(
                 window,
                 cx,
-                "IPv4 bind address",
+                t!("config-ipv4-bind"),
                 Some(&guided_prefill_value(params, &["inet4_bind_address"])),
             ),
             s4_inet6: Self::field(
                 window,
                 cx,
-                "IPv6 bind address",
+                t!("config-ipv6-bind"),
                 Some(&guided_prefill_value(params, &["inet6_bind_address"])),
             ),
 
             vmess_uuid: Self::secret_field(
                 window,
                 cx,
-                "UUID",
+                t!("config-uuid"),
                 Some(&guided_prefill_value(params, &["uuid", "id"])),
             ),
             vmess_aid: Self::field(
                 window,
                 cx,
-                "Alter ID (aid)",
+                t!("config-alter-id-placeholder"),
                 Some(&guided_prefill_value(params, &["alter_id", "aid"])),
             ),
             vmess_security: Self::panel_select(
@@ -903,7 +902,7 @@ impl ConfigForm {
             trojan_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             ss_method: Self::panel_select(
@@ -915,7 +914,7 @@ impl ConfigForm {
             ss_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             ss_plugin: Self::panel_select(
@@ -927,7 +926,7 @@ impl ConfigForm {
             ss_plugin_opts: Self::field(
                 window,
                 cx,
-                "Plugin options",
+                t!("config-plugin-options"),
                 Some(&guided_prefill_value(
                     params,
                     &["plugin_opts", "plugin-opts", "pluginOpts"],
@@ -941,7 +940,7 @@ impl ConfigForm {
             wg_private: Self::secret_field(
                 window,
                 cx,
-                "Private key",
+                t!("config-private-key"),
                 Some(&guided_prefill_value(
                     params,
                     &["private_key", "privatekey"],
@@ -950,13 +949,13 @@ impl ConfigForm {
             wg_public: Self::field(
                 window,
                 cx,
-                "Peer public key",
+                t!("config-peer-public-key"),
                 Some(&guided_prefill_value(params, &["public_key", "publickey"])),
             ),
             wg_preshared: Self::secret_field(
                 window,
                 cx,
-                "Preshared key",
+                t!("config-preshared-key"),
                 Some(&guided_prefill_value(
                     params,
                     &["pre_shared_key", "presharedkey", "preshared_key"],
@@ -965,13 +964,13 @@ impl ConfigForm {
             wg_reserved: Self::field(
                 window,
                 cx,
-                "Reserved (comma ints)",
+                t!("config-reserved"),
                 Some(&guided_prefill_value(params, &["reserved"])),
             ),
             wg_keepalive: Self::field(
                 window,
                 cx,
-                "Keepalive (seconds)",
+                t!("config-keepalive"),
                 Some(&guided_prefill_value(
                     params,
                     &["persistent_keepalive", "persistent_keepalive_interval"],
@@ -980,7 +979,7 @@ impl ConfigForm {
             wg_local_addr: Self::field(
                 window,
                 cx,
-                "Local address (comma CIDRs)",
+                t!("config-local-address"),
                 Some(&guided_prefill_value(
                     params,
                     &["address", "local_address", "local_addr"],
@@ -989,19 +988,19 @@ impl ConfigForm {
             wg_dns: Self::field(
                 window,
                 cx,
-                "DNS",
+                t!("config-dns"),
                 Some(&guided_prefill_value(params, &["dns"])),
             ),
             wg_mtu: Self::field(
                 window,
                 cx,
-                "MTU",
+                t!("config-mtu"),
                 Some(&guided_prefill_value(params, &["mtu"])),
             ),
             wg_workers: Self::field(
                 window,
                 cx,
-                "Workers",
+                t!("config-workers"),
                 Some(&guided_prefill_value(params, &["workers"])),
             ),
             wg_sys_ifc: Rc::new(RefCell::new(guided_prefill_bool(
@@ -1011,7 +1010,7 @@ impl ConfigForm {
             awg_private: Self::secret_field(
                 window,
                 cx,
-                "Private key",
+                t!("config-private-key"),
                 Some(&guided_prefill_value(
                     params,
                     &["private_key", "privatekey"],
@@ -1020,13 +1019,13 @@ impl ConfigForm {
             awg_public: Self::field(
                 window,
                 cx,
-                "Peer public key",
+                t!("config-peer-public-key"),
                 Some(&guided_prefill_value(params, &["public_key", "publickey"])),
             ),
             awg_preshared: Self::secret_field(
                 window,
                 cx,
-                "Preshared key",
+                t!("config-preshared-key"),
                 Some(&guided_prefill_value(
                     params,
                     &["pre_shared_key", "presharedkey", "preshared_key"],
@@ -1035,13 +1034,13 @@ impl ConfigForm {
             awg_reserved: Self::field(
                 window,
                 cx,
-                "Reserved (comma ints)",
+                t!("config-reserved"),
                 Some(&guided_prefill_value(params, &["reserved"])),
             ),
             awg_keepalive: Self::field(
                 window,
                 cx,
-                "Keepalive (seconds)",
+                t!("config-keepalive"),
                 Some(&guided_prefill_value(
                     params,
                     &["persistent_keepalive", "persistent_keepalive_interval"],
@@ -1050,7 +1049,7 @@ impl ConfigForm {
             awg_local_addr: Self::field(
                 window,
                 cx,
-                "Local address (comma CIDRs)",
+                t!("config-local-address"),
                 Some(&guided_prefill_value(
                     params,
                     &["address", "local_address", "local_addr"],
@@ -1059,19 +1058,19 @@ impl ConfigForm {
             awg_dns: Self::field(
                 window,
                 cx,
-                "DNS",
+                t!("config-dns"),
                 Some(&guided_prefill_value(params, &["dns"])),
             ),
             awg_mtu: Self::field(
                 window,
                 cx,
-                "MTU",
+                t!("config-mtu"),
                 Some(&guided_prefill_value(params, &["mtu"])),
             ),
             awg_workers: Self::field(
                 window,
                 cx,
-                "Workers",
+                t!("config-workers"),
                 Some(&guided_prefill_value(params, &["workers"])),
             ),
             awg_sys_ifc: Rc::new(RefCell::new(guided_prefill_bool(
@@ -1091,139 +1090,139 @@ impl ConfigForm {
             awg_jc: Self::field(
                 window,
                 cx,
-                "Jc",
+                t!("config-jc"),
                 Some(&guided_prefill_value(params, &["jc"])),
             ),
             awg_jmin: Self::field(
                 window,
                 cx,
-                "Jmin",
+                t!("config-jmin"),
                 Some(&guided_prefill_value(params, &["jmin"])),
             ),
             awg_jmax: Self::field(
                 window,
                 cx,
-                "Jmax",
+                t!("config-jmax"),
                 Some(&guided_prefill_value(params, &["jmax"])),
             ),
             awg_s1: Self::field(
                 window,
                 cx,
-                "S1",
+                t!("config-s1"),
                 Some(&guided_prefill_value(params, &["s1"])),
             ),
             awg_s2: Self::field(
                 window,
                 cx,
-                "S2",
+                t!("config-s2"),
                 Some(&guided_prefill_value(params, &["s2"])),
             ),
             awg_s3: Self::field(
                 window,
                 cx,
-                "S3",
+                t!("config-s3"),
                 Some(&guided_prefill_value(params, &["s3"])),
             ),
             awg_s4: Self::field(
                 window,
                 cx,
-                "S4",
+                t!("config-s4"),
                 Some(&guided_prefill_value(params, &["s4"])),
             ),
             awg_h1: Self::field(
                 window,
                 cx,
-                "H1",
+                t!("config-h1"),
                 Some(&guided_prefill_value(params, &["h1"])),
             ),
             awg_h2: Self::field(
                 window,
                 cx,
-                "H2",
+                t!("config-h2"),
                 Some(&guided_prefill_value(params, &["h2"])),
             ),
             awg_h3: Self::field(
                 window,
                 cx,
-                "H3",
+                t!("config-h3"),
                 Some(&guided_prefill_value(params, &["h3"])),
             ),
             awg_h4: Self::field(
                 window,
                 cx,
-                "H4",
+                t!("config-h4"),
                 Some(&guided_prefill_value(params, &["h4"])),
             ),
             awg_i1: Self::field(
                 window,
                 cx,
-                "I1",
+                t!("config-i1"),
                 Some(&guided_prefill_value(params, &["i1"])),
             ),
             awg_i2: Self::field(
                 window,
                 cx,
-                "I2",
+                t!("config-i2"),
                 Some(&guided_prefill_value(params, &["i2"])),
             ),
             awg_i3: Self::field(
                 window,
                 cx,
-                "I3",
+                t!("config-i3"),
                 Some(&guided_prefill_value(params, &["i3"])),
             ),
             awg_i4: Self::field(
                 window,
                 cx,
-                "I4",
+                t!("config-i4"),
                 Some(&guided_prefill_value(params, &["i4"])),
             ),
             awg_i5: Self::field(
                 window,
                 cx,
-                "I5",
+                t!("config-i5"),
                 Some(&guided_prefill_value(params, &["i5"])),
             ),
             awg_hpk: Self::field(
                 window,
                 cx,
-                "Header protection key",
+                t!("config-header-protection-key"),
                 Some(&guided_prefill_value(params, &["headerprotectionkey"])),
             ),
             awg_pad: Self::field(
                 window,
                 cx,
-                "Content padding addition",
+                t!("config-content-padding"),
                 Some(&guided_prefill_value(params, &["contentpaddingaddition"])),
             ),
             awg_rekey_after: Self::field(
                 window,
                 cx,
-                "Rekey after time",
+                t!("config-rekey-after"),
                 Some(&guided_prefill_value(params, &["rekeyaftertime"])),
             ),
             awg_rekey_timeout: Self::field(
                 window,
                 cx,
-                "Rekey timeout",
+                t!("config-rekey-timeout"),
                 Some(&guided_prefill_value(params, &["rekeytimeout"])),
             ),
             awg_reject_after: Self::field(
                 window,
                 cx,
-                "Reject after time",
+                t!("config-reject-after"),
                 Some(&guided_prefill_value(params, &["rejectaftertime"])),
             ),
             awg_keepalive_timeout: Self::field(
                 window,
                 cx,
-                "Keepalive timeout",
+                t!("config-keepalive-timeout"),
                 Some(&guided_prefill_value(params, &["keepalivetimeout"])),
             ),
             awg_max_handshake: Self::field(
                 window,
                 cx,
-                "Max handshake attempts",
+                t!("config-max-handshake"),
                 Some(&guided_prefill_value(params, &["maxhandshakeattempts"])),
             ),
             awg_trailers: Rc::new(RefCell::new(guided_prefill_bool(
@@ -1238,25 +1237,25 @@ impl ConfigForm {
             hy_server_ports: Self::field(
                 window,
                 cx,
-                "Server ports (e.g. 9000-9010)",
+                t!("config-server-ports-placeholder"),
                 Some(&guided_prefill_value(params, &["server_ports"])),
             ),
             hy_hop_interval: Self::field(
                 window,
                 cx,
-                "Hop interval (e.g. 30s)",
+                t!("config-hop-interval-placeholder"),
                 Some(&guided_prefill_value(params, &["hop_interval"])),
             ),
             hy_up: Self::field(
                 window,
                 cx,
-                "Up Mbps",
+                t!("config-up"),
                 Some(&guided_prefill_value(params, &["up", "up_mbps", "upmbps"])),
             ),
             hy_down: Self::field(
                 window,
                 cx,
-                "Down Mbps",
+                t!("config-down"),
                 Some(&guided_prefill_value(
                     params,
                     &["down", "down_mbps", "downmbps"],
@@ -1265,7 +1264,7 @@ impl ConfigForm {
             hy_obfs: Self::field(
                 window,
                 cx,
-                "Obfs",
+                t!("config-obfs"),
                 Some(&guided_prefill_value(params, &["obfs"])),
             ),
             hy_auth_type: Self::panel_select(
@@ -1277,19 +1276,19 @@ impl ConfigForm {
             hy_auth: Self::secret_field(
                 window,
                 cx,
-                "Auth secret",
+                t!("config-auth-secret"),
                 Some(&guided_prefill_value(params, &["auth"])),
             ),
             hy_recv_conn: Self::field(
                 window,
                 cx,
-                "Recv window conn",
+                t!("config-recv-window-conn"),
                 Some(&guided_prefill_value(params, &["recv_window_conn"])),
             ),
             hy_recv: Self::field(
                 window,
                 cx,
-                "Recv window",
+                t!("config-recv-window"),
                 Some(&guided_prefill_value(params, &["recv_window"])),
             ),
             hy_mtu: Rc::new(RefCell::new(guided_prefill_bool(
@@ -1299,19 +1298,19 @@ impl ConfigForm {
             hy_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             tuic_uuid: Self::secret_field(
                 window,
                 cx,
-                "UUID",
+                t!("config-uuid"),
                 Some(&guided_prefill_value(params, &["uuid", "id"])),
             ),
             tuic_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             tuic_cc: Self::panel_select(
@@ -1337,7 +1336,7 @@ impl ConfigForm {
             tuic_heartbeat: Self::field(
                 window,
                 cx,
-                "Heartbeat (e.g. 10s)",
+                t!("config-heartbeat-placeholder"),
                 Some(&guided_prefill_value(params, &["heartbeat"])),
             ),
 
@@ -1350,13 +1349,13 @@ impl ConfigForm {
             socks_username: Self::field(
                 window,
                 cx,
-                "Username",
+                t!("config-username"),
                 Some(&guided_prefill_value(params, &["username"])),
             ),
             socks_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             socks_network: Self::panel_select(
@@ -1372,37 +1371,37 @@ impl ConfigForm {
             http_username: Self::field(
                 window,
                 cx,
-                "Username",
+                t!("config-username"),
                 Some(&guided_prefill_value(params, &["username"])),
             ),
             http_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             http_path: Self::field(
                 window,
                 cx,
-                "Path",
+                t!("config-path"),
                 Some(&guided_prefill_value(params, &["path"])),
             ),
             http_headers: Self::field(
                 window,
                 cx,
-                "Headers",
+                t!("config-headers"),
                 Some(&guided_prefill_value(params, &["headers"])),
             ),
             anytls_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             anytls_interval: Self::field(
                 window,
                 cx,
-                "Idle check interval (e.g. 30s)",
+                t!("config-idle-check-placeholder"),
                 Some(&guided_prefill_value(
                     params,
                     &["idle_session_check_interval", "interval"],
@@ -1411,7 +1410,7 @@ impl ConfigForm {
             anytls_timeout: Self::field(
                 window,
                 cx,
-                "Idle timeout (e.g. 30s)",
+                t!("config-idle-timeout-placeholder"),
                 Some(&guided_prefill_value(
                     params,
                     &["idle_session_timeout", "timeout"],
@@ -1420,19 +1419,19 @@ impl ConfigForm {
             anytls_min: Self::field(
                 window,
                 cx,
-                "Min idle sessions",
+                t!("config-min-idle"),
                 Some(&guided_prefill_value(params, &["min_idle_session", "min"])),
             ),
             naive_username: Self::field(
                 window,
                 cx,
-                "Username",
+                t!("config-username"),
                 Some(&guided_prefill_value(params, &["username"])),
             ),
             naive_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             naive_uot: Rc::new(RefCell::new(guided_prefill_bool(
@@ -1449,19 +1448,19 @@ impl ConfigForm {
             ssh_user: Self::field(
                 window,
                 cx,
-                "User",
+                t!("config-user"),
                 Some(&guided_prefill_value(params, &["user", "username"])),
             ),
             ssh_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             ssh_private_key: Self::area(
                 window,
                 cx,
-                "Private key (paste or Browse…)",
+                t!("config-private-key-paste"),
                 Some(&guided_prefill_value(
                     params,
                     &["private_key", "privatekey"],
@@ -1470,13 +1469,13 @@ impl ConfigForm {
             ssh_key_path: Self::field(
                 window,
                 cx,
-                "Private key path",
+                t!("config-private-key-path"),
                 Some(&guided_prefill_value(params, &["private_key_path"])),
             ),
             ssh_key_pass: Self::secret_field(
                 window,
                 cx,
-                "Private key passphrase",
+                t!("config-private-key-passphrase"),
                 Some(&guided_prefill_value(
                     params,
                     &["private_key_passphrase", "private_key_pass"],
@@ -1485,25 +1484,25 @@ impl ConfigForm {
             ssh_host_key: Self::field(
                 window,
                 cx,
-                "Host key (comma list)",
+                t!("config-host-key"),
                 Some(&guided_prefill_list(params, &["host_key"])),
             ),
             ssh_host_key_algs: Self::field(
                 window,
                 cx,
-                "Host key algorithms (comma list)",
+                t!("config-host-key-algs"),
                 Some(&guided_prefill_list(params, &["host_key_algorithms"])),
             ),
             ssh_client_version: Self::field(
                 window,
                 cx,
-                "Client version",
+                t!("config-client-version"),
                 Some(&guided_prefill_value(params, &["client_version"])),
             ),
             snell_psk: Self::secret_field(
                 window,
                 cx,
-                "PSK",
+                t!("config-psk"),
                 Some(&guided_prefill_value(params, &["psk"])),
             ),
             snell_version: Self::panel_select(
@@ -1515,32 +1514,32 @@ impl ConfigForm {
             snell_obfs_mode: Self::field(
                 window,
                 cx,
-                "Obfs mode",
+                t!("config-obfs-mode"),
                 Some(&guided_prefill_value(params, &["obfs_mode", "obfs"])),
             ),
             snell_obfs_host: Self::field(
                 window,
                 cx,
-                "Obfs host",
+                t!("config-obfs-host"),
                 Some(&guided_prefill_value(params, &["obfs_host", "obfs-host"])),
             ),
             snell_userkey: Self::field(
                 window,
                 cx,
-                "User key",
+                t!("config-user-key"),
                 Some(&guided_prefill_value(params, &["userkey"])),
             ),
             snell_reuse: Rc::new(RefCell::new(guided_prefill_bool(params, &["reuse"]))),
             snell_network: Self::field(
                 window,
                 cx,
-                "Network",
+                t!("config-network"),
                 Some(&guided_prefill_value(params, &["network"])),
             ),
             snell_mode: Self::field(
                 window,
                 cx,
-                "Mode",
+                t!("config-mode"),
                 Some(&guided_prefill_value(params, &["mode"])),
             ),
             shadowtls_version: Self::panel_select(
@@ -1552,19 +1551,19 @@ impl ConfigForm {
             shadowtls_password: Self::secret_field(
                 window,
                 cx,
-                "Password",
+                t!("config-password"),
                 Some(&guided_prefill_value(params, &["password"])),
             ),
             xray_uuid: Self::secret_field(
                 window,
                 cx,
-                "UUID",
+                t!("config-uuid"),
                 Some(&guided_prefill_value(params, &["uuid", "id"])),
             ),
             xray_enc: Self::field(
                 window,
                 cx,
-                "Encryption (default none)",
+                t!("config-encryption-placeholder"),
                 Some(&guided_prefill_value(params, &["encryption"])),
             ),
             xray_flow: Self::panel_select(
@@ -1576,7 +1575,7 @@ impl ConfigForm {
             xray_sni: Self::field(
                 window,
                 cx,
-                "SNI",
+                t!("config-sni"),
                 Some(&guided_prefill_value(params, &["sni"])),
             ),
             xray_fp: Self::panel_select(
@@ -1588,25 +1587,25 @@ impl ConfigForm {
             xray_alpn: Self::field(
                 window,
                 cx,
-                "ALPN (comma list)",
+                t!("config-alpn"),
                 Some(&guided_prefill_value(params, &["alpn"])),
             ),
             xray_pbk: Self::field(
                 window,
                 cx,
-                "REALITY public key (pbk)",
+                t!("config-reality-pbk"),
                 Some(&guided_prefill_value(params, &["pbk"])),
             ),
             xray_sid: Self::field(
                 window,
                 cx,
-                "REALITY short id (sid)",
+                t!("config-reality-sid"),
                 Some(&guided_prefill_value(params, &["sid"])),
             ),
             xray_spiderx: Self::field(
                 window,
                 cx,
-                "REALITY spiderX path",
+                t!("config-reality-spiderx"),
                 Some(&guided_prefill_value(params, &["spiderx"])),
             ),
             xray_network: Self::panel_select(
@@ -1618,7 +1617,7 @@ impl ConfigForm {
             xray_mode: Self::field(
                 window,
                 cx,
-                "Mode",
+                t!("config-mode"),
                 Some(&guided_prefill_value(params, &["mode"])),
             ),
             xray_mux: Self::panel_select(
@@ -1633,19 +1632,19 @@ impl ConfigForm {
             extra_exe: Self::field(
                 window,
                 cx,
-                "Executable (app dir file name)",
+                t!("config-executable-placeholder"),
                 Some(&guided_prefill_value(params, &["exe", "binary"])),
             ),
             extra_args: Self::field(
                 window,
                 cx,
-                "Args",
+                t!("config-args"),
                 Some(&guided_prefill_value(params, &["args"])),
             ),
             extra_config: Self::area(
                 window,
                 cx,
-                "Config JSON (passed as -c <file>)",
+                t!("config-config-json-placeholder"),
                 Some(&extra_config_prefill(params)),
             ),
             advanced: Rc::new(RefCell::new(false)),
@@ -1662,7 +1661,7 @@ impl ConfigForm {
             .iter()
             .filter(|row| crate::store::is_auto_port(row.port))
             .count();
-        format!("Auto ports: {used} of {total} in use (10801–10999, spill 18081–18380)")
+        t!("config-port-budget", used = used, total = total)
     }
 
     pub(crate) fn uuid_row(
@@ -1676,7 +1675,7 @@ impl ConfigForm {
         let secret_entity = secret.clone();
         let uuid_view = view.clone();
         let presence = secret_state_caption(secret.read(cx).value().as_ref()).to_string();
-        field().label("UUID *".to_string()).child(
+        field().label(t!("config-uuid-required").to_string()).child(
             div()
                 .flex()
                 .flex_col()
@@ -1692,14 +1691,14 @@ impl ConfigForm {
                                 .flex_1()
                                 .id(format!("{id_prefix}-uuid"))
                                 .test_support()
-                                .child(labelled_masked_input("UUID", secret)),
+                                .child(labelled_masked_input(t!("config-uuid"), secret)),
                         )
                         .child(
                             Button::new(format!("{id_prefix}-uuid-generate"))
                                 .small()
-                                .label("Generate")
-                                .tooltip("Generate a random UUIDv4")
-                                .accessibility_label("Generate a random UUIDv4")
+                                .label(t!("config-generate"))
+                                .tooltip(t!("config-generate-uuid-tip"))
+                                .accessibility_label(t!("config-generate-uuid-tip"))
                                 .on_click(move |_, window, cx| {
                                     let generated = generate_uuid_v4();
                                     uuid_view.update(cx, |_, cx| {
@@ -1726,15 +1725,17 @@ impl ConfigForm {
     }
 
     pub(crate) fn panel_select_row(
-        label: &str,
+        label: impl Into<String>,
         tip_id: &'static str,
-        tip: &str,
+        tip: impl Into<String>,
         select_id: &'static str,
-        a11y: &str,
+        a11y: impl Into<String>,
         state: &Entity<SelectState<PanelChoiceList>>,
     ) -> Field {
-        let tip = tip.to_string();
-        field().label(label.to_string()).child(
+        let label = label.into();
+        let tip = tip.into();
+        let a11y = a11y.into();
+        field().label(label).child(
             div()
                 .id(tip_id)
                 .test_support()
@@ -1801,12 +1802,12 @@ impl ConfigForm {
 
     pub(crate) fn s1_network_section(&self, view: &Entity<AppView>, _cx: &App) -> impl IntoElement {
         let network_select = self.s1_network.clone();
-        let picker = field().label("Network".to_string()).child(
+        let picker = field().label(t!("config-network").to_string()).child(
             div()
                 .id("s1-network-tip")
                 .test_support()
                 .tooltip(move |_, cx| {
-                    cx.new(|_| Tooltip::new("Stream transport network".to_string()))
+                    cx.new(|_| Tooltip::new(t!("config-network-tip").to_string()))
                         .into()
                 })
                 .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
@@ -1816,7 +1817,7 @@ impl ConfigForm {
                     Select::new(&network_select)
                         .id("s1-network")
                         .small()
-                        .accessibility_label("Stream transport network"),
+                        .accessibility_label(t!("config-network-tip")),
                 ),
         );
         field().label_indent(false).child(
@@ -1833,14 +1834,14 @@ impl ConfigForm {
                                 .flex_1()
                                 .id("s1-caption")
                                 .test_support()
-                                .child(Label::new("Network")),
+                                .child(Label::new(t!("config-network"))),
                         )
                         .child(panel_toggle_button(
                             "s1-toggle",
                             if *self.s1_open.borrow() {
-                                "Hide"
+                                t!("config-hide")
                             } else {
-                                "Show"
+                                t!("config-show")
                             },
                             view,
                             &self.s1_open,
@@ -1852,32 +1853,36 @@ impl ConfigForm {
 
     pub(crate) fn s1_camouflage_section(&self, cx: &App) -> Option<AnyElement> {
         let network = Self::panel_value(&self.s1_network, cx, "tcp");
-        let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
+        let conditional = |id: &'static str, label: String, state: &Entity<InputState>| {
             field()
-                .label(label.to_string())
+                .label(label.clone())
                 .child(labelled_input(label, state).id(id))
         };
         let mut body = div().flex().flex_col().gap_1();
         let disguised = match network.as_str() {
             "ws" => {
                 body = body
-                    .child(conditional("s1-path", "Path", &self.s1_path))
-                    .child(conditional("s1-host", "Host", &self.s1_host));
+                    .child(conditional("s1-path", t!("config-path"), &self.s1_path))
+                    .child(conditional("s1-host", t!("config-host"), &self.s1_host));
                 true
             }
             "httpupgrade" | "http" => {
                 body = body
-                    .child(conditional("s1-host", "Host", &self.s1_host))
-                    .child(conditional("s1-path", "Path", &self.s1_path));
+                    .child(conditional("s1-host", t!("config-host"), &self.s1_host))
+                    .child(conditional("s1-path", t!("config-path"), &self.s1_path));
                 if network == "http" {
-                    body = body.child(conditional("s1-method", "Method", &self.s1_method));
+                    body = body.child(conditional(
+                        "s1-method",
+                        t!("config-method"),
+                        &self.s1_method,
+                    ));
                 }
                 true
             }
             "grpc" => {
                 body = body.child(conditional(
                     "s1-service-name",
-                    "Service name",
+                    t!("config-service-name"),
                     &self.s1_service_name,
                 ));
                 true
@@ -1900,7 +1905,7 @@ impl ConfigForm {
                                 .flex_1()
                                 .id("camouflage-caption")
                                 .test_support()
-                                .child(Label::new("Camouflage")),
+                                .child(Label::new(t!("config-section-camouflage"))),
                         )
                         .child(div().id("camouflage-section").test_support().child(body)),
                 )
@@ -1923,30 +1928,28 @@ impl ConfigForm {
                     div()
                         .id("s2-forced-note")
                         .test_support()
-                        .child("TLS is always on for this protocol (security locked tls)."),
+                        .child(t!("config-tls-forced")),
                 ),
             );
         } else {
             let s2_enable = self.s2_enable.clone();
             let s2_repaint = repaint.clone();
             tls_body = tls_body.child(
-            field().label_indent(false).child(
-                div().id("s2-enable").test_support().child(
-                    Switch::new("s2-enable-switch")
-                        .small()
-                        .checked(*self.s2_enable.borrow())
-                        .label("Enable TLS")
-                        .tooltip(
-                            "Wrap the stream in TLS (security=tls, or reality with a public key)",
-                        )
-                        .accessibility_label("Enable TLS for this row")
-                        .on_change(move |next: &bool, window, cx| {
-                            *s2_enable.borrow_mut() = *next;
-                            s2_repaint(window, cx);
-                        }),
+                field().label_indent(false).child(
+                    div().id("s2-enable").test_support().child(
+                        Switch::new("s2-enable-switch")
+                            .small()
+                            .checked(*self.s2_enable.borrow())
+                            .label(t!("config-enable-tls"))
+                            .tooltip(t!("config-enable-tls-tip"))
+                            .accessibility_label(t!("config-enable-tls-aria"))
+                            .on_change(move |next: &bool, window, cx| {
+                                *s2_enable.borrow_mut() = *next;
+                                s2_repaint(window, cx);
+                            }),
+                    ),
                 ),
-            ),
-        );
+            );
         }
         field().label_indent(false).child(
             Collapsible::new()
@@ -1963,15 +1966,20 @@ impl ConfigForm {
                                 .id("s2-caption")
                                 .test_support()
                                 .child(Label::new(
-                                    if forced { "TLS (always on)" } else { "TLS" }.to_string(),
+                                    if forced {
+                                        t!("config-section-tls-always")
+                                    } else {
+                                        t!("config-section-tls")
+                                    }
+                                    .to_string(),
                                 )),
                         )
                         .child(panel_toggle_button(
                             "s2-toggle",
                             if *self.s2_open.borrow() {
-                                "Hide"
+                                t!("config-hide")
                             } else {
-                                "Show"
+                                t!("config-show")
                             },
                             view,
                             &self.s2_open,
@@ -1989,28 +1997,28 @@ impl ConfigForm {
             .flex_col()
             .gap_1()
             .child(
-                field().label("SNI".to_string()).child(
+                field().label(t!("config-sni").to_string()).child(
                     div()
                         .id("s2-sni")
                         .test_support()
-                        .child(labelled_input("SNI", &self.s2_sni)),
+                        .child(labelled_input(t!("config-sni"), &self.s2_sni)),
                 ),
             )
             .child(
-                field().label("ALPN (comma list)".to_string()).child(
+                field().label(t!("config-alpn").to_string()).child(
                     div()
                         .id("s2-alpn")
                         .test_support()
-                        .child(labelled_input("ALPN (comma list)", &self.s2_alpn)),
+                        .child(labelled_input(t!("config-alpn"), &self.s2_alpn)),
                 ),
             )
             .child(
-                field().label("Fingerprint".to_string()).child(
+                field().label(t!("config-fingerprint").to_string()).child(
                     div()
                         .id("s2-fp-tip")
                         .test_support()
                         .tooltip(move |_, cx| {
-                            cx.new(|_| Tooltip::new("uTLS fingerprint".to_string()))
+                            cx.new(|_| Tooltip::new(t!("config-fingerprint-tip").to_string()))
                                 .into()
                         })
                         .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
@@ -2020,7 +2028,7 @@ impl ConfigForm {
                             Select::new(&fp_select)
                                 .id("s2-fp")
                                 .small()
-                                .accessibility_label("uTLS fingerprint"),
+                                .accessibility_label(t!("config-fingerprint-tip")),
                         ),
                 ),
             );
@@ -2034,7 +2042,7 @@ impl ConfigForm {
                         .flex_1()
                         .id("tls-security-caption")
                         .test_support()
-                        .child(Label::new("TLS Security")),
+                        .child(Label::new(t!("config-section-tls-security"))),
                 )
                 .child(div().id("tls-security-section").test_support().child(body)),
         )
@@ -2053,9 +2061,9 @@ impl ConfigForm {
                         Switch::new("s2-insecure-switch")
                             .small()
                             .checked(*self.s2_insecure.borrow())
-                            .label("Allow insecure")
-                            .tooltip("Skip certificate verification (testing only)")
-                            .accessibility_label("Skip TLS certificate verification")
+                            .label(t!("config-insecure"))
+                            .tooltip(t!("config-insecure-tip"))
+                            .accessibility_label(t!("config-insecure-aria"))
                             .on_change(move |next: &bool, window, cx| {
                                 *s2_insecure.borrow_mut() = *next;
                                 s2_repaint_insecure(window, cx);
@@ -2064,20 +2072,22 @@ impl ConfigForm {
                 ),
             )
             .child(
-                field().label("Reality public key".to_string()).child(
-                    div()
-                        .id("s2-pbk")
-                        .test_support()
-                        .child(labelled_input("Reality public key", &self.s2_pbk)),
-                ),
+                field()
+                    .label(t!("config-reality-public-key").to_string())
+                    .child(div().id("s2-pbk").test_support().child(labelled_input(
+                        t!("config-reality-public-key"),
+                        &self.s2_pbk,
+                    ))),
             )
             .child(
-                field().label("Reality short id".to_string()).child(
-                    div()
-                        .id("s2-sid")
-                        .test_support()
-                        .child(labelled_input("Reality short id", &self.s2_sid)),
-                ),
+                field()
+                    .label(t!("config-reality-short-id").to_string())
+                    .child(
+                        div()
+                            .id("s2-sid")
+                            .test_support()
+                            .child(labelled_input(t!("config-reality-short-id"), &self.s2_sid)),
+                    ),
             );
         field().label_indent(false).child(
             div()
@@ -2089,7 +2099,7 @@ impl ConfigForm {
                         .flex_1()
                         .id("tls-extras-caption")
                         .test_support()
-                        .child(Label::new("TLS extras")),
+                        .child(Label::new(t!("config-section-tls-extras"))),
                 )
                 .child(div().id("tls-extras-section").test_support().child(body)),
         )
@@ -2104,16 +2114,19 @@ impl ConfigForm {
     ) -> AnyElement {
         let _ = cx;
         if vision {
-            return field().label_indent(false).child(
-                div()
-                    .id("s3-vision-note")
-                    .test_support()
-                    .child("Mux is unavailable with the xtls-rprx-vision flow — stored mux keys are preserved."),
-            ).into_any_element();
+            return field()
+                .label_indent(false)
+                .child(
+                    div()
+                        .id("s3-vision-note")
+                        .test_support()
+                        .child(t!("config-mux-vision")),
+                )
+                .into_any_element();
         }
         let effective = self.s3_effective_mode();
         let selected = ["", "on", "off"].iter().position(|mode| *mode == effective);
-        let mode_labels = ["Keep Default", "On", "Off"];
+        let mode_labels = [t!("config-keep-default"), t!("config-on"), t!("config-off")];
         let mode_cell = self.s3_mode.clone();
         let mode_repaint = repaint.clone();
         let mut group = RadioGroup::horizontal("s3-mux-options")
@@ -2126,33 +2139,35 @@ impl ConfigForm {
             });
         for label in mode_labels {
             group = group.child(
-                Radio::new(label)
+                Radio::new(label.clone())
                     .small()
-                    .label(label)
-                    .tooltip(format!("Mux mode {label}")),
+                    .label(label.clone())
+                    .tooltip(t!("config-multiplex-tip", label = label)),
             );
         }
         let mut s3_body = div().flex().flex_col().gap_1().child(
-            field().label("Multiplex mode".to_string()).child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("s3-mux-caption")
-                            .test_support()
-                            .child(Label::new("Multiplex mode")),
-                    )
-                    .child(div().id("s3-mux-group").test_support().child(group)),
-            ),
+            field()
+                .label(t!("config-multiplex-mode").to_string())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("s3-mux-caption")
+                                .test_support()
+                                .child(Label::new(t!("config-multiplex-mode"))),
+                        )
+                        .child(div().id("s3-mux-group").test_support().child(group)),
+                ),
         );
         if *self.s3_brutal.borrow() && effective == "on" && self.s3_mode.borrow().as_str() != "on" {
             s3_body = s3_body.child(
                 div()
                     .id("s3-brutal-note")
                     .test_support()
-                    .child("Brutal requires mux (forced On)."),
+                    .child(t!("config-brutal-mux")),
             );
         }
         let brutal_cell = self.s3_brutal.clone();
@@ -2164,9 +2179,9 @@ impl ConfigForm {
                         Switch::new("s3-brutal-switch")
                             .small()
                             .checked(*self.s3_brutal.borrow())
-                            .label("Brutal (forces mux On)")
-                            .tooltip("Brutal congestion speeds (Mbps); enabling forces mux On")
-                            .accessibility_label("Enable Brutal speeds (forces mux On)")
+                            .label(t!("config-brutal"))
+                            .tooltip(t!("config-brutal-tip"))
+                            .accessibility_label(t!("config-brutal-aria"))
                             .on_change(move |next: &bool, window, cx| {
                                 *brutal_cell.borrow_mut() = *next;
                                 brutal_repaint(window, cx);
@@ -2175,19 +2190,19 @@ impl ConfigForm {
                 ),
             )
             .child(
-                field().label("Brutal up Mbps".to_string()).child(
+                field().label(t!("config-brutal-up").to_string()).child(
                     div()
                         .id("s3-up")
                         .test_support()
-                        .child(labelled_input("Brutal up Mbps", &self.s3_up)),
+                        .child(labelled_input(t!("config-brutal-up"), &self.s3_up)),
                 ),
             )
             .child(
-                field().label("Brutal down Mbps".to_string()).child(
+                field().label(t!("config-brutal-down").to_string()).child(
                     div()
                         .id("s3-down")
                         .test_support()
-                        .child(labelled_input("Brutal down Mbps", &self.s3_down)),
+                        .child(labelled_input(t!("config-brutal-down"), &self.s3_down)),
                 ),
             );
         field()
@@ -2206,14 +2221,14 @@ impl ConfigForm {
                                     .flex_1()
                                     .id("s3-caption")
                                     .test_support()
-                                    .child(Label::new("Mux")),
+                                    .child(Label::new(t!("config-section-mux"))),
                             )
                             .child(panel_toggle_button(
                                 "s3-toggle",
                                 if *self.s3_open.borrow() {
-                                    "Hide"
+                                    t!("config-hide")
                                 } else {
-                                    "Show"
+                                    t!("config-show")
                                 },
                                 view,
                                 &self.s3_open,
@@ -2233,13 +2248,11 @@ impl ConfigForm {
         let _ = cx;
         let dial_switch = |id: &'static str,
                            switch_id: &'static str,
-                           label: &str,
-                           tip: &str,
+                           label: String,
+                           tip: String,
                            cell: &Rc<RefCell<bool>>| {
             let switch_cell = cell.clone();
             let switch_repaint = repaint.clone();
-            let tip = tip.to_string();
-            let label = label.to_string();
             field().label_indent(false).child(
                 div().id(id).test_support().child(
                     Switch::new(switch_id)
@@ -2260,61 +2273,63 @@ impl ConfigForm {
             .child(dial_switch(
                 "s4-reuse",
                 "s4-reuse-switch",
-                "Reuse address",
-                "SO_REUSEADDR on the upstream socket",
+                t!("config-reuse-address"),
+                t!("config-reuse-tip"),
                 &self.s4_reuse,
             ))
             .child(dial_switch(
                 "s4-fastopen",
                 "s4-fastopen-switch",
-                "TCP fast open",
-                "TCP Fast Open on the upstream socket",
+                t!("config-tcp-fast-open"),
+                t!("config-tcp-fast-open-tip"),
                 &self.s4_fastopen,
             ))
             .child(dial_switch(
                 "s4-fragment",
                 "s4-fragment-switch",
-                "UDP fragment",
-                "Fragment upstream UDP packets",
+                t!("config-udp-fragment"),
+                t!("config-udp-fragment-tip"),
                 &self.s4_fragment,
             ))
             .child(dial_switch(
                 "s4-multipath",
                 "s4-multipath-switch",
-                "TCP multipath",
-                "Multipath TCP on the upstream socket",
+                t!("config-tcp-multipath"),
+                t!("config-tcp-multipath-tip"),
                 &self.s4_multipath,
             ))
             .child(
-                field().label("Connect timeout".to_string()).child(
-                    div()
-                        .id("s4-timeout")
-                        .test_support()
-                        .child(labelled_input("Connect timeout", &self.s4_timeout)),
-                ),
+                field()
+                    .label(t!("config-connect-timeout").to_string())
+                    .child(div().id("s4-timeout").test_support().child(labelled_input(
+                        t!("config-connect-timeout"),
+                        &self.s4_timeout,
+                    ))),
             )
             .child(
-                field().label("Bind interface".to_string()).child(
-                    div()
-                        .id("s4-bind")
-                        .test_support()
-                        .child(labelled_input("Bind interface", &self.s4_bind)),
-                ),
+                field()
+                    .label(t!("config-bind-interface").to_string())
+                    .child(
+                        div()
+                            .id("s4-bind")
+                            .test_support()
+                            .child(labelled_input(t!("config-bind-interface"), &self.s4_bind)),
+                    ),
             )
             .child(
-                field().label("IPv4 bind address".to_string()).child(
+                field().label(t!("config-ipv4-bind").to_string()).child(
                     div()
                         .id("s4-inet4")
                         .test_support()
-                        .child(labelled_input("IPv4 bind address", &self.s4_inet4)),
+                        .child(labelled_input(t!("config-ipv4-bind"), &self.s4_inet4)),
                 ),
             )
             .child(
-                field().label("IPv6 bind address".to_string()).child(
+                field().label(t!("config-ipv6-bind").to_string()).child(
                     div()
                         .id("s4-inet6")
                         .test_support()
-                        .child(labelled_input("IPv6 bind address", &self.s4_inet6)),
+                        .child(labelled_input(t!("config-ipv6-bind"), &self.s4_inet6)),
                 ),
             );
 
@@ -2328,7 +2343,7 @@ impl ConfigForm {
                         .flex_1()
                         .id("s4-caption")
                         .test_support()
-                        .child(Label::new("Dial Fields")),
+                        .child(Label::new(t!("config-section-dial"))),
                 )
                 .child(div().id("s4-section").test_support().child(s4_body)),
         )
@@ -2344,27 +2359,27 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess", uuid_error, cx));
         block = block.child(
-            field().label("Alter ID".to_string()).child(
+            field().label(t!("config-alter-id").to_string()).child(
                 div()
                     .id("vmess-aid")
                     .test_support()
-                    .child(labelled_input("Alter ID", &self.vmess_aid)),
+                    .child(labelled_input(t!("config-alter-id"), &self.vmess_aid)),
             ),
         );
         block = block.child(Self::panel_select_row(
-            "Security",
+            t!("config-security"),
             "vmess-security-tip",
-            "VMess packet cipher (legacy links keep it in security)",
+            t!("config-vmess-security-tip"),
             "vmess-security",
-            "VMess security (packet cipher)",
+            t!("config-vmess-security-aria"),
             &self.vmess_security,
         ));
         block = block.child(Self::panel_select_row(
-            "Packet encoding",
+            t!("config-packet-encoding"),
             "vmess-packet-encoding-tip",
-            "VMess packet encoding",
+            t!("config-vmess-packet-encoding-aria"),
             "vmess-packet-encoding",
-            "VMess packet encoding",
+            t!("config-vmess-packet-encoding-aria"),
             &self.vmess_packet_encoding,
         ));
 
@@ -2379,7 +2394,7 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(password_row(
-            "Password *",
+            t!("config-password-required"),
             "trojan-password",
             &self.trojan_password,
             cx,
@@ -2396,34 +2411,39 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(Self::panel_select_row(
-            "Method",
+            t!("config-method"),
             "ss-method-tip",
-            "Shadowsocks cipher (all 18)",
+            t!("config-ss-method-tip"),
             "ss-method",
-            "Shadowsocks method",
+            t!("config-ss-method-aria"),
             &self.ss_method,
         ));
         block = block.child(password_row(
-            "Password *",
+            t!("config-password-required"),
             "ss-password",
             &self.ss_password,
             cx,
         ));
         block = block.child(Self::panel_select_row(
-            "Plugin",
+            t!("config-plugin"),
             "ss-plugin-tip",
-            "Plugin executable (none runs stock)",
+            t!("config-ss-plugin-tip"),
             "ss-plugin",
-            "Shadowsocks plugin",
+            t!("config-ss-plugin-aria"),
             &self.ss_plugin,
         ));
         block = block.child(
-            field().label("Plugin options".to_string()).child(
-                div()
-                    .id("ss-plugin-opts")
-                    .test_support()
-                    .child(labelled_input("Plugin options", &self.ss_plugin_opts)),
-            ),
+            field()
+                .label(t!("config-plugin-options").to_string())
+                .child(
+                    div()
+                        .id("ss-plugin-opts")
+                        .test_support()
+                        .child(labelled_input(
+                            t!("config-plugin-options"),
+                            &self.ss_plugin_opts,
+                        )),
+                ),
         );
         let uot_cell = self.ss_uot.clone();
         let uot_repaint = repaint.clone();
@@ -2433,9 +2453,9 @@ impl ConfigForm {
                     Switch::new("ss-uot-switch")
                         .small()
                         .checked(*self.ss_uot.borrow())
-                        .label("UDP over TCP (uot)")
-                        .tooltip("UDP over TCP for shadowsocks (folds the uot flat)")
-                        .accessibility_label("UDP over TCP for shadowsocks")
+                        .label(t!("config-uot"))
+                        .tooltip(t!("config-uot-ss-tip"))
+                        .accessibility_label(t!("config-uot-ss-aria"))
                         .on_change(move |next: &bool, window, cx| {
                             *uot_cell.borrow_mut() = *next;
                             uot_repaint(window, cx);
@@ -2444,11 +2464,14 @@ impl ConfigForm {
             ),
         );
         if !Self::panel_value(&self.ss_plugin, cx, "").trim().is_empty() {
-            block = block.child(field().label_indent(false).child(
-                div().id("ss-plugin-note").test_support().child(
-                    "Plugin rows need the plugin executable beside the engine — stock check fails without it.",
+            block = block.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("ss-plugin-note")
+                        .test_support()
+                        .child(t!("config-ss-plugin-note")),
                 ),
-            ));
+            );
         }
 
         block
@@ -2468,14 +2491,14 @@ impl ConfigForm {
             secret_state_caption(peer.private_key.read(cx).value().as_ref()).to_string();
         let sys_cell = peer.sys_ifc.clone();
         let sys_repaint = repaint.clone();
-        let row = |id: String, label: &str, state: &Entity<InputState>| {
+        let row = |id: String, label: String, state: &Entity<InputState>| {
             field()
-                .label(label.to_string())
+                .label(label.clone())
                 .child(labelled_input(label, state).id(id))
         };
-        let masked_row = |id: String, label: &str, state: &Entity<InputState>| {
+        let masked_row = |id: String, label: String, state: &Entity<InputState>| {
             field()
-                .label(label.to_string())
+                .label(label.clone())
                 .child(labelled_masked_input(label, state).id(id))
         };
         div()
@@ -2483,12 +2506,10 @@ impl ConfigForm {
             .flex_col()
             .gap_2()
             .child(
-                field().label("Private key *".to_string()).child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
+                field()
+                    .label(t!("config-private-key-required").to_string())
+                    .child(
+                        div().flex().flex_col().gap_1().child(
                             div()
                                 .flex()
                                 .flex_row()
@@ -2499,87 +2520,88 @@ impl ConfigForm {
                                         .flex_1()
                                         .id(format!("{prefix}-private-key"))
                                         .test_support()
-                                        .child(labelled_masked_input("Private key", peer.private_key)),
+                                        .child(labelled_masked_input(
+                                            t!("config-private-key"),
+                                            peer.private_key,
+                                        )),
                                 )
                                 .child(
                                     Button::new(format!("{prefix}-private-key-generate"))
-                                .small()
-                                .label("Generate")
-                                .tooltip(
-                                    "Generate a fresh WireGuard private key (local only — no WARP registration)",
+                                        .small()
+                                        .label(t!("config-generate"))
+                                        .tooltip(t!("config-generate-wg-tip"))
+                                        .accessibility_label(t!("config-generate-wg-aria"))
+                                        .on_click(move |_, window, cx| {
+                                            let generated = generate_wireguard_key();
+                                            keygen_view.update(cx, |_, cx| {
+                                                secret_entity.update(cx, |state, cx| {
+                                                    state.set_value(generated, &mut *window, cx);
+                                                });
+                                            });
+                                            window.push_notification(
+                                                Notification::info(
+                                                    "Generated a new WireGuard private key",
+                                                ),
+                                                cx,
+                                            );
+                                        }),
                                 )
-                                .accessibility_label("Generate a fresh WireGuard private key")
-                                .on_click(move |_, window, cx| {
-                                    let generated = generate_wireguard_key();
-                                    keygen_view.update(cx, |_, cx| {
-                                        secret_entity.update(cx, |state, cx| {
-                                            state.set_value(generated, &mut *window, cx);
-                                        });
-                                    });
-                                    window.push_notification(
-                                        Notification::info("Generated a new WireGuard private key"),
-                                        cx,
-                                    );
-                                }),
-                        )
-                        .child(
-                            div()
-                                .id(format!("{prefix}-private-key-state"))
-                                .test_support()
-                                .text_sm()
-                                .child(key_presence),
+                                .child(
+                                    div()
+                                        .id(format!("{prefix}-private-key-state"))
+                                        .test_support()
+                                        .text_sm()
+                                        .child(key_presence),
+                                ),
                         ),
-                ),
-            ))
+                    ),
+            )
             .child(row(
                 format!("{prefix}-public-key"),
-                "Public key (peer)",
+                t!("config-public-key-peer"),
                 peer.public_key,
             ))
             .child(masked_row(
                 format!("{prefix}-preshared-key"),
-                "Preshared key",
+                t!("config-preshared-key"),
                 peer.pre_shared_key,
             ))
             .child(row(
                 format!("{prefix}-reserved"),
-                "Reserved (comma ints)",
+                t!("config-reserved"),
                 peer.reserved,
             ))
             .child(row(
                 format!("{prefix}-keepalive"),
-                "Keepalive (seconds)",
+                t!("config-keepalive"),
                 peer.keepalive,
             ))
             .child(row(
                 format!("{prefix}-local-addr"),
-                "Local address (comma CIDRs)",
+                t!("config-local-address"),
                 peer.local_addr,
             ))
-            .child(row(format!("{prefix}-dns"), "DNS", peer.dns))
-            .child(row(format!("{prefix}-mtu"), "MTU", peer.mtu))
+            .child(row(format!("{prefix}-dns"), t!("config-dns"), peer.dns))
+            .child(row(format!("{prefix}-mtu"), t!("config-mtu"), peer.mtu))
             .child(row(
                 format!("{prefix}-workers"),
-                "Workers",
+                t!("config-workers"),
                 peer.workers,
             ))
             .child(
                 field().label_indent(false).child(
-                    div()
-                        .id(format!("{prefix}-sys-ifc"))
-                        .test_support()
-                        .child(
-                            Switch::new(format!("{prefix}-sys-ifc-switch"))
-                                .small()
-                                .checked(*peer.sys_ifc.borrow())
-                                .label("System interface (sys_ifc)")
-                                .tooltip("Use the system WireGuard interface (stores as system)")
-                                .accessibility_label("Use the system WireGuard interface")
-                                .on_change(move |next: &bool, window, cx| {
-                                    *sys_cell.borrow_mut() = *next;
-                                    sys_repaint(window, cx);
-                                }),
-                        ),
+                    div().id(format!("{prefix}-sys-ifc")).test_support().child(
+                        Switch::new(format!("{prefix}-sys-ifc-switch"))
+                            .small()
+                            .checked(*peer.sys_ifc.borrow())
+                            .label(t!("config-system-interface"))
+                            .tooltip(t!("config-system-interface-tip"))
+                            .accessibility_label(t!("config-system-interface-aria"))
+                            .on_change(move |next: &bool, window, cx| {
+                                *sys_cell.borrow_mut() = *next;
+                                sys_repaint(window, cx);
+                            }),
+                    ),
                 ),
             )
     }
@@ -2625,21 +2647,19 @@ impl ConfigForm {
         repaint: &DialogRepaint,
         cx: &App,
     ) -> impl IntoElement {
-        let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
+        let row = |id: &'static str, label: String, state: &Entity<InputState>| {
             field()
-                .label(label.to_string())
+                .label(label.clone())
                 .child(labelled_input(label, state).id(id))
         };
         let switch_row = |id: &'static str,
                           switch_id: String,
-                          label: &str,
-                          tip: &str,
+                          label: String,
+                          tip: String,
                           cell: &Rc<RefCell<bool>>,
                           repaint: &DialogRepaint| {
             let switch_cell = cell.clone();
             let switch_repaint = repaint.clone();
-            let label = label.to_string();
-            let tip = tip.to_string();
             field().label_indent(false).child(
                 div().id(id).test_support().child(
                     Switch::new(switch_id)
@@ -2655,12 +2675,8 @@ impl ConfigForm {
                 ),
             )
         };
-        let caption = |id: &'static str, text: &str| {
-            div()
-                .id(id)
-                .test_support()
-                .child(Label::new(text.to_string()))
-        };
+        let caption =
+            |id: &'static str, text: String| div().id(id).test_support().child(Label::new(text));
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(self.wg_peer_block(
             view,
@@ -2683,87 +2699,100 @@ impl ConfigForm {
         block = block.child(switch_row(
             "awg-enable",
             "awg-enable-switch".to_string(),
-            "Enable Amnezia",
-            "AmneziaWG obfuscation marker (UI state — stripped at generate, like brutal speeds)",
+            t!("config-enable-amnezia"),
+            t!("config-enable-amnezia-tip"),
             &self.awg_enable,
             repaint,
         ));
         block = block.child(Self::panel_select_row(
-            "AWG version",
+            t!("config-awg-version"),
             "awg-version-tip",
-            "AmneziaWG version (2.0 or 3.x — gates the v3 fields below)",
+            t!("config-awg-version-tip"),
             "awg-version",
-            "AmneziaWG version",
+            t!("config-awg-version-aria"),
             &self.awg_version,
         ));
-        block = block.child(caption("awg-junk-caption", "Junk train"));
+        block = block.child(caption("awg-junk-caption", t!("config-section-awg-junk")));
         block = block
-            .child(row("awg-jc", "Jc", &self.awg_jc))
-            .child(row("awg-jmin", "Jmin", &self.awg_jmin))
-            .child(row("awg-jmax", "Jmax", &self.awg_jmax));
-        block = block.child(caption("awg-length-caption", "Length prefixes (S1–S4)"));
+            .child(row("awg-jc", t!("config-jc"), &self.awg_jc))
+            .child(row("awg-jmin", t!("config-jmin"), &self.awg_jmin))
+            .child(row("awg-jmax", t!("config-jmax"), &self.awg_jmax));
+        block = block.child(caption(
+            "awg-length-caption",
+            t!("config-section-awg-length"),
+        ));
         block = block
-            .child(row("awg-s1", "S1", &self.awg_s1))
-            .child(row("awg-s2", "S2", &self.awg_s2))
-            .child(row("awg-s3", "S3", &self.awg_s3))
-            .child(row("awg-s4", "S4", &self.awg_s4));
-        block = block.child(caption("awg-header-caption", "Header ranges (H1–H4)"));
+            .child(row("awg-s1", t!("config-s1"), &self.awg_s1))
+            .child(row("awg-s2", t!("config-s2"), &self.awg_s2))
+            .child(row("awg-s3", t!("config-s3"), &self.awg_s3))
+            .child(row("awg-s4", t!("config-s4"), &self.awg_s4));
+        block = block.child(caption(
+            "awg-header-caption",
+            t!("config-section-awg-header"),
+        ));
         block = block
-            .child(row("awg-h1", "H1", &self.awg_h1))
-            .child(row("awg-h2", "H2", &self.awg_h2))
-            .child(row("awg-h3", "H3", &self.awg_h3))
-            .child(row("awg-h4", "H4", &self.awg_h4));
-        block = block.child(caption("awg-chain-caption", "CPS chains (I1–I5)"));
+            .child(row("awg-h1", t!("config-h1"), &self.awg_h1))
+            .child(row("awg-h2", t!("config-h2"), &self.awg_h2))
+            .child(row("awg-h3", t!("config-h3"), &self.awg_h3))
+            .child(row("awg-h4", t!("config-h4"), &self.awg_h4));
+        block = block.child(caption(
+            "awg-chain-caption",
+            t!("config-section-awg-chains"),
+        ));
         block = block
-            .child(row("awg-i1", "I1", &self.awg_i1))
-            .child(row("awg-i2", "I2", &self.awg_i2))
-            .child(row("awg-i3", "I3", &self.awg_i3))
-            .child(row("awg-i4", "I4", &self.awg_i4))
-            .child(row("awg-i5", "I5", &self.awg_i5));
+            .child(row("awg-i1", t!("config-i1"), &self.awg_i1))
+            .child(row("awg-i2", t!("config-i2"), &self.awg_i2))
+            .child(row("awg-i3", t!("config-i3"), &self.awg_i3))
+            .child(row("awg-i4", t!("config-i4"), &self.awg_i4))
+            .child(row("awg-i5", t!("config-i5"), &self.awg_i5));
 
         if Self::panel_value(&self.awg_version, cx, "") == "3.x" {
-            block = block.child(caption("awg-v3-caption", "v3-only fields"));
+            block = block.child(caption("awg-v3-caption", t!("config-section-awg-v3")));
             block = block
-                .child(row("awg-hpk", "Header protection key", &self.awg_hpk))
-                .child(row("awg-pad", "Content padding addition", &self.awg_pad))
+                .child(row(
+                    "awg-hpk",
+                    t!("config-header-protection-key"),
+                    &self.awg_hpk,
+                ))
+                .child(row("awg-pad", t!("config-content-padding"), &self.awg_pad))
                 .child(row(
                     "awg-rekey-after",
-                    "Rekey after time",
+                    t!("config-rekey-after"),
                     &self.awg_rekey_after,
                 ))
                 .child(row(
                     "awg-rekey-timeout",
-                    "Rekey timeout",
+                    t!("config-rekey-timeout"),
                     &self.awg_rekey_timeout,
                 ))
                 .child(row(
                     "awg-reject-after",
-                    "Reject after time",
+                    t!("config-reject-after"),
                     &self.awg_reject_after,
                 ))
                 .child(row(
                     "awg-keepalive-timeout",
-                    "Keepalive timeout",
+                    t!("config-keepalive-timeout"),
                     &self.awg_keepalive_timeout,
                 ))
                 .child(row(
                     "awg-max-handshake",
-                    "Max handshake attempts",
+                    t!("config-max-handshake"),
                     &self.awg_max_handshake,
                 ));
             block = block.child(switch_row(
                 "awg-trailers",
                 "awg-trailers-switch".to_string(),
-                "Random trailers",
-                "Append random trailers (v3-only — passes through for the fork check)",
+                t!("config-awg-trailers"),
+                t!("config-awg-trailers-tip"),
                 &self.awg_trailers,
                 repaint,
             ));
             block = block.child(switch_row(
                 "awg-cookies",
                 "awg-cookies-switch".to_string(),
-                "Disable cookies",
-                "Disable handshake cookies (v3-only — passes through for the fork check)",
+                t!("config-awg-cookies"),
+                t!("config-awg-cookies-tip"),
                 &self.awg_cookies,
                 repaint,
             ));
@@ -2773,7 +2802,7 @@ impl ConfigForm {
                     div()
                         .id("awg-v3-note")
                         .test_support()
-                        .child("v3-only fields hidden — stored values preserved (never wiped)."),
+                        .child(t!("config-awg-v3-hidden")),
                 ),
             );
         }
@@ -2793,21 +2822,19 @@ impl ConfigForm {
         repaint: &DialogRepaint,
         cx: &App,
     ) -> impl IntoElement {
-        let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
+        let row = |id: &'static str, label: String, state: &Entity<InputState>| {
             field()
-                .label(label.to_string())
+                .label(label.clone())
                 .child(labelled_input(label, state).id(id))
         };
         let switch_row = |id: &'static str,
                           switch_id: String,
-                          label: &str,
-                          tip: &str,
+                          label: String,
+                          tip: String,
                           cell: &Rc<RefCell<bool>>,
                           repaint: &DialogRepaint| {
             let switch_cell = cell.clone();
             let switch_repaint = repaint.clone();
-            let label = label.to_string();
-            let tip = tip.to_string();
             field().label_indent(false).child(
                 div().id(id).test_support().child(
                     Switch::new(switch_id)
@@ -2828,12 +2855,18 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         if self.protocol_locked {
             block = block.child(
-                field().label("Protocol version".to_string()).child(
-                    div()
-                        .id("hy-version-locked")
-                        .test_support()
-                        .child(if is_v2 { "2 (locked)" } else { "1 (locked)" }),
-                ),
+                field()
+                    .label(t!("config-protocol-version").to_string())
+                    .child(
+                        div()
+                            .id("hy-version-locked")
+                            .test_support()
+                            .child(if is_v2 {
+                                t!("config-hy-version-locked-2")
+                            } else {
+                                t!("config-hy-version-locked-1")
+                            }),
+                    ),
             );
         } else {
             let picker = self.protocol_select.clone();
@@ -2854,69 +2887,76 @@ impl ConfigForm {
                     Radio::new(label)
                         .small()
                         .label(label)
-                        .tooltip(format!("Hysteria version {label}")),
+                        .tooltip(t!("config-hy-version-choice-tip", label = label)),
                 );
             }
             block = block.child(
-                field().label("Protocol version".to_string()).child(
-                    div()
-                        .id("hy-version-tip")
-                        .test_support()
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| {
-                                Tooltip::new(
-                                    "Hysteria protocol version (switches layout)".to_string(),
-                                )
+                field()
+                    .label(t!("config-protocol-version").to_string())
+                    .child(
+                        div()
+                            .id("hy-version-tip")
+                            .test_support()
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| Tooltip::new(t!("config-hy-version-tip").to_string()))
+                                    .into()
                             })
-                            .into()
-                        })
-                        .child(div().id("hy-version-group").test_support().child(group)),
-                ),
+                            .child(div().id("hy-version-group").test_support().child(group)),
+                    ),
             );
         }
         block = block
             .child(row(
                 "hy-server-ports",
-                "Server ports (e.g. 9000-9010)",
+                t!("config-server-ports-placeholder"),
                 &self.hy_server_ports,
             ))
             .child(row(
                 "hy-hop-interval",
-                "Hop interval (e.g. 30s)",
+                t!("config-hop-interval-placeholder"),
                 &self.hy_hop_interval,
             ))
-            .child(row("hy-up", "Up Mbps", &self.hy_up))
-            .child(row("hy-down", "Down Mbps", &self.hy_down))
-            .child(row("hy-obfs", "Obfs", &self.hy_obfs));
+            .child(row("hy-up", t!("config-up"), &self.hy_up))
+            .child(row("hy-down", t!("config-down"), &self.hy_down))
+            .child(row("hy-obfs", t!("config-obfs"), &self.hy_obfs));
         if is_v2 {
             block = block.child(password_row(
-                "Password *",
+                t!("config-password-required"),
                 "hy-password",
                 &self.hy_password,
                 cx,
             ));
         } else {
             block = block.child(Self::panel_select_row(
-                "Auth type",
+                t!("config-auth-type"),
                 "hy-auth-type-tip",
-                "v1 auth marker (blank leaves it unset)",
+                t!("config-hy-auth-type-tip"),
                 "hy-auth-type",
-                "Hysteria auth type",
+                t!("config-hy-auth-type-aria"),
                 &self.hy_auth_type,
             ));
-            block = block.child(password_row("Auth *", "hy-auth", &self.hy_auth, cx));
+            block = block.child(password_row(
+                t!("config-auth-required"),
+                "hy-auth",
+                &self.hy_auth,
+                cx,
+            ));
             block = block
                 .child(row(
                     "hy-recv-window-conn",
-                    "Recv window conn",
+                    t!("config-recv-window-conn"),
                     &self.hy_recv_conn,
                 ))
-                .child(row("hy-recv-window", "Recv window", &self.hy_recv));
+                .child(row(
+                    "hy-recv-window",
+                    t!("config-recv-window"),
+                    &self.hy_recv,
+                ));
             block = block.child(switch_row(
                 "hy-mtu",
                 "hy-mtu-switch".to_string(),
-                "Disable MTU discovery",
-                "Disable MTU discovery on v1 (folds disable_mtu_discovery)",
+                t!("config-hy-mtu"),
+                t!("config-hy-mtu-tip"),
                 &self.hy_mtu,
                 repaint,
             ));
@@ -2940,14 +2980,12 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let switch_row = |id: &'static str,
                           switch_id: String,
-                          label: &str,
-                          tip: &str,
+                          label: String,
+                          tip: String,
                           cell: &Rc<RefCell<bool>>,
                           repaint: &DialogRepaint| {
             let switch_cell = cell.clone();
             let switch_repaint = repaint.clone();
-            let label = label.to_string();
-            let tip = tip.to_string();
             field().label_indent(false).child(
                 div().id(id).test_support().child(
                     Switch::new(switch_id)
@@ -2966,57 +3004,60 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic", uuid_error, cx));
         block = block.child(password_row(
-            "Password *",
+            t!("config-password-required"),
             "tuic-password",
             &self.tuic_password,
             cx,
         ));
         block = block.child(Self::panel_select_row(
-            "Congestion control",
+            t!("config-congestion"),
             "tuic-cc-tip",
-            "TUIC congestion control (blank leaves it unset)",
+            t!("config-tuic-cc-tip"),
             "tuic-cc",
-            "TUIC congestion control",
+            t!("config-tuic-cc-aria"),
             &self.tuic_cc,
         ));
         block = block.child(Self::panel_select_row(
-            "UDP relay mode",
+            t!("config-udp-relay"),
             "tuic-relay-tip",
-            "TUIC relay mode (blank leaves it unset)",
+            t!("config-tuic-relay-tip"),
             "tuic-relay",
-            "TUIC UDP relay mode",
+            t!("config-tuic-relay-aria"),
             &self.tuic_relay,
         ));
         block = block.child(switch_row(
             "tuic-uot",
             "tuic-uot-switch".to_string(),
-            "UDP over stream",
-            "UDP over stream (folds udp_over_stream)",
+            t!("config-tuic-uot"),
+            t!("config-tuic-uot-tip"),
             &self.tuic_uot,
             repaint,
         ));
         block = block.child(switch_row(
             "tuic-zero-rtt",
             "tuic-zero-rtt-switch".to_string(),
-            "Zero RTT",
-            "Zero-RTT handshake (folds zero_rtt_handshake)",
+            t!("config-tuic-zero-rtt"),
+            t!("config-tuic-zero-rtt-tip"),
             &self.tuic_zero_rtt,
             repaint,
         ));
         block = block.child(
-            field().label("Heartbeat".to_string()).child(
+            field().label(t!("config-heartbeat").to_string()).child(
                 div()
                     .id("tuic-heartbeat")
                     .test_support()
-                    .child(labelled_input("Heartbeat", &self.tuic_heartbeat)),
+                    .child(labelled_input(t!("config-heartbeat"), &self.tuic_heartbeat)),
             ),
         );
 
-        block = block.child(field().label_indent(false).child(
-            div().id("tuic-notes").test_support().child(
-                "TUIC runs TLS always-on (security locked tls). Blank congestion/relay stay unset.",
+        block = block.child(
+            field().label_indent(false).child(
+                div()
+                    .id("tuic-notes")
+                    .test_support()
+                    .child(t!("config-tuic-note")),
             ),
-        ));
+        );
         block
     }
 
@@ -3030,33 +3071,33 @@ impl ConfigForm {
         let uot_repaint = repaint.clone();
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(Self::panel_select_row(
-            "Version",
+            t!("config-version"),
             "socks-version-tip",
-            "SOCKS version (blank leaves the stock default 5)",
+            t!("config-socks-version-tip"),
             "socks-version",
-            "SOCKS version",
+            t!("config-socks-version-aria"),
             &self.socks_version,
         ));
         block = block.child(
-            field().label("Username".to_string()).child(
+            field().label(t!("config-username").to_string()).child(
                 div()
                     .id("socks-username")
                     .test_support()
-                    .child(labelled_input("Username", &self.socks_username)),
+                    .child(labelled_input(t!("config-username"), &self.socks_username)),
             ),
         );
         block = block.child(password_row(
-            "Password",
+            t!("config-password"),
             "socks-password",
             &self.socks_password,
             cx,
         ));
         block = block.child(Self::panel_select_row(
-            "Network",
+            t!("config-network"),
             "socks-network-tip",
-            "SOCKS network (tcp is the default)",
+            t!("config-socks-network-tip"),
             "socks-network",
-            "SOCKS network",
+            t!("config-socks-network-aria"),
             &self.socks_network,
         ));
         block = block.child(
@@ -3065,9 +3106,9 @@ impl ConfigForm {
                     Switch::new("socks-uot-switch")
                         .small()
                         .checked(*self.socks_uot.borrow())
-                        .label("UDP over TCP (uot)")
-                        .tooltip("UDP over TCP for socks (folds the uot flat)")
-                        .accessibility_label("UDP over TCP for socks")
+                        .label(t!("config-uot"))
+                        .tooltip(t!("config-uot-socks-tip"))
+                        .accessibility_label(t!("config-uot-socks-aria"))
                         .on_change(move |next: &bool, window, cx| {
                             *uot_cell.borrow_mut() = *next;
                             uot_repaint(window, cx);
@@ -3094,33 +3135,33 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         block = block
             .child(
-                field().label("Username".to_string()).child(
+                field().label(t!("config-username").to_string()).child(
                     div()
                         .id("http-username")
                         .test_support()
-                        .child(labelled_input("Username", &self.http_username)),
+                        .child(labelled_input(t!("config-username"), &self.http_username)),
                 ),
             )
             .child(password_row(
-                "Password",
+                t!("config-password"),
                 "http-password",
                 &self.http_password,
                 cx,
             ))
             .child(
-                field().label("Path".to_string()).child(
+                field().label(t!("config-path").to_string()).child(
                     div()
                         .id("http-path")
                         .test_support()
-                        .child(labelled_input("Path", &self.http_path)),
+                        .child(labelled_input(t!("config-path"), &self.http_path)),
                 ),
             )
             .child(
-                field().label("Headers".to_string()).child(
+                field().label(t!("config-headers").to_string()).child(
                     div()
                         .id("http-headers")
                         .test_support()
-                        .child(labelled_input("Headers", &self.http_headers)),
+                        .child(labelled_input(t!("config-headers"), &self.http_headers)),
                 ),
             );
 
@@ -3141,34 +3182,40 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(password_row(
-            "Password *",
+            t!("config-password-required"),
             "anytls-password",
             &self.anytls_password,
             cx,
         ));
         block = block
             .child(
-                field().label("Idle check interval".to_string()).child(
+                field().label(t!("config-idle-check").to_string()).child(
                     div()
                         .id("anytls-interval")
                         .test_support()
-                        .child(labelled_input("Idle check interval", &self.anytls_interval)),
+                        .child(labelled_input(
+                            t!("config-idle-check"),
+                            &self.anytls_interval,
+                        )),
                 ),
             )
             .child(
-                field().label("Idle timeout".to_string()).child(
+                field().label(t!("config-idle-timeout").to_string()).child(
                     div()
                         .id("anytls-timeout")
                         .test_support()
-                        .child(labelled_input("Idle timeout", &self.anytls_timeout)),
+                        .child(labelled_input(
+                            t!("config-idle-timeout"),
+                            &self.anytls_timeout,
+                        )),
                 ),
             )
             .child(
-                field().label("Min idle sessions".to_string()).child(
+                field().label(t!("config-min-idle").to_string()).child(
                     div()
                         .id("anytls-min")
                         .test_support()
-                        .child(labelled_input("Min idle sessions", &self.anytls_min)),
+                        .child(labelled_input(t!("config-min-idle"), &self.anytls_min)),
                 ),
             );
 
@@ -3189,14 +3236,12 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let switch_row = |id: &'static str,
                           switch_id: String,
-                          label: &str,
-                          tip: &str,
+                          label: String,
+                          tip: String,
                           cell: &Rc<RefCell<bool>>,
                           repaint: &DialogRepaint| {
             let switch_cell = cell.clone();
             let switch_repaint = repaint.clone();
-            let label = label.to_string();
-            let tip = tip.to_string();
             field().label_indent(false).child(
                 div().id(id).test_support().child(
                     Switch::new(switch_id)
@@ -3215,15 +3260,17 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         block = block
             .child(
-                field().label("Username *".to_string()).child(
-                    div()
-                        .id("naive-username")
-                        .test_support()
-                        .child(labelled_input("Username", &self.naive_username)),
-                ),
+                field()
+                    .label(t!("config-username-required").to_string())
+                    .child(
+                        div()
+                            .id("naive-username")
+                            .test_support()
+                            .child(labelled_input(t!("config-username"), &self.naive_username)),
+                    ),
             )
             .child(password_row(
-                "Password *",
+                t!("config-password-required"),
                 "naive-password",
                 &self.naive_password,
                 cx,
@@ -3231,25 +3278,25 @@ impl ConfigForm {
         block = block.child(switch_row(
             "naive-uot",
             "naive-uot-switch".to_string(),
-            "UDP over TCP (uot)",
-            "UDP over TCP for naive (folds the uot flat)",
+            t!("config-uot"),
+            t!("config-uot-naive-tip"),
             &self.naive_uot,
             repaint,
         ));
         block = block.child(switch_row(
             "naive-quic",
             "naive-quic-switch".to_string(),
-            "QUIC",
-            "Run naive over QUIC instead of HTTP/2",
+            t!("config-naive-quic"),
+            t!("config-naive-quic-tip"),
             &self.naive_quic,
             repaint,
         ));
         block = block.child(Self::panel_select_row(
-            "Congestion control",
+            t!("config-congestion"),
             "naive-cc-tip",
-            "QUIC congestion control (blank leaves the chromium default cubic)",
+            t!("config-naive-cc-tip"),
             "naive-cc",
-            "Naive congestion control",
+            t!("config-naive-cc-aria"),
             &self.naive_cc,
         ));
 
@@ -3272,104 +3319,100 @@ impl ConfigForm {
         let browse_path = self.ssh_key_path.clone();
         let browse_key = self.ssh_private_key.clone();
         let mut block = div().flex().flex_col().gap_2();
-        block = block
-            .child(
-                field().label("User".to_string()).child(
-                    div()
-                        .id("ssh-user")
-                        .test_support()
-                        .child(labelled_input("User", &self.ssh_user)),
-                ),
-            )
-            .child(password_row(
-                "Password",
-                "ssh-password",
-                &self.ssh_password,
-                cx,
-            ))
-            .child(
-                field().label("Private key".to_string()).child(
-                    div()
-                        .id("ssh-private-key")
-                        .test_support()
-                        .child(labelled_textarea("Private key", &self.ssh_private_key).h(px(96.))),
-                ),
-            )
-            .child(
-                field().label("Private key path".to_string()).child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
+        block =
+            block
+                .child(
+                    field().label(t!("config-user").to_string()).child(
+                        div()
+                            .id("ssh-user")
+                            .test_support()
+                            .child(labelled_input(t!("config-user"), &self.ssh_user)),
+                    ),
+                )
+                .child(password_row(
+                    t!("config-password"),
+                    "ssh-password",
+                    &self.ssh_password,
+                    cx,
+                ))
+                .child(
+                    field().label(t!("config-private-key").to_string()).child(
+                        div().id("ssh-private-key").test_support().child(
+                            labelled_textarea(t!("config-private-key"), &self.ssh_private_key)
+                                .h(px(96.)),
+                        ),
+                    ),
+                )
+                .child(
+                    field()
+                        .label(t!("config-private-key-path").to_string())
                         .child(
                             div()
-                                .flex_1()
-                                .id("ssh-key-path")
-                                .test_support()
-                                .child(labelled_input("Private key path", &self.ssh_key_path)),
-                        )
-                        .child(
-                            Button::new("ssh-key-browse")
-                                .small()
-                                .label("Browse…")
-                                .tooltip(
-                                    "Pick a private-key file — fills the path and loads the key",
-                                )
-                                .accessibility_label("Browse for an SSH private-key file")
-                                .on_click(move |_, window, cx| {
-                                    browse_view.update(cx, |view, cx| {
-                                        view.browse_for_ssh_key(
-                                            browse_path.clone(),
-                                            browse_key.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(div().flex_1().id("ssh-key-path").test_support().child(
+                                    labelled_input(
+                                        t!("config-private-key-path"),
+                                        &self.ssh_key_path,
+                                    ),
+                                ))
+                                .child(
+                                    Button::new("ssh-key-browse")
+                                        .small()
+                                        .label(t!("config-browse"))
+                                        .tooltip(t!("config-ssh-browse-tip"))
+                                        .accessibility_label(t!("config-ssh-browse-aria"))
+                                        .on_click(move |_, window, cx| {
+                                            browse_view.update(cx, |view, cx| {
+                                                view.browse_for_ssh_key(
+                                                    browse_path.clone(),
+                                                    browse_key.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                ),
                         ),
-                ),
-            )
-            .child(
-                field().label("Private key passphrase".to_string()).child(
-                    div()
-                        .id("ssh-key-pass")
-                        .test_support()
-                        .child(labelled_masked_input(
-                            "Private key passphrase",
-                            &self.ssh_key_pass,
+                )
+                .child(
+                    field()
+                        .label(t!("config-private-key-passphrase").to_string())
+                        .child(div().id("ssh-key-pass").test_support().child(
+                            labelled_masked_input(
+                                t!("config-private-key-passphrase"),
+                                &self.ssh_key_pass,
+                            ),
                         )),
-                ),
-            )
-            .child(
-                field().label("Host key (comma list)".to_string()).child(
-                    div()
-                        .id("ssh-host-key")
-                        .test_support()
-                        .child(labelled_input("Host key (comma list)", &self.ssh_host_key)),
-                ),
-            )
-            .child(
-                field()
-                    .label("Host key algorithms (comma list)".to_string())
-                    .child(
+                )
+                .child(
+                    field().label(t!("config-host-key").to_string()).child(
+                        div()
+                            .id("ssh-host-key")
+                            .test_support()
+                            .child(labelled_input(t!("config-host-key"), &self.ssh_host_key)),
+                    ),
+                )
+                .child(
+                    field().label(t!("config-host-key-algs").to_string()).child(
                         div()
                             .id("ssh-host-key-algs")
                             .test_support()
                             .child(labelled_input(
-                                "Host key algorithms (comma list)",
+                                t!("config-host-key-algs"),
                                 &self.ssh_host_key_algs,
                             )),
                     ),
-            )
-            .child(
-                field().label("Client version".to_string()).child(
-                    div()
-                        .id("ssh-client-version")
-                        .test_support()
-                        .child(labelled_input("Client version", &self.ssh_client_version)),
-                ),
-            );
+                )
+                .child(
+                    field()
+                        .label(t!("config-client-version").to_string())
+                        .child(div().id("ssh-client-version").test_support().child(
+                            labelled_input(t!("config-client-version"), &self.ssh_client_version),
+                        )),
+                );
 
         block = block.child(field().label_indent(false).child(
             div().id("ssh-notes").test_support().child(
@@ -3390,53 +3433,64 @@ impl ConfigForm {
         let reuse_repaint = repaint.clone();
         let mut block = div().flex().flex_col().gap_2();
         block = block
-            .child(password_row("PSK *", "snell-psk", &self.snell_psk, cx))
+            .child(password_row(
+                t!("config-psk-required"),
+                "snell-psk",
+                &self.snell_psk,
+                cx,
+            ))
             .child(Self::panel_select_row(
-                "Version",
+                t!("config-version"),
                 "snell-version-tip",
-                "Snell version (blank leaves the engine default 4)",
+                t!("config-snell-version-tip"),
                 "snell-version",
-                "Snell version",
+                t!("config-snell-version-aria"),
                 &self.snell_version,
             ))
             .child(
-                field().label("Obfs mode".to_string()).child(
+                field().label(t!("config-obfs-mode").to_string()).child(
                     div()
                         .id("snell-obfs-mode")
                         .test_support()
-                        .child(labelled_input("Obfs mode", &self.snell_obfs_mode)),
+                        .child(labelled_input(
+                            t!("config-obfs-mode"),
+                            &self.snell_obfs_mode,
+                        )),
                 ),
             )
             .child(
-                field().label("Obfs host".to_string()).child(
+                field().label(t!("config-obfs-host").to_string()).child(
                     div()
                         .id("snell-obfs-host")
                         .test_support()
-                        .child(labelled_input("Obfs host", &self.snell_obfs_host)),
+                        .child(labelled_input(
+                            t!("config-obfs-host"),
+                            &self.snell_obfs_host,
+                        )),
                 ),
             )
             .child(
-                field().label("User key".to_string()).child(
+                field().label(t!("config-user-key").to_string()).child(
                     div()
                         .id("snell-userkey")
                         .test_support()
-                        .child(labelled_input("User key", &self.snell_userkey)),
+                        .child(labelled_input(t!("config-user-key"), &self.snell_userkey)),
                 ),
             )
             .child(
-                field().label("Network".to_string()).child(
+                field().label(t!("config-network").to_string()).child(
                     div()
                         .id("snell-network")
                         .test_support()
-                        .child(labelled_input("Network", &self.snell_network)),
+                        .child(labelled_input(t!("config-network"), &self.snell_network)),
                 ),
             )
             .child(
-                field().label("Mode".to_string()).child(
+                field().label(t!("config-mode").to_string()).child(
                     div()
                         .id("snell-mode")
                         .test_support()
-                        .child(labelled_input("Mode", &self.snell_mode)),
+                        .child(labelled_input(t!("config-mode"), &self.snell_mode)),
                 ),
             );
         block = block.child(
@@ -3445,9 +3499,9 @@ impl ConfigForm {
                     Switch::new("snell-reuse-switch")
                         .small()
                         .checked(*self.snell_reuse.borrow())
-                        .label("Reuse")
-                        .tooltip("Reuse sessions for snell (folds the reuse flat)")
-                        .accessibility_label("Reuse sessions for snell")
+                        .label(t!("config-reuse"))
+                        .tooltip(t!("config-snell-reuse-tip"))
+                        .accessibility_label(t!("config-snell-reuse-aria"))
                         .on_change(move |next: &bool, window, cx| {
                             *reuse_cell.borrow_mut() = *next;
                             reuse_repaint(window, cx);
@@ -3474,15 +3528,15 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         block = block
             .child(Self::panel_select_row(
-                "Version",
+                t!("config-version"),
                 "shadowtls-version-tip",
-                "ShadowTLS version (blank takes the schema default 1; v1 rows omit the password)",
+                t!("config-shadowtls-version-tip"),
                 "shadowtls-version",
-                "ShadowTLS version",
+                t!("config-shadowtls-version-aria"),
                 &self.shadowtls_version,
             ))
             .child(password_row(
-                "Password",
+                t!("config-password"),
                 "shadowtls-password",
                 &self.shadowtls_password,
                 cx,
@@ -3509,91 +3563,96 @@ impl ConfigForm {
         block = block.child(self.uuid_row(view, &self.xray_uuid, "xray", uuid_error, _cx));
         block = block
             .child(
-                field().label("Encryption".to_string()).child(
+                field().label(t!("config-encryption").to_string()).child(
                     div()
                         .id("xray-enc")
                         .test_support()
-                        .child(labelled_input("Encryption", &self.xray_enc)),
+                        .child(labelled_input(t!("config-encryption"), &self.xray_enc)),
                 ),
             )
             .child(Self::panel_select_row(
-                "Flow",
+                t!("config-flow"),
                 "xray-flow-tip",
-                "Xray flow (blank leaves the default)",
+                t!("config-xray-flow-tip"),
                 "xray-flow",
-                "Xray flow",
+                t!("config-xray-flow-aria"),
                 &self.xray_flow,
             ))
             .child(
-                field().label("SNI".to_string()).child(
+                field().label(t!("config-sni").to_string()).child(
                     div()
                         .id("xray-sni")
                         .test_support()
-                        .child(labelled_input("SNI", &self.xray_sni)),
+                        .child(labelled_input(t!("config-sni"), &self.xray_sni)),
                 ),
             )
             .child(Self::panel_select_row(
-                "Fingerprint",
+                t!("config-fingerprint"),
                 "xray-fp-tip",
-                "Xray fingerprint (blank leaves the default)",
+                t!("config-xray-fp-tip"),
                 "xray-fp",
-                "Xray fingerprint",
+                t!("config-xray-fp-aria"),
                 &self.xray_fp,
             ))
             .child(
-                field().label("ALPN (comma list)".to_string()).child(
+                field().label(t!("config-alpn").to_string()).child(
                     div()
                         .id("xray-alpn")
                         .test_support()
-                        .child(labelled_input("ALPN (comma list)", &self.xray_alpn)),
+                        .child(labelled_input(t!("config-alpn"), &self.xray_alpn)),
                 ),
             )
             .child(
-                field().label("REALITY public key (pbk)".to_string()).child(
+                field().label(t!("config-reality-pbk").to_string()).child(
                     div()
                         .id("xray-pbk")
                         .test_support()
-                        .child(labelled_input("REALITY public key (pbk)", &self.xray_pbk)),
+                        .child(labelled_input(t!("config-reality-pbk"), &self.xray_pbk)),
                 ),
             )
             .child(
-                field().label("REALITY short id (sid)".to_string()).child(
+                field().label(t!("config-reality-sid").to_string()).child(
                     div()
                         .id("xray-sid")
                         .test_support()
-                        .child(labelled_input("REALITY short id (sid)", &self.xray_sid)),
+                        .child(labelled_input(t!("config-reality-sid"), &self.xray_sid)),
                 ),
             )
             .child(
-                field().label("REALITY spiderX path".to_string()).child(
-                    div()
-                        .id("xray-spiderx")
-                        .test_support()
-                        .child(labelled_input("REALITY spiderX path", &self.xray_spiderx)),
-                ),
+                field()
+                    .label(t!("config-reality-spiderx").to_string())
+                    .child(
+                        div()
+                            .id("xray-spiderx")
+                            .test_support()
+                            .child(labelled_input(
+                                t!("config-reality-spiderx"),
+                                &self.xray_spiderx,
+                            )),
+                    ),
             )
             .child(Self::panel_select_row(
-                "Network",
+                t!("config-network"),
                 "xray-network-tip",
-                "Xray stream network (raw|xhttp|ws|httpupgrade|grpc)",
+                t!("config-xray-network-tip"),
                 "xray-network",
-                "Xray network",
+                t!("config-xray-network-aria"),
                 &self.xray_network,
             ))
             .child(
-                field().label("Mode".to_string()).child(
+                field().label(t!("config-mode").to_string()).child(
                     div()
                         .id("xray-mode")
                         .test_support()
-                        .child(labelled_input("Mode", &self.xray_mode)),
+                        .child(labelled_input(t!("config-mode"), &self.xray_mode)),
                 ),
             )
             .child(Self::panel_select_row(
-                "Mux",
+                t!("config-section-mux"),
                 "xray-mux-tip",
-                "Xray mux (Keep default leaves the sidecar default)",
+                t!("config-xray-mux-tip"),
                 "xray-mux",
-                "Xray mux",
+                t!("config-xray-mux-aria"),
                 &self.xray_mux,
             ));
         block = block.child(field().label_indent(false).child(
@@ -3615,11 +3674,11 @@ impl ConfigForm {
         let library = self.chain_library.borrow().clone();
         let mut block = div().flex().flex_col().gap_2();
         block = block.child(Self::panel_select_row(
-            "Hop from library",
+            t!("config-chain-pick"),
             "chain-pick-tip",
-            "Add or replace hops from your row list (chain and off-index-0 extracore hops are rejected)",
+            t!("config-chain-pick-tip"),
             "chain-pick",
-            "Chain hop from library",
+            t!("config-chain-pick-aria"),
             &self.chain_pick,
         ));
         {
@@ -3633,9 +3692,9 @@ impl ConfigForm {
                     div().id("chain-hop-add-row").test_support().child(
                         Button::new("chain-hop-add")
                             .small()
-                            .label("Add hop")
-                            .tooltip("Append the picked row to the chain")
-                            .accessibility_label("Add the picked row to the chain")
+                            .label(t!("config-add-hop"))
+                            .tooltip(t!("config-add-hop-tip"))
+                            .accessibility_label(t!("config-add-hop-aria"))
                             .on_click(move |_, window, cx| {
                                 let picked = add_pick.read(cx).selected_value().cloned();
                                 let picked = picked.as_deref().unwrap_or("").to_string();
@@ -3660,10 +3719,10 @@ impl ConfigForm {
                 div().id("chain-hops-empty").test_support().child(
                     Empty::new().header(
                         EmptyHeader::new()
-                            .title(EmptyTitle::new().child("No hops yet"))
-                            .description(EmptyDescription::new().child(
-                                "Add hops from the library — the first hop may be an extra-core row.",
-                            )),
+                            .title(EmptyTitle::new().child(t!("config-chain-empty-title")))
+                            .description(
+                                EmptyDescription::new().child(t!("config-chain-empty-desc")),
+                            ),
                     ),
                 ),
             );
@@ -3699,9 +3758,12 @@ impl ConfigForm {
                         .child(
                             Button::new(format!("chain-hop-replace-{index}"))
                                 .small()
-                                .label("Replace")
-                                .tooltip("Replace this hop with the picked row")
-                                .accessibility_label(format!("Replace hop {}", index + 1))
+                                .label(t!("config-replace"))
+                                .tooltip(t!("config-replace-tip"))
+                                .accessibility_label(t!(
+                                    "config-replace-hop-aria",
+                                    number = (index + 1) as i64
+                                ))
                                 .on_click(move |_, window, cx| {
                                     let picked = replace_pick.read(cx).selected_value().cloned();
                                     let picked = picked.as_deref().unwrap_or("").to_string();
@@ -3722,9 +3784,12 @@ impl ConfigForm {
                         .child(
                             Button::new(format!("chain-hop-remove-{index}"))
                                 .small()
-                                .label("Remove")
-                                .tooltip("Remove this hop from the chain")
-                                .accessibility_label(format!("Remove hop {}", index + 1))
+                                .label(t!("config-remove"))
+                                .tooltip(t!("config-remove-tip"))
+                                .accessibility_label(t!(
+                                    "config-remove-hop-aria",
+                                    number = (index + 1) as i64
+                                ))
                                 .on_click(move |_, window, cx| {
                                     let mut hops = remove_hops.borrow_mut();
                                     if index < hops.len() {
@@ -3760,7 +3825,7 @@ impl ConfigForm {
         block = block
             .child(
                 field()
-                    .label("Executable (app dir file name)".to_string())
+                    .label(t!("config-executable-placeholder").to_string())
                     .child(
                         div()
                             .flex()
@@ -3768,14 +3833,17 @@ impl ConfigForm {
                             .items_center()
                             .gap_2()
                             .child(div().flex_1().id("extra-exe").test_support().child(
-                                labelled_input("Executable (app dir file name)", &self.extra_exe),
+                                labelled_input(
+                                    t!("config-executable-placeholder"),
+                                    &self.extra_exe,
+                                ),
                             ))
                             .child(
                                 Button::new("extra-exe-browse")
                                     .small()
-                                    .label("Browse…")
-                                    .tooltip("Pick the sidecar executable — fills the path")
-                                    .accessibility_label("Browse for the extra-core executable")
+                                    .label(t!("config-browse"))
+                                    .tooltip(t!("config-extra-browse-tip"))
+                                    .accessibility_label(t!("config-extra-browse-aria"))
                                     .on_click(move |_, window, cx| {
                                         browse_view.update(cx, |view, cx| {
                                             view.browse_for_extra_exe(
@@ -3789,23 +3857,18 @@ impl ConfigForm {
                     ),
             )
             .child(
-                field().label("Args".to_string()).child(
+                field().label(t!("config-args").to_string()).child(
                     div()
                         .id("extra-args")
                         .test_support()
-                        .child(labelled_input("Args", &self.extra_args)),
+                        .child(labelled_input(t!("config-args"), &self.extra_args)),
                 ),
             )
-            .child(
-                field()
-                    .label("Config (passed as -c <file>)".to_string())
-                    .child(
-                        div().id("extra-config").test_support().child(
-                            labelled_textarea("Config (passed as -c <file>)", &self.extra_config)
-                                .h(px(96.)),
-                        ),
-                    ),
-            );
+            .child(field().label(t!("config-config-label").to_string()).child(
+                div().id("extra-config").test_support().child(
+                    labelled_textarea(t!("config-config-label"), &self.extra_config).h(px(96.)),
+                ),
+            ));
         block = block.child(field().label_indent(false).child(
             div().id("extra-notes").test_support().child(
                 "Spawned unprivileged as <exe> -c <config-file> (v1 convention — extra flags \
@@ -3829,12 +3892,12 @@ impl ConfigForm {
         let flow_select = self.vless_flow.clone();
         let packet_select = self.vless_packet_encoding.clone();
         block = block.child(
-            field().label("Flow".to_string()).child(
+            field().label(t!("config-flow").to_string()).child(
                 div()
                     .id("vless-flow-tip")
                     .test_support()
                     .tooltip(move |_, cx| {
-                        cx.new(|_| Tooltip::new("VLESS flow (vision disables mux)".to_string()))
+                        cx.new(|_| Tooltip::new(t!("config-vless-flow-tip").to_string()))
                             .into()
                     })
                     .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
@@ -3844,29 +3907,33 @@ impl ConfigForm {
                         Select::new(&flow_select)
                             .id("vless-flow")
                             .small()
-                            .accessibility_label("VLESS flow"),
+                            .accessibility_label(t!("config-vless-flow-aria")),
                     ),
             ),
         );
         block = block.child(
-            field().label("Packet encoding".to_string()).child(
-                div()
-                    .id("vless-packet-encoding-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| Tooltip::new("VLESS packet encoding".to_string()))
+            field()
+                .label(t!("config-packet-encoding").to_string())
+                .child(
+                    div()
+                        .id("vless-packet-encoding-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                Tooltip::new(t!("config-vless-packet-encoding-aria").to_string())
+                            })
                             .into()
-                    })
-                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        Select::new(&packet_select)
-                            .id("vless-packet-encoding")
-                            .small()
-                            .accessibility_label("VLESS packet encoding"),
-                    ),
-            ),
+                        })
+                        .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Select::new(&packet_select)
+                                .id("vless-packet-encoding")
+                                .small()
+                                .accessibility_label(t!("config-vless-packet-encoding-aria")),
+                        ),
+                ),
         );
 
         block
@@ -3950,8 +4017,8 @@ impl ConfigForm {
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().child(Label::new("Params")))
-            .child(labelled_textarea("Params", &self.params).h(px(96.)))
+            .child(div().child(Label::new(t!("config-params"))))
+            .child(labelled_textarea(t!("config-params"), &self.params).h(px(96.)))
             .child({
                 let format_view = view.clone();
                 let format_params = self.params.clone();
@@ -3966,16 +4033,18 @@ impl ConfigForm {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(Button::new("params-format").label("Format JSON").on_click(
-                        move |_, window, cx| {
-                            format_view.update(cx, |view, cx| {
-                                view.format_dialog_params(&format_params, window, cx);
-                            });
-                        },
-                    ))
+                    .child(
+                        Button::new("params-format")
+                            .label(t!("config-format-json"))
+                            .on_click(move |_, window, cx| {
+                                format_view.update(cx, |view, cx| {
+                                    view.format_dialog_params(&format_params, window, cx);
+                                });
+                            }),
+                    )
                     .child(
                         Button::new("params-template")
-                            .label("Load protocol template")
+                            .label(t!("config-load-template"))
                             .on_click(move |_, window, cx| {
                                 template_view.update(cx, |view, cx| {
                                     view.template_dialog_params(
@@ -3987,19 +4056,21 @@ impl ConfigForm {
                                 });
                             }),
                     )
-                    .child(Button::new("params-validate").label("Validate").on_click(
-                        move |_, window, cx| {
-                            validate_view.update(cx, |view, cx| {
-                                let protocol = validate_form.protocol_text(cx);
-                                view.validate_dialog_params(
-                                    &validate_params,
-                                    &protocol,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        },
-                    ))
+                    .child(
+                        Button::new("params-validate")
+                            .label(t!("config-validate"))
+                            .on_click(move |_, window, cx| {
+                                validate_view.update(cx, |view, cx| {
+                                    let protocol = validate_form.protocol_text(cx);
+                                    view.validate_dialog_params(
+                                        &validate_params,
+                                        &protocol,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
             });
 
         let mut form = v_form().small();
@@ -4009,26 +4080,22 @@ impl ConfigForm {
                 .flex_1()
                 .id("common-caption")
                 .test_support()
-                .child(Label::new("Common")),
+                .child(Label::new(t!("config-section-common"))),
         );
         let mut common = div().flex().flex_col().gap_1().child(common_head).child(
-            field().label("Name *".to_string()).child(
+            field().label(t!("config-name-required").to_string()).child(
                 div()
                     .id("field-name-tip")
                     .test_support()
                     .tooltip(move |_, cx| {
-                        cx.new(|_| {
-                            Tooltip::new(
-                                "Display name for this row (cards and toasts name it)".to_string(),
-                            )
-                        })
-                        .into()
+                        cx.new(|_| Tooltip::new(t!("config-name-tip").to_string()))
+                            .into()
                     })
                     .child(
                         div()
                             .id("field-name")
                             .test_support()
-                            .child(labelled_input("Name", &self.name)),
+                            .child(labelled_input(t!("config-name"), &self.name)),
                     ),
             ),
         );
@@ -4036,26 +4103,26 @@ impl ConfigForm {
         if self.protocol_locked {
             let locked = self.locked_protocol.clone();
             common = common.child(
-                field().label("Protocol".to_string()).child(
+                field().label(t!("config-protocol").to_string()).child(
                     div()
                         .id("protocol-lock")
                         .test_support()
                         .tooltip(move |_, cx| {
-                            cx.new(|_| Tooltip::new("Type is locked after creation".to_string()))
+                            cx.new(|_| Tooltip::new(t!("config-protocol-locked-tip").to_string()))
                                 .into()
                         })
-                        .child(Label::new(format!("{locked} (locked)"))),
+                        .child(Label::new(t!("config-protocol-locked", protocol = locked))),
                 ),
             );
         } else {
             let select = self.protocol_select.clone();
             common = common.child(
-                field().label("Protocol".to_string()).child(
+                field().label(t!("config-protocol").to_string()).child(
                     div()
                         .id("protocol-select-tip")
                         .test_support()
                         .tooltip(move |_, cx| {
-                            cx.new(|_| Tooltip::new("Protocol (locked after creation)".to_string()))
+                            cx.new(|_| Tooltip::new(t!("config-protocol-select-tip").to_string()))
                                 .into()
                         })
                         .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
@@ -4065,7 +4132,7 @@ impl ConfigForm {
                             Select::new(&select)
                                 .id("protocol-select")
                                 .small()
-                                .accessibility_label("Protocol"),
+                                .accessibility_label(t!("config-protocol")),
                         ),
                 ),
             );
@@ -4079,16 +4146,13 @@ impl ConfigForm {
                     .gap_2()
                     .child(
                         div().flex_1().min_w_0().child(
-                            field().label("Server *").child(
+                            field().label(t!("config-server-required")).child(
                                 div()
                                     .id("field-guided-server-tip")
                                     .test_support()
                                     .tooltip(move |_, cx| {
                                         cx.new(|_| {
-                                            Tooltip::new(
-                                                "Upstream server address (IP or hostname)"
-                                                    .to_string(),
-                                            )
+                                            Tooltip::new(t!("config-server-tip").to_string())
                                         })
                                         .into()
                                     })
@@ -4096,7 +4160,10 @@ impl ConfigForm {
                                         div()
                                             .id("field-guided-server")
                                             .test_support()
-                                            .child(labelled_input("Server", &self.guided_server))
+                                            .child(labelled_input(
+                                                t!("config-server"),
+                                                &self.guided_server,
+                                            ))
                                             .children(local_field_error(
                                                 "field-guided-server-error",
                                                 form_error.as_ref(),
@@ -4109,19 +4176,24 @@ impl ConfigForm {
                     )
                     .child(
                         div().flex_1().min_w_0().child(
-                            field().label("Server port *").child(
+                            field().label(t!("config-server-port-required")).child(
                                 div()
                                     .id("field-guided-port-tip")
                                     .test_support()
                                     .tooltip(move |_, cx| {
-                                        cx.new(|_| Tooltip::new("Upstream server port".to_string()))
-                                            .into()
+                                        cx.new(|_| {
+                                            Tooltip::new(t!("config-server-port-tip").to_string())
+                                        })
+                                        .into()
                                     })
                                     .child(
                                         div()
                                             .id("field-guided-port")
                                             .test_support()
-                                            .child(labelled_input("Server port", &self.guided_port))
+                                            .child(labelled_input(
+                                                t!("config-server-port"),
+                                                &self.guided_port,
+                                            ))
                                             .children(local_field_error(
                                                 "field-guided-port-error",
                                                 form_error.as_ref(),
@@ -4141,7 +4213,10 @@ impl ConfigForm {
                 secret_state_caption(self.guided_identity.read(cx).value().as_ref()).to_string();
             common = common.child(
                 field()
-                    .label(format!("{} *", guided_identity_label(&protocol_text)))
+                    .label(t!(
+                        "config-identity-required",
+                        label = guided_identity_label(&protocol_text)
+                    ))
                     .child(
                         div()
                             .flex()
@@ -4149,7 +4224,7 @@ impl ConfigForm {
                             .gap_1()
                             .child(div().id("field-guided-identity").test_support().child(
                                 labelled_masked_input(
-                                    &guided_identity_label(&protocol_text),
+                                    guided_identity_label(&protocol_text),
                                     &self.guided_identity,
                                 ),
                             ))
@@ -4224,11 +4299,15 @@ impl ConfigForm {
                                             .min_w_0()
                                             .id("advanced-settings-caption")
                                             .test_support()
-                                            .child(Label::new("Advanced Settings")),
+                                            .child(Label::new(t!("config-section-advanced"))),
                                     )
                                     .child(panel_toggle_button(
                                         "advanced-settings",
-                                        if advanced_open { "Hide" } else { "Show" },
+                                        if advanced_open {
+                                            t!("config-hide")
+                                        } else {
+                                            t!("config-show")
+                                        },
                                         &toggle_view,
                                         &toggle_cell,
                                     )),
@@ -4253,17 +4332,17 @@ impl ConfigForm {
                     .gap_2()
                     .child(div().flex_1().min_w_0().child(dialog_field(
                         "field-group",
-                        "Group",
+                        t!("config-group"),
                         self.group,
                     )))
                     .child(div().flex_1().min_w_0().child(dialog_field(
                         "field-bind",
-                        "Bind address",
+                        t!("config-bind"),
                         self.bind,
                     )))
                     .child(div().flex_1().min_w_0().child(dialog_field(
                         "field-port",
-                        "Port",
+                        t!("config-port"),
                         self.port,
                     ))),
             ),
@@ -4283,7 +4362,7 @@ impl ConfigForm {
         if show_test_url {
             form = form.child(dialog_field(
                 "field-test-url",
-                "Test URL (blank = global)",
+                t!("config-test-url"),
                 self.test_url,
             ));
         }

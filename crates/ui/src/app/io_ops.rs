@@ -153,10 +153,10 @@ impl AppView {
                     .button_props(
                         DialogButtonProps::default()
                             .show_cancel(true)
-                            .ok_text("Overwrite")
+                            .ok_text(t!("dialog-overwrite"))
                             .ok_variant(ButtonVariant::Danger),
                     )
-                    .title("Overwrite saved logs?")
+                    .title(t!("logs-overwrite-title"))
                     .description(description)
                     .on_ok(move |_, window, cx| {
                         view.update(cx, |view, cx| view.commit_save_visible_logs(window, cx));

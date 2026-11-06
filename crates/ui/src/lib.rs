@@ -73,9 +73,8 @@ use qrcodegen::{QrCode, QrCodeEcc};
 
 use manyproxy_core::engine::{
     engine_binary_file_name, fork_binary_file_name, is_custom_config_protocol,
-    lan_confirm_description, lan_confirm_text, lan_exposure_warning, requires_lan_confirm,
-    resolve_engine_binary, resolve_fork_binary, resolve_xray_binary, strip_ansi_codes,
-    xray_binary_file_name, AutoRestartConfig, EngineController, EngineError, LAN_CONFIRM_TITLE,
+    requires_lan_confirm, resolve_engine_binary, resolve_fork_binary, resolve_xray_binary,
+    strip_ansi_codes, xray_binary_file_name, AutoRestartConfig, EngineController, EngineError,
 };
 use manyproxy_core::health::{
     clamp_log_max_lines, outcome_is_neutral, ping_all, redact_secrets, sparkline_caption_tone,
@@ -88,9 +87,8 @@ use manyproxy_core::import::{
     is_library_export, parse_addsub_link, AddSubRequest, OpenWithKind,
 };
 use manyproxy_core::store::{
-    blank_name, chain_hop_rejection, chain_nodes_of, clear_group_tests_confirm_text,
-    compare_type_security, count_importable, due_for_refresh_for, export_confirm_description,
-    extra_config_prefill, fold_amneziawg_into_params, fold_anytls_into_params,
+    blank_name, chain_hop_rejection, chain_nodes_of, compare_type_security, count_importable,
+    due_for_refresh_for, extra_config_prefill, fold_amneziawg_into_params, fold_anytls_into_params,
     fold_chain_nodes_into_params, fold_dial_into_params, fold_extra_into_params,
     fold_guided_into_params, fold_http_into_params, fold_hysteria_into_params,
     fold_mux_into_params, fold_naive_into_params, fold_shadowsocks_inner_into_params,
@@ -100,8 +98,7 @@ use manyproxy_core::store::{
     fold_tuic_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
     fold_wireguard_into_params, fold_xray_into_params, guided_blank_field, guided_identity_fields,
     guided_prefill_bool, guided_prefill_list, guided_prefill_value, is_virtual_protocol, now_unix,
-    pristine_template_rewrite, protocol_params_template, proxy_urls, prune_duplicates_confirm_text,
-    prune_invalid_confirm_text, prune_unavailable_confirm_text, validate_extra_params,
+    pristine_template_rewrite, protocol_params_template, proxy_urls, validate_extra_params,
     vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, AutoClearGroupConfig,
     ChainHopSlot, CloseAction, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot,
     HttpFold, HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig,
@@ -140,6 +137,24 @@ use library::*;
 use pickers::*;
 use preset::*;
 use text::*;
+
+// The UI's localized copy shadows the core crate's plain builders of the same
+// name. An explicit import wins over both globs, so every call site below
+// resolves to the copy that can reach the Fluent bundle.
+pub(crate) use text::{
+    about_body, auto_clear_opt_in_note, bind_port_collision_warning,
+    clear_group_tests_confirm_text, close_confirm_description, export_confirm_description,
+    export_count_message, export_overwrite_confirm_description, export_preview_description,
+    group_delete_confirm_description, group_row_views, http_subscription_warning,
+    import_files_label, import_preview_message, lan_confirm_description, lan_confirm_text,
+    lan_confirm_title, lan_exposure_warning, lan_hint_for_bind, log_level_tooltip,
+    logs_overwrite_text, logs_save_path_text, preset_delete_confirm_description,
+    preset_row_summary, preset_summary_text, prune_duplicates_confirm_text,
+    prune_invalid_confirm_text, prune_unavailable_confirm_text, rule_set_summary,
+    settings_clear_health_text, settings_clear_snapshot_text, settings_clear_traffic_text,
+    sidecar_presence_line, stop_all_confirm_description, subscription_failures_text,
+    traffic_other_line, traffic_stats_summary_text, update_all_confirm_text,
+};
 use update::*;
 
 actions!(
@@ -577,10 +592,10 @@ pub fn run() {
                                     .button_props(
                                         DialogButtonProps::default()
                                             .show_cancel(true)
-                                            .ok_text("Stop all and close")
+                                            .ok_text(t!("close-ok"))
                                             .ok_variant(ButtonVariant::Danger),
                                     )
-                                    .title("Close ManyProxy?")
+                                    .title(t!("close-title"))
                                     .description(description)
                                     .on_ok(move |_, window, cx| {
                                         confirm_view.update(cx, |view, _| {

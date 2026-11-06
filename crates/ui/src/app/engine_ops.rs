@@ -259,9 +259,9 @@ impl AppView {
                     .button_props(
                         DialogButtonProps::default()
                             .show_cancel(true)
-                            .ok_text("Start all"),
+                            .ok_text(t!("start-all-ok")),
                     )
-                    .title(LAN_CONFIRM_TITLE)
+                    .title(lan_confirm_title())
                     .description(description)
                     .on_ok(move |_, window, cx| {
                         view.update(cx, |view, cx| view.commit_start_all(window, cx));
@@ -294,9 +294,9 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Stop all"),
+                        .ok_text(t!("stop-all-ok")),
                 )
-                .title("Stop all endpoints")
+                .title(t!("stop-all-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_stop_all(window, cx));

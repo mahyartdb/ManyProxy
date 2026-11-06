@@ -7,23 +7,34 @@ fn accessible_label(label: &str) -> String {
     label.trim_end_matches('*').trim_end().to_string()
 }
 
-pub(crate) fn labelled_input(label: &str, state: &Entity<InputState>) -> Input {
-    Input::new(state).aria_label(accessible_label(label))
+pub(crate) fn labelled_input(label: impl Into<String>, state: &Entity<InputState>) -> Input {
+    let label = label.into();
+    Input::new(state).aria_label(accessible_label(&label))
 }
 
-pub(crate) fn labelled_masked_input(label: &str, state: &Entity<InputState>) -> Input {
+pub(crate) fn labelled_masked_input(label: impl Into<String>, state: &Entity<InputState>) -> Input {
+    let label = label.into();
     Input::new(state)
         .mask_toggle()
-        .aria_label(accessible_label(label))
+        .aria_label(accessible_label(&label))
 }
 
-pub(crate) fn labelled_textarea(label: &str, state: &Entity<TextareaState>) -> Textarea {
-    Textarea::new(state).aria_label(accessible_label(label))
+pub(crate) fn labelled_textarea(
+    label: impl Into<String>,
+    state: &Entity<TextareaState>,
+) -> Textarea {
+    let label = label.into();
+    Textarea::new(state).aria_label(accessible_label(&label))
 }
 
-pub(crate) fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> Field {
+pub(crate) fn dialog_field(
+    id: &'static str,
+    label: impl Into<String>,
+    state: Entity<InputState>,
+) -> Field {
+    let label = label.into();
     field()
-        .label(label.to_string())
+        .label(label.clone())
         .child(labelled_input(label, &state).id(id))
 }
 
@@ -34,7 +45,7 @@ pub(crate) type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
-    ok_label: &'static str,
+    ok_label: &str,
     commit: DialogCommit,
 ) -> DialogFooter {
     // K2/K3: the Throne-grammar dialogs (add / edit / routing presets) carry a
@@ -63,7 +74,7 @@ pub(crate) fn dialog_footer(
         .child(
             Button::new(cancel_id)
                 .small()
-                .label("Cancel")
+                .label(t!("dialog-cancel"))
                 .on_click(|_, window, cx| {
                     window.close_all_dialogs(cx);
                     reclaim_shell_focus(window, cx);
@@ -88,7 +99,7 @@ pub(crate) fn dialog_footer(
 pub(crate) fn sheet_footer(
     ok_id: &'static str,
     cancel_id: Option<&'static str>,
-    ok_label: &'static str,
+    ok_label: &str,
     commit: DialogCommit,
 ) -> DialogFooter {
     debug_assert!(
@@ -98,12 +109,15 @@ pub(crate) fn sheet_footer(
     let commit_click = commit.clone();
     let mut footer = DialogFooter::new();
     if let Some(cancel_id) = cancel_id {
-        footer = footer.child(Button::new(cancel_id).small().label("Cancel").on_click(
-            |_, window, cx| {
-                window.close_sheet(cx);
-                reclaim_shell_focus(window, cx);
-            },
-        ));
+        footer = footer.child(
+            Button::new(cancel_id)
+                .small()
+                .label(t!("dialog-cancel"))
+                .on_click(|_, window, cx| {
+                    window.close_sheet(cx);
+                    reclaim_shell_focus(window, cx);
+                }),
+        );
     }
     footer.child(
         Button::new(ok_id)
@@ -119,31 +133,31 @@ pub(crate) fn sheet_footer(
     )
 }
 
-pub(crate) fn footer_commit_label(dialog: &str) -> &'static str {
+pub(crate) fn footer_commit_label(dialog: &str) -> String {
     match dialog {
         // K9 handed the dead Settings mapping over to K5: the settings modal
         // owns its own Cancel/Save footer, so "settings" falls through.
-        "groups" | "preset-attach" => "Close",
-        "logs" => "Apply filter",
-        "presets" | "add" => "OK",
-        "edit" => "OK",
-        "subscriptions" => "Add",
-        "preset-edit" | "subscription-edit" | "group-edit" => "Save",
-        "import" => "Import",
-        "export" => "Export",
-        "bulk-move" => "Move",
-        "group-rename" => "Rename",
-        "rule-set-add-dialog" => "Add",
-        "share" => "Copy link",
-        _ => "Close",
+        "groups" | "preset-attach" => t!("dialog-close"),
+        "logs" => t!("dialog-apply-filter"),
+        "presets" | "add" => t!("dialog-ok"),
+        "edit" => t!("dialog-ok"),
+        "subscriptions" => t!("dialog-add"),
+        "preset-edit" | "subscription-edit" | "group-edit" => t!("dialog-save"),
+        "import" => t!("dialog-import"),
+        "export" => t!("dialog-export"),
+        "bulk-move" => t!("dialog-move"),
+        "group-rename" => t!("dialog-rename"),
+        "rule-set-add-dialog" => t!("dialog-add"),
+        "share" => t!("dialog-copy-link"),
+        _ => t!("dialog-close"),
     }
 }
 
-pub(crate) fn secret_state_caption(value: &str) -> &'static str {
+pub(crate) fn secret_state_caption(value: &str) -> String {
     if value.trim().is_empty() {
-        "Not Set"
+        t!("secret-not-set")
     } else {
-        "Already Set"
+        t!("secret-already-set")
     }
 }
 

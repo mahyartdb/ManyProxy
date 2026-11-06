@@ -305,9 +305,9 @@ impl AppView {
                     .button_props(
                         DialogButtonProps::default()
                             .show_cancel(true)
-                            .ok_text("Start"),
+                            .ok_text(t!("confirm-start")),
                     )
-                    .title(LAN_CONFIRM_TITLE)
+                    .title(lan_confirm_title())
                     .description(description)
                     .on_ok(move |_, window, cx| {
                         let ids = ids.clone();
@@ -738,14 +738,14 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Move {count} configuration(s) to group"))
+                .title(t!("bulk-move-title", count = count))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(Label::new("Group"))
-                        .child(labelled_input("Group", &group_state)),
+                        .child(Label::new(t!("field-group")))
+                        .child(labelled_input(t!("field-group"), &group_state)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -755,7 +755,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "bulk-move-ok",
                     "bulk-move-cancel",
-                    footer_commit_label("bulk-move"),
+                    &footer_commit_label("bulk-move"),
                     commit_click,
                 ))
         });
@@ -787,14 +787,14 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Move \"{name}\" to group"))
+                .title(t!("bulk-move-one-title", name = name.as_str()))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(Label::new("Group"))
-                        .child(labelled_input("Group", &group_state)),
+                        .child(Label::new(t!("field-group")))
+                        .child(labelled_input(t!("field-group"), &group_state)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -804,7 +804,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "row-move-ok",
                     "row-move-cancel",
-                    footer_commit_label("bulk-move"),
+                    &footer_commit_label("bulk-move"),
                     commit_click,
                 ))
         });
@@ -877,40 +877,31 @@ impl AppView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                        .child(
-                            Button::new("groups-update-current")
-                                .label("Update current")
-                                .tooltip(
-                                    "Refresh the subscriptions feeding the focused group \
-                                     (facet filter, else selected row) — Ctrl-R",
-                                )
-                                .on_click(move |_, window, cx| {
-                                    current_view.update(cx, |view, cx| {
-                                        view.update_current_group(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("groups-update-all")
-                                .label("Update all")
-                                .tooltip(
-                                    "Refresh every subscription outside auto-skipped groups (asks first)",
-                                )
-                                .on_click(move |_, window, cx| {
-                                    all_view.update(cx, |view, cx| {
-                                        view.open_update_all_confirm(window, cx);
-                                    });
-                                }),
-                        ),
+                            .child(
+                                Button::new("groups-update-current")
+                                    .label(t!("group-update-current"))
+                                    .tooltip(t!("group-update-current-tip"))
+                                    .on_click(move |_, window, cx| {
+                                        current_view.update(cx, |view, cx| {
+                                            view.update_current_group(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("groups-update-all")
+                                    .label(t!("group-update-all"))
+                                    .tooltip(t!("group-update-all-tip"))
+                                    .on_click(move |_, window, cx| {
+                                        all_view.update(cx, |view, cx| {
+                                            view.open_update_all_confirm(window, cx);
+                                        });
+                                    }),
+                            ),
                     ),
                 );
             }
             if rows.is_empty() {
-                form = form.child(
-                    field()
-                        .label_indent(false)
-                        .child("No groups yet — groups appear when rows use them"),
-                );
+                form = form.child(field().label_indent(false).child(t!("groups-empty")));
             }
             for row in &rows {
                 let rename_view = view.clone();
@@ -924,7 +915,7 @@ impl AppView {
                 let slug = slugify_group_id(&row.name);
                 let mut buttons = div().flex().flex_row().items_center().gap_2().child(
                     Button::new(format!("group-rename-{slug}"))
-                        .label("Rename")
+                        .label(t!("group-rename"))
                         .on_click(move |_, window, cx| {
                             let group = rename_group.clone();
                             rename_view.update(cx, |view, cx| {
@@ -934,8 +925,8 @@ impl AppView {
                 );
                 buttons = buttons.child(
                     Button::new(format!("group-edit-{slug}"))
-                        .label("Edit")
-                        .tooltip("Rename + auto-refresh skip for this group")
+                        .label(t!("group-edit"))
+                        .tooltip(t!("group-edit-tip"))
                         .on_click(move |_, window, cx| {
                             let group = edit_group.clone();
                             edit_view.update(cx, |view, cx| {
@@ -947,10 +938,8 @@ impl AppView {
                 if !row.sub_ids.is_empty() {
                     buttons = buttons.child(
                         Button::new(format!("group-update-{slug}"))
-                            .label("Update")
-                            .tooltip(
-                                "Refresh this group's subscription(s) now (manual — runs even when auto-skipped)"
-                            )
+                            .label(t!("group-update"))
+                            .tooltip(t!("group-update-tip"))
                             .on_click(move |_, window, cx| {
                                 let group = update_group.clone();
                                 update_view.update(cx, |view, cx| {
@@ -961,7 +950,7 @@ impl AppView {
                 }
                 buttons = buttons.child(
                     Button::new(format!("group-delete-{slug}"))
-                        .label("Delete")
+                        .label(t!("group-delete"))
                         .on_click(move |_, window, cx| {
                             let group = delete_group.clone();
                             delete_view.update(cx, |view, cx| {
@@ -977,16 +966,9 @@ impl AppView {
                 let auto_group = row.name.clone();
                 let auto_switch = Switch::new(format!("group-auto-clear-{slug}"))
                     .checked(row.auto_clear)
-                    .label("Auto-clear unavailable")
-                    .tooltip(
-                        "Opt-in per group: after this group's URL test ends, its unavailable \
-                         rows are removed automatically. Running rows and the row being edited \
-                         are never removed; enabling asks its own confirmation.",
-                    )
-                    .accessibility_label(format!(
-                        "Auto-clear unavailable rows in group \"{}\" after group tests",
-                        row.name
-                    ))
+                    .label(t!("group-auto-clear"))
+                    .tooltip(t!("group-auto-clear-tip"))
+                    .accessibility_label(t!("group-auto-clear-aria", group = row.name.as_str()))
                     .on_change(move |next: &bool, window, cx| {
                         let group = auto_group.clone();
                         let view = auto_view.clone();
@@ -1033,13 +1015,13 @@ impl AppView {
                 );
             }
             sheet
-                .title("Groups")
+                .title(t!("groups-title"))
                 .child(form)
                 .size(px(520.))
                 .footer(sheet_footer(
                     "groups-dialog-ok",
                     None,
-                    footer_commit_label("groups"),
+                    &footer_commit_label("groups"),
                     commit_click,
                 ))
         });
@@ -1067,10 +1049,10 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Rename group \"{old_name}\""))
+                .title(t!("group-rename-title", name = old_name.as_str()))
                 .child(v_form().small().child(dialog_field(
                     "field-group-rename-name",
-                    "New group name",
+                    t!("group-new-name"),
                     name_state.clone(),
                 )))
                 .button_props(
@@ -1081,7 +1063,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-rename-ok",
                     "group-rename-cancel",
-                    footer_commit_label("group-rename"),
+                    &footer_commit_label("group-rename"),
                     commit_click,
                 ))
         });
@@ -1114,36 +1096,32 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
-                .title(format!("Edit group \"{old_name}\""))
+                .title(t!("group-edit-title", name = old_name.as_str()))
                 .child(
                     v_form()
                         .small()
                         .child(dialog_field(
                             "field-group-edit-name",
-                            "Group name",
+                            t!("group-name"),
                             name_state.clone(),
                         ))
-                        .child(field().label_indent(false).child(
-                            div().id("field-group-edit-skip").test_support().child(
-                                Switch::new("group-edit-skip")
-                                    .checked(skip_checked)
-                                    .label("Skip automatic refresh")
-                                    .tooltip(
-                                        "Skip this group's subscriptions on ticks and Update-all. \
-                                         Manual Update still works.",
-                                    )
-                                    .accessibility_label(
-                                        "Skip automatic refresh of this group's subscriptions. \
-                                         Manual Update still works.",
-                                    )
-                                    .on_change({
-                                        let skip_for_change = skip_for_change.clone();
-                                        move |next: &bool, _, _| {
-                                            *skip_for_change.borrow_mut() = *next;
-                                        }
-                                    }),
+                        .child(
+                            field().label_indent(false).child(
+                                div().id("field-group-edit-skip").test_support().child(
+                                    Switch::new("group-edit-skip")
+                                        .checked(skip_checked)
+                                        .label(t!("group-skip-refresh"))
+                                        .tooltip(t!("group-skip-refresh-tip"))
+                                        .accessibility_label(t!("group-skip-refresh-aria"))
+                                        .on_change({
+                                            let skip_for_change = skip_for_change.clone();
+                                            move |next: &bool, _, _| {
+                                                *skip_for_change.borrow_mut() = *next;
+                                            }
+                                        }),
+                                ),
                             ),
-                        )),
+                        ),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -1153,8 +1131,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-edit-ok",
                     "group-edit-cancel",
-
-                    footer_commit_label("group-edit"),
+                    &footer_commit_label("group-edit"),
                     commit_click,
                 ))
         });
@@ -1327,10 +1304,10 @@ impl AppView {
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
-                        .ok_text("Delete")
+                        .ok_text(t!("group-delete"))
                         .ok_variant(ButtonVariant::Danger),
                 )
-                .title("Delete group")
+                .title(t!("group-delete-title"))
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {

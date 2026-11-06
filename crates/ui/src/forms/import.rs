@@ -25,7 +25,7 @@ impl ImportForm {
         Self {
             text: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("One share link per line, JSON, or a WireGuard conf")
+                    .placeholder(t!("import-placeholder"))
                     .default_value(prefill_text.to_string())
             }),
             group: cx
@@ -48,17 +48,16 @@ impl ImportForm {
         );
         let (valid, invalid) = (preview.configs.len(), preview.failures.len());
         let first_failure = preview.failures.first().map(|failure| {
-            format!(
-                "item {} ({}): {}",
-                failure.index + 1,
-                failure.label,
-                failure.reason
+            t!(
+                "import-first-failure-item",
+                index = failure.index + 1,
+                label = failure.label.as_str(),
+                reason = failure.reason.as_str()
             )
         });
 
         let mut form = v_form()
             .small()
-
             .child(
                 field().label_indent(false).child(
                     div()
@@ -66,22 +65,20 @@ impl ImportForm {
                         .test_support()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "Paste links — nothing is added until you press Import. vless · vmess · trojan · ss · hysteria · tuic · wg · socks · http · anytls · naive · clash · conf files. e.g. vless://uuid@host:443#name. Drops land anywhere on the window.",
-                        ),
+                        .child(t!("import-guide")),
                 ),
             )
             .child(
-                field().label("Links, JSON, or conf").child(
+                field().label(t!("import-links-label")).child(
                     div()
                         .id("field-import-text")
                         .test_support()
-                        .child(labelled_textarea("Links, JSON, or conf", &self.text).h(px(160.))),
+                        .child(labelled_textarea(t!("import-links-label"), &self.text).h(px(160.))),
                 ),
             )
             .child(dialog_field(
                 "field-import-group",
-                "Group",
+                t!("field-group"),
                 self.group.clone(),
             ));
 
@@ -92,7 +89,7 @@ impl ImportForm {
             form = form.child(
                 field().label_indent(false).child(
                     Button::new("import-browse")
-                        .label("Browse files…")
+                        .label(t!("import-browse"))
                         .on_click(move |_, window, cx| {
                             let current_text = browse_text.read(cx).value().to_string();
                             let current_group = browse_group.read(cx).value().to_string();
@@ -123,7 +120,7 @@ impl ImportForm {
                     div()
                         .id("import-first-failure")
                         .test_support()
-                        .child(format!("first problem: {reason}")),
+                        .child(t!("import-first-problem", reason = reason)),
                 ),
             );
         }

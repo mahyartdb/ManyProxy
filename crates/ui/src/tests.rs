@@ -13859,15 +13859,15 @@ fn t44_ui_delete_group_refuses_while_rows_remain(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn laneb_group_delete_confirms_naming_count(cx: &mut TestAppContext) {
     assert!(
-        crate::group_delete_confirm_text("crew", 0).contains("\"crew\""),
+        crate::text::group_delete_confirm_text("crew", 0).contains("\"crew\""),
         "empty arm names the group"
     );
     assert!(
-        crate::group_delete_confirm_text("site/east", 2).contains("2 row(s)"),
+        crate::text::group_delete_confirm_text("site/east", 2).contains("2 row(s)"),
         "non-empty arm names the count"
     );
     assert!(
-        crate::group_delete_confirm_text("site/east", 2).contains("refuse"),
+        crate::text::group_delete_confirm_text("site/east", 2).contains("refuse"),
         "non-empty arm warns up front"
     );
     let mixed = crate::group_delete_confirm_description("site/east", 2, 3);
@@ -13882,7 +13882,7 @@ fn laneb_group_delete_confirms_naming_count(cx: &mut TestAppContext) {
     );
     assert_eq!(
         crate::group_delete_confirm_description("crew", 0, 0),
-        crate::group_delete_confirm_text("crew", 0),
+        crate::text::group_delete_confirm_text("crew", 0),
         "empty group keeps the existing copy"
     );
     cx.update(gpui_kit::init);
@@ -31906,10 +31906,13 @@ fn bug16_import_completion_commits_when_not_cancelled(cx: &mut TestAppContext) {
 fn bug25_log_level_tooltip_matches_exact_filter() {
     use crate::health::LogLevel;
     use crate::{log_level_matches, log_level_tooltip};
-    assert_eq!(log_level_tooltip("All"), "Show logs of every level");
-    assert_eq!(log_level_tooltip("Warn"), "Show only Warn records");
+    assert_eq!(log_level_tooltip(None), "Show logs of every level");
+    assert_eq!(
+        log_level_tooltip(Some(LogLevel::Warn)),
+        "Show only Warn records"
+    );
     for label in ["All", "Debug", "Info", "Warn", "Error"] {
-        let tip = log_level_tooltip(label).to_lowercase();
+        let tip = log_level_tooltip(LogLevel::from_label(label)).to_lowercase();
         assert!(
             !tip.contains("and above"),
             "no cumulative promise for {label}: {tip}"

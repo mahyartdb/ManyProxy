@@ -1,6 +1,8 @@
 use crate::*;
 
-pub(crate) const SHARE_WARNING: &str = "This link carries the endpoint's credentials — anyone holding it can use it. Prefer Copy URLs for credential-free sharing.";
+pub(crate) fn share_warning() -> String {
+    t!("share-warning")
+}
 
 // ---- T-28: share-dialog QR of the two listener URLs ---------------------
 
@@ -41,7 +43,7 @@ impl QrGrid {
 /// that fits, well past the ticket's 255-byte ceiling, and we add the quiet zone.
 pub(crate) fn qr_grid(payload: &str) -> Result<QrGrid, String> {
     let code = QrCode::encode_binary(payload.as_bytes(), QrCodeEcc::Medium)
-        .map_err(|_| format!("QR payload too long ({} bytes)", payload.len()))?;
+        .map_err(|_| t!("share-qr-too-long", bytes = payload.len()))?;
     let inner = code.size() as usize;
     let side = inner + SHARE_QR_QUIET_ZONE * 2;
     let mut dark = vec![false; side * side];

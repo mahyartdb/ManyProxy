@@ -111,9 +111,9 @@ pub(crate) fn effective_probe_url(row_override: Option<&str>, global: Option<&st
 
 pub(crate) fn format_params_json(text: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|error| format!("params are not valid JSON: {error}"))?;
+        .map_err(|error| t!("params-invalid-json", error = error.to_string()))?;
     serde_json::to_string_pretty(&value)
-        .map_err(|error| format!("params cannot be formatted: {error}"))
+        .map_err(|error| t!("params-format-failed", error = error.to_string()))
 }
 
 pub(crate) fn validate_params_json(text: &str) -> Result<(), String> {
@@ -122,13 +122,13 @@ pub(crate) fn validate_params_json(text: &str) -> Result<(), String> {
     }
     serde_json::from_str::<serde_json::Value>(text)
         .map(|_| ())
-        .map_err(|error| format!("params are not valid JSON: {error}"))
+        .map_err(|error| t!("params-invalid-json", error = error.to_string()))
 }
 
 pub(crate) fn guided_identity_label(protocol_raw: &str) -> String {
     match guided_identity_fields(protocol_raw).and_then(|guided| guided.key) {
-        Some(key) => format!("Identity ({key})"),
-        None => "Identity".to_string(),
+        Some(key) => t!("guided-identity-key", key = key),
+        None => t!("guided-identity"),
     }
 }
 
@@ -139,9 +139,9 @@ pub(crate) fn guided_hint_line(protocol_raw: &str) -> Option<String> {
         return None;
     }
     match guided.key {
-        Some(_) => Some(format!("{name} needs {}.", guided.needs)),
-        None if guided.needs == "custom JSON" => Some(format!("{name} takes custom JSON.")),
-        None => Some(format!("No secret needed for {name}.")),
+        Some(_) => Some(t!("guided-needs", name = name, needs = guided.needs)),
+        None if guided.needs == "custom JSON" => Some(t!("guided-custom-json", name = name)),
+        None => Some(t!("guided-no-secret", name = name)),
     }
 }
 
@@ -241,11 +241,11 @@ pub(crate) fn interval_picker_row(
             repaint(window, cx);
         });
     for preset in INTERVAL_PRESETS {
-        let label = format_interval_secs(*preset);
+        let label = format_interval_label(*preset);
         group = group.child(
             Radio::new(label.clone())
                 .label(label.clone())
-                .tooltip(format!("Refresh every {label}")),
+                .tooltip(t!("interval-tip", label = label.clone())),
         );
     }
     div()
@@ -256,7 +256,7 @@ pub(crate) fn interval_picker_row(
             div()
                 .id(format!("{id_prefix}-caption"))
                 .test_support()
-                .child(Label::new("Refresh interval")),
+                .child(Label::new(t!("interval-caption"))),
         )
         .child(
             div()
