@@ -30,6 +30,7 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Changed
 
+- Engineering: every interface string now resolves through an embedded Fluent catalog (English only, byte-identical output). No behavior, wording, or layout change; translations are not shipped.
 - A row's status lamp is a 24px target around the same 12px dot: easier to hit, and it announces itself as a pressed/not-pressed endpoint-state filter to assistive tech.
 - Motion is one vocabulary: panels fade in over 150 ms with an ease-out curve instead of appearing flat, and one duration, one easing, and the reduced-motion switch govern all of it.
 - Every labeled field carries its visible label as the input's accessible name, so a screen reader hears `Bind address`, not an unlabeled text box; required-field stars stay visual.
