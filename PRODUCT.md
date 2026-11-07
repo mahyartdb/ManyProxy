@@ -26,7 +26,7 @@ Windows 10/11 64-bit desktop app (GPUI), run via `cargo run` in dev or the built
 
 Confirmed: per-config loopback endpoints (SOCKS5 + HTTP, bind + port only, never credentials over copy); broad import grammar (vless, vmess, trojan, shadowsocks, hysteria v1/v2, tuic, wireguard/awg URIs and `.conf`, socks, http/https, anytls, naive, throne links, sing-box/Xray JSON, SIP008, limited Clash YAML); subscription refresh that preserves renames, avoids duplicates, and keeps last-good members on failure; per-endpoint health (URL test + TCP ping against a visible default URL) and persisted data-plane usage; explicit LAN-bind confirm for any non-loopback bind with post-start warning toast.
 
-Durable prohibitions (must survive all future work): no system proxy switching, no TUN/virtual interface, no OS DNS rewrite, no routing-rule editor, no admin/elevation path, no auto-update replacing binaries, no telemetry beyond user-initiated subscription fetches and probes through the user's own endpoints, no silent binary downloads.
+Durable prohibitions (must survive all future work): no system proxy switching, no TUN/virtual interface, no OS DNS rewrite, no routing-rule editor, no admin/elevation path, no auto-update replacing binaries, no telemetry, no silent binary downloads. The only automatic network read is the weekly release feed (opt-out in Settings → Updates); every other request is user-initiated.
 
 Explicitly undecided: future surfaces beyond the current library/detail/dialog flow. (Decided: the dense-table spike is gone, and the card list is the only library view. Scope decisions live in Out of Scope below.)
 
