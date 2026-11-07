@@ -658,14 +658,15 @@ mod tests {
         for glyph in [win::Glyph::Start, win::Glyph::Stop, win::Glyph::Test] {
             let rgba = win::glyph_rgba(glyph);
             assert_eq!(rgba.len(), 32 * 32 * 4);
-            let opaque = rgba.chunks_exact(4).filter(|px| px[3] == 255).count();
+            let (pixels, _) = rgba.as_chunks::<4>();
+            let opaque = pixels.iter().filter(|px| px[3] == 255).count();
             assert!(opaque > 100, "glyph covers enough pixels");
-            let dark = rgba
-                .chunks_exact(4)
+            let dark = pixels
+                .iter()
                 .filter(|px| px[3] == 255 && px[0] < 60)
                 .count();
-            let light = rgba
-                .chunks_exact(4)
+            let light = pixels
+                .iter()
                 .filter(|px| px[3] == 255 && px[0] > 200)
                 .count();
             assert!(dark > 0, "outline is dark");
