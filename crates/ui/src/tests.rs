@@ -28977,7 +28977,7 @@ fn t56_newer_release() -> crate::FetchedRelease {
     crate::FetchedRelease {
         tag_name: "v999.0.1".to_string(),
         prerelease: false,
-        html_url: Some("https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1".to_string()),
+        html_url: Some("https://github.com/mahyartdb/ManyProxy/releases/tag/v999.0.1".to_string()),
         release_name: Some("ManyProxy v999.0.1".to_string()),
     }
 }
@@ -29234,7 +29234,7 @@ fn t56_passive_update_fetches_only_after_a_week() {
     let body = t56_release_json(
         "v999.0.1",
         false,
-        "https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1",
+        "https://github.com/mahyartdb/ManyProxy/releases/tag/v999.0.1",
         "ManyProxy v999.0.1",
     );
     let (client, fetched, _) = t56_recording_feed_client(move |_| t48_response(200, None, &body));
@@ -29512,7 +29512,7 @@ fn t56_prerelease_visibility_follows_app_channel() {
     // a prerelease build switches to the releases list endpoint
     assert_eq!(
         crate::effective_update_feed_url(None, "0.1.0-beta.1"),
-        "https://api.github.com/repos/QMahyar/ManyProxy/releases"
+        "https://api.github.com/repos/mahyartdb/ManyProxy/releases"
     );
     // an explicit Settings override wins verbatim on either channel
     assert_eq!(
@@ -29525,13 +29525,13 @@ fn t56_prerelease_visibility_follows_app_channel() {
         t56_release_json(
             "v0.0.3-beta.1",
             true,
-            "https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.3-beta.1",
+            "https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.3-beta.1",
             "Beta one",
         ),
         t56_release_json(
             "v0.0.2",
             false,
-            "https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.2",
+            "https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.2",
             "Stable build",
         ),
     );
@@ -29550,7 +29550,7 @@ fn t56_prerelease_visibility_follows_app_channel() {
     assert_eq!(picked.tag_name, "v0.0.2");
 
     // prerelease-only feed with a stable running version is up-to-date
-    let only_prerelease = r#"[{"tag_name":"v0.0.3-beta.1","prerelease":true,"html_url":"https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.3-beta.1"}]"#;
+    let only_prerelease = r#"[{"tag_name":"v0.0.3-beta.1","prerelease":true,"html_url":"https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.3-beta.1"}]"#;
     assert_eq!(
         crate::parse_release_feed(only_prerelease, true, crate::APP_VERSION).expect("parses"),
         None,
@@ -29571,7 +29571,7 @@ fn t56_dialog_reports_new_version_with_browser_link(cx: &mut TestAppContext) {
     let release = crate::FetchedRelease {
         tag_name: "v999.0.1".to_string(),
         prerelease: false,
-        html_url: Some("https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1".to_string()),
+        html_url: Some("https://github.com/mahyartdb/ManyProxy/releases/tag/v999.0.1".to_string()),
         release_name: Some("ManyProxy v999.0.1".to_string()),
     };
     cx.update(|window, cx| {
@@ -29828,7 +29828,7 @@ fn t57_no_device_identifier_headers_anywhere() {
         t48_response(
             200,
             None,
-            r#"{"tag_name":"v0.0.1","prerelease":false,"html_url":"https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.1"}"#,
+            r#"{"tag_name":"v0.0.1","prerelease":false,"html_url":"https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.1"}"#,
         )
     });
     let release = futures::executor::block_on(crate::fetch_release_feed(

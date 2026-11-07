@@ -17,7 +17,7 @@ pub fn normalize_update_feed_url(raw: &str) -> Result<String, String> {
 }
 
 pub const UPDATE_FEED_URL_DEFAULT: &str =
-    "https://api.github.com/repos/QMahyar/ManyProxy/releases/latest";
+    "https://api.github.com/repos/mahyartdb/ManyProxy/releases/latest";
 
 /// T-06: the update check is a passive JSON GET — 10 s timeout, one MiB cap,
 /// at most five hand-followed hops. It reads the feed and nothing else;

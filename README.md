@@ -24,7 +24,7 @@ There is no web, mobile, or CLI edition — only the native desktop app.
 ## Install (portable ZIP)
 
 1. Download `manyproxy-v<tag>-windows-amd64.zip` from
-   [GitHub Releases](https://github.com/QMahyar/ManyProxy/releases) and unzip it
+   [GitHub Releases](https://github.com/mahyartdb/ManyProxy/releases) and unzip it
    anywhere you like (a normal folder, another drive, a USB stick). Each release
    also publishes `SHA256SUMS.txt`.
 2. Keep the unzipped files together in one folder: `manyproxy.exe`,
