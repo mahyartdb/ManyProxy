@@ -319,7 +319,7 @@ jobs:
           Set-Content -Path "release-notes.md" -Value $notes -Encoding utf8NoBOM
           gh release create $env:TAG $zip "SHA256SUMS.txt" `
             --repo "${{ github.repository }}" `
-            --title "ManyProxy $env:TAG (windows-amd64)" `
+            --title "ManyProxy $env:TAG" `
             --notes-file "release-notes.md" `
             --generate-notes `
             @prereleaseFlag
