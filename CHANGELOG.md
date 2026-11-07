@@ -2,7 +2,7 @@
 
 All notable changes to ManyProxy are recorded here. The format follows Keep a Changelog 1.1.0. Ticket boards live by the artifact lifecycle in `AGENTS.md`. A board exists while work is in flight and is deleted when its outcome lands here.
 
-## [Unreleased]
+## [0.0.2] - 2026-11-07
 
 ### Added
 
@@ -49,6 +49,8 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Fixed
 
+- The update check reads the published repository; the previous owner URL returned 404, so every check reported no releases.
+
 - High display scaling no longer forces a 620-point window minimum onto a shorter work area: the window floor and a restored rectangle both clamp to the primary display, keeping the status strip reachable.
 - Opening Settings costs what it paints: the three core binaries, the two data folders, and the theme are read once when the dialog opens instead of on every frame of the entry animation, and a row's filter check no longer allocates.
 - A second launch wakes the running window the moment it forwards its argv. The 200 ms instance poll is gone, so an idle app no longer wakes four times a second.
@@ -94,4 +96,5 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - UI affordances: port-filter search grammar, click-to-copy cells, connection counters, the window title running marker, header sort pickers, QR encode of listener URLs, traffic dialog top-9 exits, per-shard CPU/RAM mini-charts, log polish with `log_max_lines`, window geometry persistence, and the bind-IP picker.
 - Ops marker: `last_clean_exit` with an unclean-exit startup toast.
 
+[0.0.2]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.2
 [0.0.1-beta.1]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.1-beta.1

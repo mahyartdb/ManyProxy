@@ -72,7 +72,8 @@
 - **Auto-update that replaces binaries**: prohibited. Updates are manual
   installs; the app never replaces its own or sidecar executables
   (boundary: **Ask first** for anything new; **Never** silent replacement).
-- **Telemetry**: none. The only network calls are user-initiated
-  subscription refreshes (user-supplied URLs, generic errors that never echo
-  the URL) and health probes through the user's own running endpoints to the
-  user-visible test URL. No analytics, no crash reporting, no version pings.
+- **Telemetry**: none. Network calls are user-initiated subscription refreshes
+  (user-supplied URLs, generic errors that never echo the URL), health probes
+  through the user's own running endpoints to the user-visible test URL, and
+  one release-feed read per week at launch (Settings → Updates can turn it
+  off). No analytics and no crash reporting.

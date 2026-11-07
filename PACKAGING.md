@@ -8,16 +8,16 @@ name, path, and search-order claim below is verified against `src/`
 ## 1. Version + binary-name source (read-only)
 
 - Package name and version come from `Cargo.toml` (READ ONLY, owned by
-  feature work): `name = "manyproxy"`, `version = "0.0.1"`
+  feature work): `name = "manyproxy"`, `version = "0.0.2"`
   (`Cargo.toml:1-4`). Verified via `cargo metadata --no-deps`
-  (reports `manyproxy 0.0.1`; no build was run).
+  (reports `manyproxy 0.0.2`; no build was run).
 - The release exe is therefore `manyproxy.exe` on Windows
   (cargo names the exe after the package; no `[[bin]]` rename exists
   in `Cargo.toml`).
 - The in-app version string does derive from the package version:
-  `src/main.rs` defines `APP_VERSION = env!("CARGO_PKG_VERSION")`
-  (`src/main.rs:184`, pinned by the `t55_app_version_is_plain_semver`
-  test), and the About dialog prints it next to the stamped git hash.
+  `crates/core/src/consts.rs` defines `APP_VERSION = env!("CARGO_PKG_VERSION")`
+  (pinned by the `t55_app_version_is_plain_semver` test), and the About dialog
+  prints it next to the stamped git hash.
   So the in-app version always matches the `Cargo.toml [package]
   version`; still record the version and the git commit hash in the
   release notes by hand when packaging.
