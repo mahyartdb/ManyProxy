@@ -31,6 +31,33 @@ impl AppView {
         cx.notify();
     }
 
+    pub(crate) fn finish_passive_update_check(
+        &mut self,
+        fetched: Result<Option<FetchedRelease>, String>,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        // The opt-out or a manual check moved on while this was in flight.
+        if epoch != self.passive_update_epoch || !self.passive_update_check_enabled() {
+            return;
+        }
+        let Ok(outcome) = update_check_outcome(fetched) else {
+            // A background failure is not the user's errand; the manual path
+            // owns error reporting.
+            return;
+        };
+        match outcome {
+            UpdateCheckOutcome::Newer(release) => {
+                self.update_available = Some(release.clone());
+                self.os_notify_update(&release);
+            }
+            UpdateCheckOutcome::UpToDate | UpdateCheckOutcome::NoReleases => {
+                self.update_available = None;
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn finish_ssh_key_pick(
         &mut self,
         path_entity: Entity<InputState>,

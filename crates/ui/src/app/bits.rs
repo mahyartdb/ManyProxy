@@ -67,6 +67,10 @@ pub(crate) const META_AUTO_RESTART: &str = "auto_restart_enabled";
 /// as enabled, because the notifications exist precisely for a hidden window.
 pub(crate) const META_NOTIFY_FROM_TRAY: &str = "notify_from_tray_enabled";
 
+/// Store meta key for "Check for updates weekly"; a missing or corrupt value
+/// reads as enabled because the passive check ships on (plan decision 6).
+pub(crate) const META_PASSIVE_UPDATE_CHECK: &str = "passive_update_check_enabled";
+
 /// Bind failures are the ones where "start" did nothing because the endpoint's
 /// address was taken or unusable; the user needs the log even when the window
 /// is hidden.
