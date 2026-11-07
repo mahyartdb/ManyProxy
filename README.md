@@ -197,6 +197,17 @@ this file can use your proxies — store it somewhere safe."_) plus a preview
 default export path; cancel writes nothing. The payload round-trips through the
 import grammar, so re-import adds 0 new rows and reports duplicates.
 
+## Share links
+
+A row's **Share** action copies a `manyproxy://add/...` link that carries the
+endpoint's credentials. To open such links from a browser, chat, or Windows Run,
+turn on **Settings → General → Handle manyproxy:// links**. ManyProxy registers
+itself as the `manyproxy://` handler for your Windows account; opening a link
+then launches ManyProxy and shows the same Add preview a pasted link would.
+The switch's help line says whether the registration points at this exe, and
+turning it off removes it. `manyproxy://addsub/...` links open the subscription
+intake.
+
 ## Health, usage, and logs
 
 Each row shows persisted health samples and data-plane usage (`↓rx ↑tx`, from
