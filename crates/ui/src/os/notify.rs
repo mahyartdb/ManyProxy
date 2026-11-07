@@ -24,14 +24,16 @@ pub const MAX_PER_WINDOW: usize = 5;
 pub enum NoticeTarget {
     Logs,
     Subscriptions,
+    Update,
 }
 
-/// The three events worth a balloon. The kind is also the dedup key.
+/// The four events worth a balloon. The kind is also the dedup key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
     EngineCrash,
     SubscriptionFailure,
     PortConflict,
+    UpdateFound,
 }
 
 impl NoticeKind {
@@ -39,6 +41,7 @@ impl NoticeKind {
         match self {
             Self::EngineCrash | Self::PortConflict => NoticeTarget::Logs,
             Self::SubscriptionFailure => NoticeTarget::Subscriptions,
+            Self::UpdateFound => NoticeTarget::Update,
         }
     }
 
@@ -47,17 +50,30 @@ impl NoticeKind {
             Self::EngineCrash => 0,
             Self::SubscriptionFailure => 1,
             Self::PortConflict => 2,
+            Self::UpdateFound => 3,
         }
     }
 }
 
-/// The shell's notification policy. `allow` is the only decision point: it
-/// rejects while the window is visible (the in-app toast already covers it),
-/// when the user turned the feature off, when the same kind fired recently, and
-/// when the rolling hour is full. Only an allowed notice consumes budget.
+/// The passive update balloon has three gates before the policy's own dedup
+/// and flood rules: the weekly check is on, the window is not in front of the
+/// user, and the tray-notification setting is on.
+pub fn update_notice_allowed(
+    passive_enabled: bool,
+    window_hidden: bool,
+    notices_enabled: bool,
+) -> bool {
+    passive_enabled && window_hidden && notices_enabled
+}
+
+/// The shell's notification policy. `allow` is the shared gate: it rejects
+/// while the window is visible (the in-app toast already covers it), when the
+/// user turned the feature off, when the same kind fired recently, and when the
+/// rolling hour is full. Only an allowed notice consumes budget. The passive
+/// update notice adds [`update_notice_allowed`] before this gate.
 #[derive(Debug, Default)]
 pub struct NoticePolicy {
-    last_sent: [Option<Instant>; 3],
+    last_sent: [Option<Instant>; 4],
     recent: VecDeque<Instant>,
 }
 
@@ -125,7 +141,7 @@ mod win {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_STATE, NIF_TIP,
-        NIIF_ERROR, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+        NIIF_ERROR, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
         NIN_BALLOONUSERCLICK, NIS_HIDDEN, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -187,6 +203,7 @@ mod win {
         match kind {
             NoticeKind::EngineCrash | NoticeKind::PortConflict => NIIF_ERROR,
             NoticeKind::SubscriptionFailure => NIIF_WARNING,
+            NoticeKind::UpdateFound => NIIF_INFO,
         }
     }
 
@@ -447,5 +464,29 @@ mod tests {
             NoticeKind::SubscriptionFailure.target(),
             NoticeTarget::Subscriptions
         );
+        assert_eq!(NoticeKind::UpdateFound.target(), NoticeTarget::Update);
+    }
+
+    #[test]
+    fn the_update_balloon_needs_hidden_and_both_switches() {
+        assert!(update_notice_allowed(true, true, true));
+        assert!(!update_notice_allowed(false, true, true));
+        assert!(!update_notice_allowed(true, false, true));
+        assert!(!update_notice_allowed(true, true, false));
+    }
+
+    #[test]
+    fn an_update_notice_obeys_visibility_and_dedup() {
+        let mut policy = NoticePolicy::default();
+        let base = base();
+        assert!(!policy.allow(NoticeKind::UpdateFound, base, false, true));
+        assert!(policy.allow(NoticeKind::UpdateFound, base, true, true));
+        assert!(!policy.allow(
+            NoticeKind::UpdateFound,
+            base + Duration::from_secs(59),
+            true,
+            true
+        ));
+        assert!(policy.allow(NoticeKind::UpdateFound, base + DEDUP_COOLDOWN, true, true));
     }
 }

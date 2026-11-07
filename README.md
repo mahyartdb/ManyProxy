@@ -45,6 +45,10 @@ that uses it.
 
 ### Updating
 
+ManyProxy checks for a newer release once a week at launch and shows
+`Update available - Tools > Check for updates` in the status bar; clicking it
+opens the update dialog. Turn the weekly check off in **Settings → Updates**.
+
 There is no auto-update. Replace the folder by hand with the new release (keep
 or move `data\` if you want to keep the old library).
 
@@ -124,11 +128,12 @@ key-bound actions also have toolbar or menu entries and `Ctrl-K` palette twins.
 
 No system proxy switching, no TUN / virtual interface, no OS DNS rewrite, no
 routing-rule editor, no admin/elevation path, no auto-update that replaces
-binaries, no telemetry, and no silent binary downloads. The only network traffic
-the app originates is user-initiated: a subscription fetch, the GitHub release
-feed behind **Check for updates**, explicit `throne://remoteroute/` fetches, and
-probes through your own endpoints to the visible test URL. These are durable
-constraints, covered by the `assert_no_system_mutation` test family.
+binaries, no telemetry, and no silent binary downloads. The network traffic the
+app originates is a subscription fetch, the GitHub release feed (once a week at
+launch, or when you press **Check for updates**; Settings → Updates can turn the
+weekly read off), explicit `throne://remoteroute/` fetches, and probes through
+your own endpoints to the visible test URL. These are durable constraints,
+covered by the `assert_no_system_mutation` test family.
 
 ## Troubleshooting
 

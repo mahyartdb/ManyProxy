@@ -665,6 +665,22 @@ impl AppView {
         });
     }
 
+    /// The status hint and the tray balloon both land here: show the release
+    /// the passive check stored, and clear the hint as it becomes the dialog.
+    /// A missing release means a later check already took over.
+    pub(crate) fn open_available_update(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(release) = self.update_available.take() else {
+            return false;
+        };
+        self.open_update_check_dialog(UpdateCheckOutcome::Newer(release), window, cx);
+        cx.notify();
+        true
+    }
+
     /// F4: the missing-core hint needs somewhere actionable after its toast
     /// hides. No markdown viewer exists in the kit, so this dialog renders
     /// `docs/user/cores.md`'s three facts in place, with the project pages one

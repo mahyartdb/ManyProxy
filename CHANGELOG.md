@@ -26,7 +26,8 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - A standing not-writable banner when the data folder refuses a write, with re-probes on the tick and after a failed save.
 - The taskbar carries a Test sweep's progress, and the window's thumbnail toolbar has Start all, Stop all, and Test while the window is minimized.
 - Settings → General can register ManyProxy as the handler for `manyproxy://` links; a link opens the app and runs the same intake as a dropped file.
-- While the window is hidden, an engine crash, a failed subscription refresh, or a taken port raises a Windows notification. Clicking it restores the window with Logs or Subscriptions open, and Settings → General can turn the balloons off.
+- While the window is hidden, an engine crash, a failed subscription refresh, a taken port, or a newer release raises a Windows notification. Clicking it restores the window with Logs, Subscriptions, or the update dialog open, and Settings → General can turn the balloons off.
+- Settings → Updates has `Check for updates weekly`, on by default: at launch, after seven days, ManyProxy reads the release feed once and puts `Update available - Tools > Check for updates` in the status bar. Clicking it opens the update dialog; nothing downloads, and a background failure is silent.
 
 ### Changed
 

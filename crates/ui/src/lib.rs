@@ -257,6 +257,15 @@ struct AppView {
 
     update_check_in_flight: bool,
 
+    /// The newer release a passive check found. It is the status-bar hint's
+    /// whole state: set on `Newer`, cleared on a check, an up-to-date result,
+    /// or the opt-out.
+    update_available: Option<FetchedRelease>,
+
+    /// Bumped whenever a manual check or the opt-out supersedes a passive
+    /// fetch, so the stale result cannot land after the user moved on.
+    passive_update_epoch: u64,
+
     probe_stop: Arc<AtomicBool>,
 
     group_test_in_flight: bool,
@@ -501,6 +510,10 @@ pub fn run() {
                     if crate::tray::launched_minimized() && view.tray.is_some() {
                         view.hide_to_tray(window, cx);
                     }
+
+                    // The weekly check runs after the hidden state settles, so
+                    // a tray launch can raise the balloon instead of a hint.
+                    view.start_passive_update_check(cx);
 
                     if let Some(intake) = launch_intake.clone() {
                         view.handle_launch_intake(intake, window, cx);

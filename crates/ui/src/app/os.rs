@@ -52,6 +52,14 @@ impl AppView {
                 crate::os::notify::NoticeTarget::Subscriptions => {
                     self.open_subscriptions_dialog(window, cx);
                 }
+                crate::os::notify::NoticeTarget::Update => {
+                    // The stored release is the one the balloon announced; if
+                    // a manual check already cleared it, run the manual check
+                    // the click asked for.
+                    if !self.open_available_update(window, cx) {
+                        self.check_for_updates(window, cx);
+                    }
+                }
             }
         }
     }
@@ -79,6 +87,26 @@ impl AppView {
         if let Some(notifier) = self.os_notifier.as_mut() {
             notifier.show(kind, title, body);
         }
+    }
+
+    /// The deferred Phase 3 balloon: a passive check found a newer release
+    /// while the window is out of sight. A visible window gets the status-bar
+    /// hint alone, and the policy still owns dedup and flood.
+    pub(crate) fn os_notify_update(&mut self, release: &FetchedRelease) {
+        let Some(notifier) = self.os_notifier.as_ref() else {
+            return;
+        };
+        let hidden = notifier.window_hidden();
+        if !crate::os::notify::update_notice_allowed(
+            self.passive_update_check_enabled(),
+            hidden,
+            self.notify_from_tray_enabled(),
+        ) {
+            return;
+        }
+        let title = t!("update-notice-title");
+        let body = t!("update-notice-body", version = release.tag_name.trim());
+        self.os_notify(crate::os::notify::NoticeKind::UpdateFound, &title, &body);
     }
 
     pub(crate) fn set_taskbar_progress(&mut self, done: usize, total: usize, failed: usize) {

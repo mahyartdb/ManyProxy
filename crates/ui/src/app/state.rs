@@ -436,6 +436,8 @@ impl AppView {
             probe_ping_in_flight: false,
 
             update_check_in_flight: false,
+            update_available: None,
+            passive_update_epoch: 0,
             probe_stop: Arc::new(AtomicBool::new(false)),
             group_test_in_flight: false,
             probe_toast_key: next_toast_key(),
@@ -874,11 +876,16 @@ impl AppView {
         self.tray = None;
     }
 
-    /// One update check per click: GET the JSON feed once, then surface the
-    /// compare result. Nothing auto-checks at startup or in the background —
-    /// the ticket forbids it (checking ≠ updating; nothing is ever fetched
-    /// besides this one JSON read).
+    /// A manual check: GET the JSON feed once, then surface the compare result.
+    /// The passive weekly check (`start_passive_update_check`) is the only
+    /// automatic path. It is opt-out in Settings -> Updates, reads the same
+    /// feed at most once every seven days, and only posts the status-bar hint.
+    /// Neither path downloads or runs a release; the feed read is the whole
+    /// check.
     pub(crate) fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A manual check replaces whatever the passive path was about to say.
+        self.passive_update_epoch = self.passive_update_epoch.wrapping_add(1);
+        self.update_available = None;
         if self.update_check_in_flight {
             window.push_notification(Notification::info(t!("update-check-running")), cx);
             return;
@@ -905,6 +912,42 @@ impl AppView {
                         view.finish_update_check_no_window(fetched, cx);
                     });
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// The passive weekly check: at most one feed read per seven days, decided
+    /// at launch. The timestamp lands before the request so a failed attempt
+    /// still waits out the week; a background failure is silent because the
+    /// manual check owns error reporting.
+    pub(crate) fn start_passive_update_check(&mut self, cx: &mut Context<Self>) {
+        let enabled = self.passive_update_check_enabled();
+        let last = self.store.last_update_check();
+        let due = passive_update_check_due(last, crate::store::now_unix(), enabled);
+        if !due {
+            return;
+        }
+        self.passive_update_epoch = self.passive_update_epoch.wrapping_add(1);
+        let epoch = self.passive_update_epoch;
+        self.record_update_check();
+        let configured = self
+            .store
+            .update_feed_url()
+            .filter(|value| !value.trim().is_empty());
+        let feed_url = effective_update_feed_url(configured.as_deref(), APP_VERSION);
+        let client = cx.http_client();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let fetched =
+                fetch_passive_update(due, client, &feed_url, resolve_subscription_host).await;
+            let Some(fetched) = fetched else {
+                return;
+            };
+            cx.update(|cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.finish_passive_update_check(fetched, epoch, cx);
+                });
             });
         })
         .detach();

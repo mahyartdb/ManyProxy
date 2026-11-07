@@ -11,7 +11,9 @@ impl AppView {
     /// Links inspector tab (its group title already carries `(N)`). The
     /// error segment rides F4: the toast hides in five seconds, this line
     /// persists until a start succeeds and the controller clears it.
-    pub(crate) fn render_status_bar(&self, cx: &App) -> impl IntoElement {
+    /// A passive check that found a newer release adds the one update hint at
+    /// the right end; it opens the same dialog a manual check would.
+    pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let libraries = self.libraries.read(cx);
         let delegate = libraries.delegate();
         // A broken read has no honest count: `0 of 0` beside "Could not load
@@ -154,6 +156,20 @@ impl AppView {
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(usage)
             });
+        }
+        if self.update_available.is_some() {
+            let hint_view = cx.entity();
+            right = right.child(Separator::vertical()).child(
+                Button::new("status-update-hint")
+                    .xsmall()
+                    .text()
+                    .label(t!("status-update-hint"))
+                    .on_click(move |_, window, cx| {
+                        hint_view.update(cx, |view, cx| {
+                            view.open_available_update(window, cx);
+                        });
+                    }),
+            );
         }
         // K17/A6-6: the palette's one at-a-glance hint, parked at the bar's
         // right end. A Kbd chip (the same element the menu rows use), not

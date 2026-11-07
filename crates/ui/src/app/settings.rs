@@ -211,6 +211,7 @@ struct SettingsState {
     restore: Rc<RefCell<bool>>,
     auto_restart: Rc<RefCell<bool>>,
     notify_from_tray: Rc<RefCell<bool>>,
+    passive_update_check: Rc<RefCell<bool>>,
     close_action: Rc<RefCell<CloseAction>>,
     show_tray: Rc<RefCell<bool>>,
     window_corners: Rc<RefCell<WindowCorners>>,
@@ -879,6 +880,32 @@ impl SettingsState {
                 .id("field-settings-update-feed")
                 .test_support()
                 .child(labelled_input(t!("settings-update-feed"), &self.feed_url)),
+        ));
+
+        // The passive check is the one automatic feed read; the switch is its
+        // off ramp and takes effect on the spot.
+        let weekly_cell = self.passive_update_check.clone();
+        let weekly_view = self.view.clone();
+        let weekly_on = *weekly_cell.borrow();
+        body = body.child(settings_row(
+            self,
+            "settings-row-passive-update-check",
+            t!("settings-passive-update-check"),
+            Some(t!("settings-passive-update-check-help")),
+            muted,
+            Switch::new("settings-passive-update-check-switch")
+                .checked(weekly_on)
+                .accessibility_label(t!("settings-passive-update-check"))
+                .on_change(move |next: &bool, window, cx| {
+                    let next = *next;
+                    let cell = weekly_cell.clone();
+                    weekly_view.update(cx, |view, cx| {
+                        if view.commit_passive_update_check(next, window, cx) {
+                            *cell.borrow_mut() = next;
+                            cx.notify();
+                        }
+                    });
+                }),
         ));
 
         let last = match *self.last_check.borrow() {
@@ -1601,6 +1628,54 @@ impl AppView {
         }
     }
 
+    /// "Check for updates weekly"; missing or corrupt reads as on.
+    pub(crate) fn passive_update_check_enabled(&self) -> bool {
+        self.store
+            .get_meta(META_PASSIVE_UPDATE_CHECK)
+            .map(|value| value.as_deref() != Some("0"))
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn commit_passive_update_check(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self
+            .store
+            .set_meta(META_PASSIVE_UPDATE_CHECK, if enabled { "1" } else { "0" })
+        {
+            Ok(()) => {
+                if !enabled {
+                    // Turning it off is an instruction about the result too:
+                    // drop the hint and discard any fetch already in flight.
+                    self.passive_update_epoch = self.passive_update_epoch.wrapping_add(1);
+                    self.update_available = None;
+                }
+                let message = if enabled {
+                    t!("settings-passive-update-check-on-toast")
+                } else {
+                    t!("settings-passive-update-check-off-toast")
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!(
+                        "settings-passive-update-check-failed",
+                        error = error.to_string()
+                    )),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     pub(crate) fn commit_auto_restart(
         &mut self,
         enabled: bool,
@@ -2090,6 +2165,7 @@ impl AppView {
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
         let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
         let notify_from_tray_state = Rc::new(RefCell::new(self.notify_from_tray_enabled()));
+        let passive_update_check_state = Rc::new(RefCell::new(self.passive_update_check_enabled()));
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
         let accent_state = Rc::new(RefCell::new(self.store.accent()));
         let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
@@ -2308,6 +2384,7 @@ impl AppView {
             restore: restore_state.clone(),
             auto_restart: auto_restart_state.clone(),
             notify_from_tray: notify_from_tray_state.clone(),
+            passive_update_check: passive_update_check_state.clone(),
             close_action: close_action_state.clone(),
             show_tray: show_tray_state.clone(),
             window_corners: window_corners_state.clone(),

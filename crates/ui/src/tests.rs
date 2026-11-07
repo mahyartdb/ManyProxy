@@ -28973,6 +28973,15 @@ fn t56_release_json(tag: &str, prerelease: bool, html_url: &str, name: &str) -> 
     )
 }
 
+fn t56_newer_release() -> crate::FetchedRelease {
+    crate::FetchedRelease {
+        tag_name: "v999.0.1".to_string(),
+        prerelease: false,
+        html_url: Some("https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1".to_string()),
+        release_name: Some("ManyProxy v999.0.1".to_string()),
+    }
+}
+
 fn t56_public_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
     Ok(vec!["93.184.216.34".parse().expect("ip parses")])
 }
@@ -29192,6 +29201,304 @@ fn t56_no_releases_dialog_and_malformed_error_toast(cx: &mut TestAppContext) {
         notification_count(cx),
         1,
         "malformed feed is a plain error toast"
+    );
+}
+
+#[test]
+fn t56_passive_update_fetches_only_after_a_week() {
+    use crate::{passive_update_check_due, PASSIVE_UPDATE_CHECK_INTERVAL_SECS};
+
+    let now = 1_800_000_000;
+    let week = PASSIVE_UPDATE_CHECK_INTERVAL_SECS;
+    assert!(
+        passive_update_check_due(None, now, true),
+        "the first launch has no stamp to wait on"
+    );
+    assert!(
+        !passive_update_check_due(None, now, false),
+        "the opt-out wins over a missing stamp"
+    );
+    assert!(
+        !passive_update_check_due(Some(now - week + 1), now, true),
+        "one second early is early"
+    );
+    assert!(
+        passive_update_check_due(Some(now - week), now, true),
+        "a full week opens the gate"
+    );
+    assert!(
+        !passive_update_check_due(Some(now + 3600), now, true),
+        "a clock that moved backwards does not fetch early"
+    );
+
+    let body = t56_release_json(
+        "v999.0.1",
+        false,
+        "https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1",
+        "ManyProxy v999.0.1",
+    );
+    let (client, fetched, _) = t56_recording_feed_client(move |_| t48_response(200, None, &body));
+    let url = crate::UPDATE_FEED_URL_DEFAULT;
+    let closed = futures::executor::block_on(crate::fetch_passive_update(
+        false,
+        client.clone(),
+        url,
+        t56_public_resolver,
+    ));
+    assert!(closed.is_none(), "a closed gate returns no result");
+    assert!(
+        fetched.lock().expect("read works").is_empty(),
+        "a closed gate never reaches the client"
+    );
+    let open = futures::executor::block_on(crate::fetch_passive_update(
+        true,
+        client,
+        url,
+        t56_public_resolver,
+    ))
+    .expect("an open gate returns the fetch result");
+    assert!(
+        open.expect("the feed parses").is_some(),
+        "the configured feed is read"
+    );
+    assert_eq!(
+        fetched.lock().expect("read works").len(),
+        1,
+        "an open gate reads the feed exactly once"
+    );
+}
+
+#[gpui_kit::test]
+fn t56_passive_failure_is_silent(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let epoch = view.read_with(cx, |view, _| view.passive_update_epoch);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(
+                Err("update feed fetch failed".to_string()),
+                epoch,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        notification_count(cx),
+        0,
+        "a background failure never raises a toast"
+    );
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "a background failure never opens a dialog"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.update_available.is_none()),
+        "a failure does not invent a hint"
+    );
+}
+
+#[gpui_kit::test]
+fn t56_passive_newer_hint_opens_the_dialog_and_clears(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let epoch = view.read_with(cx, |view, _| view.passive_update_epoch);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(Ok(Some(t56_newer_release())), epoch, cx);
+        });
+    });
+    paint_frame(cx);
+    assert_painted(cx, "status-update-hint");
+    assert_eq!(
+        label_of("status-update-hint", cx),
+        "Update available - Tools > Check for updates",
+        "the hint carries the pinned copy"
+    );
+
+    cx.update(|window, cx| window.click("status-update-hint", cx));
+    paint_dialog_open(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "clicking the hint opens the update dialog"
+    );
+    assert_painted(cx, "update-new-version");
+    assert_absent(cx, "status-update-hint".to_string());
+    assert!(
+        view.read_with(cx, |view, _| view.update_available.is_none()),
+        "the hint is consumed by the dialog"
+    );
+}
+
+#[gpui_kit::test]
+fn t56_passive_result_clears_when_no_longer_newer(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let epoch = view.read_with(cx, |view, _| view.passive_update_epoch);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(Ok(Some(t56_newer_release())), epoch, cx);
+        });
+    });
+    paint_frame(cx);
+    assert_painted(cx, "status-update-hint");
+
+    let older = crate::FetchedRelease {
+        tag_name: "v0.0.0".to_string(),
+        ..t56_newer_release()
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(Ok(Some(older)), epoch, cx);
+        });
+    });
+    paint_frame(cx);
+    assert_absent(cx, "status-update-hint".to_string());
+    assert!(
+        view.read_with(cx, |view, _| view.update_available.is_none()),
+        "an older release takes the hint away"
+    );
+}
+
+#[gpui_kit::test]
+fn t56_manual_check_clears_the_passive_hint(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    // A loopback feed is refused before any DNS thread or socket, so the
+    // manual check finishes inside the test executor.
+    store
+        .set_update_feed_url("http://127.0.0.1/feed.json")
+        .expect("feed override writes");
+    let (view, cx) = mount_view(store, cx);
+    let epoch = view.read_with(cx, |view, _| view.passive_update_epoch);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(Ok(Some(t56_newer_release())), epoch, cx);
+        });
+    });
+    assert!(view.read_with(cx, |view, _| view.update_available.is_some()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.check_for_updates(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.update_available.is_none()),
+        "a manual check supersedes the passive hint"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.passive_update_epoch) > epoch,
+        "a manual check discards any passive fetch in flight"
+    );
+}
+
+#[gpui_kit::test]
+fn t56_passive_toggle_defaults_on_persists_and_takes_effect_now(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    assert!(
+        view.read_with(cx, |view, _| view.passive_update_check_enabled()),
+        "a missing meta reads as on"
+    );
+    let epoch = view.read_with(cx, |view, _| view.passive_update_epoch);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(Ok(Some(t56_newer_release())), epoch, cx);
+        });
+    });
+    assert!(view.read_with(cx, |view, _| view.update_available.is_some()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_passive_update_check(false, window, cx)
+        });
+    });
+    assert!(
+        !view.read_with(cx, |view, _| view.passive_update_check_enabled()),
+        "the opt-out persists"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.update_available.is_none()),
+        "the opt-out clears the hint on the spot"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view
+            .store
+            .get_meta(crate::META_PASSIVE_UPDATE_CHECK)
+            .expect("meta reads")),
+        Some("0".to_string())
+    );
+    // A result already in flight belongs to the check the user just turned
+    // off; it must not resurrect the hint.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_passive_update_check(Ok(Some(t56_newer_release())), epoch, cx);
+        });
+    });
+    assert!(view.read_with(cx, |view, _| view.update_available.is_none()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_passive_update_check(true, window, cx)
+        });
+    });
+    assert!(view.read_with(cx, |view, _| view.passive_update_check_enabled()));
+    assert_eq!(notification_count(cx), 2, "each commit toasts once");
+}
+
+#[gpui_kit::test]
+fn t56_passive_opt_out_is_read_at_startup(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .set_meta(crate::META_PASSIVE_UPDATE_CHECK, "0")
+        .expect("meta writes");
+    let (view, cx) = mount_view(store, cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.passive_update_check_enabled()),
+        "a persisted opt-out survives the next launch"
+    );
+}
+
+#[gpui_kit::test]
+fn t56_settings_updates_switch_defaults_on(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+    });
+    paint_dialog_open(cx);
+    scroll_settings_into_view(cx, "settings-row-passive-update-check");
+    assert_painted(cx, "settings-row-passive-update-check");
+    assert_painted(cx, "settings-passive-update-check-switch");
+    assert_painted(cx, "settings-row-passive-update-check-help");
+    assert!(
+        view.read_with(cx, |view, _| view.passive_update_check_enabled()),
+        "the switch ships on"
+    );
+
+    cx.update(|window, cx| window.click("settings-passive-update-check-switch", cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.passive_update_check_enabled()),
+        "clicking the switch commits the opt-out"
     );
 }
 
