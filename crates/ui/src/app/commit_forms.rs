@@ -650,6 +650,9 @@ impl AppView {
         }
     }
 
+    /// The retired Library menu's prune family. Slice 7 re-homes it in the
+    /// group and source manage sheet.
+    #[allow(dead_code)]
     pub(crate) fn commit_prune(
         &mut self,
         kind: GroupPruneKind,

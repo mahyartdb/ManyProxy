@@ -80,6 +80,9 @@ impl AppView {
             .on_action(cx.listener(|view, _: &InspectorTraffic, window, cx| {
                 shortcut_action(view, "inspector-traffic", window, cx);
             }))
+            .on_action(cx.listener(|view, _: &InspectorToggle, window, cx| {
+                shortcut_action(view, "inspector-toggle", window, cx);
+            }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
                     view.import_dropped_files(paths, window, cx);

@@ -262,17 +262,20 @@ impl AppView {
 }
 
 /// The startup rectangle: a stored placement wins; otherwise the window opens
-/// at 1000×700 centered in the primary display's work area. The old upper-left
+/// at 1200×700 centered in the primary display's work area. The old upper-left
 /// default (origin 0,0) is not a placement — it treated "never moved" as a
 /// deliberate corner, which is exactly the first-run corner nobody chose. A
 /// headless caller (tests, no display) keeps the old (0,0) fallback.
+///
+/// The width is the nav's own breakpoint: at 1200 the nav opens expanded, so
+/// the first frame shows the shell the user is meant to learn.
 pub(crate) fn startup_window_bounds(
     geometry: Option<WindowGeometry>,
     visible_bounds: Option<Bounds<Pixels>>,
 ) -> WindowBounds {
     let stored = geometry.and_then(WindowGeometry::clamped);
     let desired = stored.map_or_else(
-        || size(px(1000.), px(700.)),
+        || size(px(1200.), px(700.)),
         |geometry| size(px(geometry.width), px(geometry.height)),
     );
     // A stored rectangle can outgrow the display it opens on (a laptop panel

@@ -2,6 +2,25 @@
 
 All notable changes to ManyProxy are recorded here. The format follows Keep a Changelog 1.1.0. Ticket boards live by the artifact lifecycle in `AGENTS.md`. A board exists while work is in flight and is deleted when its outcome lands here.
 
+## [Unreleased]
+
+### Added
+
+- A workbench shell: a left nav carrying `All configs` and the bottom utilities, an action bar with the view title, its count, `Import`, `Add`, the command palette and a `⋯` overflow, a 36px filter slot above the table, and an engine bar under the table with the engine's state, the running count, the session traffic, `Start all`, `Stop all` and a `⋯` menu with `Test all` and `Stop testing`.
+- The nav collapses to its letters below 1200px and expands again at 1200px, so the window's new minimum still fits the table beside it.
+- `Ctrl+I` opens the inspector and closes it again.
+
+### Changed
+
+- The five-menu toolbar, the three-segment status strip and the facet band are gone. Export, About and `Check for updates` live in the action bar's `⋯`, Routing presets and Settings at the bottom of the nav, and the transport controls in the engine bar.
+- The window's minimum size is 1100×640 and it opens at 1200×700, so the nav starts expanded.
+- Toasts park above the engine bar, so a toast never covers the engine's own controls.
+
+### Fixed
+
+- The About dialog prints its body as lines instead of the literal `\n` escape sequence.
+- Stopping every endpoint asks "Stop N running configs" with a real plural.
+
 ## [0.0.2] - 2026-11-07
 
 ### Added

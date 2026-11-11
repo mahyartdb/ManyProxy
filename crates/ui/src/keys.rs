@@ -56,5 +56,6 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     bind(&mut keys, "inspector-logs", InspectorLogs);
     bind(&mut keys, "inspector-links", InspectorLinks);
     bind(&mut keys, "inspector-traffic", InspectorTraffic);
+    bind(&mut keys, "inspector-toggle", InspectorToggle);
     cx.bind_keys(keys);
 }

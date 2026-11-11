@@ -306,6 +306,13 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         &[("ctrl-6", "Ctrl+6")],
         show_traffic,
     ),
+    selected(
+        "inspector-toggle",
+        "action-label-inspector-toggle",
+        &["inspector", "panel", "toggle"],
+        &[("ctrl-i", "Ctrl+I")],
+        toggle_inspector_presence,
+    ),
     rows(
         "start",
         "action-label-start",
@@ -526,6 +533,7 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "logs",
             "settings",
             "about",
+            "inspector-toggle",
             "start-all",
             "stop-all",
             "test-all",
@@ -649,6 +657,12 @@ fn show_links(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppVie
 
 fn show_traffic(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
     view.set_inspector_tab(InspectorTab::Traffic);
+}
+
+/// Ctrl-I owns the inspector's presence: it opens the panel and closes the one
+/// that is already open.
+fn toggle_inspector_presence(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
+    view.toggle_inspector_presence();
 }
 
 fn sort_latency(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {

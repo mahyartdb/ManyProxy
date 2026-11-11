@@ -262,6 +262,8 @@ impl LibraryDelegate {
 
     /// B16: `0 of 0` reads as "your library is empty" while the rows are still
     /// on the wire, so the count line names the wait instead.
+    /// The retired facet band's count. Slice 3's filter row owns it.
+    #[allow(dead_code)]
     pub(crate) fn count_label(&self) -> String {
         match &self.load {
             LibraryLoad::Loading(_) if self.rows.is_empty() => t!("library-loading"),
@@ -637,6 +639,8 @@ impl LibraryDelegate {
         true
     }
 
+    /// The retired facet band's state. Slice 3's filter row owns it.
+    #[allow(dead_code)]
     pub(crate) fn facets_active(&self) -> bool {
         self.facet_group.is_some()
             || self.facet_status.is_some()
@@ -1077,6 +1081,8 @@ impl LibraryDelegate {
         (self.visible.len(), self.rows.len())
     }
 
+    /// The retired facet band's counts. Slice 3's filter row owns them.
+    #[allow(dead_code)]
     pub(crate) fn delegate_counts_for_search(&self) -> (usize, usize, String) {
         (self.visible.len(), self.rows.len(), self.query.clone())
     }

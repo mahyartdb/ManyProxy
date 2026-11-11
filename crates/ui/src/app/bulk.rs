@@ -148,6 +148,10 @@ impl AppView {
         .into_any_element()
     }
 
+    /// The retired facet band's "Clear facet filters" action. The band is
+    /// gone with the toolbar; the filter row that replaces it owns this
+    /// control, so the handler waits for it.
+    #[allow(dead_code)]
     pub(crate) fn clear_facets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().clear_facets();

@@ -218,6 +218,8 @@ impl FacetMenu {
         (choices, current)
     }
 
+    /// The retired facet band's display. Slice 3's filter row owns it.
+    #[allow(dead_code)]
     pub(crate) fn current_display(&self, delegate: &LibraryDelegate) -> String {
         let (choices, current) = self.choices(delegate);
         choices

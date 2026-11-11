@@ -220,18 +220,6 @@ impl AppView {
         }
     }
 
-    pub(crate) fn toggle_global_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.start_in_flight {
-            window.push_notification(Notification::info(start_busy_message()), cx);
-            return;
-        }
-        if self.engine.running_count() == 0 {
-            self.start_all_engines(window, cx);
-        } else {
-            self.stop_all_engines(window, cx);
-        }
-    }
-
     pub(crate) fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
@@ -325,18 +313,6 @@ impl AppView {
 
     pub(crate) fn health_counts(&self) -> (usize, usize) {
         self.health_store.counts(&self.engine.running_ids())
-    }
-
-    pub(crate) fn health_status_text(&self) -> String {
-        let (live, dead) = self.health_counts();
-        // K12/A5-1: the center segment is `engine <state> · health X live ·
-        // Y dead`; the label carries no colon so the `·` grammar stays the
-        // only separator the strip spends.
-        if live == 0 && dead == 0 {
-            t!("health-never-tested")
-        } else {
-            t!("health-count", live = live, dead = dead)
-        }
     }
 
     pub(crate) fn probe_kind_in_flight(&self, ping: bool) -> bool {
@@ -458,9 +434,12 @@ impl AppView {
         self.spawn_group_probe(rows, group, Some(window.window_handle()), cx);
     }
 
+    /// Stop the probe batch that is running — the group sweep or the URL
+    /// test the engine bar's `Test all` started. Both read the same stop
+    /// flag, so one button covers both.
     pub(crate) fn stop_group_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use std::sync::atomic::Ordering;
-        if !self.group_test_in_flight {
+        if !self.group_test_in_flight && !self.probe_url_in_flight {
             window.push_notification(Notification::info(t!("no-group-test-running")), cx);
             return;
         }
@@ -471,6 +450,9 @@ impl AppView {
         window.push_notification(Notification::info(t!("stopping-group-test")), cx);
     }
 
+    /// The retired Library menu's prune family. Slice 7 re-homes it in the
+    /// group and source manage sheet.
+    #[allow(dead_code)]
     pub(crate) fn health_store_prune_group(&mut self, group: &str) {
         let ids: HashSet<String> = self
             .store
@@ -483,6 +465,10 @@ impl AppView {
         self.health_store.prune_configs(&ids);
     }
 
+    /// The retired Tools → Show security toggle. The menu item is gone with
+    /// the toolbar; the protocol column carries the security suffix instead,
+    /// so the row's own flag stays until the column work lands.
+    #[allow(dead_code)]
     pub(crate) fn toggle_show_security(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // A6-4/K8: the toggle renders in place (rows re-render with the
         // security marks) — no toast while the menu is open.

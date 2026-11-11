@@ -1,6 +1,10 @@
 use crate::app::columns::WidthAction;
 use crate::*;
 
+/// The filter slot's height. It always occupies its row, so the table below
+/// it never moves.
+pub(crate) const FILTER_SLOT_HEIGHT: f32 = 36.;
+
 impl AppView {
     /// T-23: keep the last-filter memory in step with the query. `set_value`
     /// never emits `InputEvent::Change`, so the clear paths call this directly.
@@ -75,6 +79,8 @@ impl AppView {
         });
     }
 
+    /// The retired facet band's clear action. Slice 3's filter row owns it.
+    #[allow(dead_code)]
     pub(crate) fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_library_query("");
         self.search_input.update(cx, |input, cx| {
@@ -130,96 +136,28 @@ impl AppView {
         }
     }
 
-    pub(crate) fn render_facet_bar(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        self.sync_facet_pickers(window, cx);
-        let right_pad = 8.;
-        let has_facets = self.libraries.read(cx).delegate().facets_active();
-        let latency_now = self.libraries.read(cx).delegate().latency_facet;
-        // T-19: the facet area carries the same per-group opt-in switch for
-        // the focused group; has no group to protect by design.
-        let facet_group_now = self.libraries.read(cx).delegate().facet_group.clone();
-        let facet_auto_clear = facet_group_now
-            .as_deref()
-            .map(|group| self.store.auto_clear_enabled(group))
-            .unwrap_or(false);
-        let facet_auto_view = cx.entity();
-
-        let group_tip = {
-            let libraries = self.libraries.read(cx);
-            let delegate = libraries.delegate();
-            let (visible, total, _) = delegate.delegate_counts_for_search();
-            facet_tip_text(
-                &t!("facet-group-dimension"),
-                &FacetMenu::Group.current_display(delegate),
-                visible,
-                total,
-            )
-        };
+    /// The filter slot above the table. It always occupies its row, so the
+    /// table never moves when the filter row grows into it. Slice 1 keeps the
+    /// existing search input here; slice 3 replaces the slot with the full
+    /// filter row (Search · Status · Protocol · Filter).
+    pub(crate) fn render_filter_slot(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .id("facet-bar")
+            .id("filter-slot")
             .test_support()
             .flex()
             .flex_row()
-            .flex_wrap()
+            .flex_nowrap()
             .items_center()
             .gap_2()
-            .pl_2()
-            .pr(px(right_pad))
-            .py_1()
+            .w_full()
+            .h(px(FILTER_SLOT_HEIGHT))
+            .flex_shrink_0()
+            .px_2()
             .border_b_1()
             .border_color(cx.theme().border)
-            // T-23 / F-32: filters lead the row. A `flex_1` search used to
-            // claim the whole width and shove Protocol/Status under the
-            // inspector drawer at 880–1000px. The search keeps the remaining
-            // stretch but stops at 320px, so the drawer can only ever cover
-            // its right edge — never the filter values.
-            .child(
-                div()
-                    .id("facet-group-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(group_tip.clone())).into())
-                    .child(
-                        Select::new(&self.facet_group.state)
-                            .id("facet-group")
-                            .small()
-                            .accessibility_label(t!("facet-group-aria")),
-                    ),
-            )
-            .child(
-                div()
-                    .id("facet-latency-tip")
-                    .test_support()
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(t!("facet-latency-tip"))).into())
-                    .child(
-                        Select::new(&self.facet_latency.state)
-                            .id("facet-latency")
-                            .small()
-                            .accessibility_label(t!("facet-latency-aria")),
-                    ),
-            )
-            .child(
-                div().id("facet-latency-unprobed").test_support().child(
-                    Switch::new("facet-latency-unprobed-switch")
-                        .checked(latency_now.include_unprobed)
-                        .label(t!("facet-include-unprobed"))
-                        .tooltip(t!("facet-include-unprobed-tip"))
-                        .accessibility_label(t!("facet-include-unprobed-aria"))
-                        .on_change(cx.listener(|view, next: &bool, _, cx| {
-                            let bucket = view.libraries.read(cx).delegate().latency_facet.bucket;
-                            view.set_latency_facet(
-                                LatencyFacet {
-                                    bucket,
-                                    include_unprobed: *next,
-                                },
-                                cx,
-                            );
-                        })),
-                ),
-            )
+            // T-23 / F-32: the search keeps the remaining stretch but stops at
+            // 320px, so the inspector drawer can only ever cover its right
+            // edge — never the field itself.
             .child(
                 div()
                     .id("library-search")
@@ -234,59 +172,6 @@ impl AppView {
                             .aria_label(t!("search-placeholder")),
                     ),
             )
-            .child(self.render_search_count(cx))
-            .child(match facet_group_now {
-                Some(group) => {
-                    let slug = slugify_group_id(&group);
-                    div()
-                        .id(format!("facet-auto-clear-{slug}"))
-                        .test_support()
-                        .child(
-                            Switch::new(format!("facet-auto-clear-switch-{slug}"))
-                                .checked(facet_auto_clear)
-                                .label(t!("facet-auto-clear"))
-                                .tooltip(t!("facet-auto-clear-tip"))
-                                .accessibility_label(t!(
-                                    "facet-auto-clear-aria",
-                                    group = group.clone()
-                                ))
-                                .on_change({
-                                    let facet_auto_view = facet_auto_view.clone();
-                                    move |next: &bool, window, cx| {
-                                        let view = facet_auto_view.clone();
-                                        if *next {
-                                            view.update(cx, |view, cx| {
-                                                view.open_auto_clear_opt_in_confirm(
-                                                    &group, false, window, cx,
-                                                )
-                                            });
-                                        } else {
-                                            view.update(cx, |view, cx| {
-                                                view.commit_auto_clear_off(&group, window, cx)
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                        .into_any_element()
-                }
-                None => div()
-                    .id("facet-auto-clear-idle")
-                    .test_support()
-                    .into_any_element(),
-            })
-            .child(if has_facets {
-                Button::new("clear-facets")
-                    .small()
-                    .label(t!("facet-clear"))
-                    .tooltip(t!("facet-clear-tip"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.clear_facets(window, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                div().id("facets-idle").test_support().into_any_element()
-            })
             .into_any_element()
     }
 

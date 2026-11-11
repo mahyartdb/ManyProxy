@@ -50,11 +50,11 @@ fn window_options_carry_startup_size() {
         .window_bounds
         .expect("startup window bounds")
         .get_bounds();
-    assert_eq!(bounds.size.width, gpui_kit::px(1000.));
+    assert_eq!(bounds.size.width, gpui_kit::px(1200.));
     assert_eq!(bounds.size.height, gpui_kit::px(700.));
     let min = options.window_min_size.expect("startup window minimum");
-    assert_eq!(min.width, gpui_kit::px(880.));
-    assert_eq!(min.height, gpui_kit::px(620.));
+    assert_eq!(min.width, gpui_kit::px(1100.));
+    assert_eq!(min.height, gpui_kit::px(640.));
 }
 
 /// T-32: a sane stored rectangle seeds the startup window; a stored
@@ -75,7 +75,7 @@ fn t82_app_options_seeds_stored_geometry() {
     assert_eq!(bounds.origin, point(px(240.), px(120.)));
     assert_eq!(bounds.size, size(px(1280.), px(900.)));
     let min = options.window_min_size.expect("startup window minimum");
-    assert_eq!(min, size(px(880.), px(620.)), "minimums are unchanged");
+    assert_eq!(min, size(px(1100.), px(640.)), "minimums are unchanged");
 
     let undersized = crate::app_window_options(
         crate::startup_window_bounds(
@@ -95,7 +95,7 @@ fn t82_app_options_seeds_stored_geometry() {
         .get_bounds();
     assert_eq!(
         bounds.size,
-        size(px(880.), px(620.)),
+        size(px(1100.), px(640.)),
         "a stored rectangle below the minimums seeds the minimums"
     );
 }
@@ -116,7 +116,7 @@ fn t82_default_bounds_when_meta_absent_or_corrupt() {
         .expect("startup window bounds")
         .get_bounds();
     assert_eq!(bounds.origin, point(px(0.), px(0.)));
-    assert_eq!(bounds.size, size(px(1000.), px(700.)));
+    assert_eq!(bounds.size, size(px(1200.), px(700.)));
 
     store
         .set_meta(Store::META_GEOMETRY, "not json at all")
@@ -135,7 +135,7 @@ fn t82_default_bounds_when_meta_absent_or_corrupt() {
         .expect("startup window bounds")
         .get_bounds();
     assert_eq!(bounds.origin, point(px(0.), px(0.)));
-    assert_eq!(bounds.size, size(px(1000.), px(700.)));
+    assert_eq!(bounds.size, size(px(1200.), px(700.)));
 
     store
         .set_meta(Store::META_GEOMETRY, r#"{"x":40,"y":40}"#)
@@ -154,7 +154,7 @@ fn t82_default_bounds_when_meta_absent_or_corrupt() {
         .expect("startup window bounds")
         .get_bounds();
     assert_eq!(bounds.origin, point(px(0.), px(0.)));
-    assert_eq!(bounds.size, size(px(1000.), px(700.)));
+    assert_eq!(bounds.size, size(px(1200.), px(700.)));
 }
 
 /// First run: center in the primary display's work area instead of the old
@@ -167,15 +167,15 @@ fn startup_window_centers_when_unplaced() {
     let centered = crate::startup_window_bounds(None, Some(visible)).get_bounds();
     assert_eq!(
         centered.origin,
-        point(px(460.), px(170.)),
-        "1000×700 centers in the 1920×1040 work area"
+        point(px(360.), px(170.)),
+        "1200×700 centers in the 1920×1040 work area"
     );
-    assert_eq!(centered.size, size(px(1000.), px(700.)));
+    assert_eq!(centered.size, size(px(1200.), px(700.)));
 
     let old_default = WindowGeometry {
         x: 0.,
         y: 0.,
-        width: 1000.,
+        width: 1200.,
         height: 700.,
     };
     assert_eq!(
@@ -201,7 +201,7 @@ fn startup_window_centers_when_unplaced() {
         crate::startup_window_bounds(None, Some(offset))
             .get_bounds()
             .origin,
-        point(px(2380.), px(170.)),
+        point(px(2280.), px(170.)),
         "centering follows the display's own origin"
     );
 }
@@ -220,12 +220,12 @@ fn window_minimum_height_follows_the_work_area() {
     );
     assert_eq!(
         crate::window_min_size(Some(scaled)).width,
-        px(880.),
-        "a work area wider than the design floor keeps the design width"
+        px(960.),
+        "a work area narrower than the design floor keeps the work area width"
     );
     assert_eq!(
         crate::window_min_size(None),
-        size(px(880.), px(620.)),
+        size(px(1100.), px(640.)),
         "a headless caller keeps the design minimum"
     );
 
@@ -802,7 +802,7 @@ fn shell_boots_with_empty_library(cx: &mut TestAppContext) {
         list_found,
         "config list renders: missing element, see registered paths in panic context"
     );
-    assert!(cx.update(|window, _| window.try_find("status-count").is_some()));
+    assert!(cx.update(|window, _| window.try_find("action-bar-count").is_some()));
 
     cx.update(|window, cx| {
         window.open_dialog(cx, |dialog: Dialog, _, _| {
@@ -4996,16 +4996,16 @@ fn export_dialog_opens_with_verbatim_warning(cx: &mut TestAppContext) {
         window.render_frame(cx);
     });
 
-    assert!(cx.update(|window, _| window.try_find("program-menu").is_some()));
+    assert!(cx.update(|window, _| window.try_find("action-bar-overflow").is_some()));
     cx.update(|window, cx| {
-        window.click("program-menu", cx);
+        window.click("action-bar-overflow", cx);
     });
     cx.run_until_parked();
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
     });
-    assert!(cx.update(|window, _| window.try_find("export-library").is_some()));
+    assert!(cx.update(|window, _| window.try_find("action-overflow-export").is_some()));
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.open_export_dialog(window, cx));
@@ -6263,26 +6263,26 @@ fn t75_status_bar_keeps_connections_in_the_inspector(cx: &mut TestAppContext) {
         window.render_frame(cx);
     });
     assert_absent(cx, "conn-counters".to_string());
-    assert_painted(cx, "status-center");
+    assert_painted(cx, "engine-bar");
 
     // The region's min-width/truncate/tooltip pattern keeps the segment in
     // the bar at the minimum frame instead of dropping it.
-    cx.simulate_resize(size(px(880.), px(620.)));
+    cx.simulate_resize(size(px(1100.), px(640.)));
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
     });
     let bounds = cx
-        .update(|window, _| window.try_find("status-center".to_string()))
-        .expect("center segment survives the minimum width")
+        .update(|window, _| window.try_find("engine-bar-status".to_string()))
+        .expect("the engine segment survives the minimum width")
         .bounds();
     assert!(
         bounds.size.width > px(0.),
         "narrow window truncates, never zero-width: {bounds:?}"
     );
     assert!(
-        bounds.origin.x + bounds.size.width <= px(880.) + px(1.),
-        "center segment stays inside the minimum frame: {bounds:?}"
+        bounds.origin.x + bounds.size.width <= px(1100.) + px(1.),
+        "the engine segment stays inside the minimum frame: {bounds:?}"
     );
 
     cx.update(|_, cx| {
@@ -6342,7 +6342,7 @@ fn t75_counter_hidden_when_no_running_cores(cx: &mut TestAppContext) {
         window.render_frame(cx);
     });
     assert_absent(cx, "conn-counters".to_string());
-    assert_painted(cx, "status-center");
+    assert_painted(cx, "engine-bar");
 }
 
 #[test]
@@ -6858,10 +6858,10 @@ fn engine_start_all_and_stop_all_via_fake(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
     });
-    assert!(cx.update(|window, _| window.try_find("engine-status").is_some()));
+    assert!(cx.update(|window, _| window.try_find("engine-bar-status").is_some()));
 
-    assert!(cx.update(|window, _| window.try_find("tools-menu").is_some()));
-    assert!(cx.update(|window, _| window.try_find("global-start-stop").is_some()));
+    assert!(cx.update(|window, _| window.try_find("engine-bar-start-all").is_some()));
+    assert!(cx.update(|window, _| window.try_find("engine-bar-stop-all").is_some()));
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.commit_stop_all(window, cx));
@@ -6978,9 +6978,9 @@ fn health_test_all_via_fake_flags_dead(cx: &mut TestAppContext) {
         window.render_frame(cx);
     });
 
-    assert!(cx.update(|window, _| window.try_find("tools-menu").is_some()));
-    assert!(cx.update(|window, _| window.try_find("global-start-stop").is_some()));
-    assert!(cx.update(|window, _| window.try_find("health-status").is_some()));
+    assert!(cx.update(|window, _| window.try_find("engine-bar-overflow").is_some()));
+    assert!(cx.update(|window, _| window.try_find("engine-bar-start-all").is_some()));
+    assert!(cx.update(|window, _| window.try_find("engine-bar-status").is_some()));
 }
 
 #[gpui_kit::test]
@@ -9950,7 +9950,7 @@ fn laneb_identity_masked_and_sub_full_url_confirm(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn command_strip_all_ids_present(cx: &mut TestAppContext) {
+fn shell_regions_carry_one_home_each(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -9958,19 +9958,29 @@ fn command_strip_all_ids_present(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     for id in [
-        "program-menu",
-        "settings-menu",
-        "groups-menu",
-        "routing-menu",
-        "tools-menu",
-        "global-start-stop",
+        "nav",
+        "nav-all-configs",
+        "nav-routing-presets",
+        "nav-settings",
+        "action-bar",
+        "action-bar-import",
+        "action-bar-add",
+        "action-bar-palette",
+        "action-bar-overflow",
+        "filter-slot",
+        "engine-bar",
+        "engine-bar-start-all",
+        "engine-bar-stop-all",
+        "engine-bar-overflow",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
-            "{id} renders in the command strip"
+            "{id} renders in the new shell"
         );
     }
 
+    // The five-menu toolbar, the three-segment status strip and the facet
+    // band are gone, not hidden.
     for id in [
         "add-config",
         "import-config",
@@ -9978,6 +9988,18 @@ fn command_strip_all_ids_present(cx: &mut TestAppContext) {
         "manage-menu",
         "engine-menu",
         "help-menu",
+        "program-menu",
+        "settings-menu",
+        "groups-menu",
+        "routing-menu",
+        "tools-menu",
+        "global-start-stop",
+        "toolbar-import",
+        "toolbar-add-config",
+        "status-left",
+        "status-center",
+        "status-right",
+        "facet-bar",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_none()),
@@ -9985,63 +10007,18 @@ fn command_strip_all_ids_present(cx: &mut TestAppContext) {
         );
     }
 
-    let xs = cx.update(|window, _| {
-        [
-            "program-menu",
-            "settings-menu",
-            "groups-menu",
-            "routing-menu",
-            "tools-menu",
-            "global-start-stop",
-        ]
-        .iter()
-        .map(|id| {
-            window
-                .try_find(id.to_string())
-                .unwrap_or_else(|| panic!("{id} renders"))
-                .bounds()
-                .origin
-                .x
-        })
-        .collect::<Vec<_>>()
-    });
-    assert!(
-        xs.windows(2).all(|pair| pair[0] <= pair[1]),
-        "menus read PROGRAM | SETTINGS | GROUPS | ROUTING | TOOLS + global last: {xs:?}"
-    );
-
     for (trigger, items) in [
-        ("program-menu", &["export-library", "about-dialog"][..]),
         (
-            "groups-menu",
+            "action-bar-overflow",
             &[
-                "subscriptions",
-                "menu-groups-dialog",
-                "prune-duplicates",
-                "prune-unavailable",
-                "prune-invalid",
-                "prune-clear-tests",
+                "action-overflow-export",
+                "action-overflow-updates",
+                "action-overflow-about",
             ][..],
         ),
         (
-            "routing-menu",
-            &["routing-presets", "routing-open-settings"][..],
-        ),
-        (
-            "tools-menu",
-            &[
-                "engine-start-all",
-                "engine-stop-all",
-                "health-test-all",
-                "stop-testing",
-                "menu-logs",
-                "runtime-stats",
-                "traffic-stats",
-                "show-security",
-                "check-for-updates",
-                "menu-row-columns",
-                "open-palette",
-            ][..],
+            "engine-bar-overflow",
+            &["engine-bar-test-all", "engine-bar-stop-testing"][..],
         ),
     ] {
         cx.update(|window, cx| {
@@ -10068,7 +10045,7 @@ fn command_strip_all_ids_present(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
+fn t02_shell_surfaces_announce_names(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -10076,12 +10053,16 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     for (id, pinned) in [
-        ("program-menu", "Program"),
-        ("settings-menu", "Settings"),
-        ("groups-menu", "Library"),
-        ("routing-menu", "Routing"),
-        ("tools-menu", "Tools"),
-        ("global-start-stop", "Start all"),
+        ("nav-all-configs", "All configs"),
+        ("nav-routing-presets", "Routing presets"),
+        ("nav-settings", "Settings"),
+        ("action-bar-import", "Import"),
+        ("action-bar-add", "Add configuration"),
+        ("action-bar-palette", "Command palette"),
+        ("action-bar-overflow", "More actions"),
+        ("engine-bar-start-all", "Start all"),
+        ("engine-bar-stop-all", "Stop all"),
+        ("engine-bar-overflow", "More actions"),
     ] {
         let label = cx.update(|window, _| {
             window
@@ -10099,41 +10080,18 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
 
     for (trigger, items) in [
         (
-            "program-menu",
-            &[("export-library", "Export…"), ("about-dialog", "About")][..],
-        ),
-        (
-            "groups-menu",
+            "action-bar-overflow",
             &[
-                ("subscriptions", "Subscriptions…"),
-                ("menu-groups-dialog", "Groups…"),
-                ("prune-duplicates", "Remove duplicates"),
-                ("prune-unavailable", "Remove unavailable"),
-                ("prune-invalid", "Remove invalid"),
-                ("prune-clear-tests", "Clear tests"),
+                ("action-overflow-export", "Export…"),
+                ("action-overflow-updates", "Check for updates"),
+                ("action-overflow-about", "About"),
             ][..],
         ),
         (
-            "routing-menu",
+            "engine-bar-overflow",
             &[
-                ("routing-presets", "Routing presets"),
-                ("routing-open-settings", "Settings"),
-            ][..],
-        ),
-        (
-            "tools-menu",
-            &[
-                ("engine-start-all", "Start all"),
-                ("engine-stop-all", "Stop all"),
-                ("health-test-all", "Test all"),
-                ("stop-testing", "Stop Testing"),
-                ("menu-logs", "Logs"),
-                ("runtime-stats", "Runtime stats"),
-                ("traffic-stats", "Traffic stats"),
-                ("show-security", "Show security"),
-                ("check-for-updates", "Check for updates"),
-                ("menu-row-columns", "Row columns"),
-                ("open-palette", "Command palette"),
+                ("engine-bar-test-all", "Test all"),
+                ("engine-bar-stop-testing", "Stop testing"),
             ][..],
         ),
     ] {
@@ -10173,7 +10131,7 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
 /// variable in the trigger's trailing slot, and it is what pushes the three
 /// seven-letter triggers past the caret-free eight-letter Settings button.
 #[gpui_kit::test]
-fn f09_nav_carets_and_ellipsis_rule(cx: &mut TestAppContext) {
+fn f09_overflow_ellipsis_rule(cx: &mut TestAppContext) {
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -10181,49 +10139,25 @@ fn f09_nav_carets_and_ellipsis_rule(cx: &mut TestAppContext) {
     let (_view, cx) = mount_view(store, cx);
     paint_frame(cx);
 
-    let trigger_width = |cx: &mut VisualTestContext, id: &str| -> gpui_kit::Pixels {
-        cx.update(|window, _| {
+    // Both overflows are one glyph wide; they name themselves for the
+    // assistive tree and carry the full label in their tooltip.
+    for id in ["action-bar-overflow", "engine-bar-overflow"] {
+        let width = cx.update(|window, _| {
             window
                 .try_find(id.to_string())
                 .unwrap_or_else(|| panic!("{id} renders"))
                 .bounds()
                 .size
                 .width
-        })
-    };
-    // Measured floors: a caret adds ~13px to the label-only button.
-    for (id, floor) in [
-        ("program-menu", px(95.)),
-        ("groups-menu", px(95.)),
-        ("routing-menu", px(95.)),
-        ("tools-menu", px(78.)),
-    ] {
-        let width = trigger_width(cx, id);
-        assert!(
-            width >= floor,
-            "{id} holds the caret slot: {width:?} >= {floor:?}"
-        );
-    }
-    let settings = trigger_width(cx, "settings-menu");
-    assert!(
-        settings <= px(88.),
-        "Settings stays a direct action with no caret: {settings:?}"
-    );
-    // "Program", "Library" and "Routing" are shorter words than "Settings";
-    // without a caret they would sit under it, so the caret is the difference.
-    for id in ["program-menu", "groups-menu", "routing-menu"] {
-        let width = trigger_width(cx, id);
-        assert!(
-            width > settings,
-            "{id} is wider than the caret-free Settings trigger: {width:?} > {settings:?}"
-        );
+        });
+        assert!(width <= px(64.), "{id} stays one glyph wide: {width:?}");
     }
 
     // The ellipsis marks only a surface that needs input before it applies.
     assert_eq!(
-        label_of("groups-menu", cx),
-        "Library",
-        "a menu trigger needs no ellipsis"
+        label_of("action-bar-overflow", cx),
+        "More actions",
+        "the overflow names itself"
     );
     let open = |cx: &mut VisualTestContext, trigger: &'static str| {
         cx.update(|window, cx| window.click(trigger, cx));
@@ -10241,70 +10175,47 @@ fn f09_nav_carets_and_ellipsis_rule(cx: &mut TestAppContext) {
         paint_frame(cx);
     };
 
-    open(cx, "program-menu");
+    open(cx, "action-bar-overflow");
     assert_eq!(
-        label_of("export-library", cx),
+        label_of("action-overflow-export", cx),
         "Export…",
         "Export asks first"
     );
     assert_eq!(
-        label_of("about-dialog", cx),
+        label_of("action-overflow-about", cx),
         "About",
         "About applies at once"
     );
     close(cx);
 
-    open(cx, "groups-menu");
+    open(cx, "engine-bar-overflow");
     assert_eq!(
-        label_of("subscriptions", cx),
-        "Subscriptions…",
-        "Subscriptions asks first"
-    );
-    assert_eq!(
-        label_of("menu-groups-dialog", cx),
-        "Groups…",
-        "Groups asks first"
-    );
-    assert_eq!(
-        label_of("prune-clear-tests", cx),
-        "Clear tests",
-        "a confirm applies on one click, no ellipsis"
-    );
-    assert_eq!(
-        label_of("prune-duplicates", cx),
-        "Remove duplicates",
-        "prune rows are confirms, no ellipsis"
-    );
-    close(cx);
-
-    open(cx, "tools-menu");
-    assert_eq!(
-        label_of("menu-row-columns", cx),
-        "Row columns",
-        "Row columns applies on the spot, no ellipsis"
+        label_of("engine-bar-test-all", cx),
+        "Test all",
+        "Test all applies on the spot, no ellipsis"
     );
     close(cx);
 }
 
 #[gpui_kit::test]
-fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
+fn cua07_action_overflow_uia_walk_matches_fixture(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("program-menu", cx);
+        window.click("action-bar-overflow", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../tests/fixtures/uia-program-menu.json"))
-            .expect("program menu fixture parses");
-    // K8/A1-3: the toolbar cluster owns intake; PROGRAM keeps Export/About
-    // only, so the duplicate Add/Import entries stay retired.
+        serde_json::from_str(include_str!("../tests/fixtures/uia-action-overflow.json"))
+            .expect("action bar overflow fixture parses");
+    // The action bar owns intake; the overflow keeps the verbs that are
+    // neither intake nor transport.
     for retired in [
         "menu-add-config",
         "menu-import-config",
@@ -10313,7 +10224,7 @@ fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
     ] {
         assert!(
             cx.update(|window, _| window.try_find(retired.to_string()).is_none()),
-            "{retired} stays out of the PROGRAM menu"
+            "{retired} stays out of the overflow"
         );
     }
     let items = fixture["items"].as_array().expect("fixture lists items");
@@ -10324,7 +10235,7 @@ fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
     for expected in ["Export", "About"] {
         assert!(
             names.iter().any(|name| name.contains(expected)),
-            "PROGRAM walk names {expected}: {names:?}"
+            "the overflow walk names {expected}: {names:?}"
         );
     }
     for item in items {
@@ -10332,7 +10243,7 @@ fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
         let (role, label) = cx.update(|window, _| {
             let snapshot = window
                 .try_find(id.to_string())
-                .unwrap_or_else(|| panic!("{id} renders in the PROGRAM menu"));
+                .unwrap_or_else(|| panic!("{id} renders in the action bar's overflow"));
             (
                 snapshot.role().map(|role| format!("{role:?}")),
                 snapshot.label().map(str::to_string),
@@ -10569,7 +10480,7 @@ fn cua07_menus_keyboard_operable(cx: &mut TestAppContext) {
     let (_view, cx) = mount_view(store, cx);
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("program-menu", cx);
+        window.click("action-bar-overflow", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -10587,7 +10498,7 @@ fn cua07_menus_keyboard_operable(cx: &mut TestAppContext) {
     paint_frame(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "Enter on the first PROGRAM item opens Export"
+        "Enter on the first overflow item opens Export"
     );
     let before = notification_count(cx);
     cx.update(|window, cx| {
@@ -10679,7 +10590,7 @@ fn cua07_card_menu_invoke_matches_click(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t02_toolbar_fits_one_row_at_880(cx: &mut TestAppContext) {
+fn t02_shell_bars_fit_one_row_at_the_minimum(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -10688,44 +10599,49 @@ fn t02_toolbar_fits_one_row_at_880(cx: &mut TestAppContext) {
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
-    let ids = [
-        "program-menu",
-        "settings-menu",
-        "groups-menu",
-        "routing-menu",
-        "tools-menu",
-        "global-start-stop",
+    let action = [
+        "action-bar-import",
+        "action-bar-add",
+        "action-bar-palette",
+        "action-bar-overflow",
     ];
-    for id in ids {
+    let engine = [
+        "engine-bar-start-all",
+        "engine-bar-stop-all",
+        "engine-bar-overflow",
+    ];
+    for id in action.iter().chain(engine.iter()) {
         assert_painted(cx, id);
         assert_within_frame_min(cx, id);
     }
-    let ys = cx.update(|window, _| {
-        ids.iter()
-            .map(|id| {
-                window
-                    .try_find(id.to_string())
-                    .unwrap_or_else(|| panic!("{id} renders"))
-                    .bounds()
-                    .origin
-                    .y
-            })
-            .collect::<Vec<_>>()
-    });
-    let (min_y, max_y) = ys.iter().fold((ys[0], ys[0]), |(min, max), y| {
-        (
-            if *y < min { *y } else { min },
-            if *y > max { *y } else { max },
-        )
-    });
-    assert!(
-        max_y - min_y <= px(1.),
-        "toolbar shares one row at 880px minimum: {ys:?}"
-    );
+    for ids in [action.to_vec(), engine.to_vec()] {
+        let ys = cx.update(|window, _| {
+            ids.iter()
+                .map(|id| {
+                    window
+                        .try_find(id.to_string())
+                        .unwrap_or_else(|| panic!("{id} renders"))
+                        .bounds()
+                        .origin
+                        .y
+                })
+                .collect::<Vec<_>>()
+        });
+        let (min_y, max_y) = ys.iter().fold((ys[0], ys[0]), |(min, max), y| {
+            (
+                if *y < min { *y } else { min },
+                if *y > max { *y } else { max },
+            )
+        });
+        assert!(
+            max_y - min_y <= px(1.),
+            "the bar shares one row at the minimum width: {ys:?}"
+        );
+    }
 }
 
 #[gpui_kit::test]
-fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
+fn t02_shell_surfaces_run_the_same_handlers(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -10733,20 +10649,20 @@ fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     cx.update(|window, cx| {
-        window.click("program-menu", cx);
+        window.click("action-bar-overflow", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("export-library", cx);
+        window.click("action-overflow-export", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "PROGRAM Export runs its handler"
+        "the action bar's Export runs its handler"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -10760,38 +10676,7 @@ fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     cx.update(|window, cx| {
-        window.click("groups-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("subscriptions", cx);
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    assert_painted(cx, "subscriptions-dialog-ok");
-    cx.update(|window, cx| window.close_all_dialogs(cx));
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        use gpui_kit::Keystroke;
-        let escape = Keystroke::parse("escape").expect("test keystroke parses");
-        window.dispatch_keystroke(escape, cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    cx.update(|window, cx| {
-        window.click("routing-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("routing-presets", cx);
+        window.click("nav-routing-presets", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
@@ -10799,22 +10684,15 @@ fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
     paint_frame(cx);
-    cx.update(|window, cx| {
-        use gpui_kit::Keystroke;
-        let escape = Keystroke::parse("escape").expect("test keystroke parses");
-        window.dispatch_keystroke(escape, cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
 
     cx.update(|window, cx| {
-        window.click("settings-menu", cx);
+        window.click("nav-settings", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "the SETTINGS button opens the modal directly (no one-item menu)"
+        "the nav's Settings opens the modal directly"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -10829,21 +10707,14 @@ fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
 
     let before = notification_count(cx);
     cx.update(|window, cx| {
-        window.click("tools-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("engine-start-all", cx);
+        window.click("engine-bar-start-all", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
         notification_count(cx),
         before + 1,
-        "TOOLS Start all runs its handler"
+        "the engine bar's Start all runs its handler"
     );
 }
 
@@ -10856,7 +10727,7 @@ fn t02_global_toggle_present_pins_three_states() {
 }
 
 #[gpui_kit::test]
-fn t02_global_start_all_stopped_starts_all(cx: &mut TestAppContext) {
+fn t02_engine_bar_start_all_starts_every_row(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10877,15 +10748,15 @@ fn t02_global_start_all_stopped_starts_all(cx: &mut TestAppContext) {
 
     let label = cx.update(|window, _| {
         window
-            .try_find("global-start-stop".to_string())
-            .expect("global toggle renders")
+            .try_find("engine-bar-start-all".to_string())
+            .expect("the engine bar's Start all renders")
             .label()
             .map(str::to_string)
     });
     assert_eq!(label.as_deref(), Some("Start all"));
     let before = notification_count(cx);
     cx.update(|window, cx| {
-        window.click("global-start-stop", cx);
+        window.click("engine-bar-start-all", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -10898,8 +10769,8 @@ fn t02_global_start_all_stopped_starts_all(cx: &mut TestAppContext) {
 
     let label = cx.update(|window, _| {
         window
-            .try_find("global-start-stop".to_string())
-            .expect("global toggle renders")
+            .try_find("engine-bar-stop-all".to_string())
+            .expect("the engine bar's Stop all renders")
             .label()
             .map(str::to_string)
     });
@@ -10907,7 +10778,7 @@ fn t02_global_start_all_stopped_starts_all(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t02_global_start_empty_library_toasts_honestly(cx: &mut TestAppContext) {
+fn t02_engine_bar_start_all_toasts_honestly_when_empty(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -10921,7 +10792,7 @@ fn t02_global_start_empty_library_toasts_honestly(cx: &mut TestAppContext) {
     paint_frame(cx);
     let before = notification_count(cx);
     cx.update(|window, cx| {
-        window.click("global-start-stop", cx);
+        window.click("engine-bar-start-all", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -10938,8 +10809,8 @@ fn t02_global_start_empty_library_toasts_honestly(cx: &mut TestAppContext) {
     assert!(crate::start_all_message(0).contains("Nothing to start"));
     let label = cx.update(|window, _| {
         window
-            .try_find("global-start-stop".to_string())
-            .expect("global toggle renders")
+            .try_find("engine-bar-start-all".to_string())
+            .expect("the engine bar's Start all renders")
             .label()
             .map(str::to_string)
     });
@@ -10947,7 +10818,7 @@ fn t02_global_start_empty_library_toasts_honestly(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t02_global_start_lan_rows_confirm_first(cx: &mut TestAppContext) {
+fn t02_engine_bar_start_all_confirms_lan_rows_first(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10963,7 +10834,7 @@ fn t02_global_start_lan_rows_confirm_first(cx: &mut TestAppContext) {
     });
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("global-start-stop", cx);
+        window.click("engine-bar-start-all", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -10980,7 +10851,7 @@ fn t02_global_start_lan_rows_confirm_first(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t02_topbar_has_no_mode_controls(cx: &mut TestAppContext) {
+fn t02_shell_has_no_mode_controls(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -10989,12 +10860,16 @@ fn t02_topbar_has_no_mode_controls(cx: &mut TestAppContext) {
     let mut names: Vec<String> = Vec::new();
 
     for id in [
-        "program-menu",
-        "settings-menu",
-        "groups-menu",
-        "routing-menu",
-        "tools-menu",
-        "global-start-stop",
+        "nav-all-configs",
+        "nav-routing-presets",
+        "nav-settings",
+        "action-bar-import",
+        "action-bar-add",
+        "action-bar-palette",
+        "action-bar-overflow",
+        "engine-bar-start-all",
+        "engine-bar-stop-all",
+        "engine-bar-overflow",
     ] {
         names.push(cx.update(|window, _| {
             window
@@ -11007,37 +10882,17 @@ fn t02_topbar_has_no_mode_controls(cx: &mut TestAppContext) {
     }
 
     for (trigger, items) in [
-        ("program-menu", &["export-library", "about-dialog"][..]),
         (
-            "groups-menu",
+            "action-bar-overflow",
             &[
-                "subscriptions",
-                "menu-groups-dialog",
-                "prune-duplicates",
-                "prune-unavailable",
-                "prune-invalid",
-                "prune-clear-tests",
+                "action-overflow-export",
+                "action-overflow-updates",
+                "action-overflow-about",
             ][..],
         ),
         (
-            "routing-menu",
-            &["routing-presets", "routing-open-settings"][..],
-        ),
-        (
-            "tools-menu",
-            &[
-                "engine-start-all",
-                "engine-stop-all",
-                "health-test-all",
-                "stop-testing",
-                "menu-logs",
-                "runtime-stats",
-                "traffic-stats",
-                "show-security",
-                "check-for-updates",
-                "menu-row-columns",
-                "open-palette",
-            ][..],
+            "engine-bar-overflow",
+            &["engine-bar-test-all", "engine-bar-stop-testing"][..],
         ),
     ] {
         cx.update(|window, cx| {
@@ -11085,20 +10940,20 @@ fn t02_topbar_has_no_mode_controls(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t03_toolbar_import_opens_dialog(cx: &mut TestAppContext) {
+fn t03_action_bar_import_opens_dialog(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("toolbar-import", cx);
+        window.click("action-bar-import", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "the toolbar Import button opens the import dialog"
+        "the action bar's Import button opens the import dialog"
     );
     assert_painted(cx, "import-dialog-ok");
     cx.update(|window, cx| window.close_all_dialogs(cx));
@@ -11241,13 +11096,11 @@ fn ticket43_chrome_paints(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
 
-    // K11/A1-3: the toolbar owns Add/Import; the empty canvas does not
-    // repeat them.
+    // The action bar owns Add/Import; the empty canvas does not repeat them.
     for id in [
-        "tools-menu",
-        "global-start-stop",
-        "toolbar-add-config",
-        "toolbar-import",
+        "action-bar-add",
+        "action-bar-import",
+        "engine-bar-start-all",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
@@ -12072,7 +11925,7 @@ fn t73_last_query_meta_restores_on_launch(cx: &mut TestAppContext) {
     );
 
     cx.update(|window, cx| {
-        window.click("clear-search", cx);
+        restarted.update(cx, |view, cx| view.clear_library_search(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -12632,19 +12485,16 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "facet-bar");
-    assert_painted(cx, "facet-group");
-    // K11: protocol and status dropdowns retired; the row is Search · Group.
+    // The facet band is retired; the filter slot owns the search.
+    assert_absent(cx, "facet-bar".to_string());
+    assert_absent(cx, "facet-group".to_string());
     assert_absent(cx, "facet-protocol".to_string());
     assert_absent(cx, "facet-status".to_string());
-
-    assert_painted(cx, "facet-group-tip");
+    assert_absent(cx, "facet-group-tip".to_string());
     assert_absent(cx, "facet-protocol-tip".to_string());
     assert_absent(cx, "facet-status-tip".to_string());
-    // T-03: the facet row no longer repeats the Groups action — the menu
-    // bar owns it.
-    assert_absent(cx, "groups-dialog".to_string());
-    assert_painted(cx, "groups-menu");
+    assert_painted(cx, "filter-slot");
+    assert_painted(cx, "library-search");
     assert_painted(cx, &format!("check-{}", first.id));
     assert_painted(cx, &format!("check-{}", second.id));
 
@@ -12795,7 +12645,7 @@ fn k04_bulk_bar_single_line_within_min_frame(cx: &mut TestAppContext) {
         "bulk bar stays on ONE line: bar {bar_bounds:?} vs button height {start_height:?}"
     );
     assert!(
-        more_bounds.origin.x + more_bounds.size.width <= px(880. - 260.),
+        more_bounds.origin.x + more_bounds.size.width <= px(1100. - 260.),
         "bulk More never hides behind the drawer: {more_bounds:?}"
     );
     for id in [
@@ -14062,7 +13912,7 @@ fn w1_library_fifty_rows_paint_and_filter(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "config-list");
-    assert_painted(cx, "status-count");
+    assert_painted(cx, "action-bar-count");
     assert_painted(cx, &format!("library-row-{}", ids[0]));
 
     cx.update(|_, cx| {
@@ -16136,7 +15986,7 @@ fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig 
 }
 
 #[gpui_kit::test]
-fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
+fn facet_group_filters_the_list_without_a_picker(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let travel = store
@@ -16151,23 +16001,21 @@ fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_painted(cx, "facet-group");
-    cx.update(|window, cx| {
-        window.click("facet-group", cx);
+    // The facet band is retired; the filter slot owns the search and the
+    // group scope arrives with the nav in slice 7.
+    assert_absent(cx, "facet-group".to_string());
+    assert_painted(cx, "filter-slot");
+    assert_painted(cx, "library-search");
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                delegate.set_facet_group(Some("travel".to_string()));
+                delegate.apply_filter();
+                list_cx.notify();
+            });
+        });
     });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert!(
-        !cx.update(|window, cx| window.has_active_dialog(cx)),
-        "the group picker opens inline, never as a dialog"
-    );
-    assert_painted(cx, "facet-group-travel");
-    assert_painted(cx, "facet-group-team");
-    cx.update(|window, cx| {
-        window.click("facet-group-travel", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
@@ -16178,7 +16026,7 @@ fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
             .facet_group
             .clone()),
         Some("travel".to_string()),
-        "picking applies the group facet"
+        "the group facet still filters the list"
     );
     assert_painted(cx, &format!("library-row-{}", travel.id));
     assert!(
@@ -16187,8 +16035,15 @@ fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
             .is_none()),
         "the team row filters out of the visible list"
     );
-    cx.update(|window, cx| {
-        window.click("clear-facets", cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                delegate.clear_facets();
+                delegate.apply_filter();
+                list_cx.notify();
+            });
+        });
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -16200,13 +16055,13 @@ fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
             .facet_group
             .clone()),
         None,
-        "Clear restores the unfiltered library"
+        "clearing the facets restores the unfiltered library"
     );
     assert_painted(cx, &format!("library-row-{}", team.id));
 }
 
 #[gpui_kit::test]
-fn facet_group_menu_carries_enabled_disabled_and_releases_the_group(cx: &mut TestAppContext) {
+fn facet_group_choice_releases_the_state_filter(cx: &mut TestAppContext) {
     use crate::FacetStatus;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16222,18 +16077,18 @@ fn facet_group_menu_carries_enabled_disabled_and_releases_the_group(cx: &mut Tes
     cx.run_until_parked();
     paint_frame(cx);
 
-    // K11: one facet menu; enabled/disabled ride it as sentinel rows.
-    assert_painted(cx, "facet-group");
+    // The facet band is retired; the delegate keeps the mutual exclusion the
+    // band enforced, and slice 3's filter row reads it.
+    assert_absent(cx, "facet-group".to_string());
     assert_absent(cx, "facet-status".to_string());
-    cx.update(|window, cx| {
-        window.click("facet-group", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_painted(cx, "facet-status-enabled");
-    assert_painted(cx, "facet-status-disabled");
-    cx.update(|window, cx| {
-        window.click("facet-status-disabled", cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                delegate.set_facet_menu(None, Some(FacetStatus::Disabled));
+                list_cx.notify();
+            });
+        });
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -16245,13 +16100,14 @@ fn facet_group_menu_carries_enabled_disabled_and_releases_the_group(cx: &mut Tes
     assert_eq!(group, None, "the state pick releases the group choice");
 
     // Picking a group releases the sentinel in the same write.
-    cx.update(|window, cx| {
-        window.click("facet-group", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("facet-group-travel", cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                let delegate = state.delegate_mut();
+                delegate.set_facet_menu(Some("travel".to_string()), None);
+                list_cx.notify();
+            });
+        });
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -16365,7 +16221,7 @@ fn t05_latency_facet_filters_inclusively_and_composes() {
 /// T-05: the picker writes the delegate and the store, the switch releases
 /// unprobed rows, and Clear resets both surfaces.
 #[gpui_kit::test]
-fn t05_latency_picker_filters_persists_and_clears(cx: &mut TestAppContext) {
+fn t05_latency_facet_filters_persists_and_clears(cx: &mut TestAppContext) {
     use crate::{LatencyBucket, LatencyFacet};
 
     cx.update(gpui_kit::init);
@@ -16398,29 +16254,20 @@ fn t05_latency_picker_filters_persists_and_clears(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_painted(cx, "facet-latency");
-    assert_painted(cx, "facet-latency-unprobed-switch");
-    assert_eq!(label_of("facet-latency", cx), "Filter by probe latency");
-    assert_eq!(
-        label_of("facet-latency-unprobed-switch", cx),
-        "Include rows that have not been probed"
-    );
-
-    cx.update(|window, cx| {
-        window.click("facet-latency", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    for id in [
-        "facet-latency-any",
-        "facet-latency-100",
-        "facet-latency-300",
-        "facet-latency-1000",
-    ] {
-        assert_painted(cx, id);
-    }
-    cx.update(|window, cx| {
-        window.click("facet-latency-100", cx);
+    // The facet band is retired; the latency facet moves into slice 3's
+    // filter row.
+    assert_absent(cx, "facet-latency".to_string());
+    assert_absent(cx, "facet-latency-unprobed-switch".to_string());
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_latency_facet(
+                LatencyFacet {
+                    bucket: LatencyBucket::Ms100,
+                    include_unprobed: true,
+                },
+                cx,
+            );
+        });
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -16446,10 +16293,17 @@ fn t05_latency_picker_filters_persists_and_clears(cx: &mut TestAppContext) {
     assert_painted(cx, &format!("library-row-{}", fast.id));
     assert_absent(cx, format!("library-row-{}", mid.id));
     assert_painted(cx, &format!("library-row-{}", unprobed.id));
-    assert_painted(cx, "clear-facets");
 
-    cx.update(|window, cx| {
-        window.click("facet-latency-unprobed-switch", cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_latency_facet(
+                LatencyFacet {
+                    bucket: LatencyBucket::Ms100,
+                    include_unprobed: false,
+                },
+                cx,
+            );
+        });
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -16464,7 +16318,7 @@ fn t05_latency_picker_filters_persists_and_clears(cx: &mut TestAppContext) {
     assert_absent(cx, format!("library-row-{}", unprobed.id));
 
     cx.update(|window, cx| {
-        window.click("clear-facets", cx);
+        view.update(cx, |view, cx| view.clear_facets(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -16515,8 +16369,8 @@ fn t05_latency_facet_restores_from_store(cx: &mut TestAppContext) {
     });
     assert_eq!(restored, facet);
     assert_eq!(display, "Latency: ≤300 ms");
-    assert_painted(cx, "facet-latency");
-    assert_painted(cx, "facet-latency-unprobed-switch");
+    assert_absent(cx, "facet-latency".to_string());
+    assert_absent(cx, "facet-latency-unprobed-switch".to_string());
 }
 
 #[gpui_kit::test]
@@ -17176,14 +17030,7 @@ fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     cx.update(|window, cx| {
-        window.click("groups-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("menu-groups-dialog", cx);
+        view.update(cx, |view, cx| view.open_groups_dialog(window, cx));
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
@@ -17211,7 +17058,6 @@ fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
         !cx.update(|window, cx| window.has_active_sheet(cx)),
         "Escape closes the sheet"
     );
-    assert_painted(cx, "groups-menu");
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
@@ -17328,7 +17174,7 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t08_status_bar_regions_hold_order_and_floors(cx: &mut TestAppContext) {
+fn t08_engine_bar_regions_hold_order(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
@@ -17337,35 +17183,38 @@ fn t08_status_bar_regions_hold_order_and_floors(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    for id in ["status-left", "status-center", "status-right"] {
+    for id in [
+        "engine-bar-status",
+        "engine-bar-running",
+        "engine-bar-traffic",
+    ] {
         assert_painted(cx, id);
     }
-    let (origins, widths) = cx.update(|window, _| {
-        let mut origins = Vec::new();
-        let mut widths = Vec::new();
-        for id in ["status-left", "status-center", "status-right"] {
-            let snapshot = window
+    let origins = cx.update(|window, _| {
+        [
+            "engine-bar-status",
+            "engine-bar-running",
+            "engine-bar-traffic",
+        ]
+        .iter()
+        .map(|id| {
+            window
                 .try_find(id.to_string())
-                .unwrap_or_else(|| panic!("{id} renders"));
-            origins.push(snapshot.bounds().origin.x);
-            widths.push(snapshot.bounds().size.width);
-        }
-        (origins, widths)
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+                .origin
+                .x
+        })
+        .collect::<Vec<_>>()
     });
     assert!(
         origins[0] < origins[1] && origins[1] < origins[2],
-        "left/center/right read in order: {origins:?}"
+        "state/running/traffic read in order: {origins:?}"
     );
-    for (width, floor) in widths.iter().zip([px(210.), px(430.), px(150.)]) {
-        assert!(
-            *width >= floor,
-            "region holds its min_w floor ({width:?} >= {floor:?})"
-        );
-    }
 }
 
 #[gpui_kit::test]
-fn t08_palette_hint_chips_the_bar(cx: &mut TestAppContext) {
+fn t08_palette_button_owns_the_hint(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
@@ -17375,37 +17224,31 @@ fn t08_palette_hint_chips_the_bar(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_painted(cx, "palette-hint");
-    assert!(
-        cx.debug_bounds("kbd:ctrl-k").is_some(),
-        "the hint renders as a Kbd chip, not a second affordance"
-    );
+    // The retired status strip carried a Ctrl-K chip. The palette button
+    // replaces it: the binding lives in the button's tooltip, not in a
+    // second affordance on the bar.
+    assert_painted(cx, "action-bar-palette");
+    assert_absent(cx, "palette-hint".to_string());
     assert_eq!(
-        label_of("palette-hint", cx),
-        "Command palette (Ctrl+K)",
-        "the hint names the palette and its binding"
+        label_of("action-bar-palette", cx),
+        "Command palette",
+        "the palette button names itself"
     );
-    // A6-6: parked at the bar's right end, after the usage segment.
-    let (bar, hint) = cx.update(|window, _| {
+    let (bar, button) = cx.update(|window, _| {
         let bar = window
-            .try_find("status-right".to_string())
-            .unwrap_or_else(|| panic!("status-right renders"))
+            .try_find("action-bar".to_string())
+            .unwrap_or_else(|| panic!("action-bar renders"))
             .bounds();
-        let hint = window
-            .try_find("palette-hint".to_string())
-            .unwrap_or_else(|| panic!("palette-hint renders"))
+        let button = window
+            .try_find("action-bar-palette".to_string())
+            .unwrap_or_else(|| panic!("action-bar-palette renders"))
             .bounds();
-        (bar, hint)
+        (bar, button)
     });
-    let (hx, hw) = (hint.origin.x, hint.size.width);
-    let (bx, bw) = (bar.origin.x, bar.size.width);
     assert!(
-        hx >= bx && hx + hw <= bx + bw + px(1.),
-        "the hint lives inside the right region ({hint:?} in {bar:?})"
-    );
-    assert!(
-        hx + hw >= bx + bw - px(60.),
-        "the hint is the bar's last resident, not mid-bar"
+        button.origin.x >= bar.origin.x
+            && button.origin.x + button.size.width <= bar.origin.x + bar.size.width + px(1.),
+        "the palette button lives inside the action bar ({button:?} in {bar:?})"
     );
 }
 
@@ -17971,7 +17814,7 @@ fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
     });
     assert!(
         operate_bounds.origin.x >= px(0.)
-            && operate_bounds.origin.x + operate_bounds.size.width <= px(880.) + px(1.),
+            && operate_bounds.origin.x + operate_bounds.size.width <= px(1100.) + px(1.),
         "operate row never scrolls horizontally: {operate_bounds:?}"
     );
 
@@ -18046,55 +17889,37 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
 
     let before = notification_count(cx);
     cx.update(|window, cx| {
-        window.click("tools-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("engine-start-all", cx);
+        window.click("engine-bar-start-all", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
         1,
-        "TOOLS Start all starts every endpoint (the one seeded row)"
+        "the engine bar's Start all starts every endpoint (the one seeded row)"
     );
     assert_eq!(
         notification_count(cx),
         before + 1,
-        "TOOLS Start all toasts once"
+        "the engine bar's Start all toasts once"
     );
-    cx.update(|window, cx| {
-        use gpui_kit::Keystroke;
-        let escape = Keystroke::parse("escape").expect("test keystroke parses");
-        window.dispatch_keystroke(escape, cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("tools-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
     let before = notification_count(cx);
+    // The toast park sits at the bottom-right, where the engine bar's own
+    // controls live. Clearing the toast first keeps the click on the button.
+    cx.update(|window, cx| window.clear_notifications(cx));
     cx.update(|window, cx| {
-        window.click("engine-stop-all", cx);
+        window.click("engine-bar-stop-all", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
         1,
-        "TOOLS Stop all asks first: the confirm gates the kill"
+        "the engine bar's Stop all asks first: the confirm gates the kill"
     );
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "TOOLS Stop all opens the stop-all confirm"
+        "the engine bar's Stop all opens the stop-all confirm"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
@@ -18105,12 +17930,12 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
         0,
-        "TOOLS Stop all stops it again once confirmed"
+        "the engine bar's Stop all stops it again once confirmed"
     );
     assert_eq!(
         notification_count(cx),
         before + 1,
-        "TOOLS Stop all toasts once after the confirm"
+        "the engine bar's Stop all toasts once after the confirm"
     );
 
     cx.update(|_, cx| {
@@ -18156,7 +17981,7 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
     });
     assert!(
         operate_bounds.origin.x >= px(0.)
-            && operate_bounds.origin.x + operate_bounds.size.width <= px(880.) + px(1.),
+            && operate_bounds.origin.x + operate_bounds.size.width <= px(1100.) + px(1.),
         "grouped operate row never scrolls horizontally: {operate_bounds:?}"
     );
     assert!(
@@ -19212,18 +19037,18 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
         "Test the selected endpoint (Ctrl-T)"
     );
 
-    // PROGRAM's remaining items (Export · About) carry no shortcut, so the
-    // chipped rows all live in TOOLS.
+    // The retired Tools menu carried the chipped rows. The engine bar's menu
+    // names its actions alone; the bindings live in the palette.
     cx.update(|window, cx| {
-        window.click("tools-menu", cx);
+        window.click("engine-bar-overflow", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    for (id, pinned, chip) in [
-        ("stop-testing", "Stop Testing", "kbd:ctrl-."),
-        ("open-palette", "Command palette", "kbd:ctrl-k"),
+    for (id, pinned) in [
+        ("engine-bar-test-all", "Test all"),
+        ("engine-bar-stop-testing", "Stop testing"),
     ] {
         let label = cx.update(|window, _| {
             window
@@ -19238,10 +19063,14 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
             "{id} announces the action alone, without the key"
         );
         assert!(
-            cx.debug_bounds(chip).is_some(),
-            "{id} keeps its {chip} chip"
+            !label.as_deref().unwrap_or_default().contains('('),
+            "{id} keeps every key out of its accessible name"
         );
     }
+    assert!(
+        cx.debug_bounds("kbd:ctrl-.").is_none(),
+        "the engine bar's menu row carries no shortcut chip"
+    );
     cx.update(|window, cx| {
         use gpui_kit::Keystroke;
         let escape = Keystroke::parse("escape").expect("test keystroke parses");
@@ -19291,7 +19120,7 @@ fn clear_search_hint_clears_query(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn empty_library_points_at_the_toolbar_only(cx: &mut TestAppContext) {
+fn empty_library_points_at_the_action_bar_only(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
@@ -19300,15 +19129,15 @@ fn empty_library_points_at_the_toolbar_only(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    // F18: the canvas now carries the CTAs; the toolbar keeps working as the
-    // intake home for populated libraries.
+    // F18: the canvas now carries the CTAs; the action bar keeps working as
+    // the intake home for populated libraries.
     assert_painted(cx, "empty-add");
     assert_painted(cx, "empty-import");
-    assert_painted(cx, "toolbar-add-config");
-    assert_painted(cx, "toolbar-import");
+    assert_painted(cx, "action-bar-add");
+    assert_painted(cx, "action-bar-import");
 
     cx.update(|window, cx| {
-        window.click("toolbar-add-config", cx);
+        window.click("action-bar-add", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -19322,7 +19151,7 @@ fn empty_library_points_at_the_toolbar_only(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("toolbar-import", cx);
+        window.click("action-bar-import", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -21868,8 +21697,8 @@ fn f19_inspector_starts_closed_in_both_presentations(cx: &mut TestAppContext) {
     assert_absent(cx, "config-detail".to_string());
     let narrow = row_width(cx);
     assert!(
-        (narrow - 1000.).abs() <= 1.,
-        "a closed drawer costs the table nothing, got {narrow}"
+        (narrow - 944.).abs() <= 1.,
+        "a closed drawer costs the table only the nav's width, got {narrow}"
     );
 
     // Docked: the split pane's inspector side is gone, not just empty.
@@ -21877,7 +21706,7 @@ fn f19_inspector_starts_closed_in_both_presentations(cx: &mut TestAppContext) {
     assert_absent(cx, "config-detail".to_string());
     let wide = row_width(cx);
     assert!(
-        (wide - 1400.).abs() <= 1.,
+        (wide - 1180.).abs() <= 1.,
         "a closed dock takes no split space, got {wide}"
     );
     assert!(!view.read_with(cx, |view, _| view.inspector_visible));
@@ -23500,8 +23329,8 @@ fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
         "no-hits names the Clear search affordance"
     );
     assert!(
-        cx.update(|window, _| window.try_find("search-count".to_string()).is_some()),
-        "N of M row renders"
+        cx.update(|window, _| window.try_find("action-bar-count".to_string()).is_some()),
+        "the action bar keeps the count"
     );
 }
 
@@ -23585,11 +23414,14 @@ fn ticket03_search_count_persistent_with_live_count(cx: &mut TestAppContext) {
     assert!(query.trim().is_empty(), "no query active");
     assert_eq!(crate::search_count_text(visible, total), "2 of 2");
 
-    assert_painted(cx, "search-count");
-    assert_painted(cx, "facet-bar");
+    assert_painted(cx, "filter-slot");
     assert_painted(cx, "library-search");
-    assert_painted(cx, "facet-group");
-    // K11: the row is Search · Group · N of M.
+    assert_painted(cx, "action-bar-count");
+    // The facet band is retired; its count row moves to the filter row in
+    // slice 3.
+    assert_absent(cx, "search-count".to_string());
+    assert_absent(cx, "facet-bar".to_string());
+    assert_absent(cx, "facet-group".to_string());
     assert_absent(cx, "facet-protocol".to_string());
     assert_absent(cx, "facet-status".to_string());
 }
@@ -23645,12 +23477,14 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
     assert_eq!(pre.2, Some(FacetStatus::Enabled), "state facet established");
     assert!(pre.3, "row checked");
     assert!(pre.4, "facets active");
-    assert_painted(cx, "clear-search");
-    assert_painted(cx, "clear-facets");
+    // The facet band's clear buttons are gone with the band; the filter row
+    // that replaces it owns them.
+    assert_absent(cx, "clear-search".to_string());
+    assert_absent(cx, "clear-facets".to_string());
     assert_painted(cx, "bulk-more");
 
     cx.update(|window, cx| {
-        window.click("clear-search", cx);
+        view.update(cx, |view, cx| view.clear_library_search(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -23690,7 +23524,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("clear-facets", cx);
+        view.update(cx, |view, cx| view.clear_facets(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -23819,7 +23653,8 @@ fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
         "Search configurations",
         "search field placeholder pinned"
     );
-    assert_painted(cx, "search-count");
+    assert_painted(cx, "filter-slot");
+    assert_painted(cx, "library-search");
 
     let focus = view.read_with(cx, |view, _| view.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
@@ -23852,8 +23687,8 @@ fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
     assert_eq!((visible, total), (1, 2), "query filters the library");
     assert_eq!(query, "Work", "query established");
     assert_eq!(crate::search_count_text(visible, total), "1 of 2");
-    assert_painted(cx, "search-count");
-    assert_painted(cx, "clear-search");
+    assert_painted(cx, "library-search");
+    assert_absent(cx, "search-count".to_string());
 }
 
 #[gpui_kit::test]
@@ -23872,8 +23707,9 @@ fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_painted(cx, "facet-group-tip");
-    // K11: the row carries one facet tip; protocol/status are gone.
+    // The facet band is retired; the tip's wording lives on until slice 3's
+    // filter row carries it.
+    assert_absent(cx, "facet-group-tip".to_string());
     assert_absent(cx, "facet-protocol-tip".to_string());
     assert_absent(cx, "facet-status-tip".to_string());
 
@@ -23938,7 +23774,7 @@ fn t20_inspector_tab_row_fits_the_narrowest_drawer(cx: &mut TestAppContext) {
     cx.run_until_parked();
     open_inspector(&view, cx);
 
-    for (width, height) in [(1000., 700.), (1400., 800.), (880., 700.)] {
+    for (width, height) in [(1000., 700.), (1400., 800.), (960., 700.)] {
         paint_frame_at(cx, width, height);
         assert_painted(cx, "inspector-tabs");
         for slug in SLUGS {
@@ -24246,13 +24082,13 @@ fn empty_library_offers_one_entry_point(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    // F18: the canvas repeats the toolbar's two intake actions under the
-    // sentence that names them; the toolbar stays home when rows exist.
+    // F18: the canvas repeats the action bar's two intake actions under the
+    // sentence that names them; the action bar stays home when rows exist.
     assert_painted(cx, "empty-library-ctas");
     assert_painted(cx, "empty-add");
     assert_painted(cx, "empty-import");
-    assert_painted(cx, "toolbar-add-config");
-    assert_painted(cx, "toolbar-import");
+    assert_painted(cx, "action-bar-add");
+    assert_painted(cx, "action-bar-import");
 }
 
 #[gpui_kit::test]
@@ -24266,17 +24102,17 @@ fn t06_empty_library_describer_teaches_next_step(cx: &mut TestAppContext) {
     paint_frame(cx);
     assert_painted(cx, "library-empty");
     // F18: the next step is the actions the sentence names — inline now,
-    // with the toolbar still carrying them when rows exist.
+    // with the action bar still carrying them when rows exist.
     assert_painted(cx, "empty-add");
     assert_painted(cx, "empty-import");
-    assert_painted(cx, "toolbar-add-config");
-    assert_painted(cx, "toolbar-import");
+    assert_painted(cx, "action-bar-add");
+    assert_painted(cx, "action-bar-import");
     let (total, enabled) =
         view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().counts());
     assert_eq!((total, enabled), (0, 0), "counts name the empty set");
     assert_eq!(
-        view.read_with(cx, |view, _| view.health_status_text()),
-        "health never tested",
+        view.read_with(cx, |view, _| view.health_counts()),
+        (0, 0),
         "empty health never reads as failure"
     );
 
@@ -24288,7 +24124,7 @@ fn t06_empty_library_describer_teaches_next_step(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t04_empty_library_actions_live_in_toolbar(cx: &mut TestAppContext) {
+fn t04_empty_library_actions_live_in_the_action_bar(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
@@ -24297,12 +24133,12 @@ fn t04_empty_library_actions_live_in_toolbar(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    // F18: the canvas holds the intake CTAs and the toolbar keeps its pair,
-    // both bound to the same handlers.
+    // F18: the canvas holds the intake CTAs and the action bar keeps its
+    // pair, both bound to the same handlers.
     assert_painted(cx, "empty-library-ctas");
     assert_painted(cx, "empty-add");
     assert_painted(cx, "empty-import");
-    for id in ["toolbar-add-config", "toolbar-import"] {
+    for id in ["action-bar-add", "action-bar-import"] {
         assert_painted(cx, id);
         assert_within_frame(cx, id);
     }
@@ -24333,14 +24169,10 @@ fn t04_density_anchors_paint(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     for id in [
-        "search-count",
-        "clear-search",
-        "clear-facets",
-        "toolbar-add-config",
-        "toolbar-import",
-        "status-count",
-        "engine-status",
-        "health-status",
+        "action-bar-count",
+        "action-bar-add",
+        "action-bar-import",
+        "engine-bar-status",
     ] {
         assert_painted(cx, id);
     }
@@ -25631,35 +25463,25 @@ fn k9_settings_body_auto_heights(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn routing_menu_links_into_the_presets_manager(cx: &mut TestAppContext) {
+fn nav_links_into_the_presets_manager(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
-    cx.update(|window, cx| {
-        window.click("routing-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
     paint_frame(cx);
     assert!(
-        cx.update(|window, _| window.try_find("routing-presets").is_some()),
-        "routing-presets renders in the Routing menu"
+        cx.update(|window, _| window.try_find("nav-routing-presets").is_some()),
+        "the nav carries Routing presets"
     );
-    assert!(
-        cx.update(|window, _| window.try_find("routing-open-settings").is_some()),
-        "routing-open-settings renders in the Routing menu"
-    );
-    // T-04: the routing summary left Settings — the Routing menu links into
-    // the presets manager instead, and the link is not dead.
+    // T-04: the routing summary left Settings — the nav links into the
+    // presets manager instead, and the link is not dead.
     cx.update(|window, cx| {
-        window.click("routing-presets", cx);
+        window.click("nav-routing-presets", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "the Routing menu opens the presets manager"
+        "the nav opens the presets manager"
     );
     assert!(
         cx.update(|window, _| window.try_find("presets-dialog-ok").is_some()),
@@ -25673,20 +25495,13 @@ fn routing_menu_links_into_the_presets_manager(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     cx.update(|window, cx| {
-        window.click("routing-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("routing-open-settings", cx);
+        window.click("nav-settings", cx);
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "Routing settings opens the Settings dialog"
+        "the nav's Settings opens the Settings dialog"
     );
     assert!(
         cx.update(|window, _| window.try_find("settings-section-general").is_some()),
@@ -28084,9 +27899,9 @@ fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         window.render_frame(cx);
     });
 
-    // K8: the SETTINGS button opens the modal directly — no one-item menu.
+    // The nav's Settings opens the modal directly — no one-item menu.
     cx.update(|window, cx| {
-        window.click("settings-menu", cx);
+        window.click("nav-settings", cx);
     });
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -29315,21 +29130,26 @@ fn t56_passive_newer_hint_opens_the_dialog_and_clears(cx: &mut TestAppContext) {
         });
     });
     paint_frame(cx);
-    assert_painted(cx, "status-update-hint");
+    assert_painted(cx, "action-bar-update-dot");
     assert_eq!(
-        label_of("status-update-hint", cx),
-        "Update available - Tools > Check for updates",
-        "the hint carries the pinned copy"
+        label_of("action-bar-update-dot", cx),
+        "Update available — choose Check for updates… from the action bar's overflow menu",
+        "the dot carries the pinned copy"
     );
 
-    cx.update(|window, cx| window.click("status-update-hint", cx));
+    cx.update(|window, cx| window.click("action-bar-overflow", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("action-overflow-updates", cx));
     paint_dialog_open(cx);
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "clicking the hint opens the update dialog"
+        "the overflow's update item opens the update dialog"
     );
     assert_painted(cx, "update-new-version");
-    assert_absent(cx, "status-update-hint".to_string());
+    assert_absent(cx, "action-bar-update-dot".to_string());
     assert!(
         view.read_with(cx, |view, _| view.update_available.is_none()),
         "the hint is consumed by the dialog"
@@ -29350,7 +29170,7 @@ fn t56_passive_result_clears_when_no_longer_newer(cx: &mut TestAppContext) {
         });
     });
     paint_frame(cx);
-    assert_painted(cx, "status-update-hint");
+    assert_painted(cx, "action-bar-update-dot");
 
     let older = crate::FetchedRelease {
         tag_name: "v0.0.0".to_string(),
@@ -29362,7 +29182,7 @@ fn t56_passive_result_clears_when_no_longer_newer(cx: &mut TestAppContext) {
         });
     });
     paint_frame(cx);
-    assert_absent(cx, "status-update-hint".to_string());
+    assert_absent(cx, "action-bar-update-dot".to_string());
     assert!(
         view.read_with(cx, |view, _| view.update_available.is_none()),
         "an older release takes the hint away"
@@ -29897,29 +29717,18 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_painted(cx, "program-menu");
-    assert_within_frame(cx, "program-menu");
     for id in [
-        "program-menu",
-        "settings-menu",
-        "groups-menu",
-        "routing-menu",
-        "tools-menu",
-        "global-start-stop",
+        "nav",
+        "nav-all-configs",
+        "action-bar",
+        "filter-slot",
+        "engine-bar",
     ] {
-        assert!(
-            cx.update(|window, _| window.try_find(id).is_some()),
-            "{id} renders in the command strip"
-        );
-    }
-
-    // K11: the filter band is Search · Group · N of M.
-    for id in ["facet-bar", "facet-group"] {
         assert_painted(cx, id);
         assert_within_frame(cx, id);
     }
-    assert_absent(cx, "facet-protocol".to_string());
-    assert_absent(cx, "facet-status".to_string());
+    assert_absent(cx, "facet-bar".to_string());
+    assert_absent(cx, "facet-group".to_string());
 
     for id in [&first.id, &second.id, &third.id] {
         let row = format!("library-row-{id}");
@@ -29966,25 +29775,23 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
         );
     }
 
-    assert_painted(cx, "status-count");
-    assert_within_frame(cx, "status-count");
-    assert_painted(cx, "status-left");
-    assert_within_frame(cx, "status-left");
+    assert_painted(cx, "action-bar-count");
+    assert_within_frame(cx, "action-bar-count");
     for id in [
-        "status-center",
-        "status-right",
-        "engine-status",
-        "health-status",
+        "engine-bar",
+        "engine-bar-status",
+        "engine-bar-running",
+        "engine-bar-traffic",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders in the status strip"
+            "{id} renders in the engine bar"
         );
     }
 }
 
 fn paint_frame_min(cx: &mut VisualTestContext) {
-    cx.simulate_resize(size(px(880.), px(620.)));
+    cx.simulate_resize(size(px(1100.), px(640.)));
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
@@ -30001,11 +29808,11 @@ fn assert_within_frame_min(cx: &mut VisualTestContext, id: &str) {
         "{id} starts inside the minimum frame: {bounds:?}"
     );
     assert!(
-        bounds.origin.x + bounds.size.width <= px(880.) + px(1.),
+        bounds.origin.x + bounds.size.width <= px(1100.) + px(1.),
         "{id} ends inside the minimum frame width: {bounds:?}"
     );
     assert!(
-        bounds.origin.y + bounds.size.height <= px(620.) + px(1.),
+        bounds.origin.y + bounds.size.height <= px(640.) + px(1.),
         "{id} ends inside the minimum frame height: {bounds:?}"
     );
 }
@@ -30040,24 +29847,17 @@ fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
 
     for id in [
-        "program-menu",
-        "settings-menu",
-        "groups-menu",
-        "routing-menu",
-        "tools-menu",
-        "global-start-stop",
+        "nav",
+        "nav-all-configs",
+        "action-bar",
+        "filter-slot",
+        "engine-bar",
     ] {
         assert_painted(cx, id);
         assert_within_frame_min(cx, id);
     }
-
-    // K11: the filter band is Search · Group · N of M.
-    for id in ["facet-bar", "facet-group"] {
-        assert_painted(cx, id);
-        assert_within_frame_min(cx, id);
-    }
-    assert_absent(cx, "facet-protocol".to_string());
-    assert_absent(cx, "facet-status".to_string());
+    assert_absent(cx, "facet-bar".to_string());
+    assert_absent(cx, "facet-group".to_string());
 
     let first_row = format!("library-row-{}", first.id);
     let second_row = format!("library-row-{}", second.id);
@@ -30090,19 +29890,17 @@ fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
     assert_painted(cx, "config-endpoints");
     assert_within_frame_min(cx, "config-endpoints");
 
-    assert_painted(cx, "status-count");
-    assert_within_frame_min(cx, "status-count");
-    assert_painted(cx, "status-left");
-    assert_within_frame_min(cx, "status-left");
+    assert_painted(cx, "action-bar-count");
+    assert_within_frame_min(cx, "action-bar-count");
     for id in [
-        "status-center",
-        "status-right",
-        "engine-status",
-        "health-status",
+        "engine-bar",
+        "engine-bar-status",
+        "engine-bar-running",
+        "engine-bar-traffic",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders in the status strip at minimum size"
+            "{id} renders in the engine bar at minimum size"
         );
         assert_within_frame_min(cx, id);
     }
@@ -30143,7 +29941,7 @@ fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn laneb_status_live_segments(cx: &mut TestAppContext) {
+fn laneb_engine_bar_counts_the_running_rows(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     use gpui_kit::component::IndexPath;
     use gpui_kit::Keystroke;
@@ -30183,17 +29981,15 @@ fn laneb_status_live_segments(cx: &mut TestAppContext) {
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
-    for id in ["status-filter", "traffic-status"] {
+    for id in ["engine-bar-running", "engine-bar-traffic"] {
         assert_painted(cx, id);
         assert_within_frame_min(cx, id);
     }
     assert_absent(cx, "status-ports".to_string());
-    let filter = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().active_filter_text()
-    });
+    let running = label_of("engine-bar-running", cx);
     assert!(
-        filter.contains("status: Stopped"),
-        "filter segment names the facet: {filter}"
+        running.contains("1 running"),
+        "the engine bar names the running count: {running}"
     );
 }
 
@@ -30252,16 +30048,16 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
             });
         });
     }
-    let (total, engine_text, health_text, totals) = view.read_with(cx, |view, cx| {
+    let (total, engine_text, health, totals) = view.read_with(cx, |view, cx| {
         (
             view.libraries.read(cx).delegate().counts().0,
             view.engine.status_text(),
-            view.health_status_text(),
+            view.health_counts(),
             crate::summed_traffic_text(&view.store),
         )
     });
     assert_eq!(total, 3, "three rows counted");
-    assert_eq!(health_text, "health 2 live · 1 dead");
+    assert_eq!(health, (2, 1), "health counts the live and the dead");
     assert_eq!(engine_text, "engine running");
     assert_eq!(
         crate::status_count_text(total, 3),
@@ -30270,7 +30066,7 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     let totals = totals.expect("traffic totals render once bytes flow");
     assert_eq!(totals, "out 1.0 KB · in 2.0 KB", "traffic totals read");
 
-    for text in [&engine_text, &health_text, &totals] {
+    for text in [&engine_text, &totals] {
         for name in ["Alpha", "Beta", "Gamma"] {
             assert!(
                 !text.contains(name),
@@ -30283,10 +30079,9 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     cx.run_until_parked();
     paint_frame(cx);
     for id in [
-        "status-count",
-        "engine-status",
-        "health-status",
-        "traffic-status",
+        "action-bar-count",
+        "engine-bar-status",
+        "engine-bar-traffic",
     ] {
         assert_painted(cx, id);
     }
@@ -30315,16 +30110,16 @@ fn f04_last_engine_error_paints_after_the_toast(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "engine-status");
-    let text = label_of("engine-last-error", cx);
+    assert_painted(cx, "engine-bar-status");
+    let text = label_of("engine-bar-error", cx);
     assert!(
         text.contains("boom: bad field"),
         "the failed start stays on the bar: {text}"
     );
     assert_eq!(
-        label_of("engine-status", cx),
+        label_of("engine-bar-status", cx),
         "engine stopped",
-        "the strip still names the engine state"
+        "the bar still names the engine state"
     );
 }
 
@@ -30393,7 +30188,7 @@ fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
-        label_of("status-count", cx),
+        label_of("action-bar-count", cx),
         "2 configurations · 1 set for launch",
         "the count names the launch contract, not a start promise"
     );
@@ -30423,7 +30218,7 @@ fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t11_status_strip_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
+fn t11_engine_bar_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -30440,27 +30235,22 @@ fn t11_status_strip_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
 
     assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
 
-    assert_painted(cx, "status-count");
-    assert_within_frame_min(cx, "status-count");
-    assert_painted(cx, "status-left");
-    assert_within_frame_min(cx, "status-left");
+    assert_painted(cx, "action-bar-count");
+    assert_within_frame_min(cx, "action-bar-count");
 
     for id in [
-        "status-center",
-        "status-right",
-        "engine-status",
-        "health-status",
-        "traffic-status",
+        "engine-bar",
+        "engine-bar-status",
+        "engine-bar-running",
+        "engine-bar-traffic",
     ] {
-        if cx.update(|window, _| window.try_find(id.to_string()).is_some()) {
-            assert_within_frame_min(cx, id);
-        }
+        assert_painted(cx, id);
+        assert_within_frame_min(cx, id);
     }
-    assert_painted(cx, "status-left");
 }
 
 #[gpui_kit::test]
-fn t10_status_slots_hold_width_across_value_changes(cx: &mut TestAppContext) {
+fn t10_engine_bar_slots_hold_width_across_value_changes(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     use gpui_kit::component::IndexPath;
     use gpui_kit::Keystroke;
@@ -30503,19 +30293,23 @@ fn t10_status_slots_hold_width_across_value_changes(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     let region_widths = |cx: &mut VisualTestContext| {
-        ["status-left", "status-center", "status-right"]
-            .iter()
-            .map(|id| {
-                cx.update(|window, _| {
-                    window
-                        .try_find(id.to_string())
-                        .unwrap_or_else(|| panic!("{id} renders"))
-                        .bounds()
-                        .size
-                        .width
-                })
+        [
+            "engine-bar-status",
+            "engine-bar-running",
+            "engine-bar-traffic",
+        ]
+        .iter()
+        .map(|id| {
+            cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .bounds()
+                    .size
+                    .width
             })
-            .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
     };
     let before = region_widths(cx);
 
@@ -30558,7 +30352,7 @@ fn t10_status_slots_hold_width_across_value_changes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn k12_status_bar_three_segments(cx: &mut TestAppContext) {
+fn k12_engine_bar_names_engine_running_and_traffic(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -30577,27 +30371,33 @@ fn k12_status_bar_three_segments(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     assert_eq!(
-        label_of("status-count", cx),
+        label_of("action-bar-count", cx),
         "1 configuration · 1 set for launch",
-        "left segment counts restore flags"
+        "the action bar counts the library"
     );
     assert_eq!(
-        label_of("engine-status", cx),
+        label_of("engine-bar-status", cx),
         "engine stopped",
-        "center segment names only the engine state"
+        "the engine bar names the engine state"
     );
     assert_eq!(
-        label_of("health-status", cx),
-        "health never tested",
-        "empty health never reads as failure"
+        label_of("engine-bar-running", cx),
+        "· 0 running",
+        "the engine bar names the running count"
     );
     assert_eq!(
-        label_of("traffic-status", cx),
+        label_of("engine-bar-traffic", cx),
         "out 1.0 KB · in 2.0 KB",
         "usage names both directions in words"
     );
 
-    for id in ["status-left", "status-center", "status-right"] {
+    for id in [
+        "action-bar",
+        "engine-bar",
+        "engine-bar-status",
+        "engine-bar-running",
+        "engine-bar-traffic",
+    ] {
         assert_painted(cx, id);
     }
     assert_absent(cx, "status-ports".to_string());
@@ -30607,7 +30407,7 @@ fn k12_status_bar_three_segments(cx: &mut TestAppContext) {
 /// K12/A5-2: nothing paints left of the first segment, and a bar with no
 /// usage holds no lone separator — the stray dash the video caught.
 #[gpui_kit::test]
-fn k12_status_bar_no_stray_dash(cx: &mut TestAppContext) {
+fn k12_engine_bar_counts_stay_honest(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
@@ -30624,19 +30424,20 @@ fn k12_status_bar_no_stray_dash(cx: &mut TestAppContext) {
                 .bounds()
         })
     };
-    let left = bounds("status-left", cx);
-    let count = bounds("status-count", cx);
+    let bar = bounds("engine-bar", cx);
+    let status = bounds("engine-bar-status", cx);
     assert_eq!(
-        count.origin.x, left.origin.x,
-        "the first segment starts flush at the bar's left edge: {left:?} vs {count:?}"
+        status.origin.x,
+        bar.origin.x + px(12.),
+        "the first segment starts inside the bar's padding: {bar:?} vs {status:?}"
     );
     assert_eq!(
-        label_of("status-count", cx),
+        label_of("action-bar-count", cx),
         "0 configurations · 0 set for launch",
         "empty counts stay honest"
     );
     assert_eq!(
-        label_of("traffic-status", cx),
+        label_of("engine-bar-traffic", cx),
         "out 0 B · in 0 B",
         "zero usage stays honest instead of posing as traffic"
     );
@@ -30964,6 +30765,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Inspector logs", "Ctrl-4"),
         ("Inspector links", "Ctrl-5"),
         ("Inspector traffic", "Ctrl-6"),
+        ("Toggle inspector", "Ctrl-I"),
         ("Uncheck all", "Esc"),
         ("Copy URLs", "Ctrl-U"),
         ("Command palette", "Ctrl-K"),
@@ -31632,14 +31434,14 @@ fn t67_ctrl_period_stops_group_test(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t67_menu_item_shows_key_hint(cx: &mut TestAppContext) {
+fn t67_engine_bar_menu_names_the_action_alone(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("tools-menu", cx);
+        window.click("engine-bar-overflow", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -31647,20 +31449,20 @@ fn t67_menu_item_shows_key_hint(cx: &mut TestAppContext) {
     paint_frame(cx);
     let label = cx.update(|window, _| {
         window
-            .try_find("stop-testing".to_string())
-            .unwrap_or_else(|| panic!("stop-testing renders in the tools menu"))
+            .try_find("engine-bar-stop-testing".to_string())
+            .unwrap_or_else(|| panic!("Stop testing renders in the engine bar menu"))
             .label()
             .map(str::to_string)
     });
     assert_eq!(
         label.as_deref(),
-        Some("Stop Testing"),
-        "Tools ▸ Stop Testing announces the action alone, like the Shift-F5 sibling"
+        Some("Stop testing"),
+        "the engine bar's Stop testing announces the action alone"
     );
-    // The key hint stays visible as a chip beside the row, not in its name.
+    // The binding lives in the palette, not in a chip beside the row.
     assert!(
-        cx.debug_bounds("kbd:ctrl-.").is_some(),
-        "Tools ▸ Stop Testing paints the Ctrl-. hint as a chip"
+        cx.debug_bounds("kbd:ctrl-.").is_none(),
+        "the engine bar's menu row carries no shortcut chip"
     );
 }
 
@@ -31672,15 +31474,12 @@ fn t67_show_security_toggles_in_place_without_toast(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
     let before = notification_count(cx);
+    // The toolbar's Show security item is retired with the toolbar; the
+    // delegate's own flag stays until the protocol column carries the
+    // security suffix.
+    assert_absent(cx, "show-security".to_string());
     cx.update(|window, cx| {
-        window.click("tools-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("show-security", cx);
+        view.update(cx, |view, cx| view.toggle_show_security(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -31690,12 +31489,12 @@ fn t67_show_security_toggles_in_place_without_toast(cx: &mut TestAppContext) {
             .read(cx)
             .delegate()
             .show_security),
-        "Tools ▸ Show security flips the delegate in place"
+        "the security flag flips the delegate in place"
     );
     assert_eq!(
         notification_count(cx),
         before,
-        "Show security renders in place — no toast"
+        "the security flag renders in place — no toast"
     );
 }
 
@@ -31835,14 +31634,12 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
 
     let status = view.read_with(cx, |view, _| {
         (
-            view.health_status_text(),
             crate::summed_traffic_text(&view.store).unwrap_or_default(),
             view.engine.status_text(),
         )
     });
-    assert_no_canaries(&status.0, "health status");
-    assert_no_canaries(&status.1, "traffic status");
-    assert_no_canaries(&status.2, "engine status");
+    assert_no_canaries(&status.0, "traffic status");
+    assert_no_canaries(&status.1, "engine status");
 
     cx.update(|_, cx| {
             view.update(cx, |view, _| {
@@ -35430,25 +35227,25 @@ fn t08_refused_write_raises_the_banner_naming_the_folder(cx: &mut TestAppContext
         "the banner announces the sentence it paints"
     );
 
-    let toggle = cx
-        .update(|window, _| window.try_find("global-start-stop".to_string()))
-        .expect("the toolbar toggle renders")
+    let slot = cx
+        .update(|window, _| window.try_find("filter-slot".to_string()))
+        .expect("the filter slot renders")
         .bounds();
     let banner = cx
         .update(|window, _| window.try_find("write-banner".to_string()))
         .expect("the banner renders")
         .bounds();
-    let content = cx
-        .update(|window, _| window.try_find("main-content".to_string()))
-        .expect("the content area renders")
+    let row = cx
+        .update(|window, _| window.try_find("library-column-headers".to_string()))
+        .expect("the table header renders")
         .bounds();
     assert!(
-        banner.origin.y >= toggle.origin.y + toggle.size.height - px(1.),
-        "the banner sits under the toolbar: banner {banner:?}, toolbar control {toggle:?}"
+        banner.origin.y >= slot.origin.y + slot.size.height - px(1.),
+        "the banner sits under the filter slot: banner {banner:?}, slot {slot:?}"
     );
     assert!(
-        content.origin.y >= banner.origin.y + banner.size.height - px(1.),
-        "the table starts under the banner: banner {banner:?}, content {content:?}"
+        row.origin.y >= banner.origin.y + banner.size.height - px(1.),
+        "the table starts under the banner: banner {banner:?}, header {row:?}"
     );
     assert_eq!(
         cx.update(|window, _| window
@@ -35514,8 +35311,8 @@ fn t08_banner_fits_the_minimum_frame_and_the_table_stays_below(cx: &mut TestAppC
         .expect("the seeded row renders")
         .bounds();
     assert!(
-        list.origin.y >= banner.origin.y + banner.size.height - px(1.),
-        "the list starts under the banner: banner {banner:?}, list {list:?}"
+        list.origin.y <= banner.origin.y + px(1.),
+        "the banner lives inside the list pane: banner {banner:?}, list {list:?}"
     );
     assert!(
         row_bounds.origin.y >= banner.origin.y + banner.size.height - px(1.),
@@ -36435,14 +36232,15 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
     };
 
     for (id, pinned) in [
-        ("program-menu", "Program"),
-        ("settings-menu", "Settings"),
-        ("groups-menu", "Library"),
-        ("routing-menu", "Routing"),
-        ("tools-menu", "Tools"),
-        ("toolbar-import", "Import"),
-        ("toolbar-add-config", "Add configuration"),
-        ("global-start-stop", "Start all"),
+        ("nav-routing-presets", "Routing presets"),
+        ("nav-settings", "Settings"),
+        ("action-bar-import", "Import"),
+        ("action-bar-add", "Add configuration"),
+        ("action-bar-palette", "Command palette"),
+        ("action-bar-overflow", "More actions"),
+        ("engine-bar-start-all", "Start all"),
+        ("engine-bar-stop-all", "Stop all"),
+        ("engine-bar-overflow", "More actions"),
         ("bulk-start", "Start"),
         ("bulk-stop", "Stop"),
         ("bulk-more", "More bulk actions"),
@@ -36470,7 +36268,7 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
     }
 
     // Static segments: no action, but each still names itself.
-    for id in ["bulk-label", "palette-hint"] {
+    for id in ["bulk-label", "action-bar-count", "engine-bar-status"] {
         let (_, label) = snapshot(cx, id);
         assert!(
             label.as_ref().is_some_and(|label| !label.is_empty()),
@@ -36485,7 +36283,7 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
 /// frame at the restore size and at the minimum, with the drawer + bulk bar
 /// up (the state the audit photographed).
 #[gpui_kit::test]
-fn b19_palette_hint_fits_the_status_bar_row(cx: &mut TestAppContext) {
+fn b19_action_bar_controls_fit_their_row(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let work = store
@@ -36499,33 +36297,33 @@ fn b19_palette_hint_fits_the_status_bar_row(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.select_visible_checked(window, cx));
     });
 
-    for (width, height) in [(1000., 700.), (880., 620.)] {
+    for (width, height) in [(1200., 700.), (1100., 640.)] {
         paint_frame_at(cx, width, height);
-        assert_painted(cx, "palette-hint");
-        let (hint, right) = cx.update(|window, _| {
+        assert_painted(cx, "action-bar-palette");
+        let (button, bar) = cx.update(|window, _| {
             let bounds = |id: &str| {
                 window
                     .try_find(id.to_string())
                     .unwrap_or_else(|| panic!("{id} renders at {width}x{height}"))
                     .bounds()
             };
-            (bounds("palette-hint"), bounds("status-right"))
+            (bounds("action-bar-palette"), bounds("action-bar"))
         });
         let frame = size(px(width), px(height));
         assert!(
-            hint.size.height <= right.size.height,
-            "the chip never wraps taller than its row at {width}x{height}: {hint:?} in {right:?}"
+            button.size.height <= bar.size.height,
+            "the control never wraps taller than its row at {width}x{height}: {button:?} in {bar:?}"
         );
         assert!(
-            hint.origin.x >= px(0.)
-                && hint.origin.y >= px(0.)
-                && hint.origin.x + hint.size.width <= frame.width
-                && hint.origin.y + hint.size.height <= frame.height,
-            "the chip paints whole inside the frame at {width}x{height}: {hint:?} in {frame:?}"
+            button.origin.x >= px(0.)
+                && button.origin.y >= px(0.)
+                && button.origin.x + button.size.width <= frame.width
+                && button.origin.y + button.size.height <= frame.height,
+            "the control paints whole inside the frame at {width}x{height}: {button:?} in {frame:?}"
         );
         assert!(
-            hint.origin.x + hint.size.width <= right.origin.x + right.size.width,
-            "the right zone does not clip the chip at {width}x{height}: {hint:?} in {right:?}"
+            button.origin.x + button.size.width <= bar.origin.x + bar.size.width,
+            "the bar does not clip the control at {width}x{height}: {button:?} in {bar:?}"
         );
     }
 }
@@ -38007,4 +37805,384 @@ fn bulk_label_adds_the_selection_count_when_it_differs() {
         "1 checked (of 3)",
         "a checks-only bulk session never shows a zero selection"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 1 — the workbench shell
+// ---------------------------------------------------------------------------
+
+/// The shell's four regions are painted, and the three retired surfaces are
+/// gone for good.
+#[gpui_kit::test]
+fn shell_renders_nav_action_bar_filter_slot_and_engine_bar(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (_view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    for id in ["nav", "action-bar", "filter-slot", "engine-bar"] {
+        assert_painted(cx, id);
+    }
+    for id in ["manyproxy-toolbar", "facet-bar", "status-count"] {
+        assert_absent(cx, id.to_string());
+    }
+}
+
+/// The engine bar sits below the content row and outside the resizable split:
+/// it spans the table and the inspector, and never the nav.
+#[gpui_kit::test]
+fn engine_bar_spans_the_split_but_not_the_nav(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1440., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+
+    let (nav, bar) = cx.update(|window, _| {
+        let bounds = |id: &str| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .bounds()
+        };
+        (bounds("nav"), bounds("engine-bar"))
+    });
+    assert_eq!(
+        bar.origin.x,
+        nav.origin.x + nav.size.width,
+        "the engine bar starts where the nav ends: {nav:?} vs {bar:?}"
+    );
+    assert_eq!(
+        bar.origin.x + bar.size.width,
+        px(1440.),
+        "the engine bar ends at the window's right edge: {bar:?}"
+    );
+}
+
+/// The nav collapses below the breakpoint and expands at it, and the labels
+/// live only in the expanded nav.
+#[gpui_kit::test]
+fn nav_collapses_at_1199_and_expands_at_1200(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (_view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    paint_frame_at(cx, 1199., 700.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1199., 700.);
+    let narrow = cx.update(|window, _| {
+        window
+            .try_find("nav".to_string())
+            .expect("the nav renders")
+            .bounds()
+            .size
+            .width
+    });
+    assert_eq!(narrow, px(56.), "the nav collapses below the breakpoint");
+    assert_absent(cx, "nav-all-configs-label".to_string());
+    assert_painted(cx, "nav-all-configs-letter");
+
+    paint_frame_at(cx, 1200., 700.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1200., 700.);
+    let wide = cx.update(|window, _| {
+        window
+            .try_find("nav".to_string())
+            .expect("the nav renders")
+            .bounds()
+            .size
+            .width
+    });
+    assert_eq!(wide, px(220.), "the nav expands at the breakpoint");
+    assert_painted(cx, "nav-all-configs-label");
+    assert_absent(cx, "nav-all-configs-letter".to_string());
+}
+
+/// The inspector still starts hidden and still toggles with Ctrl-I through
+/// the new shell.
+#[gpui_kit::test]
+fn inspector_still_starts_hidden_and_toggles_with_ctrl_i(cx: &mut TestAppContext) {
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.inspector_visible),
+        "the inspector starts hidden"
+    );
+    assert_absent(cx, "config-detail".to_string());
+
+    let focus = view.read_with(cx, |view, _| view.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    let toggle = || Keystroke::parse("ctrl-i").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        view.read_with(cx, |view, _| view.inspector_visible),
+        "Ctrl-I opens the inspector"
+    );
+    assert_painted(cx, "config-detail");
+
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.inspector_visible),
+        "Ctrl-I closes the inspector again"
+    );
+}
+
+/// The window's design minimum, and the clamp a persisted rectangle under it
+/// gets on launch.
+#[test]
+fn window_minimum_is_1100_by_640() {
+    assert_eq!(
+        crate::window_min_size(None),
+        size(px(1100.), px(640.)),
+        "the design minimum is the new shell's floor"
+    );
+    let clamped = WindowGeometry {
+        x: 10.,
+        y: 10.,
+        width: 800.,
+        height: 500.,
+    }
+    .clamped()
+    .expect("a sane rectangle survives");
+    assert_eq!(
+        (clamped.width, clamped.height),
+        (1100., 640.),
+        "a rectangle under the floor is clamped up to it"
+    );
+}
+
+/// Every retired menu verb has one home left. The palette is navigation, not
+/// a second home, so it does not count here.
+#[gpui_kit::test]
+fn every_retired_menu_action_has_one_reachable_surface(cx: &mut TestAppContext) {
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (_view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    // The homes this slice builds.
+    for id in [
+        "nav-routing-presets",
+        "nav-settings",
+        "action-bar-import",
+        "action-bar-add",
+        "action-bar-palette",
+        "engine-bar-start-all",
+        "engine-bar-stop-all",
+    ] {
+        assert_painted(cx, id);
+    }
+
+    // The action bar's overflow carries the verbs that had no other home.
+    cx.update(|window, cx| {
+        window.click("action-bar-overflow", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in [
+        "action-overflow-export",
+        "action-overflow-updates",
+        "action-overflow-about",
+    ] {
+        assert_painted(cx, id);
+    }
+    cx.update(|window, cx| {
+        let escape = Keystroke::parse("escape").expect("test keystroke parses");
+        window.dispatch_keystroke(escape, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // The engine bar's overflow carries the pool-wide test verbs.
+    cx.update(|window, cx| {
+        window.click("engine-bar-overflow", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in ["engine-bar-test-all", "engine-bar-stop-testing"] {
+        assert_painted(cx, id);
+    }
+    cx.update(|window, cx| {
+        let escape = Keystroke::parse("escape").expect("test keystroke parses");
+        window.dispatch_keystroke(escape, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // The verbs whose home a later slice builds stay in the palette until
+    // then: the palette is their interim home, not a second one.
+    let palette: Vec<&str> = crate::PALETTE_GROUPS
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    for id in [
+        "subscriptions",
+        "groups",
+        "logs",
+        "runtime-stats",
+        "traffic-stats",
+        "row-columns",
+    ] {
+        assert!(
+            palette.contains(&id),
+            "{id} stays in the palette until its own home lands"
+        );
+    }
+}
+
+/// The old table still filters through the new slot, and the action bar's
+/// count follows it.
+#[gpui_kit::test]
+fn old_table_still_filters_through_the_slot_search(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    store
+        .add(row19_seed("Home", "b.example.com", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_painted(cx, "filter-slot");
+    assert_painted(cx, "library-search");
+    assert_eq!(
+        label_of("action-bar-count", cx),
+        "2 configurations · 0 set for launch",
+        "the action bar counts the whole library"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.set_query("Work", window, list_cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let visible = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().visible.len()
+    });
+    assert_eq!(visible, 1, "the slot's query still filters the rows");
+    assert_eq!(
+        label_of("action-bar-count", cx),
+        "2 configurations · 0 set for launch",
+        "the count names the library, not the filtered rows"
+    );
+}
+
+/// The engine bar's actions dispatch the same handlers as the retired Tools
+/// menu: the same confirmations, the same batch.
+#[gpui_kit::test]
+fn engine_bar_actions_use_the_existing_confirmations(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let solo = store
+        .add(t30_engine_seed("Solo", "10964"))
+        .expect("seed works");
+    let mut lan = t30_engine_seed("Lan", "10963");
+    lan.bind_ip = "0.0.0.0".to_string();
+    store.add(lan).expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            let (engine, _) = EngineController::fake();
+            view.engine = engine;
+        });
+    });
+    paint_frame(cx);
+
+    // Start all keeps the per-row LAN confirmation.
+    cx.update(|window, cx| {
+        window.click("engine-bar-start-all", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "Start all still asks before a LAN bind"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        0,
+        "nothing serves before the confirmation"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+    cx.run_until_parked();
+
+    // Stop all keeps the running-row confirmation.
+    view.update(cx, |view, _| {
+        let rows: Vec<_> = view
+            .store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .filter(|row| row.id == solo.id)
+            .collect();
+        view.engine
+            .start_all(&rows)
+            .expect("the fake engine starts the loopback row");
+    });
+    paint_frame(cx);
+    cx.update(|window, cx| {
+        window.click("engine-bar-stop-all", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "Stop all still asks before it kills"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.engine.running_count()),
+        1,
+        "the endpoint serves until the confirmation"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
+    cx.run_until_parked();
+
+    // Test all and Stop testing ride the engine bar's overflow.
+    cx.update(|window, cx| {
+        window.click("engine-bar-overflow", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "engine-bar-test-all");
+    assert_painted(cx, "engine-bar-stop-testing");
 }

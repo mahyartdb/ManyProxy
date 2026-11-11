@@ -54,7 +54,6 @@ use gpui_kit::component::sheet::Sheet;
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
@@ -78,9 +77,9 @@ use manyproxy_core::engine::{
 };
 use manyproxy_core::health::{
     clamp_log_max_lines, outcome_is_neutral, ping_all, redact_secrets, sparkline_caption_tone,
-    test_all, test_group, truncate, url_test_sparkline, HealthKind, HealthProber, HealthStore,
-    LatencyTone, LogLevel, LogStore, LogTagIndex, ProbeExclusions, RealHealthProber, TestOutcome,
-    TrafficSeenMap, DEFAULT_TEST_URL,
+    test_all_stoppable, test_group, truncate, url_test_sparkline, HealthKind, HealthProber,
+    HealthStore, LatencyTone, LogLevel, LogStore, LogTagIndex, ProbeExclusions, RealHealthProber,
+    TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL,
 };
 use manyproxy_core::import::{
     classify_open_with, commit_batch, format_import_failures, import_text, is_addsub_attempt,
@@ -192,6 +191,7 @@ actions!(
         InspectorLogs,
         InspectorLinks,
         InspectorTraffic,
+        InspectorToggle,
         OpenPalette,
         CopyUrls,
         UpdateCurrentGroup
