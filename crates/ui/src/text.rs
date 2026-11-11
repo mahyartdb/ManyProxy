@@ -816,6 +816,7 @@ pub(crate) fn shortcut_action_label(action: &str) -> String {
         "Inspector logs" => t!("shortcut-inspector-logs"),
         "Inspector links" => t!("shortcut-inspector-links"),
         "Inspector traffic" => t!("shortcut-inspector-traffic"),
+        "Toggle inspector" => t!("shortcut-toggle-inspector"),
         "Uncheck all" => t!("shortcut-uncheck-all"),
         "Copy URLs" => t!("shortcut-copy-urls"),
         "Command palette" => t!("shortcut-command-palette"),

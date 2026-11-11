@@ -35,6 +35,7 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Inspector logs", "Ctrl-4"),
     ("Inspector links", "Ctrl-5"),
     ("Inspector traffic", "Ctrl-6"),
+    ("Toggle inspector", "Ctrl-I"),
     ("Uncheck all", "Esc"),
     ("Copy URLs", "Ctrl-U"),
     ("Command palette", "Ctrl-K"),

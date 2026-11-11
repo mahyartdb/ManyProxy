@@ -2738,6 +2738,18 @@ impl AppView {
         self.set_inspector_tab(tab);
     }
 
+    /// Ctrl-I owns the inspector's presence on its own: it opens the panel,
+    /// and closes the one that is already open. The tab it shows is the tab
+    /// the user last read.
+    pub(crate) fn toggle_inspector_presence(&mut self) {
+        if self.inspector_visible {
+            self.inspector_visible = false;
+            return;
+        }
+        self.inspector_visible = true;
+        self.detail_scroll.set_offset(point(px(0.), px(0.)));
+    }
+
     pub(crate) fn adjust_conn_column_widths(
         &mut self,
         delta: i32,

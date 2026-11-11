@@ -191,6 +191,7 @@ actions!(
         InspectorLogs,
         InspectorLinks,
         InspectorTraffic,
+        InspectorToggle,
         OpenPalette,
         CopyUrls,
         UpdateCurrentGroup

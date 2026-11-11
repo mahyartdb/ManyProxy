@@ -30765,6 +30765,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Inspector logs", "Ctrl-4"),
         ("Inspector links", "Ctrl-5"),
         ("Inspector traffic", "Ctrl-6"),
+        ("Toggle inspector", "Ctrl-I"),
         ("Uncheck all", "Esc"),
         ("Copy URLs", "Ctrl-U"),
         ("Command palette", "Ctrl-K"),
