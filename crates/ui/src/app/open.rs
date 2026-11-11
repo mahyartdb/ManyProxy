@@ -573,6 +573,10 @@ impl AppView {
             &Store::default_path().display().to_string(),
             &Store::default_export_path().display().to_string(),
         );
+        // The bundle carries its line breaks as the two characters `\n`, and a
+        // text child paints them as they are. The body is cut on them here so
+        // the dialog shows lines, not escape sequences.
+        let body_lines = body.split("\\n").map(str::to_string).collect::<Vec<_>>();
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let check_view = about_view.clone();
             dialog
@@ -587,7 +591,7 @@ impl AppView {
                                 .id("about-body")
                                 .test_support()
                                 .text_sm()
-                                .child(body.clone()),
+                                .children(body_lines.iter().map(|line| div().child(line.clone()))),
                         )
                         .child(
                             Button::new("about-check-for-updates")
@@ -786,6 +790,9 @@ impl AppView {
         });
     }
 
+    /// The retired Library menu's prune family. Slice 7 re-homes it in the
+    /// group and source manage sheet.
+    #[allow(dead_code)]
     pub(crate) fn open_prune_confirm(
         &mut self,
         kind: GroupPruneKind,

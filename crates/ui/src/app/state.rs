@@ -1212,6 +1212,9 @@ impl AppView {
         .detach();
     }
 
+    /// The retired Library menu's prune family. Slice 7 re-homes it in the
+    /// group and source manage sheet.
+    #[allow(dead_code)]
     pub(crate) fn group_test_sample_count(&self, group: &str) -> usize {
         let ids: HashSet<String> = self
             .store
@@ -1405,6 +1408,11 @@ impl AppView {
         } else {
             self.probe_url_in_flight = true;
         }
+        // The batch reads the shared stop flag, so it starts from a clean one:
+        // a cancelled sweep must not cancel the next run.
+        self.probe_stop
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stop = self.probe_stop.clone();
         // K5: batched runs say once that they started. Single-row runs keep
         // the established one-shot result toast, so the editor's own Health
         // tab stays the per-row detail surface.
@@ -1455,7 +1463,7 @@ impl AppView {
                     let outcomes = if ping {
                         ping_all(&rows, &counting)
                     } else {
-                        test_all(&rows, &url, &counting)
+                        test_all_stoppable(&rows, &url, &counting, &stop)
                     };
                     sweep_active.store(false, std::sync::atomic::Ordering::SeqCst);
                     (outcomes, prober)

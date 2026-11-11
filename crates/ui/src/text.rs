@@ -42,6 +42,8 @@ pub fn sort_header_marker(sort: LibrarySort) -> String {
         _ => format!(" {}", t!("sort-marker-asc")),
     }
 }
+/// The retired facet band's hint. Slice 3's filter row owns it.
+#[allow(dead_code)]
 pub fn facet_tip_text(
     dimension: &str,
     active_display: &str,
@@ -109,6 +111,9 @@ pub(crate) fn latency_bucket_label(bucket: LatencyBucket) -> String {
     }
 }
 
+/// The retired Library menu's prune family. Slice 7 re-homes it in the
+/// group and source manage sheet.
+#[allow(dead_code)]
 pub(crate) fn group_prune_label(kind: GroupPruneKind) -> String {
     match kind {
         GroupPruneKind::Duplicates => t!("prune-duplicates"),
@@ -116,25 +121,6 @@ pub(crate) fn group_prune_label(kind: GroupPruneKind) -> String {
         GroupPruneKind::Invalid => t!("prune-invalid"),
         GroupPruneKind::ClearTests => t!("prune-clear-tests"),
     }
-}
-
-/// The toolbar's one start/stop control. The glyphs are not copy; the name is.
-pub(crate) fn global_toggle_text(running: usize, busy: bool) -> (String, String) {
-    let glyph = if busy {
-        "…"
-    } else if running == 0 {
-        "▶"
-    } else {
-        "■"
-    };
-    let name = if busy {
-        t!("toolbar-connecting")
-    } else if running == 0 {
-        t!("action-start-all")
-    } else {
-        t!("action-stop-all")
-    };
-    (glyph.to_string(), name)
 }
 
 /// K12/A5-1: the center segment names the engine state only; the endpoint
@@ -652,6 +638,9 @@ pub(crate) fn log_level_tooltip(level: Option<LogLevel>) -> String {
         Some(level) => t!("logs-level-tooltip", label = log_level_label(Some(level))),
     }
 }
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
 pub(crate) fn prune_duplicates_confirm_text(
     group: &str,
     total: usize,
@@ -676,12 +665,21 @@ pub(crate) fn prune_duplicates_confirm_text(
         preview = preview.join(", ")
     )
 }
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
 pub(crate) fn prune_unavailable_confirm_text(group: &str, count: usize) -> String {
     t!("prune-unavailable-confirm", group = group, count = count)
 }
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
 pub(crate) fn prune_invalid_confirm_text(group: &str, count: usize) -> String {
     t!("prune-invalid-confirm", group = group, count = count)
 }
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
 pub(crate) fn clear_group_tests_confirm_text(group: &str, count: usize) -> String {
     t!("prune-clear-tests-confirm", group = group, count = count)
 }

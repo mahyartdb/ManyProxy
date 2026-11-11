@@ -28,9 +28,11 @@ pub(crate) const TOAST_ERROR_MS: u64 = 8000;
 pub(crate) const TOAST_ERROR_HARD_CAP_MS: u64 = 15_000;
 /// Delete→Undo toast lifetime; the removed rows live in memory exactly as long.
 pub(crate) const TOAST_UNDO_MS: u64 = 8000;
-/// The status bar is ~26px tall; a cushion above it is the small safe-area
-/// offset, so a toast can never cover the bar or sit on the window edge.
-const TOAST_BOTTOM_MARGIN: f32 = 36.0;
+/// The engine bar is 40px tall and its transport controls sit at the right
+/// end — exactly where the park is. A cushion above the bar is the safe-area
+/// offset, so a toast can never cover the bar's controls or sit on the
+/// window edge.
+const TOAST_BOTTOM_MARGIN: f32 = 52.0;
 const TOAST_EDGE_MARGIN: f32 = 16.0;
 
 /// Buttons a toast may carry. The kit's `Notification::action` renders one

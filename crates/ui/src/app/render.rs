@@ -102,17 +102,17 @@ impl Render for AppView {
 
         let app_entity = cx.entity();
         // T-03/F2: one geometry spec, computed once per frame and handed to
-        // the header strip, the rows and the list pane's drawer reserve.
+        // the header strip, the rows and the list pane's drawer reserve. The
+        // table lives beside the nav, so the budget it is measured against is
+        // the column's width, not the window's.
         let show_detail = self.config_count(cx) != 0;
         let docked = self.inspector_docked(window);
         let inspector_width = self.inspector_width(cx);
         let inspector_visible = show_detail && self.inspector_visible;
-        let layout = InspectorLayout::compute(
-            window.viewport_size().width.as_f32(),
-            inspector_width,
-            docked,
-            inspector_visible,
-        );
+        let nav_width = self.nav_width(window);
+        let column_width = (window.viewport_size().width.as_f32() - nav_width).max(0.);
+        let layout =
+            InspectorLayout::compute(column_width, inspector_width, docked, inspector_visible);
         self.libraries.update(cx, |state, cx| {
             let list_focus = state.focus_handle(cx);
             let delegate = state.delegate_mut();
@@ -132,7 +132,10 @@ impl Render for AppView {
         // T-26: the titlebar label carries the same `· N running` text the OS
         // title gets, both composed from the one shared helper.
         let current_title = window_title_text(self.engine.running_count());
-        let facet_bar = self.render_facet_bar(window, cx);
+        let nav = self.render_nav(window, cx);
+        let action_bar = self.render_action_bar(cx);
+        let filter_slot = self.render_filter_slot(cx);
+        let engine_bar = self.render_engine_bar(cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let column_headers = self.render_library_column_headers(window, cx);
         let mut list_pane = div()
@@ -142,8 +145,14 @@ impl Render for AppView {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(facet_bar)
+            // The bar above the table carries labels that cannot shrink; the
+            // pane must not grow to fit them, or the table would slide out of
+            // the window at a large text size.
+            .min_w_0()
+            .child(action_bar)
+            .child(filter_slot)
             .child(bulk_bar)
+            .children(self.render_writable_banner(cx))
             .child(column_headers)
             .child(List::new(&self.libraries).flex_1());
         if !docked && inspector_visible {
@@ -188,20 +197,41 @@ impl Render for AppView {
 
         self.render_shell(cx)
             .child(self.render_titlebar(current_title, window, cx))
-            .child(self.render_toolbar(cx))
-            .children(self.render_writable_banner(cx))
             .child(
                 div()
-                    .id("main-content")
+                    .id("body")
                     .test_support()
-                    .relative()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
                     .min_h_0()
-                    .child(split),
+                    .child(nav)
+                    .child(
+                        div()
+                            .id("main-column")
+                            .test_support()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(
+                                div()
+                                    .id("main-content")
+                                    .test_support()
+                                    .relative()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(split),
+                            )
+                            // The engine bar is a sibling of the content row,
+                            // not a child of the split: it spans the table and
+                            // the inspector, and the nav is never under it.
+                            .child(engine_bar),
+                    ),
             )
-            .child(self.render_status_bar(cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))

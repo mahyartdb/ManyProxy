@@ -15,6 +15,12 @@ titlebar-maximize = Maximize the window
 titlebar-restore = Restore the window
 titlebar-close = Close the window
 
+# Shell
+nav-all-configs = All configs
+nav-routing-presets = Routing presets
+action-overflow = More actions
+engine-bar-aria = Engine status and global actions
+
 # Tray
 tray-show = Show
 tray-select-exit = Select exit
@@ -86,7 +92,7 @@ toolbar-starting-tip = Starting every endpoint…
 status-clear-search = Clear search
 status-clear-search-tip = Clear the search query (keeps facet filters and checked)
 status-palette-hint = Command palette (Ctrl+K)
-status-update-hint = Update available - Tools > Check for updates
+status-update-hint = Update available — choose Check for updates… from the action bar's overflow menu
 status-count =
     { $total } { $total ->
         [one] configuration
@@ -270,7 +276,11 @@ confirm-restart = Restart
 start-all-ok = Start all
 stop-all-ok = Stop all
 stop-all-title = Stop all endpoints
-stop-all-confirm = Stop { $count } running endpoint(s): { $names }? Endpoints close and flags clear.
+stop-all-confirm =
+    { $count ->
+        [one] Stop 1 running config: { $names }?
+       *[other] Stop { $count } running configs: { $names }?
+    } Endpoints close and flags clear.
 close-title = Close ManyProxy?
 close-ok = Stop all and close
 confirm-reset-traffic-title = Reset traffic
