@@ -4218,8 +4218,10 @@ pub struct WindowGeometry {
 impl WindowGeometry {
     /// T-32: the same minimums `app_window_options` hands the window, kept
     /// here so a restored rectangle can never seed a window below them.
-    pub const MIN_WIDTH: f32 = 880.;
-    pub const MIN_HEIGHT: f32 = 620.;
+    /// The redesign's shell (nav + table + inspector + engine bar) needs the
+    /// wider floor: 880×620 cannot hold the nav beside the table.
+    pub const MIN_WIDTH: f32 = 1100.;
+    pub const MIN_HEIGHT: f32 = 640.;
 
     /// T-32: the sane position box — anything further out is clamped rather
     /// than dropped, so even a hand-edited row lands somewhere visible.
