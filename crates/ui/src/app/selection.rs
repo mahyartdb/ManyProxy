@@ -61,11 +61,6 @@ impl BatchRun {
 }
 
 impl AppView {
-    /// The ids the filters keep, in the order the table paints them.
-    pub(crate) fn visible_row_ids(&self, cx: &App) -> Vec<String> {
-        self.libraries.read(cx).delegate().visible_ids()
-    }
-
     /// Whether a row is in the selection.
     pub(crate) fn is_selected(&self, id: &str) -> bool {
         self.selection.contains(id)
@@ -85,14 +80,15 @@ impl AppView {
     /// filter hides appended in library order. Selection is not a visible-row
     /// set: a hidden row stays selected, so it still counts and still acts.
     pub(crate) fn selected_ids_in_visible_order(&self, cx: &App) -> Vec<String> {
-        let delegate = self.libraries.read(cx);
-        let delegate = delegate.delegate();
-        let mut ids: Vec<String> = delegate
-            .visible_ids()
+        let mut ids: Vec<String> = self
+            .visible_row_ids(cx)
             .into_iter()
             .filter(|id| self.selection.contains(id))
             .collect();
-        let mut hidden: Vec<String> = delegate
+        let mut hidden: Vec<String> = self
+            .libraries
+            .read(cx)
+            .delegate()
             .row_ids()
             .into_iter()
             .filter(|id| self.selection.contains(id))
@@ -102,15 +98,15 @@ impl AppView {
         ids
     }
 
-    /// How many selected rows the current filter hides.
+    /// How many selected rows the current filter hides. The count is pure so
+    /// the batch bar and the list can never disagree.
     pub(crate) fn selection_hidden_count(&self, cx: &App) -> usize {
-        let delegate = self.libraries.read(cx);
-        let delegate = delegate.delegate();
-        let visible = delegate.visible_ids();
-        self.selection
-            .iter()
-            .filter(|id| !visible.contains(id))
-            .count()
+        let delegate = self.libraries.read(cx).delegate();
+        manyproxy_core::library::query::selection_hidden_count(
+            &self.selection,
+            &self.visible,
+            &delegate.rows,
+        )
     }
 
     /// Plain click: the selection becomes exactly this row, and the anchor and
@@ -352,14 +348,7 @@ impl AppView {
 
     /// Scroll the focused row into view through the list's own API.
     fn scroll_to_row(&self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let index = {
-            let delegate = self.libraries.read(cx);
-            delegate
-                .delegate()
-                .visible_ids()
-                .iter()
-                .position(|row| row == id)
-        };
+        let index = self.visible_row_ids(cx).iter().position(|row| row == id);
         let Some(index) = index else {
             return;
         };
