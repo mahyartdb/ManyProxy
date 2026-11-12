@@ -113,6 +113,10 @@ impl Render for AppView {
         let column_width = (window.viewport_size().width.as_f32() - nav_width).max(0.);
         let layout =
             InspectorLayout::compute(column_width, inspector_width, docked, inspector_visible);
+        // R11: one layout resolved once per frame. Every visible column keeps
+        // its width; the table scrolls when the sum is wider than the pane.
+        let metrics = RowMetrics::for_table_width(layout.table_w, self.column_layout);
+        let content_width = self.column_layout.content_width(layout.table_w);
         self.libraries.update(cx, |state, cx| {
             let list_focus = state.focus_handle(cx);
             let delegate = state.delegate_mut();
@@ -120,8 +124,6 @@ impl Render for AppView {
                 delegate.app_view = Some(app_entity);
                 cx.notify();
             }
-            let metrics =
-                RowMetrics::for_table_width(layout.table_w, delegate.row_columns, delegate.layout);
             delegate.set_row_metrics(metrics);
             // T-06: the row cards paint the kit focus ring while the list holds
             // the keyboard; the handle lives on the ListState, the app owns the
@@ -137,20 +139,18 @@ impl Render for AppView {
         let filter_slot = self.render_filter_slot(cx);
         let engine_bar = self.render_engine_bar(cx);
         let column_headers = self.render_library_column_headers(window, cx);
-        let mut list_pane = div()
-            .id("config-list")
+        // R11: the header and the rows live in one horizontally scrolled
+        // column, so they can never drift apart and a narrow pane scrolls
+        // instead of hiding a column.
+        let table = div()
+            .id("library-table")
             .test_support()
+            .w(px(content_width))
+            .min_w(px(content_width))
+            .h_full()
             .flex()
             .flex_col()
-            .flex_1()
             .min_h_0()
-            // The bar above the table carries labels that cannot shrink; the
-            // pane must not grow to fit them, or the table would slide out of
-            // the window at a large text size.
-            .min_w_0()
-            .child(action_bar)
-            .child(filter_slot)
-            .children(self.render_writable_banner(cx))
             .child(column_headers)
             // The blank area below the rows belongs to the table, not to a
             // row: a plain click there clears the selection. Rows stop their
@@ -167,6 +167,32 @@ impl Render for AppView {
                         }
                     }))
                     .child(List::new(&self.libraries).size_full()),
+            );
+        let mut list_pane = div()
+            .id("config-list")
+            .test_support()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            // The bar above the table carries labels that cannot shrink; the
+            // pane must not grow to fit them, or the table would slide out of
+            // the window at a large text size.
+            .min_w_0()
+            .child(action_bar)
+            .child(filter_slot)
+            .children(self.render_writable_banner(cx))
+            .child(
+                div()
+                    .id("library-hscroll")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .track_scroll(&self.table_scroll)
+                    .overflow_x_scroll()
+                    .horizontal_scrollbar(&self.table_scroll)
+                    .child(table),
             );
         if !docked && inspector_visible {
             list_pane = list_pane.pr(px(layout.drawer_w));

@@ -81,8 +81,6 @@ toolbar-show-security = Show security
 toolbar-show-security-tip = Toggle the transport-security column
 toolbar-check-updates = Check for updates
 toolbar-check-updates-tip = Fetch the release feed once (JSON only — nothing downloads or runs)
-toolbar-row-columns = Row columns
-toolbar-row-columns-tip = Choose which columns each library row shows
 toolbar-palette-tip = Every action, searchable (Ctrl-K)
 toolbar-import-tip = Import share links or files (Ctrl-O)
 toolbar-connecting = Connecting…
@@ -123,10 +121,14 @@ column-width-aria = { $action } { $column } column
 column-restored = { $column } column restored to default
 columns-reset = Columns reset to defaults
 column-layout-save-failed = Could not save column layout: { $error }
-row-columns-save-failed = Could not save column choice: { $error }
 
 # Sort headers and menus
 sort-key-none = None (library order)
+sort-key-name = Name (text)
+sort-key-group = Group (text)
+sort-key-protocol = Protocol (text)
+sort-key-upstream = Upstream (text)
+sort-key-endpoint = Endpoint (bind, then port)
 sort-key-latency = Latency (latest URL test)
 sort-key-download = Download (current session)
 sort-key-upload = Upload (current session)
@@ -140,12 +142,8 @@ sort-direction-descending = descending
 sort-marker-asc = · asc
 sort-marker-desc = · desc
 sort-marker-fixed = · fixed
-sort-current-aria = { $label } — current sort
-sort-by = Sort by { $label }
-sort-direction = Direction: { $from } → { $to }
-sort-direction-tip = Reverse the active key (Type | Security keeps its fixed order)
-sort-header-active-tip = { $label } — sorted by { $key } ({ $direction }) — click to reverse, right-click to change
-sort-header-idle-tip = { $label } — click to sort, right-click to pick a sort key
+sort-header-active-tip = { $label } — sorted by { $key } ({ $direction }) — click to reverse, right-click for columns
+sort-header-idle-tip = { $label } — click to sort, right-click for columns
 
 # Search and facet bar
 facet-group-dimension = group or status
@@ -283,20 +281,21 @@ restore-title = Restore library
 restore-requires-clause = Restore requires a matching ManyProxy export (schema manyproxy-library, version 1).
 restore-description = This replaces the current library with the exported backup (row ids, groups, enabled flags, subscriptions, and deletions are restored exactly). { $clause }
 
-# Row columns dialog
-columns-protocol = Protocol
-columns-protocol-tip = Show the config's protocol on each row
-columns-upstream = Upstream
-columns-upstream-tip = Show the upstream host:port on each row
-columns-health = Health
-columns-health-tip = Show serving state and probe evidence on each row
-columns-group = Group
-columns-group-tip = Show the group tag on each row
-columns-traffic = Traffic
-columns-traffic-tip = Show data-plane totals on serving rows
-columns-reset-button = Reset columns
-columns-reset-tip = Restore the default column widths and order
-columns-title = Row columns
+# Columns sheet
+columns-title = Columns
+columns-sheet-hint = Locked columns can be reordered but never hidden.
+columns-always-visible = Always visible
+columns-size-this = Size Column to Fit
+columns-size-all = Size All Columns to Fit
+columns-more = More…
+columns-move-up = Move up
+columns-move-down = Move down
+columns-move-up-aria = Move { $column } up
+columns-move-down-aria = Move { $column } down
+columns-reset-widths = Reset Column Widths
+columns-reset-order = Reset Column Order
+columns-reset-visibility = Reset Column Visibility
+columns-reset-all = Reset All Columns
 
 # Logs
 logs-filter-placeholder = Filter logs
@@ -1569,18 +1568,9 @@ action-label-settings = Settings
 action-label-about = About
 action-label-runtime-stats = Runtime stats
 action-label-traffic-stats = Traffic stats
-action-label-row-columns = Row columns
+action-label-row-columns = Columns…
 action-label-text-size = Toggle large text
-action-label-sort-latency = Sort by latency
-action-label-sort-download = Sort by download speed
-action-label-sort-upload = Sort by upload speed
-action-label-sort-out-ip = Sort by outbound IP
-action-label-sort-type-security = Sort by type and security
-action-label-sort-traffic-total = Sort by total traffic
-action-label-sort-traffic-down = Sort by downloaded traffic
-action-label-sort-traffic-up = Sort by uploaded traffic
 action-label-sort-none = Clear sort
-action-label-sort-direction = Reverse sort direction
 action-label-inspector-details = Show Details tab
 action-label-inspector-health = Show Health tab
 action-label-inspector-logs = Show Logs tab

@@ -204,9 +204,16 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
     selected(
         "row-columns",
         "action-label-row-columns",
-        &["column", "columns", "rows", "display"],
+        &[
+            "column",
+            "columns",
+            "layout",
+            "width",
+            "order",
+            "visibility",
+        ],
         &[],
-        AppView::open_row_columns_dialog,
+        AppView::open_columns_sheet,
     ),
     selected(
         "text-size",
@@ -216,74 +223,11 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         text_size,
     ),
     selected(
-        "sort-latency",
-        "action-label-sort-latency",
-        &["sort", "latency", "ping", "health"],
-        &[],
-        sort_latency,
-    ),
-    selected(
-        "sort-download",
-        "action-label-sort-download",
-        &["sort", "download", "speed", "traffic"],
-        &[],
-        sort_download,
-    ),
-    selected(
-        "sort-upload",
-        "action-label-sort-upload",
-        &["sort", "upload", "speed", "traffic"],
-        &[],
-        sort_upload,
-    ),
-    selected(
-        "sort-out-ip",
-        "action-label-sort-out-ip",
-        &["sort", "out", "ip", "egress"],
-        &[],
-        sort_out_ip,
-    ),
-    selected(
-        "sort-type-security",
-        "action-label-sort-type-security",
-        &["sort", "type", "security", "protocol"],
-        &[],
-        sort_type_security,
-    ),
-    selected(
-        "sort-traffic-total",
-        "action-label-sort-traffic-total",
-        &["sort", "traffic", "total", "usage"],
-        &[],
-        sort_traffic_total,
-    ),
-    selected(
-        "sort-traffic-down",
-        "action-label-sort-traffic-down",
-        &["sort", "traffic", "download", "rx"],
-        &[],
-        sort_traffic_down,
-    ),
-    selected(
-        "sort-traffic-up",
-        "action-label-sort-traffic-up",
-        &["sort", "traffic", "upload", "tx"],
-        &[],
-        sort_traffic_up,
-    ),
-    selected(
         "sort-none",
         "action-label-sort-none",
         &["sort", "clear", "none", "library", "order"],
         &[],
         sort_none,
-    ),
-    selected(
-        "sort-direction",
-        "action-label-sort-direction",
-        &["sort", "reverse", "direction", "ascending", "descending"],
-        &[],
-        sort_direction,
     ),
     selected(
         "inspector-details",
@@ -585,21 +529,7 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "density-compact",
         ],
     ),
-    (
-        "Sort",
-        &[
-            "sort-latency",
-            "sort-download",
-            "sort-upload",
-            "sort-out-ip",
-            "sort-type-security",
-            "sort-traffic-total",
-            "sort-traffic-down",
-            "sort-traffic-up",
-            "sort-direction",
-            "sort-none",
-        ],
-    ),
+    ("Sort", &["sort-none"]),
 ];
 
 pub(crate) fn action(id: &str) -> &'static ActionDef {
@@ -707,44 +637,8 @@ fn toggle_inspector_presence(view: &mut AppView, _window: &mut Window, _cx: &mut
     view.toggle_inspector_presence();
 }
 
-fn sort_latency(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::Latency, window, cx);
-}
-
-fn sort_download(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::Download, window, cx);
-}
-
-fn sort_upload(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::Upload, window, cx);
-}
-
-fn sort_out_ip(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::OutIp, window, cx);
-}
-
-fn sort_type_security(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TypeSecurity, window, cx);
-}
-
-fn sort_traffic_total(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TrafficTotal, window, cx);
-}
-
-fn sort_traffic_down(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TrafficDown, window, cx);
-}
-
-fn sort_traffic_up(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TrafficUp, window, cx);
-}
-
 fn sort_none(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.set_library_sort(LibrarySortKey::None, window, cx);
-}
-
-fn sort_direction(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.toggle_library_sort_direction(window, cx);
 }
 
 fn text_size(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {

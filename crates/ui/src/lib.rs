@@ -46,6 +46,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, ResizableState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::separator::Separator;
@@ -360,16 +361,22 @@ struct AppView {
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
 
-    row_columns: RowColumns,
+    /// T-03/R11: the one column layout — order, visibility and widths. The
+    /// header and the delegate both read this copy; nothing else owns one.
+    column_layout: ColumnLayout,
 
     /// T-03: the width drag in flight. `None` means no pointer is resizing a
-    /// column; the delegate layout updates every move and only mouse-up writes
-    /// the store.
+    /// column; the layout updates every move and only mouse-up writes the
+    /// store.
     column_resize: Option<ColumnResize>,
 
     /// T-04: the header drag's live landing slot. `None` while not dragging (or
     /// between cells), so the strip paints one indicator at most.
-    column_drop: Option<(LibraryColumn, DropSide)>,
+    column_drop: Option<(ColumnId, DropSide)>,
+
+    /// The horizontal offset shared by the header strip and the rows. One
+    /// scroll container owns it, so the two can never drift apart.
+    table_scroll: ScrollHandle,
 
     inspector_tab: InspectorTab,
 
@@ -418,7 +425,7 @@ struct AppView {
 /// without accumulating rounding drift.
 #[derive(Clone, Copy)]
 struct ColumnResize {
-    column: LibraryColumn,
+    column: ColumnId,
     start_x: f32,
     start_width: f32,
 }
@@ -434,7 +441,7 @@ pub(crate) enum DropSide {
 /// type, so a drag can never target the pinned lamp/check/name/copy cells.
 #[derive(Clone, Copy)]
 pub(crate) struct ColumnDrag {
-    pub(crate) column: LibraryColumn,
+    pub(crate) column: ColumnId,
 }
 
 /// T-08: why this session is running in memory instead of on disk. The banner
