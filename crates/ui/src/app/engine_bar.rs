@@ -5,9 +5,6 @@
 //! Not here: the console — slice 6 adds it.
 use crate::*;
 
-/// The engine bar's height.
-pub(crate) const ENGINE_BAR_HEIGHT: f32 = 40.;
-
 impl AppView {
     /// The engine bar. It sits under the content row, outside the resizable
     /// split, so it spans the table and the inspector alike — never the nav.
@@ -57,7 +54,7 @@ impl AppView {
             .items_center()
             .gap_2()
             .w_full()
-            .h(px(ENGINE_BAR_HEIGHT))
+            .h(px(self.density.engine_bar_height()))
             .flex_shrink_0()
             .min_w_0()
             .px_3()

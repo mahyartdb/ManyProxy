@@ -205,6 +205,9 @@ struct SettingsState {
     appearance: Rc<RefCell<String>>,
     accent: Rc<RefCell<Accent>>,
     text_size: Rc<RefCell<TextSize>>,
+    /// R22/R30: the row density. It owns the row pitch and every chrome
+    /// height, and it is persisted under `row_density`.
+    density: Rc<RefCell<Density>>,
     text_size_slider: Entity<SliderState>,
     autostart: Rc<RefCell<bool>>,
     link_handler: Rc<RefCell<bool>>,
@@ -535,6 +538,48 @@ impl SettingsState {
             Some(t!("settings-text-size-help")),
             muted,
             text_size_control,
+        ));
+
+        // R22/R30: the density. One radio pair: comfortable rows are 36px,
+        // compact rows are 30px, and the chrome follows.
+        let density_cell = self.density.clone();
+        let density_view = self.view.clone();
+        let current_density = *density_cell.borrow();
+        let mut density_group = RadioGroup::horizontal("settings-density-options")
+            .selected_index(match current_density {
+                Density::Comfortable => Some(0),
+                Density::Compact => Some(1),
+            })
+            .on_change(move |ix, window, cx| {
+                let density = match ix {
+                    0 => Density::Comfortable,
+                    _ => Density::Compact,
+                };
+                let cell = density_cell.clone();
+                density_view.update(cx, |view, cx| {
+                    view.set_density(density, window, cx);
+                    *cell.borrow_mut() = density;
+                    cx.notify();
+                });
+            });
+        for density in [Density::Comfortable, Density::Compact] {
+            let label = density_label(density);
+            density_group = density_group.child(
+                Radio::new(label.clone())
+                    .label(label)
+                    .tooltip(density_label(density)),
+            );
+        }
+        body = body.child(settings_row(
+            self,
+            "settings-row-density",
+            t!("settings-density"),
+            Some(t!("settings-density-help")),
+            muted,
+            div()
+                .id("settings-density-group")
+                .test_support()
+                .child(density_group),
         ));
 
         // Launch at login.
@@ -2118,9 +2163,9 @@ impl AppView {
             // T-06: the reset clears the list's own selection too, so UIA
             // stops naming a row that no longer exists.
             state.set_selected_index(None, window, cx);
-            state.delegate_mut().clear_checked();
             cx.notify();
         });
+        self.clear_selection(window, cx);
         self.reload(window, cx);
         window.push_notification(
             Notification::success(t!("library-reset-done", count = removed)),
@@ -2157,6 +2202,38 @@ impl AppView {
         true
     }
 
+    /// R22: the density owns every chrome height and the row pitch. The
+    /// choice is written on every change, so the next launch reads it back.
+    pub(crate) fn set_density(
+        &mut self,
+        density: Density,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.density = density;
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_density(density);
+            list_cx.notify();
+        });
+        if let Err(error) = self.store.set_row_density(density) {
+            window.push_notification(
+                Notification::error(t!("density-save-failed", error = error.to_string())),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// The palette's `Density: Comfortable`.
+    pub(crate) fn set_comfortable_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_density(Density::Comfortable, window, cx);
+    }
+
+    /// The palette's `Density: Compact`.
+    pub(crate) fn set_compact_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_density(Density::Compact, window, cx);
+    }
+
     pub(crate) fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
 
@@ -2169,6 +2246,7 @@ impl AppView {
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
         let accent_state = Rc::new(RefCell::new(self.store.accent()));
         let text_size_state = Rc::new(RefCell::new(self.store.text_size()));
+        let density_state = Rc::new(RefCell::new(self.store.row_density()));
         let text_size_slider = cx.new(|_| {
             SliderState::new()
                 .min(TextSize::MIN as f32)
@@ -2378,6 +2456,7 @@ impl AppView {
             appearance: appearance_state.clone(),
             accent: accent_state.clone(),
             text_size: text_size_state.clone(),
+            density: density_state.clone(),
             text_size_slider: text_size_slider.clone(),
             autostart: autostart_state.clone(),
             link_handler: link_handler_state.clone(),

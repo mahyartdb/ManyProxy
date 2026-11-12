@@ -1,10 +1,6 @@
 use crate::app::columns::WidthAction;
 use crate::*;
 
-/// The filter slot's height. It always occupies its row, so the table below
-/// it never moves.
-pub(crate) const FILTER_SLOT_HEIGHT: f32 = 36.;
-
 impl AppView {
     /// T-23: keep the last-filter memory in step with the query. `set_value`
     /// never emits `InputEvent::Change`, so the clear paths call this directly.
@@ -137,10 +133,28 @@ impl AppView {
     }
 
     /// The filter slot above the table. It always occupies its row, so the
-    /// table never moves when the filter row grows into it. Slice 1 keeps the
-    /// existing search input here; slice 3 replaces the slot with the full
-    /// filter row (Search · Status · Protocol · Filter).
+    /// table never moves. A selection swaps the search for the batch bar —
+    /// the search's own state stays untouched while the bar is up.
     pub(crate) fn render_filter_slot(&self, cx: &mut Context<Self>) -> AnyElement {
+        let height = self.density.filter_row_height();
+        if self.selection_count() > 0 {
+            return div()
+                .id("filter-slot")
+                .test_support()
+                .flex()
+                .flex_row()
+                .flex_nowrap()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .h(px(height))
+                .flex_shrink_0()
+                .px_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(self.render_batch_bar(cx))
+                .into_any_element();
+        }
         div()
             .id("filter-slot")
             .test_support()
@@ -150,7 +164,7 @@ impl AppView {
             .items_center()
             .gap_2()
             .w_full()
-            .h(px(FILTER_SLOT_HEIGHT))
+            .h(px(height))
             .flex_shrink_0()
             .px_2()
             .border_b_1()
@@ -194,6 +208,7 @@ impl AppView {
         let has_rows = !delegate.rows.is_empty();
         let view = cx.entity();
         let column_drop = self.column_drop;
+        let clear_view = view.clone();
         if !has_rows {
             // An empty library keeps today's empty-state clean: a header strip
             // over nothing is noise.
@@ -210,7 +225,7 @@ impl AppView {
             .flex_row()
             .flex_nowrap()
             .items_center()
-            .gap_2()
+            .gap(px(RowMetrics::GAP))
             // A drag move outside any movable header must clear the indicator;
             // parent listeners register before child listeners, so the headers
             // below can put it back when the pointer is over one of them.
@@ -219,26 +234,28 @@ impl AppView {
                     view.clear_column_drop(cx);
                 }),
             )
+            // A plain click on the header is a click outside the rows: the
+            // selection goes. Header controls that act (sort, menus, resize)
+            // keep their own handlers; this only adds the clearing.
+            .on_click(move |_, window, cx| {
+                clear_view.update(cx, |view, cx| {
+                    if view.selection_count() > 0 {
+                        view.clear_selection(window, cx);
+                    }
+                });
+            })
             // The row's content starts after the list item's 4px inset and
             // the card's 8px padding — the strip starts at the same place.
             .px_3()
-            .py_1()
+            .h(px(self.density.header_height()))
             .border_b_1()
             .border_color(cx.theme().border)
-            // The gutter the row cards spend on the serving lamp and checkbox.
+            // The lead gutter the row spends on its state glyph.
             .child(
                 div()
-                    .id("header-lamp-check")
+                    .id("header-lead")
                     .test_support()
-                    .w(px(metrics.lamp_check))
-                    .flex_shrink_0(),
-            )
-            // The numeral check chip's reserved slot.
-            .child(
-                div()
-                    .id("header-check-slot")
-                    .test_support()
-                    .w(px(metrics.check_slot))
+                    .w(px(metrics.lead))
                     .flex_shrink_0(),
             )
             .child(
@@ -248,7 +265,7 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_sm()
+                    .text_size(rems(ROW_NAME_REMS))
                     .text_color(cx.theme().muted_foreground)
                     .child(t!("column-name")),
             );
@@ -271,13 +288,13 @@ impl AppView {
                 }
             });
         }
-        // The row's trailing cell holds the copy action; the strip keeps the
-        // same width so the columns stay lined up.
+        // The row's trailing reserve holds the hover actions; the strip keeps
+        // the same width so the columns line up.
         strip = strip.child(
             div()
-                .id("header-copy")
+                .id("header-actions")
                 .test_support()
-                .w(px(metrics.copy))
+                .w(px(metrics.actions))
                 .flex_shrink_0(),
         );
         strip = strip.child(column_drag_canvas(view));

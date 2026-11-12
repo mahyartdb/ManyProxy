@@ -6,6 +6,11 @@ use gpui_kit::*;
 /// `key_context`, so a focused text input still wins.
 pub(crate) const APP_KEY_CONTEXT: &str = "manyproxy-library";
 
+/// The list's own key context, reached from the app's. A binding that names
+/// this descendant matches deeper than one that names the app alone, so it
+/// outranks the kit's list bindings.
+pub(crate) const LIST_CONTEXT: &str = "manyproxy-library > List";
+
 /// Binds one table action's keystrokes. The keystrokes live in the action
 /// table, so a shortcut cannot exist here and nowhere else.
 fn bind<A: Action + Clone>(out: &mut Vec<KeyBinding>, id: &str, event: A) {
@@ -27,7 +32,7 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     bind(&mut keys, "stop", StopSelected);
     bind(&mut keys, "test", TestSelected);
     bind(&mut keys, "stop-testing", StopTesting);
-    bind(&mut keys, "clear-checked", ClearChecked);
+    bind(&mut keys, "clear-selection", ClearSelection);
     bind(&mut keys, "open-palette", OpenPalette);
     bind(&mut keys, "copy-urls", CopyUrls);
     bind(&mut keys, "update-current-group", UpdateCurrentGroup);
@@ -45,10 +50,34 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
         SelectNextRow,
         Some(APP_KEY_CONTEXT),
     ));
+    // The plain arrows move the focus and the selection with it. The binding
+    // names the list as a descendant of the app, so it outranks the kit's own
+    // arrow bindings: the list never moves on its own.
+    keys.push(KeyBinding::new("up", FocusPreviousRow, Some(LIST_CONTEXT)));
+    keys.push(KeyBinding::new("down", FocusNextRow, Some(LIST_CONTEXT)));
+    keys.push(KeyBinding::new(
+        "home",
+        FocusFirstRow,
+        Some(APP_KEY_CONTEXT),
+    ));
+    keys.push(KeyBinding::new("end", FocusLastRow, Some(APP_KEY_CONTEXT)));
+    keys.push(KeyBinding::new(
+        "space",
+        ToggleFocused,
+        Some(APP_KEY_CONTEXT),
+    ));
     keys.push(KeyBinding::new(
         "ctrl-a",
         SelectAllRows,
         Some(APP_KEY_CONTEXT),
+    ));
+    // The kit's List binds Escape to Cancel at `List`; a focused list would
+    // otherwise swallow the app's clear-selection. The descendant context
+    // outranks the kit's, so Escape clears wherever the table has the keyboard.
+    keys.push(KeyBinding::new(
+        "escape",
+        ClearSelection,
+        Some(LIST_CONTEXT),
     ));
     bind(&mut keys, "focus-search", FocusSearch);
     bind(&mut keys, "inspector-details", InspectorDetails);

@@ -221,16 +221,17 @@ impl AppView {
 
                 if !outcome.imported_ids.is_empty() {
                     let first = outcome.imported_ids.clone();
-                    self.libraries.update(cx, |list_state, list_cx| {
-                        list_state.delegate_mut().check_ids(&first);
-                        // T-06: selection belongs to the list, not to a
-                        // delegate field the kit never sees. Routing it
-                        // through the list's own setter is what makes
-                        // `ListItem::selected` and `aria_selected` name the
-                        // imported row.
-                        select_first_visible(list_state, &first, window, list_cx);
+                    // The imported rows join the one selection model, and the
+                    // focus lands on the first of them.
+                    for id in &first {
+                        self.selection.insert(id.clone());
+                    }
+                    self.selection_anchor = first.first().cloned();
+                    self.selection_focus = first.first().cloned();
+                    self.libraries.update(cx, |_list_state, list_cx| {
                         list_cx.notify();
                     });
+                    cx.notify();
                 }
                 true
             }

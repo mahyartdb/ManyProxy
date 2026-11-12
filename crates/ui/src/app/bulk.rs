@@ -1,13 +1,12 @@
-//! Bulk actions over the checked set: bar rendering and start/copy/delete commits.
+//! Bulk actions over the selection: bar rendering and start/copy/delete commits.
 //! Belongs: multi-row actions and the bar that exposes them.
 //! Not here: selection or single-row inspector actions.
 use crate::*;
 
-/// K4/A3-2: one menu row for the bulk bar's overflow. The row carries its own
-/// stable id so the menu contents are provable in the completed frame; Delete
-/// is the only danger row. K17 ruling (spec line 91): pressing it deletes at
-/// once — no blocking confirm — and the Undo toast is the safety net.
-fn bulk_menu_item(
+/// One menu row for the batch bar's overflow. The row carries its own stable
+/// id so the menu contents are provable in the completed frame; Delete is the
+/// only danger row.
+fn batch_menu_item(
     id: &'static str,
     label: String,
     danger: bool,
@@ -37,115 +36,444 @@ fn bulk_menu_item(
 }
 
 impl AppView {
-    pub(crate) fn render_bulk_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = self.libraries.read(cx).delegate().bulk_label();
-        if label.is_empty() {
-            return div().id("bulk-bar").test_support().into_any_element();
+    /// The batch bar. It lives in the filter slot, so the table never moves
+    /// when it appears. It shows whenever the selection is not empty.
+    ///
+    /// Left to right: `×`, the count, the running count, the batch's own
+    /// result, `Show failures`, the hidden count, then the verbs.
+    pub(crate) fn render_batch_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.selection_count();
+        if selected == 0 {
+            return div().id("batch-bar").test_support().into_any_element();
         }
+        let view = cx.entity();
+        let running = self
+            .selection
+            .iter()
+            .filter(|id| self.engine.is_running(id))
+            .count();
+        let hidden = self.selection_hidden_count(cx);
+        let batch = self.batch.clone();
 
-        let more_view = cx.entity();
-
-        Self::motion_enter(
-            div()
-                .id("bulk-bar")
-                .test_support()
-                .flex()
-                .flex_row()
-                // K4/A3-2: the bar is ONE line. The five secondary verbs moved
-                // behind More, so Start/Stop/More never wrap and never run
-                // under the inspector drawer at the 880px minimum width.
-                .flex_nowrap()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .min_w_0()
-                .bg(cx.theme().group_box)
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .child(
-                    div()
-                        .id("bulk-label")
-                        .test_support()
-                        .flex_shrink_0()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        // B19: the count is the bar's only status text, so it
-                        // names itself like every other bar segment does.
-                        .aria_label(label.clone())
-                        .tooltip(|_, cx| cx.new(|_| Tooltip::new(t!("bulk-tooltip"))).into())
-                        .child(label),
-                )
-                .child(
-                    Button::new("bulk-start")
+        let mut bar = div()
+            .id("batch-bar")
+            .test_support()
+            .flex()
+            .flex_row()
+            .flex_nowrap()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .h_full()
+            .min_w_0()
+            .px_2()
+            .child(
+                Button::new("batch-clear")
+                    .small()
+                    .compact()
+                    .ghost()
+                    .label("×")
+                    .accessibility_label(t!("selection-clear"))
+                    .tooltip(t!("selection-clear"))
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.clear_selection(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("batch-count")
+                    .test_support()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .aria_label(t!("selection-count", count = selected))
+                    .child(t!("selection-count", count = selected)),
+            );
+        if running > 0 {
+            bar = bar.child(
+                div()
+                    .id("batch-running")
+                    .test_support()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("selection-running", count = running)),
+            );
+        }
+        if let Some(batch) = &batch {
+            let status = if batch.done < batch.total() {
+                match batch.kind {
+                    BatchKind::Start => {
+                        t!("batch-starting", done = batch.done, total = batch.total())
+                    }
+                    BatchKind::Stop => {
+                        t!("batch-stopping", done = batch.done, total = batch.total())
+                    }
+                    BatchKind::Test => {
+                        t!("batch-testing", done = batch.done, total = batch.total())
+                    }
+                }
+            } else {
+                t!("batch-result", ok = batch.ok, failed = batch.failed.len())
+            };
+            bar = bar.child(
+                div()
+                    .id("batch-status")
+                    .test_support()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status),
+            );
+            if !batch.failed.is_empty() {
+                let failures = batch.failed_ids();
+                let fail_view = view.clone();
+                bar = bar.child(
+                    Button::new("batch-show-failures")
                         .small()
-                        .label(t!("bulk-start"))
-                        .tooltip(t!("bulk-start-tip"))
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.commit_bulk_start(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-stop")
-                        .small()
-                        .label(t!("bulk-stop"))
-                        .tooltip(t!("bulk-stop-tip"))
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.commit_bulk_stop(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-more")
-                        .small()
-                        .label(t!("bulk-more"))
-                        .dropdown_caret(true)
-                        .accessibility_label(t!("bulk-more-aria"))
-                        .tooltip(t!("bulk-more-tip"))
-                        .dropdown_menu(move |menu, _, _| {
-                            menu.item(bulk_menu_item(
-                                "bulk-more-select-visible",
-                                t!("bulk-check-visible"),
-                                false,
-                                more_view.clone(),
-                                |view, window, cx| view.select_visible_checked(window, cx),
-                            ))
-                            .item(bulk_menu_item(
-                                "bulk-more-clear",
-                                t!("bulk-uncheck-all"),
-                                false,
-                                more_view.clone(),
-                                |view, window, cx| view.clear_checked(window, cx),
-                            ))
-                            .separator()
-                            .item(bulk_menu_item(
-                                "bulk-more-move",
-                                t!("bulk-move"),
-                                false,
-                                more_view.clone(),
-                                |view, window, cx| view.open_bulk_move_dialog(window, cx),
-                            ))
-                            .item(bulk_menu_item(
-                                "bulk-more-copy",
-                                t!("bulk-copy-proxies"),
-                                false,
-                                more_view.clone(),
-                                |view, window, cx| view.commit_bulk_copy_proxies(window, cx),
-                            ))
-                            .separator()
-                            .item(bulk_menu_item(
-                                "bulk-more-delete",
-                                t!("bulk-delete"),
-                                true,
-                                more_view.clone(),
-                                |view, window, cx| view.bulk_delete_checked(window, cx),
-                            ))
+                        .compact()
+                        .label(t!("batch-show-failures"))
+                        .tooltip(t!("batch-show-failures-tip"))
+                        .on_click(move |_, window, cx| {
+                            fail_view.update(cx, |view, cx| {
+                                view.show_batch_failures(&failures, window, cx);
+                            });
                         }),
-                )
-                .into_any_element(),
-            "bulk-bar-enter",
-            cx,
-        )
-        .into_any_element()
+                );
+            }
+        }
+        if hidden > 0 {
+            let hide_view = view.clone();
+            bar = bar.child(
+                Button::new("batch-hidden")
+                    .small()
+                    .compact()
+                    .label(t!("selection-hidden", count = hidden))
+                    .tooltip(t!("selection-hidden-tip"))
+                    .on_click(move |_, window, cx| {
+                        hide_view.update(cx, |view, cx| {
+                            view.reveal_hidden_selection(window, cx);
+                        });
+                    }),
+            );
+        }
+        bar = bar
+            .child(div().flex_1())
+            .child(
+                Button::new("batch-start")
+                    .small()
+                    .compact()
+                    .label(t!("action-label-start"))
+                    .accessibility_label(t!("action-label-start"))
+                    .disabled(self.batch_running())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.start_selected_batch(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("batch-stop")
+                    .small()
+                    .compact()
+                    .label(t!("action-label-stop"))
+                    .accessibility_label(t!("action-label-stop"))
+                    .disabled(self.batch_running())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.stop_selected_batch(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("batch-test")
+                    .small()
+                    .compact()
+                    .label(t!("action-label-test"))
+                    .accessibility_label(t!("action-label-test"))
+                    .disabled(self.batch_running())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.test_selected_batch(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("batch-divider")
+                    .test_support()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .bg(cx.theme().border),
+            )
+            .child(
+                Button::new("batch-delete")
+                    .small()
+                    .compact()
+                    .label(t!("action-label-delete"))
+                    .accessibility_label(t!("action-label-delete"))
+                    .disabled(self.batch_running())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.delete_selected_batch(window, cx);
+                    })),
+            )
+            .child(self.render_batch_more(view));
+        bar.into_any_element()
+    }
+
+    /// The batch bar's overflow. It is a popover, never a second bar.
+    fn render_batch_more(&self, view: Entity<AppView>) -> AnyElement {
+        let enabled = self
+            .selection
+            .iter()
+            .all(|id| self.row_config(id).is_some_and(|row| row.enabled));
+        let copy_view = view.clone();
+        let move_view = view.clone();
+        let preset_view = view.clone();
+        let reset_view = view.clone();
+        let delete_view = view.clone();
+        let toggle_view = view.clone();
+        Button::new("batch-more")
+            .small()
+            .compact()
+            .label("⋯")
+            .dropdown_caret(true)
+            .accessibility_label(t!("batch-more-aria"))
+            .tooltip(t!("batch-more-tip"))
+            .dropdown_menu(move |menu, _, _| {
+                menu.item(batch_menu_item(
+                    "batch-more-copy",
+                    t!("batch-more-copy"),
+                    false,
+                    copy_view.clone(),
+                    |view, window, cx| {
+                        let ids = view.selected_ids_in_visible_order(cx);
+                        view.copy_selected_urls(&ids, window, cx);
+                    },
+                ))
+                .item(batch_menu_item(
+                    "batch-more-toggle",
+                    if enabled {
+                        t!("batch-more-dont-start")
+                    } else {
+                        t!("batch-more-start")
+                    },
+                    false,
+                    toggle_view.clone(),
+                    |view, window, cx| view.toggle_selection_enabled(window, cx),
+                ))
+                .item(batch_menu_item(
+                    "batch-more-move",
+                    t!("batch-more-move"),
+                    false,
+                    move_view.clone(),
+                    |view, window, cx| view.open_bulk_move_dialog(window, cx),
+                ))
+                .item(batch_menu_item(
+                    "batch-more-preset",
+                    t!("batch-more-preset"),
+                    false,
+                    preset_view.clone(),
+                    |view, window, cx| view.open_preset_attach_for_selection(window, cx),
+                ))
+                .separator()
+                .item(batch_menu_item(
+                    "batch-more-reset-traffic",
+                    t!("action-label-reset-traffic"),
+                    false,
+                    reset_view.clone(),
+                    |view, window, cx| view.reset_traffic_for_selection(window, cx),
+                ))
+                .item(batch_menu_item(
+                    "batch-more-reset-usage",
+                    t!("action-label-reset-usage"),
+                    false,
+                    reset_view.clone(),
+                    |view, window, cx| view.reset_usage_for_selection(window, cx),
+                ))
+                .separator()
+                .item(batch_menu_item(
+                    "batch-more-delete",
+                    t!("action-label-delete"),
+                    true,
+                    delete_view.clone(),
+                    |view, window, cx| view.delete_selected_batch(window, cx),
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// Whether a batch is still running. The bar's own verbs wait for it.
+    pub(crate) fn batch_running(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|batch| batch.done < batch.total())
+    }
+
+    /// Settle a Start batch from the engine's applied set. An id the snapshot
+    /// holds but the engine did not apply counts as failed — dirty, unreadable,
+    /// refused or skipped, the row is not serving.
+    pub(crate) fn settle_batch_start(&mut self, applied: &[String]) {
+        let Some(batch) = self.batch.as_mut() else {
+            return;
+        };
+        if batch.kind != BatchKind::Start || batch.is_finished() {
+            return;
+        }
+        batch.failed = batch
+            .ids
+            .iter()
+            .filter(|id| !applied.contains(id))
+            .cloned()
+            .collect();
+        batch.ok = batch.total() - batch.failed.len();
+        batch.done = batch.total();
+    }
+
+    /// Settle a Stop batch from the engine: every snapshotted row that is no
+    /// longer serving counts as stopped, whether it was running or not.
+    pub(crate) fn settle_batch_stop(&mut self) {
+        let Some(batch) = self.batch.as_ref() else {
+            return;
+        };
+        if batch.kind != BatchKind::Stop || batch.is_finished() {
+            return;
+        }
+        let failed: Vec<String> = batch
+            .ids
+            .iter()
+            .filter(|id| self.engine.is_running(id))
+            .cloned()
+            .collect();
+        if let Some(batch) = self.batch.as_mut() {
+            batch.done = batch.total();
+            batch.ok = batch.total() - failed.len();
+            batch.failed = failed;
+        }
+    }
+
+    /// Settle a Test batch from the probe's outcomes. A snapshotted row the
+    /// probe never sampled counts as failed: it was not tested.
+    pub(crate) fn settle_batch_test(&mut self, outcomes: &[TestOutcome]) {
+        let Some(batch) = self.batch.as_ref() else {
+            return;
+        };
+        if batch.kind != BatchKind::Test || batch.is_finished() {
+            return;
+        }
+        let failed: Vec<String> = batch
+            .ids
+            .iter()
+            .filter(|id| {
+                !outcomes.iter().any(|outcome| {
+                    &outcome.sample.config_id == *id && outcome.sample.latency_ms.is_some()
+                })
+            })
+            .cloned()
+            .collect();
+        if let Some(batch) = self.batch.as_mut() {
+            batch.done = batch.total();
+            batch.ok = batch.total() - failed.len();
+            batch.failed = failed;
+        }
+    }
+
+    /// The batch bar's `Start with ManyProxy` / `Don't start with ManyProxy`:
+    /// the enabled flag flips for every selected config.
+    pub(crate) fn toggle_selection_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        let enable = !ids
+            .iter()
+            .all(|id| self.row_config(id).is_some_and(|row| row.enabled));
+        for id in &ids {
+            self.commit_enabled_flag(id, enable, window, cx);
+        }
+    }
+
+    /// The batch bar's `Reset → Traffic`: every selected config's counters.
+    pub(crate) fn reset_traffic_for_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        for id in &ids {
+            self.commit_reset_traffic(id, window, cx);
+        }
+    }
+
+    /// The batch bar's `Reset → Usage`: every selected config's counters.
+    pub(crate) fn reset_usage_for_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        for id in &ids {
+            self.commit_usage_reset(id, window, cx);
+        }
+    }
+
+    /// R29: the table narrows to the ids the last batch failed on. The
+    /// ordinary filter controls take it away again.
+    pub(crate) fn show_batch_failures(
+        &mut self,
+        failed: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let failed: HashSet<String> = failed.iter().cloned().collect();
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_failure_filter(Some(failed));
+            list_cx.notify();
+        });
+        self.reload(window, cx);
+    }
+
+    /// The hidden count's button: the filter goes away and the first hidden
+    /// selected row comes into view. The selection does not change.
+    pub(crate) fn reveal_hidden_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_library_search(window, cx);
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().clear_facets();
+            list_cx.notify();
+        });
+        let hidden = {
+            let libraries = self.libraries.read(cx);
+            let delegate = libraries.delegate();
+            let visible = delegate.visible_ids();
+            delegate
+                .row_ids()
+                .into_iter()
+                .find(|id| self.selection.contains(id) && !visible.contains(id))
+        };
+        let Some(id) = hidden else {
+            return;
+        };
+        let index = {
+            let libraries = self.libraries.read(cx);
+            libraries
+                .delegate()
+                .visible_ids()
+                .iter()
+                .position(|row| row == &id)
+        };
+        if let Some(index) = index {
+            self.libraries.update(cx, |state, list_cx| {
+                state.scroll_to_item(
+                    IndexPath::new(index),
+                    ScrollStrategy::Nearest,
+                    window,
+                    list_cx,
+                );
+            });
+        }
     }
 
     /// The retired facet band's "Clear facet filters" action. The band is
@@ -166,44 +494,8 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn clear_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().clear_checked();
-            list_cx.notify();
-        });
-
-        window.focus(&self.focus, cx);
-        cx.notify();
-    }
-
-    /// Shift+Up/Down: move the focus row one step and re-draw the range from
-    /// the anchor, keeping the kit's focus update from collapsing the set.
-    pub(crate) fn extend_selection_by(
-        &mut self,
-        delta: isize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.libraries.update(cx, |state, list_cx| {
-            let Some(target) = state.delegate_mut().shift_focus(delta) else {
-                return;
-            };
-            state.set_selected_index(Some(target), window, list_cx);
-            list_cx.notify();
-        });
-        cx.notify();
-    }
-
-    /// Ctrl+A: select every row the filters keep, without moving the focus.
-    pub(crate) fn select_all_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().select_all_visible();
-            list_cx.notify();
-        });
-        cx.notify();
-    }
-
-    pub(crate) fn clear_checked_unless_dialog(
+    /// Escape: the top layer goes first, then the selection.
+    pub(crate) fn clear_selection_unless_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -212,69 +504,67 @@ impl AppView {
             return false;
         }
         // T-03: in the narrow drawer the inspector is the top layer — Esc
-        // closes it and hands focus back to the list, and the checked set
+        // closes it and hands focus back to the list, and the selection
         // survives (one overlay layer per Esc).
         if self.close_inspector(window, cx) {
             return false;
         }
-        self.clear_checked(window, cx);
-        // The kit's index is the last-clicked row; clearing it drops the focus
-        // ring with the wash so Esc leaves no row looking selected.
-        self.libraries.update(cx, |state, list_cx| {
-            state.set_selected_index(None, window, list_cx);
-            list_cx.notify();
-        });
+        self.clear_selection(window, cx);
+        cx.notify();
         true
     }
 
-    /// T-05: the bulk copy — one TAB-separated line per checked-and-running
-    /// row (`name<TAB>socks5://host:port`), so twenty profiles paste into a
-    /// spreadsheet as two columns. Running rows only; the toast says how
-    /// many checked rows were stopped and skipped. Nothing checked means
-    /// every running row.
-    pub(crate) fn commit_bulk_copy_proxies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let checked: Vec<String> = self
-            .libraries
-            .read(cx)
-            .delegate()
-            .checked_rows()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect();
-        let ids: Vec<String> = if checked.is_empty() {
-            self.engine.running_ids()
-        } else {
-            checked
-        };
-        let mut lines: Vec<String> = Vec::new();
-        let mut skipped = 0usize;
-        for id in &ids {
-            let Some(config) = self.row_config(id) else {
-                continue;
-            };
-            if !self.engine.is_running(id) {
-                skipped += 1;
-                continue;
-            }
-            // The STORED bind host travels with the URL — never a hardcoded
-            // 127.0.0.1, never a hand-rolled format.
-            let (socks, _) = proxy_urls(&config.bind_ip, config.port);
-            lines.push(format!("{}\t{}", config.name, socks));
-        }
-        if lines.is_empty() {
-            window.push_notification(Notification::info(bulk_copy_nothing_message(skipped)), cx);
-            return;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
-        window.push_notification(
-            Notification::success(bulk_copy_proxies_message(lines.len(), skipped)),
-            cx,
-        );
+    /// Shift+Up/Down: the focus moves one row and the range from the anchor
+    /// to the new focus replaces the set.
+    pub(crate) fn extend_selection_by(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_focus(delta, window, cx);
     }
 
-    pub(crate) fn commit_bulk_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.libraries.read(cx).delegate().checked_rows();
-        self.start_rows(rows, window, cx);
+    /// Ctrl+A: select every row the filters keep, without moving the focus.
+    pub(crate) fn select_all_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_visible_rows(cx);
+    }
+    /// The batch bar's Start: the selection is snapshotted, and the snapshot
+    /// is what runs. Changing the selection mid-flight never changes the
+    /// batch.
+    pub(crate) fn start_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        self.batch = Some(BatchRun::new(BatchKind::Start, ids.clone()));
+        cx.notify();
+        self.start_selected_rows(&ids, window, cx);
+    }
+
+    /// The batch bar's Stop: the same snapshot rule.
+    pub(crate) fn stop_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        self.batch = Some(BatchRun::new(BatchKind::Stop, ids.clone()));
+        cx.notify();
+        self.stop_selected_rows(&ids, window, cx);
+    }
+
+    /// The batch bar's Test: the same snapshot rule.
+    pub(crate) fn test_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        self.batch = Some(BatchRun::new(BatchKind::Test, ids.clone()));
+        cx.notify();
+        self.test_selected_rows(&ids, window, cx);
     }
 
     pub(crate) fn start_rows(
@@ -289,6 +579,7 @@ impl AppView {
         }
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
+            self.settle_batch_start(&[]);
             return;
         }
         let lan: Vec<(String, String)> = rows
@@ -354,12 +645,14 @@ impl AppView {
     ) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
+            self.settle_batch_start(&[]);
             return;
         }
         self.start_in_flight = true;
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
             window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
+            self.settle_batch_start(&[]);
             return;
         }
         let mut skipped_dirty: Vec<String> = Vec::new();
@@ -389,7 +682,7 @@ impl AppView {
         }
 
         // T-05: ONE additive start for the whole batch. The engine unions
-        // the checked rows with what already serves and applies once, so a
+        // the selected rows with what already serves and applies once, so a
         // twenty-row batch neither flaps the engine twenty times nor drops
         // the rows that were already serving.
         let requested = configs.len();
@@ -404,6 +697,7 @@ impl AppView {
         }
         self.start_in_flight = false;
         self.reload(window, cx);
+        self.settle_batch_start(&outcome.applied);
         if !skipped_dirty.is_empty() {
             window.push_notification(
                 Notification::info(skipped_dirty_message(&skipped_dirty)),
@@ -512,18 +806,6 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn commit_bulk_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<String> = self
-            .libraries
-            .read(cx)
-            .delegate()
-            .checked_rows()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect();
-        self.stop_ids(&ids, window, cx);
-    }
-
     pub(crate) fn stop_selected_rows(
         &mut self,
         ids: &[String],
@@ -567,6 +849,7 @@ impl AppView {
             }
         }
         self.reload(window, cx);
+        self.settle_batch_stop();
         if failed.is_empty() {
             if stopped.is_empty() {
                 window.push_notification(Notification::info(t!("stop-bulk-empty")), cx);
@@ -600,43 +883,118 @@ impl AppView {
         }
     }
 
-    /// K17 ruling (spec line 91): bulk More ▾ Delete is immediate — the
-    /// blocking confirm is gone, and the K5 delete→undo pipeline is the only
-    /// safety net (same stash, one batched Undo toast).
-    pub(crate) fn bulk_delete_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.libraries.read(cx).delegate().checked_rows();
-        if rows.is_empty() {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        }
-        let targets: Vec<(String, String)> = rows
-            .iter()
-            .map(|row| (row.id.clone(), row.name.clone()))
-            .collect();
-        self.commit_bulk_delete(&targets, window, cx);
-    }
-
-    /// Delete from the row menu or the Delete key. One row still asks its own
-    /// confirm; more than one is the bulk path (K17): immediate, one Undo toast.
+    /// The signed delete split: one row goes at once, two or more confirm
+    /// first. A row a filter hides still counts — the selection is not a
+    /// visible-row set.
     pub(crate) fn delete_selected_rows(
         &mut self,
         ids: &[String],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let [id] = ids {
-            self.open_remove_for_row(id, window, cx);
-            return;
+        match ids {
+            [] => {
+                window.push_notification(Notification::info(no_selection_message()), cx);
+            }
+            [id] => {
+                self.delete_row_immediately(id, window, cx);
+            }
+            _ => {
+                self.open_bulk_delete_confirm(ids, window, cx);
+            }
         }
+    }
+
+    /// The batch bar's Delete: the same split, on the selection.
+    pub(crate) fn delete_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        self.delete_selected_rows(&ids, window, cx);
+    }
+
+    /// One row deletes at once; the Undo toast is the safety net.
+    pub(crate) fn delete_row_immediately(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_remove(id, window, cx);
+        self.clear_selection(window, cx);
+    }
+
+    /// Two or more: one confirm that names the rows, the running count and
+    /// the subscription count.
+    pub(crate) fn open_bulk_delete_confirm(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let names: Vec<String> = ids
+            .iter()
+            .filter_map(|id| self.row_config(id))
+            .map(|row| row.name)
+            .collect();
+        let running = ids.iter().filter(|id| self.engine.is_running(id)).count();
+        let subscribed = ids
+            .iter()
+            .filter(|id| {
+                self.row_config(id)
+                    .is_some_and(|row| row.subscription_id.is_some())
+            })
+            .count();
+        let first = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        let extra = names.len().saturating_sub(3);
+        let more = if extra > 0 {
+            t!("delete-more", count = extra)
+        } else {
+            String::new()
+        };
+        let title = t!("delete-title", count = ids.len());
+        let description = t!(
+            "delete-body",
+            names = first,
+            more = more,
+            running = running,
+            subs = subscribed
+        );
+        let ids_for_commit = ids.to_vec();
+        open_app_alert_dialog(window, cx, move |alert, _, _| {
+            let view = view.clone();
+            let ids = ids_for_commit.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text(t!("action-label-delete"))
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .title(title.clone())
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.commit_bulk_delete_ids(&ids, window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// The confirmed delete: every row goes, and one Undo toast covers them.
+    pub(crate) fn commit_bulk_delete_ids(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let targets: Vec<(String, String)> = ids
             .iter()
             .filter_map(|id| self.row_config(id))
             .map(|row| (row.id, row.name))
             .collect();
-        if targets.is_empty() {
-            window.push_notification(Notification::info(no_selection_message()), cx);
-            return;
-        }
         self.commit_bulk_delete(&targets, window, cx);
     }
 
@@ -656,7 +1014,7 @@ impl AppView {
                 continue;
             }
             // K17: the whole row is captured BEFORE removal — one batch key
-            // covers the whole checked set through the same stash the
+            // covers the whole selection through the same stash the
             // single-row delete uses, so expiry stays permanent and Undo
             // restores names + groups at once.
             let captured = self.store.get(id).ok().flatten();
@@ -671,12 +1029,12 @@ impl AppView {
             }
         }
         self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().clear_checked();
+            state.delegate_mut().clear_facets();
             list_cx.notify();
         });
+        self.clear_selection(window, cx);
         self.reload(window, cx);
 
-        window.focus(&self.focus, cx);
         if targets.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -693,14 +1051,7 @@ impl AppView {
     }
 
     pub(crate) fn open_bulk_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<String> = self
-            .libraries
-            .read(cx)
-            .delegate()
-            .checked_rows()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect();
+        let ids = self.selected_ids_in_visible_order(cx);
         self.open_move_ids_dialog(ids, window, cx);
     }
 

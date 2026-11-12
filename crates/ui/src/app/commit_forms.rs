@@ -75,10 +75,9 @@ impl AppView {
                 self.reload(window, cx);
                 // F12: the new row is the confirmation. A filter that hides
                 // it leaves the previous selection alone.
-                self.libraries.update(cx, |list_state, list_cx| {
-                    select_first_visible(list_state, &[created_id], window, list_cx);
-                    list_cx.notify();
-                });
+                if self.visible_row_ids(cx).iter().any(|id| id == &created_id) {
+                    self.select_row(&created_id, cx);
+                }
                 window.push_notification(Notification::success(message), cx);
                 true
             }
@@ -1725,40 +1724,47 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_attach(
+    /// The selection's attach: the same preset, applied to every selected
+    /// config. One message names the count.
+    pub(crate) fn commit_preset_attach_ids(
         &mut self,
-        config_id: &str,
+        config_ids: &[String],
         preset_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self
-            .store
-            .set_config_preset(config_id, preset_id.as_deref())
-        {
-            Ok(row) => {
-                self.reload(window, cx);
-                let message = match preset_id {
-                    Some(_) => {
-                        let name = self
-                            .preset_name_for(row.preset_id.as_deref())
-                            .unwrap_or_else(|| "preset".to_string());
-                        t!(
-                            "preset-attached-toast",
-                            row = row.name.as_str(),
-                            name = name.as_str()
-                        )
-                    }
-                    None => t!("preset-detached-toast", row = row.name.as_str()),
-                };
-                window.push_notification(Notification::success(message), cx);
-                window.close_all_dialogs(cx);
-                reclaim_shell_focus(window, cx);
-            }
-            Err(error) => {
-                self.report_save_error(error, window, cx);
+        let mut failed: Vec<String> = Vec::new();
+        for id in config_ids {
+            if self
+                .store
+                .set_config_preset(id, preset_id.as_deref())
+                .is_err()
+            {
+                failed.push(id.clone());
             }
         }
+        self.reload(window, cx);
+        if failed.is_empty() {
+            let name = preset_id
+                .as_deref()
+                .and_then(|id| self.preset_name_for(Some(id)))
+                .unwrap_or_else(|| "preset".to_string());
+            window.push_notification(
+                Notification::success(t!(
+                    "preset-attached-toast-many",
+                    count = config_ids.len(),
+                    name = name
+                )),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::warning(t!("preset-attach-failed", count = failed.len())),
+                cx,
+            );
+        }
+        window.close_all_dialogs(cx);
+        reclaim_shell_focus(window, cx);
     }
 
     /// Remove: blocked while any preset references the set (loud inline), the

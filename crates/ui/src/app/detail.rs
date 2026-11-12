@@ -188,7 +188,7 @@ impl AppView {
 
     /// F19: Esc and the close button shut the inspector in BOTH presentations
     /// and hand focus back to the list. It reports whether it closed
-    /// anything, so the caller can leave the checked set alone — one overlay
+    /// anything, so the caller can leave the selection alone - one overlay
     /// layer per Esc.
     pub(crate) fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.inspector_visible {
@@ -1572,64 +1572,73 @@ impl AppView {
         }
     }
 
-    pub(crate) fn row_context_menu(
+    /// R31: the row's `More` menu. The order is exhaustive and signed: every
+    /// verb the surface map gives a row lives here, and nothing is dropped.
+    ///
+    /// The menu acts on the row it was opened on, unless that row is part of a
+    /// multi-selection — then the verb that widens to the set widens.
+    pub(crate) fn row_more_menu(
         menu: PopupMenu,
         row_id: &str,
         view: &Entity<AppView>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let multi_count = view
-            .read(cx)
-            .libraries
-            .read(cx)
-            .delegate()
-            .selected_ids()
-            .len();
-        let multi_count = if view
-            .read(cx)
-            .libraries
-            .read(cx)
-            .delegate()
-            .is_selected(row_id)
-        {
-            multi_count
-        } else {
-            1
+        let multi_count = {
+            let app = view.read(cx);
+            if app.is_selected(row_id) {
+                app.selection_count()
+            } else {
+                1
+            }
         };
-        // K8/A6-2: 7 core verbs at top level (Reset… is its own submenu) and
-        // the demoted row chores behind `More ▾`. Speedtest / Resolve Out-IP /
-        // Resolve domain are retired (K8): they appear in no menu at all.
-        let menu = ["start", "stop", "test", "copy-proxy", "edit"]
+        let mut menu = ["start", "stop", "test"]
             .into_iter()
             .fold(menu, |menu, id| {
                 menu.item(Self::row_context_item(id, row_id, view, multi_count))
             });
+        menu = menu
+            .item(Self::row_context_item("edit", row_id, view, multi_count))
+            .item(Self::row_context_item(
+                "copy-urls",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("move", row_id, view, multi_count))
+            .item(Self::row_context_item(
+                "assign-preset",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("logs", row_id, view, multi_count))
+            .item(Self::row_context_item("share", row_id, view, multi_count))
+            .item(Self::row_context_item(
+                "duplicate",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("ping", row_id, view, multi_count));
         let reset_id = row_id.to_string();
         let reset_view = view.clone();
-        let menu = menu
-            .submenu(t!("rowctx-reset"), window, cx, move |menu, _, _| {
-                ["reset-traffic", "reset-usage"]
-                    .into_iter()
-                    .fold(menu, |menu, id| {
-                        menu.item(Self::context_menu_item(id, &reset_id, &reset_view, None))
-                    })
-            })
-            .item(Self::row_context_item("delete", row_id, view, multi_count));
-        let more_id = row_id.to_string();
-        let more_view = view.clone();
-        menu.submenu(t!("rowctx-more"), window, cx, move |menu, _, _| {
-            ["move", "copy-urls", "share", "duplicate", "ping"]
+        menu = menu.submenu(t!("rowctx-reset"), window, cx, move |menu, _, _| {
+            ["reset-traffic", "reset-usage"]
                 .into_iter()
                 .fold(menu, |menu, id| {
-                    menu.item(Self::row_context_item(
-                        id,
-                        &more_id,
-                        &more_view,
-                        multi_count,
-                    ))
+                    menu.item(Self::context_menu_item(id, &reset_id, &reset_view, None))
                 })
-        })
+        });
+        menu = menu
+            .item(Self::row_context_item(
+                "auto-start",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("delete", row_id, view, multi_count));
+        menu
     }
 
     /// K1/A4-8: the operate row's overflow — ONE `…` trigger holding the five

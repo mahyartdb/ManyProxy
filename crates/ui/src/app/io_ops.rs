@@ -24,6 +24,28 @@ impl AppView {
         window.push_notification(Notification::success(t!("copied-proxy-urls")), cx);
     }
 
+    /// The chip's chevron: the HTTP form of the row's endpoint.
+    pub(crate) fn copy_row_http(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
+            return;
+        };
+        let (_, http) = proxy_urls(&config.bind_ip, config.port);
+        cx.write_to_clipboard(ClipboardItem::new_string(http));
+        window.push_notification(Notification::success(t!("copied-http-url")), cx);
+    }
+
+    /// The chip's chevron: both forms, SOCKS first, one per line.
+    pub(crate) fn copy_row_both(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
+            return;
+        };
+        let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
+        window.push_notification(Notification::success(t!("copied-proxy-urls")), cx);
+    }
+
     pub(crate) fn copy_selected_urls(
         &mut self,
         ids: &[String],

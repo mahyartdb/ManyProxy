@@ -100,12 +100,14 @@ impl AppView {
         self.start_in_flight = true;
         let Ok(Some(config)) = self.store.get(id) else {
             self.start_in_flight = false;
+            self.settle_batch_start(&[]);
             return;
         };
 
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
             window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
+            self.settle_batch_start(&[]);
             return;
         };
         let was_running = self.engine.is_running(id);
@@ -148,6 +150,12 @@ impl AppView {
             }
         }
         self.start_in_flight = false;
+        let applied: Vec<String> = if self.engine.is_running(id) {
+            vec![id.to_string()]
+        } else {
+            Vec::new()
+        };
+        self.settle_batch_start(&applied);
     }
 
     pub(crate) fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -90,7 +90,7 @@ toolbar-starting-tip = Starting every endpoint…
 
 # Status strip
 status-clear-search = Clear search
-status-clear-search-tip = Clear the search query (keeps facet filters and checked)
+status-clear-search-tip = Clear the search query (keeps the facet filters)
 status-palette-hint = Command palette (Ctrl+K)
 status-update-hint = Update available — choose Check for updates… from the action bar's overflow menu
 status-count =
@@ -107,21 +107,6 @@ health-count = health { $live } live · { $dead } dead
 traffic-totals = out { $tx } · in { $rx }
 
 # Bulk bar
-bulk-tooltip = Blue wash = selected (F5). Blue bar + filled checkbox = checked (bulk).
-bulk-start = Start
-bulk-start-tip = Start every checked endpoint
-bulk-stop = Stop
-bulk-stop-tip = Stop every checked endpoint
-bulk-more = More
-bulk-more-aria = More bulk actions
-bulk-more-tip = Move, copy, or delete the checked rows
-bulk-check-visible = Check all visible
-bulk-uncheck-all = Uncheck all
-bulk-move = Move to group
-bulk-copy-proxies = Copy proxies
-bulk-delete = Delete
-bulk-checked = { $checked } checked (of { $visible })
-bulk-checked-selected = { $checked } checked · { $selected } selected (of { $visible })
 
 # Library columns
 column-group = Group
@@ -176,7 +161,7 @@ facet-auto-clear = Auto-clear unavailable
 facet-auto-clear-tip = Opt-in per group: after this group's URL test ends, its unavailable rows are removed automatically. Running rows and the row being edited are never removed; enabling asks its own confirmation.
 facet-auto-clear-aria = Auto-clear unavailable rows in group "{ $group }" after group tests
 facet-clear = Clear facet filters
-facet-clear-tip = Clear the group, status, and latency filters (keeps search and checked)
+facet-clear-tip = Clear the group, status, and latency filters (keeps search and the selection)
 facet-tip = Filter by { $dimension }: { $active } · { $visible } of { $total } shown
 facet-all-groups = All groups ({ $total })
 facet-group-all = Group: All
@@ -214,19 +199,9 @@ library-no-matches = No matches — Clear search
 library-empty-title = No proxy configurations yet
 library-empty-text = Add one proxy, or use Import for many at once.
 library-no-upstream = no upstream
-row-checked-aria = Checked { $name } (bulk action target)
-row-check-aria = Check { $name } for bulk actions
 row-bind-tip = Serve bind address { $bind }
 row-port-tip = Local endpoint { $bind }:{ $port } — edit it in the inspector
 row-port-aria = Local port { $port } on { $bind }
-row-copy-socks = Copy SOCKS
-row-copy-socks-aria = Copy SOCKS URL for { $name }
-row-copy-socks-tip = Copy this row's SOCKS proxy URL only — socks5://{ $bind }:{ $port }
-row-lamp-active-tip = { $label } · click to stop filtering
-row-lamp-idle-tip = { $label } · click to show only { $status } rows
-lamp-failed = Failed — { $name } (dead while serving)
-lamp-serving = Serving — { $name }
-lamp-stopped = Stopped — { $name }
 
 # Row context menus
 rowctx-multi-start = Start { $count } configurations
@@ -309,6 +284,8 @@ restore-requires-clause = Restore requires a matching ManyProxy export (schema m
 restore-description = This replaces the current library with the exported backup (row ids, groups, enabled flags, subscriptions, and deletions are restored exactly). { $clause }
 
 # Row columns dialog
+columns-protocol = Protocol
+columns-protocol-tip = Show the config's protocol on each row
 columns-upstream = Upstream
 columns-upstream-tip = Show the upstream host:port on each row
 columns-health = Health
@@ -989,7 +966,7 @@ settings-appearance-tip-dark = Dark theme
 settings-appearance-tip-light = Light theme
 settings-appearance-tip-system = Follow the Windows app theme
 settings-accent = Accent color
-settings-accent-help = Tints selection, checked controls, and the focus ring. Health and error colors stay fixed.
+settings-accent-help = Tints selection, batch actions, and the focus ring. Health and error colors stay fixed.
 settings-accent-aria = { $accent } accent
 settings-text-size = Text size
 settings-text-size-help = Scales the window's text from 100% to 150%; the library row pitch and the minimum window size stay fixed.
@@ -1081,7 +1058,12 @@ shortcut-inspector-logs = Inspector logs
 shortcut-inspector-links = Inspector links
 shortcut-inspector-traffic = Inspector traffic
 shortcut-toggle-inspector = Toggle inspector
-shortcut-uncheck-all = Uncheck all
+shortcut-focus-up = Move focus up
+shortcut-focus-down = Move focus down
+shortcut-focus-first = Move focus to first row
+shortcut-focus-last = Move focus to last row
+shortcut-toggle-focused = Toggle focused row
+shortcut-clear-selection = Clear selection
 shortcut-copy-urls = Copy URLs
 shortcut-command-palette = Command palette
 shortcut-update-group = Update the group in focus
@@ -1114,7 +1096,7 @@ corners-rounded-explanation = Round the window's outer corners.
 corners-small-explanation = Use the smaller Windows 11 corner radius.
 corners-square-explanation = Square off the window's outer corners.
 test-scope-running = Every running endpoint
-test-scope-checked = Checked endpoints only
+test-scope-checked = Selected endpoints only
 
 # Inspector
 detail-start-tip = Start the selected endpoint (F5)
@@ -1434,7 +1416,7 @@ probe-timeout-invalid = The probe timeout must be a whole number of seconds ({ $
 probe-timeout-set = Probe timeout set to { $secs } seconds
 probe-timeout-failed = Probe timeout change failed: { $error }
 test-all-scope-running-toast = Test all covers every running endpoint
-test-all-scope-checked-toast = Test all covers the checked endpoints only
+test-all-scope-checked-toast = Test all covers the selected endpoints only
 test-all-scope-failed = Test-all scope change failed: { $error }
 bind-host-added = Added { $host }
 bind-host-removed = Removed { $host }
@@ -1451,14 +1433,10 @@ bulk-start-unreadable = { $count } configuration(s) not started (could not read)
 bulk-start-flag-failed = { $count } started but the enabled flag could not be saved: { $names }
 bulk-start-failed = Started { $started }, { $count } failed: { $joined }
 bulk-start-refused = Could not start { $requested } configuration(s): { $detail } (nothing new started)
-bulk-copy-proxies-toast = Copied { $copied } proxies
-bulk-copy-proxies-skipped = Copied { $copied } proxies ({ $skipped } checked rows are stopped and were skipped)
-bulk-copy-nothing = No running endpoint to copy
-bulk-copy-nothing-skipped = No running endpoint to copy ({ $skipped } checked rows are stopped and were skipped)
 no-selection = Select a configuration first
 start-busy = Starting… already in progress
 start-bulk-started = Started { $count } configuration(s)
-stop-bulk-empty = Nothing to stop — no checked endpoints are running
+stop-bulk-empty = Nothing to stop - no selected endpoints are running
 stop-bulk-stopped = Stopped { $count } configuration(s)
 stop-bulk-failed = Stop failed for { $count } configuration(s): { $names }
 stop-bulk-partial = Stopped { $stopped }, { $failed } failed: { $names }
@@ -1578,7 +1556,6 @@ action-label-paste-import = Import from clipboard
 action-label-export-library = Export library
 action-label-open-palette = Command palette
 action-label-focus-search = Focus search field
-action-label-clear-checked = Clear checked
 action-label-update-current-group = Update current group
 action-label-stop-testing = Stop testing
 action-label-start-all = Start all
@@ -1655,3 +1632,74 @@ autostart-write-not-stuck = autostart write did not stick
 preset-simple-example-direct = domain:example.com, suffix:cn
 preset-simple-example-block = keyword:ads, processName:updater.exe
 preset-simple-example-proxy = ruleset:streaming, domain:netflix.com
+
+# Batch bar (slice 2: the one selection model)
+selection-count =
+    { $count ->
+        [one] 1 selected
+       *[other] { $count } selected
+    }
+selection-running =
+    { $count ->
+        [one] 1 running
+       *[other] { $count } running
+    }
+selection-hidden =
+    { $count ->
+        [one] 1 hidden
+       *[other] { $count } hidden
+    }
+selection-hidden-tip = Clear filters to show the selected configs
+selection-clear = Clear selection
+batch-starting = Starting { $done } of { $total }
+batch-result = { $ok } ok · { $failed } failed
+batch-stopping = Stopping { $done } of { $total }
+batch-testing = Testing { $done } of { $total }
+batch-show-failures = Show failures
+batch-show-failures-tip = Show only the rows the last batch failed on
+batch-more-aria = More batch actions
+batch-more-tip = Copy, move, preset, reset or delete the selected configs
+batch-more-copy = Copy endpoints
+batch-more-start = Start with ManyProxy
+batch-more-dont-start = Don't start with ManyProxy
+batch-more-move = Move to group
+batch-more-preset = Assign preset
+
+# Delete (the signed split: one row at once, two or more confirm)
+delete-title =
+    { $count ->
+        [one] Delete 1 config?
+       *[other] Delete { $count } configs?
+    }
+delete-body = { $names }{ $more } · { $running } running · { $subs } from a subscription
+delete-more =
+    { $count ->
+        [one] , and 1 more
+       *[other] , and { $count } more
+    }
+
+# Endpoint chip
+copy-socks = Copy SOCKS
+copy-http = Copy HTTP
+copy-both = Copy both
+endpoint-chip-tip = Click to copy SOCKS
+endpoint-chip-menu-aria = More endpoint formats
+copied-http-url = HTTP URL copied
+
+# Row menu
+row-more-aria = More actions for this config
+row-more-tip = More actions for this config
+
+# Density
+density-comfortable = Density: Comfortable
+density-compact = Density: Compact
+settings-density = Row density
+settings-density-help = Comfortable rows are 36px; compact rows are 30px. The bars follow.
+density-save-failed = Could not save the row density: { $error }
+action-label-clear-selection = Clear selection
+action-label-density-comfortable = Density: Comfortable
+action-label-density-compact = Density: Compact
+action-label-assign-preset = Assign preset
+action-tip-assign-preset = Attach a routing preset to this config
+preset-attached-toast-many = Preset attached to { $count } configs
+preset-attach-failed = The preset could not be attached to { $count } configs

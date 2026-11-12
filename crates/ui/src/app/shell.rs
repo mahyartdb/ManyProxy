@@ -32,9 +32,9 @@ impl AppView {
                 shortcut_action(view, "stop-testing", window, cx);
             }))
             // Escape reaches here with a dialog open on purpose: clearing the
-            // check is the one shortcut the overlay does not own.
-            .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
-                run_action(view, "clear-checked", ActionTarget::Selection, window, cx);
+            // selection is the one shortcut the overlay does not own.
+            .on_action(cx.listener(|view, _: &ClearSelection, window, cx| {
+                run_action(view, "clear-selection", ActionTarget::Selection, window, cx);
             }))
             .on_action(cx.listener(|view, _: &OpenPalette, window, cx| {
                 shortcut_action(view, "open-palette", window, cx);
@@ -56,6 +56,21 @@ impl AppView {
             }))
             .on_action(cx.listener(|view, _: &SelectNextRow, window, cx| {
                 view.extend_selection_by(1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusPreviousRow, window, cx| {
+                view.move_focus(-1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusNextRow, window, cx| {
+                view.move_focus(1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusFirstRow, window, cx| {
+                view.focus_first_row(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusLastRow, window, cx| {
+                view.focus_last_row(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ToggleFocused, _window, cx| {
+                view.toggle_focused_row(cx);
             }))
             .on_action(cx.listener(|view, _: &SelectAllRows, window, cx| {
                 view.select_all_visible(window, cx);

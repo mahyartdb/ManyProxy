@@ -1,7 +1,7 @@
 //! The SQLite store: schema, queries, DPAPI-sealed secrets and the data dir.
 //! Belongs: every row/subscription/settings read and write plus their error types.
 //! Not here: UI state, engine processes, dialog strings.
-use crate::library::{LatencyFacet, LibraryColumns};
+use crate::library::{Density, LatencyFacet, LibraryColumns};
 use crate::secret::Secret;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -307,7 +307,7 @@ pub enum TestAllScope {
     /// Every running endpoint — the behaviour the app shipped with.
     #[default]
     Running,
-    /// Only the endpoints whose rows are checked.
+    /// Only the endpoints whose rows are selected.
     Checked,
 }
 
@@ -330,7 +330,7 @@ impl TestAllScope {
     pub fn label(self) -> &'static str {
         match self {
             TestAllScope::Running => "Every running endpoint",
-            TestAllScope::Checked => "Checked endpoints only",
+            TestAllScope::Checked => "Selected endpoints only",
         }
     }
 }
@@ -8554,6 +8554,21 @@ impl Store {
 
     pub fn set_latency_facet(&mut self, facet: LatencyFacet) -> Result<(), StoreError> {
         self.set_meta(Self::META_LATENCY_FACET, &facet.to_json())
+    }
+
+    /// The row density. A missing or unknown value reads as comfortable, so a
+    /// corrupt payload can only reset the pitch, never hide the table.
+    pub const META_ROW_DENSITY: &str = "row_density";
+
+    pub fn row_density(&self) -> Density {
+        match self.get_meta(Self::META_ROW_DENSITY) {
+            Ok(Some(raw)) => Density::from_token(&raw).unwrap_or_default(),
+            _ => Density::default(),
+        }
+    }
+
+    pub fn set_row_density(&mut self, density: Density) -> Result<(), StoreError> {
+        self.set_meta(Self::META_ROW_DENSITY, density.token())
     }
 
     pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";

@@ -117,8 +117,10 @@ pub fn sort_header_keys(column: &str) -> &'static [LibrarySortKey] {
     }
 }
 
-/// The movable columns, in their default order. The lamp/check gutter and the
-/// name stay pinned left; the copy action stays pinned right.
+/// The movable columns, in their default order. The endpoint, health and
+/// group columns lead, because the signed row reads Name, Endpoint, Health,
+/// Group; the name stays pinned left and the trailing actions stay pinned
+/// right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryColumn {
     Group,
@@ -131,11 +133,11 @@ pub enum LibraryColumn {
 
 impl LibraryColumn {
     pub const ALL: [LibraryColumn; 6] = [
+        LibraryColumn::Endpoint,
+        LibraryColumn::Health,
         LibraryColumn::Group,
         LibraryColumn::Protocol,
         LibraryColumn::Upstream,
-        LibraryColumn::Endpoint,
-        LibraryColumn::Health,
         LibraryColumn::Traffic,
     ];
 
@@ -359,6 +361,7 @@ impl LibraryColumns {
 /// measure the label against the row cell it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowColumns {
+    pub protocol: bool,
     pub upstream: bool,
     pub health: bool,
     pub group: bool,
@@ -368,22 +371,24 @@ pub struct RowColumns {
 impl Default for RowColumns {
     fn default() -> Self {
         Self {
-            upstream: true,
+            protocol: false,
+            upstream: false,
             health: true,
-            group: false,
+            group: true,
             traffic: false,
         }
     }
 }
 
 impl RowColumns {
-    pub const ORDER: [&'static str; 4] = ["upstream", "health", "group", "traffic"];
+    pub const ORDER: [&'static str; 5] = ["protocol", "upstream", "health", "group", "traffic"];
 
     pub fn parse(raw: &str) -> Self {
         if raw.trim().is_empty() {
             return Self::default();
         }
         let mut columns = Self {
+            protocol: false,
             upstream: false,
             health: false,
             group: false,
@@ -391,6 +396,7 @@ impl RowColumns {
         };
         for token in raw.split(',').map(str::trim) {
             match token {
+                "protocol" => columns.protocol = true,
                 "upstream" => columns.upstream = true,
                 "health" => columns.health = true,
                 "group" => columns.group = true,
@@ -402,12 +408,13 @@ impl RowColumns {
     }
 
     pub fn display(self) -> String {
-        if !self.upstream && !self.health && !self.group && !self.traffic {
+        if !self.protocol && !self.upstream && !self.health && !self.group && !self.traffic {
             return "none".to_string();
         }
-        let mut names = Vec::with_capacity(4);
+        let mut names = Vec::with_capacity(5);
         for name in Self::ORDER {
             let enabled = match name {
+                "protocol" => self.protocol,
                 "upstream" => self.upstream,
                 "health" => self.health,
                 "group" => self.group,
@@ -631,7 +638,7 @@ mod tests {
         assert!(layout.move_column(LibraryColumn::Traffic, LibraryColumn::Group, false));
         let parsed = LibraryColumns::from_json(&layout.to_json());
         assert_eq!(parsed, layout, "widths and order round-trip");
-        assert_eq!(parsed.order()[0], LibraryColumn::Traffic);
+        assert_eq!(parsed.order()[2], LibraryColumn::Traffic);
 
         assert_eq!(
             LibraryColumns::from_json("not json"),
@@ -644,7 +651,7 @@ mod tests {
         assert_eq!(partial.order()[0], LibraryColumn::Traffic);
         assert_eq!(
             partial.order()[1],
-            LibraryColumn::Group,
+            LibraryColumn::Endpoint,
             "omitted columns append in canonical order"
         );
         assert_eq!(
@@ -662,11 +669,11 @@ mod tests {
         assert_eq!(
             layout.order(),
             &[
-                LibraryColumn::Group,
-                LibraryColumn::Upstream,
                 LibraryColumn::Endpoint,
                 LibraryColumn::Protocol,
                 LibraryColumn::Health,
+                LibraryColumn::Group,
+                LibraryColumn::Upstream,
                 LibraryColumn::Traffic,
             ],
             "move after the target"
