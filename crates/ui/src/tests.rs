@@ -11,6 +11,8 @@ use crate::store::{
     AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError, WindowGeometry,
 };
 use crate::AppView;
+use crate::ColumnId;
+use crate::ColumnLayout;
 use crate::ConfigForm;
 use crate::ExitTraffic;
 use gpui_kit::component::dialog::Dialog;
@@ -12435,8 +12437,7 @@ fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn r04_row_columns_dialog_toggles_and_persists(cx: &mut TestAppContext) {
-    use crate::RowColumns;
+fn r04_columns_sheet_toggles_and_persists(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -12444,32 +12445,42 @@ fn r04_row_columns_dialog_toggles_and_persists(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_row_columns_dialog(window, cx));
+        view.update(cx, |view, cx| view.open_columns_sheet(window, cx));
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
     assert!(
-        cx.update(|window, cx| window.has_active_dialog(cx)),
-        "columns dialog opens"
+        cx.update(|window, cx| window.has_active_sheet(cx)),
+        "columns sheet opens"
     );
     for id in [
-        "columns-upstream",
-        "columns-health",
-        "columns-group",
-        "columns-traffic",
-        "columns-dialog-close",
+        "columns-sheet-toggle-upstream",
+        "columns-sheet-toggle-health",
+        "columns-sheet-toggle-group",
+        "columns-sheet-toggle-name",
+        "columns-sheet-up-group",
+        "columns-sheet-down-group",
+        "columns-sheet-reset-widths",
+        "columns-sheet-reset-order",
+        "columns-sheet-reset-visibility",
+        "columns-sheet-reset-all",
+        "columns-sheet-done",
     ] {
         assert_painted(cx, id);
     }
-    assert_eq!(
-        view.read_with(cx, |view, _| view.row_columns),
-        RowColumns::default(),
-        "safe subset on by default"
+    let layout = view.read_with(cx, |view, _| view.column_layout);
+    assert!(
+        layout.is_visible(ColumnId::Health)
+            && layout.is_visible(ColumnId::Group)
+            && !layout.is_visible(ColumnId::Upstream)
+            && !layout.is_visible(ColumnId::Protocol)
+            && !layout.is_visible(ColumnId::Traffic),
+        "the signed defaults: {layout:?}"
     );
     // Upstream is off by default; turn it on so the toggle has a subject.
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_row_column("upstream", true, window, cx);
+            view.set_column_visible(ColumnId::Upstream, true, window, cx);
         });
     });
     cx.run_until_parked();
@@ -12477,28 +12488,81 @@ fn r04_row_columns_dialog_toggles_and_persists(cx: &mut TestAppContext) {
     assert_painted(cx, &format!("row-upstream-{}", seeded.id));
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_row_column("upstream", false, window, cx);
+            view.set_column_visible(ColumnId::Upstream, false, window, cx);
         });
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
-    cx.run_until_parked();
-    paint_dialog_open(cx);
     let after = view.read_with(cx, |view, cx| {
         (
-            view.row_columns,
-            view.libraries.read(cx).delegate().row_columns,
-            view.store.library_columns_raw(),
+            view.column_layout,
+            view.libraries.read(cx).delegate().row_metrics.layout,
+            view.store.library_column_layout(),
         )
     });
     assert!(
-        !after.0.upstream && after.0.health && after.0.group,
+        !after.0.is_visible(ColumnId::Upstream)
+            && after.0.is_visible(ColumnId::Health)
+            && after.0.is_visible(ColumnId::Group),
         "toggle flips one column, keeps the rest: {:?}",
         after.0
     );
     assert_eq!(after.0, after.1, "delegate mirrors the choice");
-    assert_eq!(after.2.as_deref(), Some("health,group"), "choice persists");
+    assert_eq!(after.0, after.2, "the layout key persists the choice");
     assert_absent(cx, format!("row-upstream-{}", seeded.id));
+
+    // Locked columns cannot be hidden even through the API the checkbox calls.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.set_column_visible(ColumnId::Name, false, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Name),
+        "Name is always visible"
+    );
+}
+
+/// R11: the retired `row-columns` palette id now opens the Columns sheet.
+#[gpui_kit::test]
+fn columns_palette_action_opens_the_sheet(cx: &mut TestAppContext) {
+    use crate::app::actions::{palette_action_at, PALETTE_GROUPS};
+    use gpui_kit::component::IndexPath;
+
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let (section, row) = PALETTE_GROUPS
+        .iter()
+        .enumerate()
+        .find_map(|(section, (_, ids))| {
+            ids.iter()
+                .position(|candidate| *candidate == "row-columns")
+                .map(|row| (section, row))
+        })
+        .expect("row-columns is in a palette group");
+    let op = IndexPath::new(row).section(section);
+    assert_eq!(palette_action_at(op), Some("row-columns"));
+    assert_eq!(
+        crate::t!("action-label-row-columns"),
+        "Columns…",
+        "the palette names the sheet, not the retired dialog"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.run_palette_op(op, window, cx));
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_sheet(cx)),
+        "the palette opens the columns sheet"
+    );
 }
 
 #[gpui_kit::test]
@@ -12789,45 +12853,32 @@ fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext
 /// T-05: the copy toast is honest about what it skipped.
 
 #[test]
-fn r01_row_columns_defaults_parse_and_display() {
-    use crate::RowColumns;
-    let defaults = RowColumns::default();
+fn r01_legacy_column_seed_reads_the_default_layout() {
+    let layout = ColumnLayout::default();
     assert!(
-        defaults.health
-            && defaults.group
-            && !defaults.protocol
-            && !defaults.upstream
-            && !defaults.traffic,
-        "the signed row's columns on by default: {defaults:?}"
+        layout.is_visible(ColumnId::Name)
+            && layout.is_visible(ColumnId::Endpoint)
+            && layout.is_visible(ColumnId::Health)
+            && layout.is_visible(ColumnId::Group)
+            && !layout.is_visible(ColumnId::Protocol)
+            && !layout.is_visible(ColumnId::Upstream)
+            && !layout.is_visible(ColumnId::Traffic),
+        "the signed defaults: {layout:?}"
     );
-    assert_eq!(defaults.display(), "health,group");
-    assert_eq!(RowColumns::parse(""), defaults, "missing reads defaults");
     assert_eq!(
-        RowColumns::parse("group,traffic,bogus"),
-        RowColumns {
-            protocol: false,
-            upstream: false,
-            health: false,
-            group: true,
-            traffic: true,
+        layout.order(),
+        &ColumnId::ALL,
+        "Name, Endpoint, Health, Group, Protocol, Upstream, Traffic"
+    );
+    assert_eq!(
+        ColumnLayout::seed_from_legacy("upstream,health"),
+        {
+            let mut seeded = ColumnLayout::default();
+            seeded.set_hidden(ColumnId::Group, true);
+            seeded.set_hidden(ColumnId::Upstream, false);
+            seeded
         },
-        "unknown tokens ignored, missing means off"
-    );
-    assert_eq!(
-        RowColumns::parse("none"),
-        RowColumns {
-            protocol: false,
-            upstream: false,
-            health: false,
-            group: false,
-            traffic: false,
-        },
-        "all-off persists as none"
-    );
-    assert_eq!(
-        RowColumns::parse(&defaults.display()),
-        defaults,
-        "display round-trips"
+        "the retired token list seeds visibility once"
     );
 }
 
@@ -21292,46 +21343,53 @@ fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppCon
     assert_painted(cx, "detail-serving");
 }
 
-/// F2: upstream is the optional cell the width budget gives up. With the
-/// default row (name, endpoint, health, group) it needs 780px; at 740 it is
-/// gone, so the 640 floor never overflows.
+/// R11: the table never hides a visible column to make the widths fit. The
+/// default set plus Upstream exceeds 740px, so the content scrolls instead.
 #[test]
-fn t03_row_budget_drops_upstream_at_the_floor() {
-    use crate::{LibraryColumns, RowColumns, RowMetrics};
+fn t03_row_metrics_keep_every_visible_column() {
+    use crate::{ColumnId, ColumnLayout, RowMetrics};
 
-    let columns = RowColumns {
-        upstream: true,
-        ..RowColumns::default()
-    };
-    let layout = LibraryColumns::default();
-    let at_780 = RowMetrics::for_table_width(780., columns, layout);
-    assert!(at_780.show_upstream, "upstream fits at 780");
-    assert!(at_780.show_health, "health is never budgeted away");
+    let mut layout = ColumnLayout::default();
+    layout.set_hidden(ColumnId::Upstream, false);
+    let at_740 = RowMetrics::for_table_width(740., layout);
+    assert!(
+        at_740.column_visible(ColumnId::Upstream),
+        "upstream stays visible at 740"
+    );
+    assert!(
+        at_740.column_visible(ColumnId::Health),
+        "health is never budgeted away"
+    );
+    assert!(
+        layout.content_width(740.) > 740.,
+        "a too-wide table scrolls instead of dropping a column"
+    );
 
-    let at_740 = RowMetrics::for_table_width(740., columns, layout);
-    assert!(!at_740.show_upstream, "upstream drops at 740");
-    assert!(at_740.show_health, "health is never budgeted away");
-
-    // Name, endpoint, health and group never drop. The row that remains once
-    // upstream is gone fits the floor with room to spare.
-    let min_row = RowMetrics::LEAD
-        + RowMetrics::NAME_MIN
-        + RowMetrics::ENDPOINT
-        + RowMetrics::HEALTH
-        + RowMetrics::GROUP
-        + RowMetrics::ACTIONS
-        + 5. * RowMetrics::GAP;
-    assert_eq!(min_row, 610.);
-    assert!(min_row <= RowMetrics::TABLE_MIN);
-    assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 758.);
+    // The default visible set (Name, Endpoint, Health, Group) still fits the
+    // floor with the leading and trailing reserves.
+    let default_content = ColumnLayout::default().content_width(740.);
+    assert!(
+        default_content <= 740.,
+        "the signed default fits the floor: {default_content}"
+    );
+    assert_eq!(
+        RowMetrics::for_table_width(740., ColumnLayout::default()).column_width(ColumnId::Name),
+        740. - RowMetrics::LEAD
+            - RowMetrics::ACTIONS
+            - RowMetrics::ENDPOINT
+            - RowMetrics::HEALTH
+            - RowMetrics::GROUP
+            - 3. * RowMetrics::GAP,
+        "an unset Name absorbs the leftover"
+    );
 }
 
-/// T-03: one gesture from edge to edge: the delegate follows every move, the
+/// T-03: one gesture from edge to edge: the app layout follows every move, the
 /// store only hears about the final width, and a double-click restores the
 /// computed default.
 #[gpui_kit::test]
 fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppContext) {
-    use crate::{LibraryColumn, RowMetrics};
+    use crate::{ColumnId, RowMetrics};
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -21347,7 +21405,11 @@ fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppCont
 
     assert_eq!(
         view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().row_metrics.health
+            view.libraries
+                .read(cx)
+                .delegate()
+                .row_metrics
+                .column_width(ColumnId::Health)
         }),
         RowMetrics::HEALTH,
         "the persisted default starts at the computed width"
@@ -21356,10 +21418,12 @@ fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppCont
     drag_column_edge(cx, "column-resize-health", 40.);
     let (live, saved) = view.read_with(cx, |view, cx| {
         (
-            view.libraries.read(cx).delegate().row_metrics.health,
-            view.store
-                .library_column_layout()
-                .width(LibraryColumn::Health),
+            view.libraries
+                .read(cx)
+                .delegate()
+                .row_metrics
+                .column_width(ColumnId::Health),
+            view.store.library_column_layout().width(ColumnId::Health),
         )
     });
     assert_eq!(live, RowMetrics::HEALTH + 40., "the row and header reflow");
@@ -21367,21 +21431,27 @@ fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppCont
 
     drag_column_edge(cx, "column-resize-endpoint", -500.);
     let endpoint = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().row_metrics.endpoint
+        view.libraries
+            .read(cx)
+            .delegate()
+            .row_metrics
+            .column_width(ColumnId::Endpoint)
     });
     assert_eq!(
         endpoint,
-        LibraryColumn::Endpoint.min_width(),
+        ColumnId::Endpoint.min_width(),
         "a drag past the floor stops at the column minimum"
     );
 
     double_click_column_edge(cx, "column-resize-health");
     let (live, saved) = view.read_with(cx, |view, cx| {
         (
-            view.libraries.read(cx).delegate().row_metrics.health,
-            view.store
-                .library_column_layout()
-                .width(LibraryColumn::Health),
+            view.libraries
+                .read(cx)
+                .delegate()
+                .row_metrics
+                .column_width(ColumnId::Health),
+            view.store.library_column_layout().width(ColumnId::Health),
         )
     });
     assert_eq!(
@@ -21392,12 +21462,12 @@ fn t03_column_drag_resizes_persists_and_double_click_resets(cx: &mut TestAppCont
     assert_eq!(saved, RowMetrics::HEALTH, "the reset persists");
 }
 
-/// T-03: the keyboard/a11y route. A sortable header's menu carries the sort
-/// keys and the width verbs together; a plain header carries only the verbs;
-/// the dialog's Reset clears every override.
+/// R11/R7: every header opens the same Explorer-style menu — two fit verbs,
+/// seven checkmarked visibility rows, and More. Locked rows are checked and
+/// disabled; the sheet's Reset All clears every override.
 #[gpui_kit::test]
-fn t03_column_width_menu_and_dialog_reset(cx: &mut TestAppContext) {
-    use crate::{LibraryColumn, LibraryColumns, RowMetrics};
+fn t03_column_header_menu_and_sheet_reset(cx: &mut TestAppContext) {
+    use crate::{ColumnId, ColumnLayout, RowMetrics};
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -21417,68 +21487,766 @@ fn t03_column_width_menu_and_dialog_reset(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     for id in [
-        "sort-header-health-latency",
-        "column-menu-health-wider",
-        "column-menu-health-narrower",
-        "column-menu-health-reset",
+        "columns-menu-size-this",
+        "columns-menu-size-all",
+        "columns-menu-name",
+        "columns-menu-endpoint",
+        "columns-menu-health",
+        "columns-menu-group",
+        "columns-menu-protocol",
+        "columns-menu-upstream",
+        "columns-menu-traffic",
+        "columns-menu-more",
     ] {
         assert_painted(cx, id);
     }
-    cx.update(|window, cx| window.click("column-menu-health-wider".to_string(), cx));
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().row_metrics.health
-        }),
-        RowMetrics::HEALTH + 16.,
-        "Wider nudges the column by one step"
-    );
+    assert_absent(cx, "sort-header-health-latency".to_string());
 
+    // Every header's menu is the same menu, Name included.
     cx.update(|window, cx| {
-        window.right_click("header-endpoint".to_string(), cx);
+        window.right_click("sort-header-name".to_string(), cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "column-menu-endpoint-wider");
-    assert_painted(cx, "column-menu-endpoint-reset");
-    assert_absent(cx, "sort-header-endpoint-none".to_string());
-    cx.update(|window, cx| window.click("column-menu-endpoint-reset".to_string(), cx));
+    assert_painted(cx, "columns-menu-size-this");
+    assert_painted(cx, "columns-menu-more");
+
+    // A visibility row flips one column and persists; Name refuses to hide.
+    cx.update(|window, cx| window.click("columns-menu-group".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let hidden = view.read_with(cx, |view, _| view.column_layout);
+    assert!(!hidden.is_visible(ColumnId::Group), "group hides");
+    assert_eq!(
+        hidden,
+        view.read_with(cx, |view, _| view.store.library_column_layout()),
+        "the hide persists"
+    );
+    assert_absent(cx, "sort-header-group".to_string());
+
+    cx.update(|window, cx| {
+        window.right_click("sort-header-name".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        view.read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Name),
+        "a disabled locked row cannot hide Name"
+    );
+
+    // Size to fit writes an explicit width; it stops Name flexing and persists.
+    cx.update(|window, cx| {
+        window.right_click("sort-header-endpoint".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-size-this".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let fitted = view.read_with(cx, |view, _| view.column_layout);
+    assert!(
+        fitted.is_custom(ColumnId::Endpoint),
+        "fit writes an explicit width"
+    );
+    assert_eq!(
+        fitted,
+        view.read_with(cx, |view, _| view.store.library_column_layout()),
+        "the fitted width persists"
+    );
+    assert!(fitted.width(ColumnId::Endpoint) >= ColumnId::Endpoint.min_width());
+
+    // More opens the sheet; Reset All restores every dimension.
+    cx.update(|window, cx| {
+        window.right_click("sort-header-health".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-more".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert!(
+        cx.update(|window, cx| window.has_active_sheet(cx)),
+        "More opens the columns sheet"
+    );
+    cx.update(|window, cx| {
+        window.click("columns-sheet-reset-all".to_string(), cx);
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let (layout, saved) = view.read_with(cx, |view, _| {
+        (view.column_layout, view.store.library_column_layout())
+    });
+    assert_eq!(
+        layout,
+        ColumnLayout::default(),
+        "Reset All clears overrides"
+    );
+    assert_eq!(saved, ColumnLayout::default(), "the reset persists");
+    assert_eq!(
+        layout.width(ColumnId::Health),
+        RowMetrics::HEALTH,
+        "the default width is back"
+    );
+}
+
+/// R11: the same Explorer menu opens on every header, Name and Endpoint are
+/// the locked rows, and the other five toggle from it.
+#[gpui_kit::test]
+fn header_menu_is_identical_on_every_column(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Menu", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.inspector_visible = false;
+            view.set_column_visible(ColumnId::Traffic, true, window, cx);
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+
+    let menu_ids = [
+        "columns-menu-size-this",
+        "columns-menu-size-all",
+        "columns-menu-name",
+        "columns-menu-endpoint",
+        "columns-menu-health",
+        "columns-menu-group",
+        "columns-menu-protocol",
+        "columns-menu-upstream",
+        "columns-menu-traffic",
+        "columns-menu-more",
+    ];
+    for header in [
+        "sort-header-name",
+        "sort-header-endpoint",
+        "sort-header-traffic",
+    ] {
+        cx.update(|window, cx| window.right_click(header.to_string(), cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in menu_ids {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| {
+            let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // Locked rows refuse; the other columns obey.
+    cx.update(|window, cx| window.right_click("sort-header-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        view.read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Name),
+        "Name cannot be hidden from the menu"
+    );
+
+    cx.update(|window, cx| window.right_click("sort-header-traffic".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-traffic".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !view
+            .read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Traffic),
+        "Traffic hides from the same menu"
+    );
+}
+
+/// R7: every visible column sorts from its header; a second click reverses it
+/// and the marker names the direction.
+#[gpui_kit::test]
+fn header_click_sorts_every_visible_column_and_reverses(cx: &mut TestAppContext) {
+    use crate::store::{LibrarySort, LibrarySortKey, SortDirection};
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    store
+        .add(row19_seed("Zulu", "b.example.com", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.inspector_visible = false;
+            view.set_column_visible(ColumnId::Protocol, true, window, cx);
+            view.set_column_visible(ColumnId::Traffic, true, window, cx);
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+
+    for (header, key) in [
+        ("sort-header-name", LibrarySortKey::Name),
+        ("sort-header-protocol", LibrarySortKey::Protocol),
+        ("sort-header-traffic", LibrarySortKey::TrafficTotal),
+    ] {
+        cx.update(|window, cx| window.click(header.to_string(), cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().sort),
+            LibrarySort::new(key, SortDirection::Ascending),
+            "{header} picks its natural key"
+        );
+        assert!(
+            label_of(header, cx).contains("asc"),
+            "{header} shows the ascending marker"
+        );
+
+        cx.update(|window, cx| window.click(header.to_string(), cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().sort),
+            LibrarySort::new(key, SortDirection::Descending),
+            "{header} reverses on the second click"
+        );
+        assert!(
+            label_of(header, cx).contains("desc"),
+            "{header} shows the descending marker"
+        );
+    }
+}
+
+/// R11: the menu's checkmarks toggle visibility and the header follows.
+#[gpui_kit::test]
+fn header_menu_checkmarks_toggle_visibility(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Toggle", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+    assert_absent(cx, "sort-header-protocol".to_string());
+
+    cx.update(|window, cx| window.right_click("sort-header-health".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-protocol".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        view.read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Protocol),
+        "Protocol is on"
+    );
+    assert_painted(cx, "sort-header-protocol");
+    assert_painted(cx, &format!("row-protocol-{}", row.id));
+
+    cx.update(|window, cx| window.right_click("sort-header-health".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-protocol".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !view
+            .read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Protocol),
+        "Protocol is off again"
+    );
+    assert_absent(cx, "sort-header-protocol".to_string());
+    assert_absent(cx, format!("row-protocol-{}", row.id));
+
+    cx.update(|window, cx| window.right_click("sort-header-health".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-group".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_absent(cx, "sort-header-group".to_string());
+    assert_absent(cx, format!("row-group-{}", row.id));
+}
+
+/// R17: fit measures every row, not the virtualized page. The long name sits
+/// far below the fold and still widens the column.
+#[gpui_kit::test]
+fn size_column_to_fit_uses_the_widest_value_not_the_visible_page(cx: &mut TestAppContext) {
+    use crate::RowMetrics;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    for index in 0..40 {
+        store
+            .add(row19_seed(
+                &format!("short {index}"),
+                "a.example.com",
+                &format!("{}", 10801 + index),
+            ))
+            .expect("seed works");
+    }
+    store
+        .add(row19_seed(
+            "A very long configuration name that lives below the virtualized fold",
+            "a.example.com",
+            "10999",
+        ))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.inspector_visible = false;
+        cx.notify();
+    });
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.right_click("sort-header-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-size-this".to_string(), cx));
     cx.run_until_parked();
     paint_frame(cx);
 
+    let layout = view.read_with(cx, |view, _| view.column_layout);
+    assert!(
+        layout.is_custom(ColumnId::Name),
+        "fit writes an explicit width"
+    );
+    assert!(
+        layout.width(ColumnId::Name) > RowMetrics::NAME_MIN + 60.,
+        "the off-screen name, not the short page, sets the width: {}",
+        layout.width(ColumnId::Name)
+    );
+}
+
+/// R11/R17: Size All fits every visible column in one write; with all seven
+/// visible the fitted table is wider than the pane and scrolls.
+#[gpui_kit::test]
+fn size_all_columns_to_fit_starts_horizontal_scroll_when_needed(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed(
+            "A configuration name long enough to widen the fitted table",
+            "a-very-long-upstream-hostname-for-fit.example.com",
+            "10801",
+        ))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.open_row_columns_dialog(window, cx);
+            view.inspector_visible = false;
+            for column in ColumnId::ALL {
+                view.set_column_visible(column, true, window, cx);
+            }
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.right_click("sort-header-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-size-all".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let layout = view.read_with(cx, |view, _| view.column_layout);
+    for column in ColumnId::ALL {
+        assert!(layout.is_visible(column), "{column:?} stays visible");
+        assert!(layout.is_custom(column), "{column:?} is fitted");
+        let id = format!("sort-header-{}", column.id());
+        assert!(
+            cx.update(|window, _| window.try_find(id.clone()).is_some()),
+            "{id} is still in the tree"
+        );
+    }
+    assert!(
+        layout.content_width(0.) > 1000.,
+        "the fitted table is wider than the frame: {}",
+        layout.content_width(0.)
+    );
+}
+
+/// R11: Name and Endpoint refuse both visibility routes; the menu row is
+/// disabled and the sheet checkbox is disabled.
+#[gpui_kit::test]
+fn locked_visibility_controls_are_disabled_in_the_sheet_and_menu(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Locked", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.right_click("sort-header-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.right_click("sort-header-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("columns-menu-endpoint".to_string(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let after_menu = view.read_with(cx, |view, _| view.column_layout);
+    assert!(after_menu.is_visible(ColumnId::Name));
+    assert!(after_menu.is_visible(ColumnId::Endpoint));
+
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_columns_sheet(window, cx)));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    cx.update(|window, cx| window.click("columns-sheet-toggle-name".to_string(), cx));
+    cx.update(|window, cx| window.click("columns-sheet-toggle-endpoint".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let after_sheet = view.read_with(cx, |view, _| view.column_layout);
+    assert!(after_sheet.is_visible(ColumnId::Name));
+    assert!(after_sheet.is_visible(ColumnId::Endpoint));
+}
+
+/// R11: the sheet's up/down buttons call the same `move_column` the header drag
+/// uses and persist on each click; locked columns still reorder.
+#[gpui_kit::test]
+fn columns_sheet_reorders_with_buttons_and_persists(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Reorder", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_columns_sheet(window, cx)));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+
+    cx.update(|window, cx| window.click("columns-sheet-down-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let moved = view.read_with(cx, |view, _| view.column_layout);
+    assert_eq!(moved.order()[0], ColumnId::Endpoint, "Endpoint moves up");
+    assert_eq!(moved.order()[1], ColumnId::Name, "Name moves down");
+    assert_eq!(
+        moved,
+        view.read_with(cx, |view, _| view.store.library_column_layout()),
+        "the button write persists"
+    );
+
+    // Locked rows are disabled; clicking them changes nothing.
+    cx.update(|window, cx| window.click("columns-sheet-toggle-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    cx.update(|window, cx| window.click("columns-sheet-toggle-endpoint".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let after = view.read_with(cx, |view, _| view.column_layout);
+    assert!(after.is_visible(ColumnId::Name), "Name stays visible");
+    assert!(
+        after.is_visible(ColumnId::Endpoint),
+        "Endpoint stays visible"
+    );
+
+    cx.update(|window, cx| window.click("columns-sheet-up-name".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| *view.column_layout.order()),
+        ColumnId::ALL,
+        "Move up restores the default order"
+    );
+}
+
+/// R11: each reset verb changes only the dimension it names; Reset All restores
+/// every default.
+#[gpui_kit::test]
+fn reset_widths_order_visibility_and_all(cx: &mut TestAppContext) {
+    use crate::RowMetrics;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Reset", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut layout = view.column_layout;
+            layout.set_width(ColumnId::Health, 140.);
+            layout.set_hidden(ColumnId::Group, true);
+            layout.set_hidden(ColumnId::Traffic, false);
+            layout.move_column(ColumnId::Traffic, ColumnId::Name, false);
+            view.commit_column_layout(layout, window, cx);
+            view.open_columns_sheet(window, cx);
         });
     });
     cx.run_until_parked();
     paint_dialog_open(cx);
-    assert_painted(cx, "columns-dialog-reset");
-    cx.update(|window, cx| window.click("columns-dialog-reset".to_string(), cx));
+
+    cx.update(|window, cx| window.click("columns-sheet-reset-widths".to_string(), cx));
     cx.run_until_parked();
     paint_dialog_open(cx);
-    let (layout, saved) = view.read_with(cx, |view, cx| {
-        (
-            view.libraries.read(cx).delegate().layout,
-            view.store.library_column_layout(),
-        )
+    let widths = view.read_with(cx, |view, _| view.column_layout);
+    assert_eq!(widths.width(ColumnId::Health), RowMetrics::HEALTH);
+    assert_eq!(widths.order()[0], ColumnId::Traffic, "order untouched");
+    assert!(!widths.is_visible(ColumnId::Group), "visibility untouched");
+    assert!(widths.is_visible(ColumnId::Traffic));
+
+    cx.update(|window, cx| window.click("columns-sheet-reset-order".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let order = view.read_with(cx, |view, _| view.column_layout);
+    assert_eq!(order.order(), &ColumnId::ALL);
+    assert!(!order.is_visible(ColumnId::Group), "visibility untouched");
+    assert!(order.is_visible(ColumnId::Traffic));
+
+    cx.update(|window, cx| window.click("columns-sheet-reset-visibility".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let visibility = view.read_with(cx, |view, _| view.column_layout);
+    assert_eq!(visibility, ColumnLayout::default());
+    assert!(visibility.is_visible(ColumnId::Group));
+    assert!(!visibility.is_visible(ColumnId::Traffic));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut layout = view.column_layout;
+            layout.set_width(ColumnId::Health, 140.);
+            layout.move_column(ColumnId::Traffic, ColumnId::Name, false);
+            view.commit_column_layout(layout, window, cx);
+        });
     });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    cx.update(|window, cx| window.click("columns-sheet-reset-all".to_string(), cx));
+    cx.run_until_parked();
+    paint_dialog_open(cx);
+    let all = view.read_with(cx, |view, _| view.column_layout);
+    assert_eq!(all, ColumnLayout::default());
     assert_eq!(
-        layout,
-        LibraryColumns::default(),
-        "the dialog clears overrides"
+        all,
+        view.read_with(cx, |view, _| view.store.library_column_layout()),
+        "Reset All persists"
     );
-    assert_eq!(saved, LibraryColumns::default(), "the reset persists");
-    assert_eq!(layout.width(LibraryColumn::Health), RowMetrics::HEALTH);
 }
 
-/// T-04: a header drag carries the column and its sort behavior. The drop line
-/// paints before release, the new order persists, and the pinned name/copy
-/// cells stay outside the movable run.
+/// R11: one horizontal scroll container owns the header and the rows, so a
+/// scroll moves both by the same amount.
+#[gpui_kit::test]
+fn horizontal_scroll_moves_header_and_rows_together(cx: &mut TestAppContext) {
+    use gpui_kit::ScrollDelta;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Scroll", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.inspector_visible = false;
+            let mut layout = view.column_layout;
+            for column in ColumnId::ALL {
+                layout.set_hidden(column, false);
+                layout.set_width(column, 200.);
+            }
+            view.commit_column_layout(layout, window, cx);
+        });
+    });
+    paint_frame_at(cx, 1100., 700.);
+
+    let header_left = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find("sort-header-name".to_string())
+                .expect("Name header renders")
+                .bounds()
+                .origin
+                .x
+                .as_f32()
+        })
+    };
+    let row_left = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find(format!("row-name-{}", row.id))
+                .expect("Name cell renders")
+                .bounds()
+                .origin
+                .x
+                .as_f32()
+        })
+    };
+    let before_header = header_left(cx);
+    let before_row = row_left(cx);
+    assert!(
+        (before_header - before_row).abs() < 1.,
+        "header and row start at the same x: {before_header} vs {before_row}"
+    );
+
+    cx.update(|window, cx| {
+        window.scroll(
+            "library-hscroll",
+            ScrollDelta::Pixels(point(px(-250.), px(0.))),
+            cx,
+        );
+    });
+    paint_frame_at(cx, 1100., 700.);
+    let after_header = header_left(cx);
+    let after_row = row_left(cx);
+    assert!(
+        before_header - after_header > 100.,
+        "the scroll moved the header left: {before_header} -> {after_header}"
+    );
+    assert!(
+        (after_header - after_row).abs() < 1.,
+        "the rows keep the header's offset: {after_header} vs {after_row}"
+    );
+}
+
+/// R11: at 1100px a wide visible layout scrolls; no column is auto-hidden.
+#[gpui_kit::test]
+fn narrow_window_never_auto_hides_a_visible_column(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Narrow", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.inspector_visible = false;
+            let mut layout = view.column_layout;
+            for column in ColumnId::ALL {
+                layout.set_hidden(column, false);
+                layout.set_width(column, 200.);
+            }
+            view.commit_column_layout(layout, window, cx);
+        });
+    });
+    paint_frame_at(cx, 1100., 700.);
+
+    for column in ColumnId::ALL {
+        let id = format!("sort-header-{}", column.id());
+        assert!(
+            cx.update(|window, _| window.try_find(id.clone()).is_some()),
+            "{id} is still in the tree"
+        );
+    }
+    let layout = view.read_with(cx, |view, _| view.column_layout);
+    assert!(
+        layout.content_width(0.) > 1100.,
+        "the layout is wider than the window and scrolls: {}",
+        layout.content_width(0.)
+    );
+}
+
+/// Persistence: a corrupt v2 never falls back to the legacy string, and the
+/// lock is enforced even for a payload that tries to hide Name.
+#[gpui_kit::test]
+fn corrupt_layout_ignores_legacy_and_keeps_name_endpoint(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Corrupt", "a.example.com", "10801"))
+        .expect("seed works");
+    store
+        .set_meta(Store::META_LIBRARY_COLUMN_LAYOUT, "{not json")
+        .expect("corrupt layout writes");
+    store
+        .set_meta(Store::META_LIBRARY_COLUMNS, "upstream,health,traffic")
+        .expect("legacy seed writes");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let layout = view.read_with(cx, |view, _| view.column_layout);
+    assert_eq!(layout, ColumnLayout::default(), "corrupt reads defaults");
+    assert!(layout.is_visible(ColumnId::Name));
+    assert!(layout.is_visible(ColumnId::Endpoint));
+    assert!(
+        layout.is_visible(ColumnId::Group),
+        "the legacy set is not resurrected"
+    );
+    assert!(!layout.is_visible(ColumnId::Protocol));
+}
+
+/// Persistence: the live drag updates the app and leaves the store alone;
+/// mouse-up writes the final layout.
+#[gpui_kit::test]
+fn layout_persists_on_resize_finish_or_drop_finish(cx: &mut TestAppContext) {
+    use crate::RowMetrics;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Persist", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let before = view.read_with(cx, |view, _| view.store.library_column_layout());
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.begin_column_resize(ColumnId::Health, 0., RowMetrics::HEALTH, cx);
+            view.drag_column_resize(40., cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.store.library_column_layout()),
+        before,
+        "the store waits for mouse-up"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.column_layout.width(ColumnId::Health)),
+        RowMetrics::HEALTH + 40.,
+        "the live layout follows the pointer"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.finish_column_resize(window, cx));
+    });
+    cx.run_until_parked();
+    let saved = view.read_with(cx, |view, _| view.store.library_column_layout());
+    assert_eq!(
+        saved.width(ColumnId::Health),
+        RowMetrics::HEALTH + 40.,
+        "mouse-up persists the final width"
+    );
+}
+
+/// T-04/R11: a header drag carries the column and its sort behavior. The drop
+/// line paints before release, the new order persists, and Name participates
+/// like every other column.
 #[gpui_kit::test]
 fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
-    use crate::{LibraryColumn, LibrarySortKey};
+    use crate::{ColumnId, LibrarySortKey};
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let row = store
@@ -21490,7 +22258,7 @@ fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| {
             view.inspector_visible = false;
             // Protocol is an opt-in column; the drag needs it painted.
-            view.set_row_column("protocol", true, window, cx);
+            view.set_column_visible(ColumnId::Protocol, true, window, cx);
             cx.notify();
         });
     });
@@ -21511,26 +22279,24 @@ fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
     drag_column_header(
         cx,
         "sort-header-health",
-        "header-protocol",
+        "sort-header-protocol",
         false,
         Some("column-drop-protocol"),
     );
 
-    let (layout, saved) = view.read_with(cx, |view, cx| {
-        (
-            view.libraries.read(cx).delegate().layout,
-            view.store.library_column_layout(),
-        )
+    let (layout, saved) = view.read_with(cx, |view, _| {
+        (view.column_layout, view.store.library_column_layout())
     });
     assert_eq!(layout, saved, "the new order is written on release");
-    assert_eq!(layout.order()[1], LibraryColumn::Group);
-    assert_eq!(layout.order()[2], LibraryColumn::Health);
-    assert_eq!(layout.order()[3], LibraryColumn::Protocol);
+    assert_eq!(layout.order()[1], ColumnId::Endpoint);
+    assert_eq!(layout.order()[2], ColumnId::Group);
+    assert_eq!(layout.order()[3], ColumnId::Health);
+    assert_eq!(layout.order()[4], ColumnId::Protocol);
 
     let health = left(cx, "sort-header-health");
     assert!(
-        left(cx, "header-name") < health && health < left(cx, "header-protocol"),
-        "Health now paints between the pinned Name and Protocol"
+        left(cx, "sort-header-name") < health && health < left(cx, "sort-header-protocol"),
+        "Health now paints between the Name and Protocol headers"
     );
     let row_health = left(cx, &format!("row-health-{}", row.id));
     assert!(
@@ -21551,11 +22317,11 @@ fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
     );
 }
 
-/// T-04: the pinned name column is not a drop target, and the indicator never
-/// lingers when the pointer leaves the movable run.
+/// R11: locked means "cannot hide", not "cannot move". Name is a normal drop
+/// target and a normal drag source.
 #[gpui_kit::test]
-fn t04_column_drag_cannot_cross_fixed_columns(cx: &mut TestAppContext) {
-    use crate::{LibraryColumn, LibraryColumns};
+fn t04_name_column_participates_in_reordering(cx: &mut TestAppContext) {
+    use crate::ColumnId;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -21566,34 +22332,23 @@ fn t04_column_drag_cannot_cross_fixed_columns(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.inspector_visible = false;
-            // Both opt-in columns must paint for the drag to cross them.
-            view.set_row_column("protocol", true, window, cx);
-            view.set_row_column("upstream", true, window, cx);
+            view.set_column_visible(ColumnId::Protocol, true, window, cx);
             cx.notify();
         });
     });
     paint_frame(cx);
 
-    begin_column_drag(cx, "header-protocol");
-    move_column_drag(cx, "header-upstream", false);
-    assert_painted(cx, "column-drop-upstream");
+    begin_column_drag(cx, "sort-header-protocol");
+    move_column_drag(cx, "sort-header-name", false);
+    assert_painted(cx, "column-drop-name");
 
-    move_column_drag(cx, "header-name", false);
-    assert_absent(cx, "column-drop-upstream".to_string());
-
-    release_column_drag(cx, "header-name", false);
-    let (layout, saved) = view.read_with(cx, |view, cx| {
-        (
-            view.libraries.read(cx).delegate().layout,
-            view.store.library_column_layout(),
-        )
+    release_column_drag(cx, "sort-header-name", false);
+    let (layout, saved) = view.read_with(cx, |view, _| {
+        (view.column_layout, view.store.library_column_layout())
     });
-    assert_eq!(
-        layout.order(),
-        &LibraryColumn::ALL,
-        "dropping on the pinned Name leaves the order untouched"
-    );
-    assert_eq!(saved, LibraryColumns::default(), "nothing was persisted");
+    assert_eq!(layout.order()[0], ColumnId::Protocol);
+    assert_eq!(layout.order()[1], ColumnId::Name);
+    assert_eq!(layout, saved, "the reorder persists");
 }
 
 /// F2: at the default 1000px frame the table reserves the drawer's 260px, so
@@ -21770,11 +22525,11 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
 
     // Every header label sits at its column's first character.
     let pairs: [(&str, &str); 7] = [
-        ("header-name", "row-name"),
-        ("header-group", "row-group"),
-        ("header-protocol", "row-protocol"),
-        ("header-upstream", "row-upstream"),
-        ("header-endpoint", "row-endpoint"),
+        ("sort-header-name", "row-name"),
+        ("sort-header-group", "row-group"),
+        ("sort-header-protocol", "row-protocol"),
+        ("sort-header-upstream", "row-upstream"),
+        ("sort-header-endpoint", "row-endpoint"),
         ("sort-header-health", "row-health"),
         ("sort-header-traffic", "row-traffic"),
     ];
@@ -32376,16 +33131,16 @@ fn t77_sort_composes_with_facets_and_port_filter() {
     );
 }
 
-/// T-27: both sortable headers paint, right-click opens the picker menu,
-/// the live choice is marked, and picking a key persists it.
+/// R11: every header opens the same Explorer menu. The visibility rows follow
+/// the layout (legacy seed included), and More reaches the columns sheet.
 #[gpui_kit::test]
 fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
-        .set_library_columns("upstream,health,traffic")
-        .expect("column choice writes");
+        .set_meta(Store::META_LIBRARY_COLUMNS, "upstream,health,traffic")
+        .expect("legacy column choice writes");
     store
         .set_library_sort(crate::store::LibrarySort::new(
             crate::store::LibrarySortKey::TrafficTotal,
@@ -32398,7 +33153,7 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     // F1: the open drawer occludes the columns it covers, and this test is
-    // about the sort menus, so keep the inspector closed at full table width.
+    // about the header menu, so keep the inspector closed at full table width.
     view.update(cx, |view, cx| {
         view.inspector_visible = false;
         cx.notify();
@@ -32413,7 +33168,7 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
             crate::store::LibrarySortKey::TrafficTotal,
             crate::store::SortDirection::Ascending
         ),
-        "launch reads the persisted sort beside library_columns"
+        "launch reads the persisted sort beside the legacy column seed"
     );
 
     cx.update(|window, _| {
@@ -32439,119 +33194,39 @@ fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     for id in [
-        "sort-header-traffic-none",
-        "sort-header-traffic-traffic_total",
-        "sort-header-traffic-traffic_down",
-        "sort-header-traffic-traffic_up",
-        "sort-header-traffic-direction",
+        "columns-menu-size-this",
+        "columns-menu-size-all",
+        "columns-menu-name",
+        "columns-menu-endpoint",
+        "columns-menu-health",
+        "columns-menu-group",
+        "columns-menu-protocol",
+        "columns-menu-upstream",
+        "columns-menu-traffic",
+        "columns-menu-more",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders in the traffic sort menu"
+            "{id} renders in every header menu"
         );
     }
     assert!(
         cx.update(|window, _| window
-            .try_find("sort-header-traffic-latency".to_string())
+            .try_find("sort-header-traffic-none".to_string())
             .is_none()),
-        "the traffic menu offers only the traffic keys"
-    );
-    let marked = cx.update(|window, _| {
-        window
-            .try_find("sort-header-traffic-traffic_total".to_string())
-            .and_then(|snapshot| snapshot.label().map(str::to_string))
-            .unwrap_or_default()
-    });
-    assert!(
-        marked.contains("current sort"),
-        "the persisted key carries the marker: {marked:?}"
+        "the retired per-column sort picker is gone"
     );
 
-    cx.update(|window, cx| {
-        window.click("sort-header-traffic-direction".to_string(), cx);
-    });
+    // The hidden group can be restored from this menu and the header returns.
+    cx.update(|window, cx| window.click("columns-menu-group".to_string(), cx));
     cx.run_until_parked();
     paint_frame(cx);
-    assert_eq!(
-        view.read_with(cx, |view, cx| (
-            view.libraries.read(cx).delegate().sort,
-            view.store.library_sort()
-        )),
-        (
-            crate::store::LibrarySort::new(
-                crate::store::LibrarySortKey::TrafficTotal,
-                crate::store::SortDirection::Descending
-            ),
-            crate::store::LibrarySort::new(
-                crate::store::LibrarySortKey::TrafficTotal,
-                crate::store::SortDirection::Descending
-            ),
-        ),
-        "the direction toggle reaches both the list and the meta row"
-    );
-
-    cx.update(|window, cx| {
-        window.right_click("sort-header-health".to_string(), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    for id in [
-        "sort-header-health-none",
-        "sort-header-health-latency",
-        "sort-header-health-download",
-        "sort-header-health-upload",
-        "sort-header-health-out_ip",
-        "sort-header-health-type_security",
-        "sort-header-health-direction",
-    ] {
-        assert!(
-            cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders in the health sort menu"
-        );
-    }
     assert!(
-        !cx.update(|window, _| window
-            .try_find("sort-header-health-none".to_string())
-            .and_then(|snapshot| snapshot.label().map(str::to_string))
-            .unwrap_or_default()
-            .contains("current sort")),
-        "a key owned by the other column is not marked here"
+        view.read_with(cx, |view, _| view.column_layout)
+            .is_visible(ColumnId::Group),
+        "the menu shows the group again"
     );
-    let direction = cx.update(|window, _| {
-        window
-            .try_find("sort-header-health-direction".to_string())
-            .and_then(|snapshot| snapshot.label().map(str::to_string))
-            .unwrap_or_default()
-    });
-    assert!(
-        direction.contains("descending"),
-        "the direction item shows the live direction: {direction:?}"
-    );
-
-    cx.update(|window, cx| {
-        window.click("sort-header-health-latency".to_string(), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_eq!(
-        view.read_with(cx, |view, cx| (
-            view.libraries.read(cx).delegate().sort,
-            view.store.library_sort()
-        )),
-        (
-            crate::store::LibrarySort::new(
-                crate::store::LibrarySortKey::Latency,
-                crate::store::SortDirection::Descending
-            ),
-            crate::store::LibrarySort::new(
-                crate::store::LibrarySortKey::Latency,
-                crate::store::SortDirection::Descending
-            ),
-        ),
-        "picking a key keeps the direction and persists the pair"
-    );
+    assert_painted(cx, "sort-header-group");
 }
 
 /// T-27: the header itself is the mouse and keyboard route to sorting —
@@ -32565,8 +33240,8 @@ fn t77_header_click_and_keyboard_sort(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
-        .set_library_columns("upstream,health,traffic")
-        .expect("column choice writes");
+        .set_meta(Store::META_LIBRARY_COLUMNS, "upstream,health,traffic")
+        .expect("legacy column choice writes");
     store
         .add(facet_seed("Work", "vless", "travel", "10801"))
         .expect("seed works");
@@ -36018,8 +36693,8 @@ fn b16_search_no_matches_keeps_its_copy_while_a_refresh_is_in_flight(cx: &mut Te
     assert_absent(cx, "skeleton-row-0".to_string());
 }
 
-/// K12: the palette's Sort group is a full route to the sort model, and the
-/// text-size toggle is reachable without opening Settings.
+/// K12: the palette keeps one Sort verb — `sort-none` — beside the header
+/// sort, and the text-size toggle is reachable without opening Settings.
 #[gpui_kit::test]
 fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
     use crate::app::actions::{palette_action_at, PALETTE_GROUPS};
@@ -36027,7 +36702,13 @@ fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
 
     cx.update(gpui_kit::init);
-    let store = Store::open_in_memory().expect("in-memory store opens");
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .set_library_sort(LibrarySort::new(
+            LibrarySortKey::Latency,
+            SortDirection::Descending,
+        ))
+        .expect("sort choice writes");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
@@ -36049,39 +36730,18 @@ fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
         "the Sort group sits after Manage so Settings keeps its palette index"
     );
     assert_eq!(
-        palette_action_at(op("sort-latency")),
-        Some("sort-latency"),
-        "every sort action resolves through the palette table"
+        PALETTE_GROUPS[2].1,
+        &["sort-none"],
+        "the eight standalone sort verbs and the direction toggle are retired"
     );
-
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.run_palette_op(op("sort-latency"), window, cx)
-        });
-    });
-    cx.run_until_parked();
     assert_eq!(
-        view.read_with(cx, |view, cx| (
-            view.libraries.read(cx).delegate().sort,
-            view.store.library_sort(),
-        )),
-        (
-            LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
-            LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
-        ),
-        "the palette picks the same key a header click would"
+        palette_action_at(op("sort-none")),
+        Some("sort-none"),
+        "the remaining sort action resolves through the palette table"
     );
-
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.run_palette_op(op("sort-direction"), window, cx)
-        });
-    });
-    cx.run_until_parked();
-    assert_eq!(
-        view.read_with(cx, |view, _| view.store.library_sort()),
-        LibrarySort::new(LibrarySortKey::Latency, SortDirection::Descending),
-        "the palette reverses the live sort"
+    assert!(
+        !PALETTE_GROUPS[2].1.contains(&"sort-latency"),
+        "header clicks own key selection now"
     );
 
     cx.update(|window, cx| {
@@ -38259,8 +38919,9 @@ fn header_and_blank_table_clicks_clear_selection(cx: &mut TestAppContext) {
     paint_frame(cx);
     assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
 
-    // The Name header cell has no verb of its own; the strip owns the click.
-    cx.update(|window, cx| window.click("header-name", cx));
+    // The Name header cell sorts like every other header; the strip owns the
+    // click that clears the selection.
+    cx.update(|window, cx| window.click("sort-header-name", cx));
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
