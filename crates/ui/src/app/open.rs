@@ -3,6 +3,7 @@
 //! Not here: commit handlers (see `commit_forms`) or plain rendering.
 use crate::*;
 
+use crate::app::columns::ColumnsSheetBody;
 use gpui_kit::component::list::ListState;
 
 const SING_BOX_RELEASES_URL: &str = "https://github.com/SagerNet/sing-box/releases";
@@ -1393,101 +1394,20 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_row_columns_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let live: Rc<RefCell<RowColumns>> = Rc::new(RefCell::new(self.row_columns));
+    pub(crate) fn open_columns_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
-            let view = view.clone();
-            let current = *live.borrow();
-            let mut body = div().flex().flex_col().gap_2();
-            for (id, label, tip, enabled) in [
-                (
-                    "columns-protocol",
-                    t!("columns-protocol"),
-                    t!("columns-protocol-tip"),
-                    current.protocol,
-                ),
-                (
-                    "columns-upstream",
-                    t!("columns-upstream"),
-                    t!("columns-upstream-tip"),
-                    current.upstream,
-                ),
-                (
-                    "columns-health",
-                    t!("columns-health"),
-                    t!("columns-health-tip"),
-                    current.health,
-                ),
-                (
-                    "columns-group",
-                    t!("columns-group"),
-                    t!("columns-group-tip"),
-                    current.group,
-                ),
-                (
-                    "columns-traffic",
-                    t!("columns-traffic"),
-                    t!("columns-traffic-tip"),
-                    current.traffic,
-                ),
-            ] {
-                let column = match id {
-                    "columns-protocol" => "protocol",
-                    "columns-upstream" => "upstream",
-                    "columns-health" => "health",
-                    "columns-group" => "group",
-                    _ => "traffic",
-                };
-                let live = live.clone();
-                let switch_view = view.clone();
-                body = body.child(
-                    Switch::new(id)
-                        .checked(enabled)
-                        .label(label.as_str())
-                        .accessibility_label(label.as_str())
-                        .tooltip(tip)
-                        .on_change(move |enabled: &bool, window, cx| {
-                            let enabled = *enabled;
-                            {
-                                let mut current = live.borrow_mut();
-                                match column {
-                                    "protocol" => current.protocol = enabled,
-                                    "upstream" => current.upstream = enabled,
-                                    "health" => current.health = enabled,
-                                    "group" => current.group = enabled,
-                                    _ => current.traffic = enabled,
-                                }
-                            }
-                            switch_view.update(cx, |view, cx| {
-                                view.set_row_column(column, enabled, window, cx);
-                            });
-                        }),
-                );
-            }
-            let reset_view = view.clone();
-            body = body.child(
-                div().flex().justify_end().pt_1().child(
-                    Button::new("columns-dialog-reset")
-                        .small()
-                        .label(t!("columns-reset-button"))
-                        .tooltip(t!("columns-reset-tip"))
-                        .on_click(move |_, window, cx| {
-                            reset_view.update(cx, |view, cx| {
-                                view.reset_all_columns(window, cx);
-                            });
-                        }),
-                ),
-            );
-            let close: DialogCommit = Rc::new(|_, _| true);
-            dialog
+        let body = cx.new(|cx| ColumnsSheetBody::new(view, cx));
+        open_app_sheet(window, cx, move |sheet: Sheet, _, _| {
+            let body = body.clone();
+            sheet
                 .title(t!("columns-title"))
                 .child(body)
-                .footer(dialog_footer(
-                    "columns-dialog-close",
-                    "columns-dialog-cancel",
+                .size(px(520.))
+                .footer(sheet_footer(
+                    "columns-sheet-done",
+                    None,
                     &t!("dialog-close"),
-                    close,
+                    Rc::new(|_, _| true),
                 ))
         });
     }

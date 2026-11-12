@@ -104,15 +104,9 @@ pub(crate) struct LibraryDelegate {
 
     pub(crate) out_ips: HashMap<String, String>,
 
-    pub(crate) row_columns: RowColumns,
-
-    /// T-03: the user's width/order overrides, loaded from store meta at boot
-    /// and written back when a drag or menu action settles.
-    pub(crate) layout: LibraryColumns,
-
-    /// T-03: the geometry the header strip and the row both read. The owner
-    /// decides it once per frame (the table's width decides which optional
-    /// columns fit) and hands it to both readers.
+    /// T-03/R11: the geometry the header strip and the row both read. The
+    /// owner resolves the app's one layout against the table width once per
+    /// frame and hands the same snapshot to both readers.
     pub(crate) row_metrics: RowMetrics,
 
     /// R22: the density. It owns the row pitch and every chrome height, so
@@ -159,14 +153,7 @@ impl LibraryDelegate {
             latency: HashMap::new(),
             data_traffic: HashMap::new(),
             out_ips: HashMap::new(),
-            row_columns: RowColumns::default(),
-            layout: LibraryColumns::default(),
-            row_metrics: RowMetrics::widths(
-                false,
-                false,
-                RowColumns::default(),
-                LibraryColumns::default(),
-            ),
+            row_metrics: RowMetrics::for_table_width(0., ColumnLayout::default()),
             density: Density::default(),
             app_view: None,
             endpoint_inputs: HashMap::new(),
@@ -417,21 +404,7 @@ impl LibraryDelegate {
             || inputs.port.read(cx).value().as_str() != row.port.to_string().as_str()
     }
 
-    pub(crate) fn set_row_columns(&mut self, columns: RowColumns) {
-        self.row_columns = columns;
-    }
-
-    pub(crate) fn set_layout(&mut self, layout: LibraryColumns) {
-        self.layout = layout;
-    }
-
-    /// T-03: live resize writes only the delegate; the store write waits for
-    /// mouse-up so one drag is one meta row, not one per frame.
-    pub(crate) fn set_column_width(&mut self, column: LibraryColumn, width: f32) {
-        self.layout.set_width(column, width);
-    }
-
-    /// T-03: the owner hands both readers the same geometry.
+    /// T-03/R11: the owner hands both readers the same geometry.
     pub(crate) fn set_row_metrics(&mut self, metrics: RowMetrics) {
         self.row_metrics = metrics;
     }
@@ -758,7 +731,9 @@ impl ListDelegate for LibraryDelegate {
         let item = ListItem::new(format!("library-row-{}", row_id))
             .selected(selected)
             .aria_selected(selected)
-            .px_2()
+            // The content width is exact: the lead, the columns and the
+            // trailing reserve fill it with no outer padding.
+            .px_0()
             // The row is flat: a definite height and a hairline, never a card
             // with a gap under it.
             .py_0()
@@ -786,7 +761,6 @@ impl ListDelegate for LibraryDelegate {
             .flex_row()
             .flex_nowrap()
             .items_center()
-            .gap(px(RowMetrics::GAP))
             .border_b_1()
             .border_color(cx.theme().border);
 
@@ -826,7 +800,6 @@ impl ListDelegate for LibraryDelegate {
             health_tone_color(probe_tone, cx.theme())
         };
         {
-            let name = row_name.clone();
             let mut cells: Vec<AnyElement> = Vec::new();
             // The lead: one state glyph and nothing else. It reports what the
             // row is doing — it is not a button, so it has no hit target and
@@ -846,45 +819,48 @@ impl ListDelegate for LibraryDelegate {
                     .child(state_glyph(view.state, cx.theme()))
                     .into_any_element(),
             );
-            // The name flexes into the leftover space and truncates.
-            cells.push(
-                div()
-                    .id(format!("row-name-{row_id}"))
-                    .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .child(
-                        div()
-                            .id(format!("row-name-text-{row_id}"))
-                            .test_support()
-                            .max_w(relative(1.))
-                            .truncate()
-                            .text_size(rems(ROW_NAME_REMS))
-                            .text_color(if view.enabled {
-                                cx.theme().foreground
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            // F14: the tooltip belongs to the text, not the
-                            // flexible cell, so blank space after a short
-                            // name does not open the full route.
-                            .tooltip({
-                                let tip = full_route.clone();
-                                move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                            })
-                            .child(Label::new(name)),
-                    )
-                    .into_any_element(),
-            );
-            // The movable cells follow the user's order, so a drag still
-            // moves them. The endpoint is the chip; the rest are quiet text.
+            // Every column follows the user's order, Name included. The
+            // wrapper owns the inter-column gaps so the lead and the trailing
+            // reserve sit flush against the run, matching `content_width`.
+            let mut column_cells: Vec<AnyElement> = Vec::new();
             for column in *metrics.layout.order() {
                 if !metrics.column_visible(column) {
                     continue;
                 }
+                let width = metrics.column_width(column);
                 let cell: AnyElement = match column {
-                    LibraryColumn::Endpoint => {
+                    ColumnId::Name => {
+                        div()
+                            .id(format!("row-name-{row_id}"))
+                            .test_support()
+                            .w(px(width))
+                            .min_w_0()
+                            .flex_shrink_0()
+                            .flex()
+                            .child(
+                                div()
+                                    .id(format!("row-name-text-{row_id}"))
+                                    .test_support()
+                                    .max_w(relative(1.))
+                                    .truncate()
+                                    .text_size(rems(ROW_NAME_REMS))
+                                    .text_color(if view.enabled {
+                                        cx.theme().foreground
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    // F14: the tooltip belongs to the text, not
+                                    // the cell, so blank space after a short
+                                    // name does not open the full route.
+                                    .tooltip({
+                                        let tip = full_route.clone();
+                                        move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                    })
+                                    .child(Label::new(row_name.clone())),
+                            )
+                            .into_any_element()
+                    }
+                    ColumnId::Endpoint => {
                         let chip_view = self.app_view.clone();
                         let chip_id = row_id.clone();
                         let menu_view = self.app_view.clone();
@@ -892,7 +868,7 @@ impl ListDelegate for LibraryDelegate {
                         div()
                             .id(format!("row-endpoint-{row_id}"))
                             .test_support()
-                            .w(px(metrics.endpoint))
+                            .w(px(width))
                             .flex_shrink_0()
                             .flex()
                             .flex_row()
@@ -958,12 +934,12 @@ impl ListDelegate for LibraryDelegate {
                             )
                             .into_any_element()
                     }
-                    LibraryColumn::Health => {
+                    ColumnId::Health => {
                         let health_text = view.health_text.clone();
                         let mut cell = div()
                             .id(format!("row-health-{row_id}"))
                             .test_support()
-                            .w(px(metrics.health))
+                            .w(px(width))
                             .flex_shrink_0()
                             .truncate()
                             .text_size(rems(ROW_CELL_REMS))
@@ -978,40 +954,40 @@ impl ListDelegate for LibraryDelegate {
                         }
                         cell.into_any_element()
                     }
-                    LibraryColumn::Group => div()
+                    ColumnId::Group => div()
                         .id(format!("row-group-{row_id}"))
                         .test_support()
-                        .w(px(metrics.group))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_size(rems(ROW_GROUP_REMS))
                         .text_color(cx.theme().muted_foreground)
                         .child(view.group.clone())
                         .into_any_element(),
-                    LibraryColumn::Protocol => div()
+                    ColumnId::Protocol => div()
                         .id(format!("row-protocol-{row_id}"))
                         .test_support()
-                        .w(px(metrics.protocol))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_size(rems(ROW_CELL_REMS))
                         .text_color(cx.theme().muted_foreground)
                         .child(view.protocol.clone())
                         .into_any_element(),
-                    LibraryColumn::Upstream => div()
+                    ColumnId::Upstream => div()
                         .id(format!("row-upstream-{row_id}"))
                         .test_support()
-                        .w(px(metrics.upstream))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_size(rems(ROW_CELL_REMS))
                         .text_color(cx.theme().muted_foreground)
                         .child(upstream.clone())
                         .into_any_element(),
-                    LibraryColumn::Traffic => div()
+                    ColumnId::Traffic => div()
                         .id(format!("row-traffic-{row_id}"))
                         .test_support()
-                        .w(px(metrics.traffic))
+                        .w(px(width))
                         .flex_shrink_0()
                         .truncate()
                         .text_size(rems(ROW_CELL_REMS))
@@ -1019,8 +995,20 @@ impl ListDelegate for LibraryDelegate {
                         .child(traffic_text.clone())
                         .into_any_element(),
                 };
-                cells.push(cell);
+                column_cells.push(cell);
             }
+            cells.push(
+                div()
+                    .id(format!("row-columns-{row_id}"))
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(RowMetrics::GAP))
+                    .flex_shrink_0()
+                    .children(column_cells)
+                    .into_any_element(),
+            );
             // The trailing reserve. It is always there, so the grid never
             // shifts; the buttons appear on hover or keyboard focus.
             let transport_view = self.app_view.clone();
