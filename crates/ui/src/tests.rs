@@ -4799,7 +4799,7 @@ fn edit_and_remove_dialogs_open(cx: &mut TestAppContext) {
     let target = config.clone();
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.open_remove_confirm(target.clone(), window, cx)
+            view.delete_row_immediately(&target.id, window, cx)
         });
     });
     cx.run_until_parked();
@@ -4921,12 +4921,7 @@ fn import_commit_selects_and_checks_new_rows(cx: &mut TestAppContext) {
         "first imported row is selected"
     );
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .checked_rows()
-            .len()),
+        view.read_with(cx, |view, _| view.selection_count()),
         2,
         "all imported rows arrive checked"
     );
@@ -5805,7 +5800,6 @@ fn traffic_body_multi(flows: &[(&str, u64, u64)]) -> String {
 #[gpui_kit::test]
 fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppContext) {
     use crate::engine::{ClashTarget, EngineController};
-    use gpui_kit::component::IndexPath;
 
     cx.update(gpui_kit::init);
 
@@ -5893,10 +5887,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
         view.update(cx, |view, cx| {
             view.inspector_tab = crate::InspectorTab::Links;
             view.conn.selected_only = false;
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
             cx.notify();
         });
     });
@@ -5917,10 +5908,7 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.conn.selected_only = true;
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(1));
-                list_cx.notify();
-            });
+            view.select_visible_row(1, cx);
         });
     });
     cx.run_until_parked();
@@ -5971,7 +5959,6 @@ fn t74_conn_setup<'a>(
     dest: &str,
 ) -> (Entity<AppView>, &'a mut VisualTestContext, String) {
     use crate::health::ClashConn;
-    use gpui_kit::component::IndexPath;
 
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -5998,10 +5985,7 @@ fn t74_conn_setup<'a>(
             view.inspector_tab = crate::InspectorTab::Links;
             view.conn.selected_only = false;
             view.conn.sort_desc = true;
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
             // F19: setting the selection by hand skips the row pick that opens
             // the inspector.
             view.open_inspector();
@@ -6667,7 +6651,6 @@ fn restart_restores_traffic_mirror(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn live_sidecar_lines_appear_under_right_config_redacted(cx: &mut TestAppContext) {
     use crate::engine::{inbound_tag, EngineController};
-    use gpui_kit::component::IndexPath;
 
     cx.update(gpui_kit::init);
 
@@ -6730,9 +6713,7 @@ fn live_sidecar_lines_appear_under_right_config_redacted(cx: &mut TestAppContext
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
             view.reload(window, cx);
         });
     });
@@ -6986,7 +6967,6 @@ fn health_test_all_via_fake_flags_dead(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn logs_dialog_filters_to_selected_and_redacts(cx: &mut TestAppContext) {
     use crate::engine::inbound_tag;
-    use gpui_kit::component::IndexPath;
 
     cx.update(gpui_kit::init);
 
@@ -7004,9 +6984,7 @@ fn logs_dialog_filters_to_selected_and_redacts(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
             let rows = vec![config.clone()];
             let tags = crate::health::LogTagIndex::build(&rows);
             view.logs.store.push_raw(
@@ -7091,7 +7069,6 @@ fn seed_lan_input(name: &str) -> NewConfig {
 
 #[gpui_kit::test]
 fn lan_single_start_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
 
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -7108,9 +7085,7 @@ fn lan_single_start_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
             view.start_selected_engine(window, cx);
         });
     });
@@ -7164,7 +7139,6 @@ fn lan_start_all_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn loopback_single_start_skips_confirm(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
 
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -7181,9 +7155,7 @@ fn loopback_single_start_skips_confirm(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
             view.start_selected_engine(window, cx);
         });
     });
@@ -7337,17 +7309,11 @@ fn notification_count(cx: &mut VisualTestContext) -> usize {
 /// needs them selects the row first — the same way a click does.
 fn select_library_row(view: &Entity<AppView>, cx: &mut VisualTestContext, id: &str) {
     cx.update(|window, cx| {
-        window.click(format!("library-row-{id}"), cx);
+        window.click(format!("row-name-text-{id}"), cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let selected = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .selected_row()
-            .map(|row| row.id)
-    });
+    let selected = view.read_with(cx, |view, _| view.selection_focus.clone());
     assert_eq!(selected.as_deref(), Some(id), "the row is selected");
 }
 
@@ -7663,16 +7629,13 @@ fn import_commit_generic_single_invalid_stays_open(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn db_error_on_toggle_notifies(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
             view.store
                 .set_query_only_for_test()
                 .expect("readonly works");
@@ -8218,12 +8181,7 @@ fn t07_partial_import_toasts_counts_and_selects_checks(cx: &mut TestAppContext) 
         "first imported row is selected"
     );
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .checked_rows()
-            .len()),
+        view.read_with(cx, |view, _| view.selection_count()),
         2,
         "all imported rows arrive checked"
     );
@@ -9082,7 +9040,6 @@ fn ticket43_duplicate_creates_disabled_auto_row(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t03_row_actions_target_clicked_row_not_selection(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let alpha = store
@@ -9094,10 +9051,7 @@ fn t03_row_actions_target_clicked_row_not_selection(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -9125,7 +9079,6 @@ fn t03_row_actions_target_clicked_row_not_selection(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t03_row_duplicate_and_move_ignore_selection(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let alpha = store
@@ -9137,10 +9090,7 @@ fn t03_row_duplicate_and_move_ignore_selection(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -9491,10 +9441,7 @@ fn ticket43_probe_toast_and_traffic_resets(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            use gpui_kit::component::IndexPath;
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let before = notification_count(cx);
@@ -10281,7 +10228,7 @@ fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    let card = format!("row-card-{}", row.id);
+    let card = format!("row-surface-{}", row.id);
     assert!(
         cx.update(|window, _| window.try_find(card.clone()).is_some()),
         "seeded card paints"
@@ -10293,49 +10240,49 @@ fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../tests/fixtures/uia-card-context-menu.json"))
-            .expect("card menu fixture parses");
-    // K8/A6-2: six core verbs render as id-pinned rows; `Reset…` and `More ▾`
-    // are kit submenu rows (label-pinned, they carry no element id), so the
-    // closed-menu walk sees exactly these six.
-    fn assert_fixture_item(
-        cx: &mut VisualTestContext,
-        id: &str,
-        name: &str,
-        role: &str,
-        scope: &str,
-    ) {
-        let (found_role, label) = cx.update(|window, _| {
+    // R31: the row More menu is exhaustive and top-to-bottom. Every verb
+    // the surface map gives a row lives here, in this order, and nothing is
+    // demoted behind a second submenu any more.
+    let core = [
+        ("start", "Start"),
+        ("stop", "Stop"),
+        ("test", "Test"),
+        ("edit", "Edit"),
+        ("copy-urls", "Copy URLs"),
+        ("move", "Move to group"),
+        ("assign-preset", "Assign preset"),
+        ("logs", "Logs"),
+        ("share", "Share…"),
+        ("duplicate", "Duplicate"),
+        ("ping", "Ping"),
+        ("auto-start", "Restore on launch"),
+        ("delete", "Delete"),
+    ];
+    let mut rows = Vec::new();
+    for (verb, name) in core {
+        let id = format!("rowctx-{verb}-{}", row.id);
+        let (role, label, y) = cx.update(|window, _| {
             let snapshot = window
-                .try_find(id.to_string())
-                .unwrap_or_else(|| panic!("{id} renders in {scope}"));
+                .try_find(id.clone())
+                .unwrap_or_else(|| panic!("{id} renders in the row More menu"));
             (
                 snapshot.role().map(|role| format!("{role:?}")),
                 snapshot.label().map(str::to_string),
+                snapshot.bounds().origin.y,
             )
         });
         assert_eq!(
-            found_role.as_deref(),
-            Some(role),
-            "{id} exposes its fixture role"
+            role.as_deref(),
+            Some("MenuItem"),
+            "{id} exposes its MenuItem role"
         );
-        assert_eq!(
-            label.as_deref(),
-            Some(name),
-            "{id} announces its fixture name"
-        );
+        assert_eq!(label.as_deref(), Some(name), "{id} announces its name");
+        rows.push((name, y));
     }
-    let items = fixture["items"].as_array().expect("fixture lists items");
-    assert_eq!(items.len(), 6, "card menu pins exactly 6 core rows");
-    for item in items {
-        let verb = item["verb"].as_str().expect("fixture verb");
-        assert_fixture_item(
-            cx,
-            &format!("rowctx-{verb}-{}", row.id),
-            item["name"].as_str().expect("fixture name"),
-            item["role"].as_str().expect("fixture role"),
-            "the card menu",
+    for pair in rows.windows(2) {
+        assert!(
+            pair[0].1 < pair[1].1,
+            "row More order is Start, Stop, Test, Edit, Copy URLs, Move to group, Assign preset, Logs, Share., Duplicate, Ping, Reset., Restore on launch, Delete: {rows:?}"
         );
     }
 
@@ -10347,74 +10294,14 @@ fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
     });
     assert!(
         labels.iter().any(|label| label == "Reset…"),
-        "the Reset… submenu row renders: {labels:?}"
+        "the Reset. submenu row renders: {labels:?}"
     );
     assert!(
-        labels.iter().any(|label| label == "More ▾"),
-        "the More ▾ submenu row renders: {labels:?}"
+        !labels.iter().any(|label| label == "More ?"),
+        "the old More submenu is retired: {labels:?}"
     );
 
-    let wanted: std::collections::HashSet<String> = items
-        .iter()
-        .map(|item| {
-            format!(
-                "rowctx-{}-{}",
-                item["verb"].as_str().expect("fixture verb"),
-                row.id
-            )
-        })
-        .collect();
-    let observed: Vec<String> = cx.update(|window, _| {
-        gpui_kit::base::test_support::snapshots(window)
-            .iter()
-            .filter_map(|snapshot| {
-                snapshot.path().last().and_then(|last| {
-                    let id = format!("{last:?}");
-                    if id.contains("rowctx-") {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect()
-    });
-    assert_eq!(
-        observed.len(),
-        6,
-        "card menu walks exactly 6 core rows, no seventh: {observed:?}"
-    );
-    for id in &observed {
-        assert!(
-            wanted.iter().any(|want| id.contains(want)),
-            "walked node {id} is one of the 6 pinned rows"
-        );
-    }
-
-    // Keyboard: Up from no selection lands on the LAST row (More ▾), whose
-    // submenu paints the demoted verbs.
-    fn press_key(cx: &mut VisualTestContext, key: &str) {
-        cx.update(|window, cx| {
-            let stroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
-            window.dispatch_keystroke(stroke, cx);
-        });
-        cx.run_until_parked();
-        paint_frame(cx);
-    }
-    press_key(cx, "up");
-    for item in fixture["more"].as_array().expect("fixture lists More") {
-        let verb = item["verb"].as_str().expect("fixture verb");
-        assert_fixture_item(
-            cx,
-            &format!("rowctx-{verb}-{}", row.id),
-            item["name"].as_str().expect("fixture name"),
-            item["role"].as_str().expect("fixture role"),
-            "the More ▾ submenu",
-        );
-    }
-
-    // K8: the Speedtest / Resolve Out-IP / Resolve domain verbs are retired —
-    // they appear in no menu at all.
+    // K8: the Speedtest / Resolve Out-IP / Resolve domain verbs are retired.
     for verb in ["speedtest", "out-ip", "resolve-domain"] {
         let id = format!("rowctx-{verb}-{}", row.id);
         assert!(
@@ -10423,42 +10310,6 @@ fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
         );
     }
 
-    // …and `More ▾` reads top → bottom as Move to group · Copy URLs · Share… ·
-    // Duplicate · Ping.
-    let more_items = fixture["more"].as_array().expect("fixture lists More");
-    assert_eq!(more_items.len(), 5, "More ▾ pins exactly 5 rows");
-    let mut more_order = Vec::new();
-    for item in more_items {
-        let verb = item["verb"].as_str().expect("fixture verb");
-        let id = format!("rowctx-{verb}-{}", row.id);
-        let bounds = cx.update(|window, _| {
-            window
-                .try_find(id.clone())
-                .unwrap_or_else(|| panic!("{id} renders in the More ▾ submenu"))
-                .bounds()
-        });
-        more_order.push((bounds.origin.y, bounds.origin.x));
-    }
-    for pair in more_order.windows(2) {
-        assert!(
-            pair[0].0 < pair[1].0,
-            "More ▾ order is Move to group · Copy URLs · Share… · Duplicate · Ping: {more_order:?}"
-        );
-    }
-
-    // …and two Ups further (delete → Reset…) open the Reset… submenu.
-    press_key(cx, "up");
-    press_key(cx, "up");
-    for item in fixture["reset"].as_array().expect("fixture lists Reset") {
-        let verb = item["verb"].as_str().expect("fixture verb");
-        assert_fixture_item(
-            cx,
-            &format!("rowctx-{verb}-{}", row.id),
-            item["name"].as_str().expect("fixture name"),
-            item["role"].as_str().expect("fixture role"),
-            "the Reset… submenu",
-        );
-    }
     cx.update(|window, cx| {
         use gpui_kit::Keystroke;
         let escape = Keystroke::parse("escape").expect("test keystroke parses");
@@ -10512,7 +10363,7 @@ fn cua07_menus_keyboard_operable(cx: &mut TestAppContext) {
         "Esc closes Add"
     );
     assert_eq!(notification_count(cx), before, "Esc commits nothing");
-    let card = format!("row-card-{}", row.id);
+    let card = format!("row-surface-{}", row.id);
     cx.update(|window, cx| {
         window.right_click(card.clone(), cx);
     });
@@ -10547,7 +10398,7 @@ fn cua07_card_menu_invoke_matches_click(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    let card = format!("row-card-{}", row.id);
+    let card = format!("row-surface-{}", row.id);
     cx.update(|window, cx| {
         window.right_click(card.clone(), cx);
     });
@@ -11248,7 +11099,6 @@ fn laneb_settings_clears_confirm(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn empty_start_and_stopped_stop_warn_honestly(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
@@ -11282,9 +11132,7 @@ fn empty_start_and_stopped_stop_warn_honestly(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -12063,63 +11911,6 @@ fn t44_facets_and_with_text_query() {
 }
 
 #[test]
-fn t44_checked_set_honest_label_and_prune() {
-    use crate::store::ProxyConfig;
-    use crate::LibraryDelegate;
-    fn row(id: &str, name: &str, group: &str) -> ProxyConfig {
-        ProxyConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com"}"#.to_string().into(),
-            group: group.to_string(),
-            enabled: true,
-            bind_ip: "127.0.0.1".to_string(),
-            port: 10801,
-            subscription_id: None,
-            identity_key: None,
-            preset_id: None,
-        }
-    }
-    let mut delegate = LibraryDelegate::new();
-    delegate.set_rows(vec![
-        row("1", "Alpha", "g"),
-        row("2", "Beta", "g"),
-        row("3", "Gamma", "g"),
-    ]);
-    assert_eq!(delegate.bulk_label(), "");
-    delegate.toggle_checked("1");
-    delegate.toggle_checked("3");
-    delegate.toggle_checked("ghost");
-    assert_eq!(delegate.checked.len(), 2, "unknown ids never check");
-    assert_eq!(delegate.bulk_label(), "2 checked (of 3)");
-
-    delegate.query = "alpha".to_string();
-    delegate.apply_filter();
-    assert_eq!(delegate.checked.len(), 2);
-    assert_eq!(delegate.bulk_label(), "2 checked (of 1)");
-    let checked: Vec<String> = delegate
-        .checked_rows()
-        .iter()
-        .map(|r| r.id.clone())
-        .collect();
-    assert_eq!(checked, vec!["1".to_string(), "3".to_string()]);
-
-    delegate.query = String::new();
-    delegate.set_facet_group(Some("nope".to_string()));
-    assert_eq!(delegate.bulk_label(), "2 checked (of 0)");
-    delegate.clear_facets();
-
-    delegate.set_rows(vec![row("1", "Alpha", "g"), row("2", "Beta", "g")]);
-    assert_eq!(delegate.checked.len(), 1);
-    assert_eq!(delegate.bulk_label(), "1 checked (of 2)");
-    delegate.toggle_checked("1");
-    assert_eq!(delegate.bulk_label(), "");
-    delegate.clear_checked();
-    assert_eq!(delegate.bulk_label(), "");
-}
-
-#[test]
 fn t09_show_security_and_type_security_sort() {
     use crate::apply_show_security;
     use crate::store::ProxyConfig;
@@ -12194,69 +11985,12 @@ fn t09_group_toast_texts_name_scope() {
     );
 }
 
-#[test]
-fn t01_checked_positions_and_selection_stay_distinct() {
-    use crate::store::ProxyConfig;
-    use crate::LibraryDelegate;
-    use gpui_kit::component::IndexPath;
-    fn row(id: &str, name: &str) -> ProxyConfig {
-        ProxyConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com"}"#.to_string().into(),
-            group: "g".to_string(),
-            enabled: true,
-            bind_ip: "127.0.0.1".to_string(),
-            port: 10801,
-            subscription_id: None,
-            identity_key: None,
-            preset_id: None,
-        }
-    }
-    let mut delegate = LibraryDelegate::new();
-    delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta"), row("3", "Gamma")]);
-    delegate.toggle_checked("1");
-    delegate.toggle_checked("3");
-    delegate.selected = Some(IndexPath::new(2));
-    assert_eq!(delegate.checked_position("1"), Some(1));
-    assert_eq!(delegate.checked_position("3"), Some(2));
-    assert_eq!(
-        delegate.checked_position("2"),
-        None,
-        "the selected-only row carries no chip"
-    );
-    assert_eq!(delegate.bulk_label(), "2 checked (of 3)");
-    assert_eq!(
-        delegate.selected_row().map(|row| row.name),
-        Some("Gamma".to_string()),
-        "the wash names the selected row"
-    );
-    assert_eq!(
-        delegate
-            .checked_rows()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect::<Vec<_>>(),
-        vec!["1".to_string(), "3".to_string()],
-        "bulk acts on the checked set, never the selection"
-    );
-
-    delegate.toggle_checked("1");
-    assert_eq!(delegate.checked_position("3"), Some(1));
-    assert_eq!(delegate.bulk_label(), "1 checked (of 3)");
-    delegate.selected = None;
-    assert_eq!(
-        delegate.checked.len(),
-        1,
-        "checks survive a selection clear"
-    );
-}
-
 /// B2: the render path borrows rows so a frame does not clone a config per
 /// visible row; `row_at` stays the owning accessor for callers that need it.
+/// B2: the render path borrows rows so a frame does not clone a config per
+/// visible row.
 #[test]
-fn library_row_ref_borrows_while_row_at_clones() {
+fn library_row_ref_borrows_the_stored_row() {
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![ProxyConfig {
         id: "1".to_string(),
@@ -12278,17 +12012,23 @@ fn library_row_ref_borrows_while_row_at_clones() {
     );
     assert_eq!(delegate.rows[0].name, "Alpha");
     assert_eq!(
-        delegate.row_at(IndexPath::new(0)).map(|row| row.id),
+        delegate.row_by_id("1").map(|row| row.id.clone()),
         Some("1".to_string()),
-        "the owning accessor still returns an independent config"
+        "the row is found by id"
     );
 }
 
 /// F3: the checkbox is a bulk-set edit, not a selection gesture. A real
 /// pointer click on another row's checkbox must check that row without
 /// moving the selection, and the second click must leave both alone.
+/// The one selection model: a plain click replaces the set, a Ctrl click
+/// toggles one row, and a Shift click replaces the set with the range from
+/// the anchor.
+/// The one selection model: a plain click replaces the set, a Ctrl click
+/// toggles one row, and a Shift click replaces the set with the range from
+/// the anchor.
 #[gpui_kit::test]
-fn f03_checkbox_click_keeps_checked_and_selected_independent(cx: &mut TestAppContext) {
+fn selection_click_modifiers(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -12297,55 +12037,58 @@ fn f03_checkbox_click_keeps_checked_and_selected_independent(cx: &mut TestAppCon
     let second = store
         .add(row19_seed("Second", "b.example.com", "10802"))
         .expect("seed works");
-    let _third = store
+    let third = store
         .add(row19_seed("Third", "c.example.com", "10803"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
+
+    // A plain click replaces the set.
     select_library_row(&view, cx, &first.id);
-
-    let check = format!("check-target-{}", second.id);
-    assert_painted(cx, &check);
-    cx.update(|window, cx| window.click(check.clone(), cx));
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    let (checked, selected) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (
-            delegate.checked.iter().cloned().collect::<Vec<_>>(),
-            delegate.selected_row().map(|row| row.id),
-        )
-    });
     assert_eq!(
-        checked,
-        vec![second.id.clone()],
-        "the click checks exactly its own row"
-    );
-    assert_eq!(
-        selected.as_deref(),
-        Some(first.id.as_str()),
-        "checking never selects the checked row"
+        view.read_with(cx, |view, _| view.selection_ids()),
+        vec![first.id.clone()],
+        "the plain click selects exactly its row"
     );
 
-    // The bulk bar appears after the first click, so the second click reads
-    // the fresh bounds rather than the pre-bar ones.
-    cx.update(|window, cx| window.click(check, cx));
+    // A Ctrl click toggles the row and leaves the rest alone.
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", second.id),
+        gpui_kit::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
     cx.run_until_parked();
     paint_frame(cx);
-    let (checked, selected) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (
-            delegate.checked.len(),
-            delegate.selected_row().map(|row| row.id),
-        )
-    });
-    assert_eq!(checked, 0, "the second click unchecks");
     assert_eq!(
-        selected.as_deref(),
-        Some(first.id.as_str()),
-        "unchecking does not restore or move the selection"
+        view.read_with(cx, |view, _| view.selection_ids()),
+        vec![first.id.clone(), second.id.clone()],
+        "the Ctrl click adds its row"
+    );
+
+    // A Shift click replaces the set with the range from the anchor.
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", third.id),
+        gpui_kit::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_ids()),
+        vec![first.id.clone(), second.id.clone(), third.id.clone()],
+        "the Shift click replaces the set with the range"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        Some(first.id.clone()),
+        "the anchor stays where it was"
     );
 }
 
@@ -12353,8 +12096,6 @@ fn f03_checkbox_click_keeps_checked_and_selected_independent(cx: &mut TestAppCon
 fn t01_detail_header_names_acting_row() {
     use crate::acting_on_label;
     use crate::store::ProxyConfig;
-    use crate::LibraryDelegate;
-    use gpui_kit::component::IndexPath;
     fn row(id: &str, name: &str) -> ProxyConfig {
         ProxyConfig {
             id: id.to_string(),
@@ -12370,17 +12111,9 @@ fn t01_detail_header_names_acting_row() {
             preset_id: None,
         }
     }
-    let mut delegate = LibraryDelegate::new();
-    delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta")]);
-    delegate.toggle_checked("1");
-    delegate.selected = Some(IndexPath::new(1));
-    let acting = delegate.selected_row().expect("a row is selected");
+    let acting = row("2", "Beta");
     assert_eq!(acting_on_label(&acting), "Acting on: Beta");
-    assert!(
-        delegate.checked.contains("1"),
-        "the bulk set is untouched by selection"
-    );
-    assert_ne!(acting.id, "1", "header names the selection, not a check");
+    assert_ne!(acting.id, "1", "the header names the selection");
 }
 
 #[test]
@@ -12473,7 +12206,7 @@ fn t44_facet_options_inventory_rows() {
 }
 
 #[gpui_kit::test]
-fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
+fn t44_ui_bars_and_the_batch_bar_paint(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -12485,114 +12218,58 @@ fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
-    // The facet band is retired; the filter slot owns the search.
     assert_absent(cx, "facet-bar".to_string());
     assert_absent(cx, "facet-group".to_string());
-    assert_absent(cx, "facet-protocol".to_string());
-    assert_absent(cx, "facet-status".to_string());
-    assert_absent(cx, "facet-group-tip".to_string());
-    assert_absent(cx, "facet-protocol-tip".to_string());
-    assert_absent(cx, "facet-status-tip".to_string());
     assert_painted(cx, "filter-slot");
     assert_painted(cx, "library-search");
-    assert_painted(cx, &format!("check-{}", first.id));
-    assert_painted(cx, &format!("check-{}", second.id));
+    // The checkbox is retired: no row carries one.
+    assert_absent(cx, format!("check-{}", first.id));
+    assert_absent(cx, format!("check-{}", second.id));
 
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&first.id);
-                list_cx.notify();
-            });
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_painted(cx, "bulk-bar");
-    assert_painted(cx, "bulk-label");
-    assert_painted(cx, "bulk-start");
-    assert_painted(cx, "bulk-stop");
-    assert_painted(cx, "bulk-more");
-    // K4: the checked row is the leading bar + filled kit checkbox. The
-    // numeral chip and the checked rim are gone; selection owns the rim.
-    assert_painted(cx, &format!("row-check-bar-{}", first.id));
+    // A selection swaps the search for the batch bar.
+    select_library_row(&view, cx, &first.id);
+    assert_painted(cx, "batch-bar");
+    assert_painted(cx, "batch-count");
+    assert_painted(cx, "batch-start");
+    assert_painted(cx, "batch-stop");
+    assert_painted(cx, "batch-test");
+    assert_painted(cx, "batch-delete");
+    assert_painted(cx, "batch-more");
+    assert_absent(cx, "library-search".to_string());
+    // No checked control survives anywhere in the row.
+    assert_absent(cx, format!("row-check-bar-{}", first.id));
     assert_absent(cx, format!("row-check-bar-{}", second.id));
     assert_absent(cx, format!("row-check-chip-{}", first.id));
     assert_absent(cx, format!("row-check-chip-{}", second.id));
-    // The secondary verbs moved behind More, so they are not on the bar.
-    for id in [
-        "bulk-select-visible",
-        "bulk-clear",
-        "bulk-enable",
-        "bulk-disable",
-        "bulk-move",
-        "bulk-copy",
-        "bulk-delete",
-    ] {
-        assert_absent(cx, id.to_string());
-    }
+    // The old Copy SOCKS cell is gone; the endpoint chip replaces it.
+    assert_painted(cx, &format!("row-endpoint-chip-{}", first.id));
 
+    // The count names the selection.
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
+
+    // The batch bar's More is a popover with the signed verbs.
     cx.update(|window, cx| {
-        window.click("bulk-more", cx);
+        window.click("batch-more", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
     for id in [
-        "bulk-more-select-visible",
-        "bulk-more-clear",
-        "bulk-more-move",
-        "bulk-more-copy",
-        "bulk-more-delete",
+        "batch-more-copy",
+        "batch-more-toggle",
+        "batch-more-move",
+        "batch-more-preset",
+        "batch-more-reset-traffic",
+        "batch-more-reset-usage",
+        "batch-more-delete",
     ] {
         assert_painted(cx, id);
     }
-    let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
-    cx.update(|window, cx| {
-        window.dispatch_keystroke(escape, cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_absent(cx, "bulk-more-delete".to_string());
-    let label = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().bulk_label()
-    });
-    assert_eq!(label, "1 checked (of 2)");
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "home".to_string();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-        });
-    });
-    let label = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().bulk_label()
-    });
-    assert_eq!(label, "1 checked (of 1)");
-
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.select_visible_checked(window, cx));
-    });
-    let label = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().bulk_label()
-    });
-    assert_eq!(label, "2 checked (of 1)");
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_checked(window, cx));
-    });
-    let label = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().bulk_label()
-    });
-    assert_eq!(label, "");
 }
 
 #[gpui_kit::test]
-fn k04_bulk_bar_single_line_within_min_frame(cx: &mut TestAppContext) {
+fn k04_batch_bar_single_line_within_min_frame(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -12604,107 +12281,54 @@ fn k04_bulk_bar_single_line_within_min_frame(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.toggle_checked(&first.id);
-                delegate.toggle_checked(&second.id);
-                list_cx.notify();
-            });
+            view.select_rows(&[first.id.clone(), second.id.clone()], cx);
         });
     });
     cx.run_until_parked();
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
-    assert_painted(cx, "bulk-bar");
-    assert_within_frame_min(cx, "bulk-bar");
-    assert_painted(cx, "bulk-label");
-    for id in ["bulk-start", "bulk-stop", "bulk-more"] {
+    assert_painted(cx, "batch-bar");
+    assert_within_frame_min(cx, "batch-bar");
+    assert_painted(cx, "batch-count");
+    for id in ["batch-start", "batch-stop", "batch-more"] {
         assert_painted(cx, id);
         assert_within_frame_min(cx, id);
     }
-    // K4/A3-2: the bar is one line, and its content ends before the 260px
-    // inspector drawer can cover it at the 880px minimum width.
+    // The bar is one line, and its content ends before the 260px inspector
+    // drawer can cover it at the 880px minimum width.
     let (bar_bounds, start_height, more_bounds) = cx.update(|window, _| {
         let bar = window
-            .try_find("bulk-bar".to_string())
-            .expect("bulk bar renders")
+            .try_find("batch-bar".to_string())
+            .expect("batch bar renders")
             .bounds();
         let start = window
-            .try_find("bulk-start".to_string())
-            .expect("bulk start renders")
+            .try_find("batch-start".to_string())
+            .expect("batch start renders")
             .bounds();
         let more = window
-            .try_find("bulk-more".to_string())
-            .expect("bulk more renders")
+            .try_find("batch-more".to_string())
+            .expect("batch more renders")
             .bounds();
         (bar, start.size.height, more)
     });
     assert!(
         bar_bounds.size.height <= start_height + px(20.),
-        "bulk bar stays on ONE line: bar {bar_bounds:?} vs button height {start_height:?}"
+        "the batch bar stays on ONE line: bar {bar_bounds:?} vs button height {start_height:?}"
     );
     assert!(
-        more_bounds.origin.x + more_bounds.size.width <= px(1100. - 260.),
-        "bulk More never hides behind the drawer: {more_bounds:?}"
+        more_bounds.origin.x + more_bounds.size.width
+            <= bar_bounds.origin.x + bar_bounds.size.width,
+        "the batch More stays inside the bar: {more_bounds:?} in {bar_bounds:?}"
     );
-    for id in [
-        "bulk-select-visible",
-        "bulk-clear",
-        "bulk-enable",
-        "bulk-disable",
-        "bulk-move",
-        "bulk-copy",
-        "bulk-delete",
-    ] {
-        assert_absent(cx, id.to_string());
-    }
-
-    cx.update(|window, cx| {
-        window.click("bulk-more", cx);
-    });
-    cx.run_until_parked();
-    paint_frame_min(cx);
-    cx.run_until_parked();
-    paint_frame_min(cx);
-    let items = [
-        "bulk-more-select-visible",
-        "bulk-more-clear",
-        "bulk-more-move",
-        "bulk-more-copy",
-        "bulk-more-delete",
-    ];
-    let mut order = Vec::new();
-    for id in items {
-        assert_painted(cx, id);
-        let bounds = cx.update(|window, _| {
-            window
-                .try_find(id.to_string())
-                .unwrap_or_else(|| panic!("{id} renders"))
-                .bounds()
-        });
-        order.push((bounds.origin.y, bounds.origin.x));
-    }
-    for pair in order.windows(2) {
-        assert!(
-            pair[0] <= pair[1],
-            "More reads selection | verbs | Delete trailing: {order:?}"
-        );
-    }
-    let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
-    cx.update(|window, cx| {
-        window.dispatch_keystroke(escape, cx);
-    });
-    cx.run_until_parked();
-    paint_frame_min(cx);
-    assert_absent(cx, "bulk-more-delete".to_string());
 }
 
 /// K4: the compact bar's Start is the SAME batch path the menu used to own.
 /// Clicking the real button must reach `start_many_additive` — one apply for
 /// every checked row, never a per-row spawn loop.
+/// The batch bar's Start is the SAME batch path the menu used to own.
 #[gpui_kit::test]
-fn k04_bulk_start_button_uses_batch_path(cx: &mut TestAppContext) {
+fn k04_batch_start_button_uses_batch_path(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12726,22 +12350,15 @@ fn k04_bulk_start_button_uses_batch_path(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                for id in [&alpha.id, &gamma.id] {
-                    delegate.toggle_checked(id);
-                }
-                list_cx.notify();
-            });
+            view.select_rows(&[alpha.id.clone(), gamma.id.clone()], cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "bulk-start");
-    assert_absent(cx, "bulk-enable".to_string());
+    assert_painted(cx, "batch-start");
 
     cx.update(|window, cx| {
-        window.click("bulk-start", cx);
+        window.click("batch-start", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -12754,11 +12371,11 @@ fn k04_bulk_start_button_uses_batch_path(cx: &mut TestAppContext) {
     let serving = view.read_with(cx, |view, _| view.engine.running_ids());
     assert!(
         serving.contains(&alpha.id) && serving.contains(&gamma.id),
-        "both checked rows serve: {serving:?}"
+        "both selected rows serve: {serving:?}"
     );
     assert!(
         !serving.contains(&beta.id),
-        "the unchecked row was not started: {serving:?}"
+        "the unselected row was not started: {serving:?}"
     );
     let served = stock.last_config().expect("the batch served a config");
     let value: serde_json::Value =
@@ -12774,13 +12391,12 @@ fn k04_bulk_start_button_uses_batch_path(cx: &mut TestAppContext) {
     }
     assert!(
         !ports.contains(&10992),
-        "the unchecked port never enters the batch: {ports:?}"
+        "the unselected port never enters the batch: {ports:?}"
     );
 }
 
 #[gpui_kit::test]
 fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -12795,41 +12411,27 @@ fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.toggle_checked(&first.id);
-                delegate.toggle_checked(&second.id);
-                delegate.selected = Some(IndexPath::new(2));
-                list_cx.notify();
-            });
+            view.select_rows(&[first.id.clone(), second.id.clone()], cx);
         });
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
     paint_frame(cx);
-    // K4: checked rows carry a 3px leading accent bar, not a rim and not a
-    // numeral chip; the selected-only row carries no check mark at all.
-    assert_painted(cx, &format!("row-check-bar-{}", first.id));
-    assert_painted(cx, &format!("row-check-bar-{}", second.id));
+    // One selection model: the selected rows carry the wash and the rim, and
+    // no row carries a check bar or a check chip.
+    assert_absent(cx, format!("row-check-bar-{}", first.id));
+    assert_absent(cx, format!("row-check-bar-{}", second.id));
     assert_absent(cx, format!("row-check-bar-{}", third.id));
     assert_absent(cx, format!("row-check-chip-{}", first.id));
     assert_absent(cx, format!("row-check-chip-{}", second.id));
     assert_absent(cx, format!("row-check-chip-{}", third.id));
-    let bar_bounds = cx.update(|window, _| {
-        window
-            .try_find(format!("row-check-bar-{}", first.id))
-            .expect("checked bar renders")
-            .bounds()
-    });
-    assert_eq!(bar_bounds.size.width, px(3.), "the bar is exactly 3px wide");
-    assert_painted(cx, "bulk-bar");
-    assert_painted(cx, "bulk-label");
-
+    // Every row carries the lead and the endpoint chip.
+    assert_painted(cx, &format!("row-lead-{}", first.id));
+    assert_painted(cx, &format!("row-endpoint-chip-{}", first.id));
+    assert_painted(cx, &format!("row-endpoint-menu-{}", first.id));
+    assert_painted(cx, "batch-bar");
+    assert_painted(cx, "batch-count");
     assert_painted(cx, "detail-acting-on");
-    let label = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().bulk_label()
-    });
-    assert_eq!(label, "2 checked (of 3)");
 }
 
 #[gpui_kit::test]
@@ -12864,6 +12466,14 @@ fn r04_row_columns_dialog_toggles_and_persists(cx: &mut TestAppContext) {
         RowColumns::default(),
         "safe subset on by default"
     );
+    // Upstream is off by default; turn it on so the toggle has a subject.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.set_row_column("upstream", true, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_dialog_open(cx);
     assert_painted(cx, &format!("row-upstream-{}", seeded.id));
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -12882,12 +12492,12 @@ fn r04_row_columns_dialog_toggles_and_persists(cx: &mut TestAppContext) {
         )
     });
     assert!(
-        !after.0.upstream && after.0.health,
+        !after.0.upstream && after.0.health && after.0.group,
         "toggle flips one column, keeps the rest: {:?}",
         after.0
     );
     assert_eq!(after.0, after.1, "delegate mirrors the choice");
-    assert_eq!(after.2.as_deref(), Some("health"), "choice persists");
+    assert_eq!(after.2.as_deref(), Some("health,group"), "choice persists");
     assert_absent(cx, format!("row-upstream-{}", seeded.id));
 }
 
@@ -12972,17 +12582,12 @@ fn r05_dirty_start_gates_and_clean_launches(cx: &mut TestAppContext) {
     );
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.toggle_checked(&dirty.id);
-                delegate.toggle_checked(&clean.id);
-                list_cx.notify();
-            });
+            view.select_rows(&[dirty.id.clone(), clean.id.clone()], cx);
         });
     });
     let before_bulk = notification_count(cx);
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+        view.update(cx, |view, cx| view.start_selected_batch(window, cx));
     });
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
@@ -13000,7 +12605,7 @@ fn r05_dirty_start_gates_and_clean_launches(cx: &mut TestAppContext) {
 /// serving, and the whole batch runs ONE apply — the fake engine's check
 /// counter is the proof (one `check_config` per apply, never per row).
 #[gpui_kit::test]
-fn start_checked_is_additive(cx: &mut TestAppContext) {
+fn start_selected_is_additive(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -13033,17 +12638,14 @@ fn start_checked_is_additive(cx: &mut TestAppContext) {
     );
     let checks_before = stock.check_calls();
 
-    // Only C is checked.
+    // Only C is selected.
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&gamma.id);
-                list_cx.notify();
-            });
+            view.select_rows(std::slice::from_ref(&gamma.id), cx);
         });
     });
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+        view.update(cx, |view, cx| view.start_selected_batch(window, cx));
     });
 
     assert_eq!(
@@ -13078,6 +12680,8 @@ fn start_checked_is_additive(cx: &mut TestAppContext) {
 
 /// T-05: twenty checked rows are ONE apply. The fake's check counter is
 /// the proof — it counts applies, never per-row starts.
+/// Twenty selected rows are ONE apply. The fake's check counter is the
+/// proof — it counts applies, never per-row starts.
 #[gpui_kit::test]
 fn bulk_start_twenty_rows_applies_once(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
@@ -13102,22 +12706,16 @@ fn bulk_start_twenty_rows_applies_once(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                for id in &ids {
-                    delegate.toggle_checked(id);
-                }
-                list_cx.notify();
-            });
+            view.select_rows(&ids, cx);
         });
     });
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+        view.update(cx, |view, cx| view.start_selected_batch(window, cx));
     });
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
         20,
-        "every checked row serves"
+        "every selected row serves"
     );
     assert_eq!(
         stock.check_calls(),
@@ -13128,6 +12726,9 @@ fn bulk_start_twenty_rows_applies_once(cx: &mut TestAppContext) {
 
 /// T-05: a checked row whose port is occupied is NAMED and skipped while
 /// the rest start. The batch is not refused and no every-row failure is
+/// reported.
+/// A selected row whose port is occupied is NAMED and skipped while the
+/// rest start. The batch is not refused and no every-row failure is
 /// reported.
 #[gpui_kit::test]
 fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext) {
@@ -13154,17 +12755,14 @@ fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                for id in [&alpha.id, &squatter.id, &gamma.id] {
-                    delegate.toggle_checked(id);
-                }
-                list_cx.notify();
-            });
+            view.select_rows(
+                &[alpha.id.clone(), squatter.id.clone(), gamma.id.clone()],
+                cx,
+            );
         });
     });
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+        view.update(cx, |view, cx| view.start_selected_batch(window, cx));
     });
     let serving = view.read_with(cx, |view, _| view.engine.running_ids());
     assert_eq!(serving.len(), 2, "the two free rows serve: {serving:?}");
@@ -13187,104 +12785,27 @@ fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext
 
 /// T-05: `Copy proxies` yields one TAB-separated line per running checked
 /// row — two spreadsheet columns, the name and the URL.
-#[gpui_kit::test]
-fn bulk_copy_proxies_yields_one_tab_separated_line_per_running_row(cx: &mut TestAppContext) {
-    use crate::engine::EngineController;
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10991"))
-        .expect("seed works");
-    let beta = store
-        .add(t30_engine_seed("Beta", "10992"))
-        .expect("seed works");
-    let gamma = store
-        .add(t30_engine_seed("Gamma", "10993"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    let (engine, _stock) = EngineController::fake();
-    cx.update(|_, cx| {
-        view.update(cx, |view, _| {
-            view.engine = engine;
-        });
-    });
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.start_row(&alpha.id, window, cx));
-    });
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.start_row(&beta.id, window, cx));
-    });
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                for id in [&alpha.id, &beta.id, &gamma.id] {
-                    delegate.toggle_checked(id);
-                }
-                list_cx.notify();
-            });
-        });
-    });
-    let read_clip = |cx: &mut VisualTestContext| {
-        cx.update(|_, cx| {
-            cx.read_from_clipboard()
-                .and_then(|item| item.text())
-                .unwrap_or_default()
-                .to_string()
-        })
-    };
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_bulk_copy_proxies(window, cx));
-    });
-    let clip = read_clip(cx);
-    let lines: Vec<&str> = clip.lines().collect();
-    assert_eq!(lines.len(), 2, "one line per running checked row: {clip}");
-    for line in &lines {
-        let columns: Vec<&str> = line.split('\t').collect();
-        assert_eq!(columns.len(), 2, "two spreadsheet columns: {line}");
-    }
-    assert!(clip.contains("Alpha\t"), "the name leads the line: {clip}");
-    assert!(clip.contains("Beta\t"), "the name leads the line: {clip}");
-    assert!(
-        !clip.contains("Gamma"),
-        "the stopped row is skipped: {clip}"
-    );
-    let (socks, _) = crate::store::proxy_urls("127.0.0.1", 10991);
-    assert!(
-        clip.contains(&socks),
-        "the URL carries the stored bind: {clip}"
-    );
-}
-
+///
 /// T-05: the copy toast is honest about what it skipped.
-#[test]
-fn t05_bulk_copy_messages_name_the_skipped_rows() {
-    use crate::{bulk_copy_nothing_message, bulk_copy_proxies_message};
-    assert_eq!(bulk_copy_proxies_message(12, 0), "Copied 12 proxies");
-    assert_eq!(
-        bulk_copy_proxies_message(12, 3),
-        "Copied 12 proxies (3 checked rows are stopped and were skipped)"
-    );
-    assert_eq!(bulk_copy_nothing_message(0), "No running endpoint to copy");
-    assert!(
-        bulk_copy_nothing_message(3).contains("3 checked rows are stopped"),
-        "the empty copy still names the skips"
-    );
-}
 
 #[test]
 fn r01_row_columns_defaults_parse_and_display() {
     use crate::RowColumns;
     let defaults = RowColumns::default();
     assert!(
-        defaults.upstream && defaults.health && !defaults.group && !defaults.traffic,
-        "safe subset on by default: {defaults:?}"
+        defaults.health
+            && defaults.group
+            && !defaults.protocol
+            && !defaults.upstream
+            && !defaults.traffic,
+        "the signed row's columns on by default: {defaults:?}"
     );
-    assert_eq!(defaults.display(), "upstream,health");
+    assert_eq!(defaults.display(), "health,group");
     assert_eq!(RowColumns::parse(""), defaults, "missing reads defaults");
     assert_eq!(
         RowColumns::parse("group,traffic,bogus"),
         RowColumns {
+            protocol: false,
             upstream: false,
             health: false,
             group: true,
@@ -13295,6 +12816,7 @@ fn r01_row_columns_defaults_parse_and_display() {
     assert_eq!(
         RowColumns::parse("none"),
         RowColumns {
+            protocol: false,
             upstream: false,
             health: false,
             group: false,
@@ -13391,9 +12913,10 @@ fn t01_row_cells_carry_one_fact_each() {
     }
 }
 
+/// One selection model: the selected row wears the wash and the rim, and
+/// no row carries a second, checked control.
 #[gpui_kit::test]
-fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
+fn t01_the_selection_wears_the_wash_and_the_rim(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let only = store
@@ -13402,12 +12925,7 @@ fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.toggle_checked(&only.id);
-                delegate.selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_row(&only.id, cx);
         });
     });
     cx.run_until_parked();
@@ -13417,23 +12935,25 @@ fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     assert_painted(cx, &format!("library-row-{}", only.id));
-    assert_painted(cx, &format!("row-card-{}", only.id));
+    assert_painted(cx, &format!("row-surface-{}", only.id));
     assert_painted(cx, "detail-acting-on");
 
-    assert_painted(cx, &format!("check-{}", only.id));
-    assert_painted(cx, &format!("row-check-bar-{}", only.id));
+    // The checkbox is retired: the row carries no check control at all.
+    assert_absent(cx, format!("check-{}", only.id));
+    assert_absent(cx, format!("row-check-bar-{}", only.id));
     assert_absent(cx, format!("row-check-chip-{}", only.id));
-    assert_painted(cx, "bulk-bar");
-    let (position, label) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (delegate.checked_position(&only.id), delegate.bulk_label())
-    });
-    assert_eq!(position, Some(1), "the checked set keeps its order");
-    assert_eq!(label, "1 checked (of 1)");
+    assert_painted(cx, "batch-bar");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        1,
+        "the selection holds exactly one row"
+    );
 }
 
+/// The lead is 24px wide and holds one 14px glyph. It is status, not a
+/// control: clicking it changes no selection and no filter.
 #[gpui_kit::test]
-fn t01_lamp_meets_twenty_four_px_target(cx: &mut TestAppContext) {
+fn row_lead_reports_phase_without_being_clickable(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -13452,18 +12972,57 @@ fn t01_lamp_meets_twenty_four_px_target(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    let id = format!("row-dot-{}", seeded.id);
+    let id = format!("row-lead-{}", seeded.id);
     assert_painted(cx, &id);
-    let bounds = cx.update(|window, _| window.try_find(id.clone()).expect("lamp finds").bounds());
-    assert!(
-        bounds.size.width >= px(crate::RowMetrics::LAMP_TARGET)
-            && bounds.size.height >= px(crate::RowMetrics::LAMP_TARGET),
-        "lamp keeps a 24px-minimum target: {bounds:?}"
+    let bounds = cx.update(|window, _| window.try_find(id.clone()).expect("lead finds").bounds());
+    assert_eq!(
+        bounds.size.width,
+        px(crate::RowMetrics::LEAD),
+        "the lead is exactly 24px wide: {bounds:?}"
     );
+    // The lead carries no button role: it is a mark, not a control.
+    let role = cx.update(|window, _| {
+        window
+            .try_find(id.clone())
+            .expect("lead finds")
+            .role()
+            .map(|role| format!("{role:?}"))
+    });
+    assert!(
+        role.as_deref().is_none_or(|role| !role.contains("Button")),
+        "the lead is not a button: {role:?}"
+    );
+
+    // Clicking the lead, centre or edge, changes no selection and no filter.
+    let before = view.read_with(cx, |view, _| view.selection_count());
+    cx.update(|window, cx| window.click(id.clone(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        before,
+        "the lead is status only"
+    );
+    let status = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().facet_status
+    });
+    assert_eq!(status, None, "the lead is not a filter trigger");
+    cx.update(|window, cx| window.click_at(id, point(px(1.), px(12.)), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        before,
+        "the whole 24px lead is inert"
+    );
+    let status = view.read_with(cx, |view, cx| {
+        view.libraries.read(cx).delegate().facet_status
+    });
+    assert_eq!(status, None, "the lead never writes the status facet");
 }
 
 #[gpui_kit::test]
-fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
+fn t44_ui_escape_clears_the_selection_only_without_dialog(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -13473,30 +13032,21 @@ fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&first.id);
-                list_cx.notify();
-            });
+            view.select_row(&first.id, cx);
         });
     });
 
     let cleared = cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
+        view.update(cx, |view, cx| {
+            view.clear_selection_unless_dialog(window, cx)
+        })
     });
     assert!(cleared, "escape clears with no dialog open");
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().bulk_label()
-        }),
-        ""
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 0);
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&first.id);
-                list_cx.notify();
-            });
+            view.select_row(&first.id, cx);
         });
     });
     cx.update(|window, cx| {
@@ -13505,15 +13055,15 @@ fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     let cleared = cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
+        view.update(cx, |view, cx| {
+            view.clear_selection_unless_dialog(window, cx)
+        })
     });
-    assert!(!cleared, "escape keeps the set while a dialog is open");
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().bulk_label()
-        }),
-        "1 checked (of 1)"
+    assert!(
+        !cleared,
+        "escape keeps the selection while a dialog is open"
     );
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
     cx.update(|window, cx| window.close_all_dialogs(cx));
 }
 
@@ -13531,11 +13081,7 @@ fn t44_ui_bulk_move_and_group_manager(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&first.id);
-                state.delegate_mut().toggle_checked(&second.id);
-                list_cx.notify();
-            });
+            view.select_rows(&[first.id.clone(), second.id.clone()], cx);
         });
     });
     let moved = cx.update(|window, cx| {
@@ -13593,8 +13139,6 @@ fn t44_ui_bulk_move_and_group_manager(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t44_ui_rename_group_refreshes_facets_and_inspector(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
-
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -13608,10 +13152,7 @@ fn t44_ui_rename_group_refreshes_facets_and_inspector(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let renamed = cx.update(|window, cx| {
@@ -14304,7 +13845,6 @@ fn honest_footer_labels_name_their_effect() {
         "subscription-edit",
         "import",
         "export",
-        "bulk-move",
         "group-rename",
     ] {
         let label = footer_commit_label(dialog);
@@ -14479,7 +14019,7 @@ fn honest_footers_close_silently_without_side_effects(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.open_preset_attach_dialog(row, window, cx)
+            view.open_preset_attach_dialog(row.clone(), vec![row.id.clone()], window, cx)
         });
     });
     paint_dialog_open(cx);
@@ -14618,7 +14158,9 @@ fn destructive_confirms_gate_on_named_affirmative(cx: &mut TestAppContext) {
     // K5: single-row delete no longer confirms — it is immediate with an
     // Undo toast; the other destructive classes below still confirm.
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_remove_confirm(row, window, cx));
+        view.update(cx, |view, cx| {
+            view.delete_row_immediately(&row.id, window, cx)
+        });
     });
     assert!(
         !cx.update(|window, cx| window.has_active_dialog(cx)),
@@ -14682,9 +14224,9 @@ fn t10_bulk_delete_result_reports_per_row_outcomes() {
 }
 
 #[gpui_kit::test]
-fn t10_bulk_delete_stops_running_and_removes_checked(cx: &mut TestAppContext) {
+fn bulk_delete_single_is_immediate_and_multi_confirms(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     // The Undo click happens inside the toast's slide-in; reduce motion keeps
@@ -14692,13 +14234,13 @@ fn t10_bulk_delete_stops_running_and_removes_checked(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
     cx.update(crate::bind_app_keys);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
-    // K17: names carry a ticket prefix — the undo stash is shared across
+    // K17: names carry a ticket prefix - the undo stash is shared across
     // this process's tests and other suites delete rows named Work/Home
     // without consuming their batch (bug07 leaves one behind on purpose).
-    store
+    let work = store
         .add(t30_engine_seed("K17 Work", "10981"))
         .expect("seed works");
-    store
+    let home = store
         .add(t30_engine_seed("K17 Home", "10982"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
@@ -14709,13 +14251,78 @@ fn t10_bulk_delete_stops_running_and_removes_checked(cx: &mut TestAppContext) {
             view.engine = engine;
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+
+    // One row deletes at once: no dialog, and the Undo toast is the safety net.
+    let before_single = notification_count(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.select_rows(std::slice::from_ref(&work.id), cx);
+            view.delete_selected_batch(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "one row deletes without a confirm"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        1,
+        "the single row is gone at once"
+    );
+    assert_eq!(
+        notification_count(cx),
+        before_single + 1,
+        "one Undo toast acknowledges the delete"
+    );
+    assert_eq!(
+        crate::undo_stash_count_named("K17 Work"),
+        1,
+        "the single row waits in memory for the toast lifetime"
+    );
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("k5-undo", cx));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        2,
+        "Undo restores the single row"
+    );
+    assert_eq!(
+        crate::undo_stash_count_named("K17 Work"),
+        0,
+        "the restored row leaves the stash"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view
+            .store
+            .get(&home.id)
+            .expect("store reads")
+            .is_some()),
+        "the other row never left"
+    );
+
+    // Undo restores the row with a new id, not the selection; pick the
+    // restored row again before F5.
+    let restored_work = view.read_with(cx, |view, _| {
+        view.store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "K17 Work")
+            .expect("Undo put the row back")
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_rows(std::slice::from_ref(&restored_work.id), cx);
+        });
+    });
+    // The toast button took the keyboard; F5 lives on the shell.
     cx.update(|window, cx| window.focus(&focus, cx));
     let keystroke = Keystroke::parse("f5").expect("test keystroke parses");
     cx.update(|window, cx| {
@@ -14738,22 +14345,33 @@ fn t10_bulk_delete_stops_running_and_removes_checked(cx: &mut TestAppContext) {
                 .iter()
                 .map(|row| row.id.clone())
                 .collect();
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().check_ids(&all);
-                list_cx.notify();
-            });
-            // K17 ruling (spec line 91): the More ▾ Delete path is immediate.
-            view.bulk_delete_checked(window, cx);
+            view.select_rows(&all, cx);
+            // Two or more selected: one confirm names the rows before
+            // anything is removed.
+            view.delete_selected_batch(window, cx);
         });
     });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "two or more rows confirm before deleting"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        2,
+        "the confirm leaves the store alone"
+    );
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("ok", cx));
+    cx.run_until_parked();
     assert!(
         !cx.update(|window, cx| window.has_active_dialog(cx)),
-        "bulk delete runs at once, no blocking dialog"
+        "the confirm closes after Delete"
     );
     assert_eq!(
         view.read_with(cx, |view, cx| view.config_count(cx)),
         0,
-        "all checked rows removed"
+        "every selected row is removed"
     );
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
@@ -14784,7 +14402,7 @@ fn t10_bulk_delete_stops_running_and_removes_checked(cx: &mut TestAppContext) {
     assert_eq!(
         restored.len(),
         2,
-        "one Undo restores the whole checked set: {:?}",
+        "one Undo restores the whole selection: {:?}",
         restored
             .iter()
             .map(|row| row.name.clone())
@@ -14829,11 +14447,8 @@ fn bug04_bulk_stop_counts_only_real_stops_and_keeps_flag(cx: &mut TestAppContext
     cx.update(|window, cx| {
         stock.fail_check("re-gen broke");
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().check_ids(&ids);
-                list_cx.notify();
-            });
-            view.commit_bulk_stop(window, cx);
+            view.select_rows(&ids, cx);
+            view.stop_selected_batch(window, cx);
         });
     });
     assert_eq!(notification_count(cx), before + 1, "one outcome toast");
@@ -14858,11 +14473,8 @@ fn bug04_bulk_stop_counts_only_real_stops_and_keeps_flag(cx: &mut TestAppContext
     let before = notification_count(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().check_ids(&ids);
-                list_cx.notify();
-            });
-            view.commit_bulk_stop(window, cx);
+            view.select_rows(&ids, cx);
+            view.stop_selected_batch(window, cx);
         });
     });
     assert_eq!(notification_count(cx), before + 1, "one outcome toast");
@@ -15202,7 +14814,7 @@ fn f12_add_selects_the_created_row(cx: &mut TestAppContext) {
     });
     assert!(closed, "the guided form commits and closes");
 
-    let (created, selected) = view.read_with(cx, |view, cx| {
+    let (created, selected) = view.read_with(cx, |view, _cx| {
         let rows = view.store.list().expect("list reads");
         let created = rows
             .iter()
@@ -15210,14 +14822,7 @@ fn f12_add_selects_the_created_row(cx: &mut TestAppContext) {
             .expect("created row persists")
             .id
             .clone();
-        (
-            created,
-            view.libraries
-                .read(cx)
-                .delegate()
-                .selected_row()
-                .map(|row| row.id),
-        )
+        (created, view.selection_focus.clone())
     });
     assert_eq!(
         selected.as_deref(),
@@ -15255,13 +14860,7 @@ fn f12_add_under_excluding_filter_keeps_selection(cx: &mut TestAppContext) {
         })
     });
     assert!(closed, "the guided form commits and closes");
-    let selected = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .selected_row()
-            .map(|row| row.id)
-    });
+    let selected = view.read_with(cx, |view, _cx| view.selection_focus.clone());
     assert_eq!(
         selected.as_deref(),
         Some(alpha.id.as_str()),
@@ -15588,16 +15187,14 @@ fn t05_import_commit_never_starts_endpoints(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t05_lan_start_gates_with_naming_confirm(cx: &mut TestAppContext) {
     use crate::{lan_confirm_text, lan_exposure_warning};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_lan_input("Lan")).expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
             view.start_selected_engine(window, cx);
         });
     });
@@ -15704,7 +15301,7 @@ fn library_paints_two_stored_rows(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn library_row_cards_paint_with_gap(cx: &mut TestAppContext) {
+fn library_rows_paint_flat_without_gaps(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -15719,24 +15316,36 @@ fn library_row_cards_paint_with_gap(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    let first_card = format!("row-card-{}", first.id);
-    let second_card = format!("row-card-{}", second.id);
+    let first_card = format!("row-surface-{}", first.id);
+    let second_card = format!("row-surface-{}", second.id);
     assert_painted(cx, &first_card);
     assert_painted(cx, &second_card);
     let (first_bounds, second_bounds) = cx.update(|window, _| {
         let first = window
             .try_find(first_card)
-            .expect("first row card finds")
+            .expect("first row surface finds")
             .bounds();
         let second = window
             .try_find(second_card)
-            .expect("second row card finds")
+            .expect("second row surface finds")
             .bounds();
         (first, second)
     });
-    assert!(
-        second_bounds.origin.y > first_bounds.origin.y + first_bounds.size.height,
-        "row cards keep a gap: first {first_bounds:?}, second {second_bounds:?}"
+    let pitch = crate::Density::Comfortable.pitch();
+    assert_eq!(
+        first_bounds.size.height.as_f32(),
+        pitch,
+        "the first row fills the density pitch"
+    );
+    assert_eq!(
+        second_bounds.size.height.as_f32(),
+        pitch,
+        "the second row fills the density pitch"
+    );
+    assert_eq!(
+        second_bounds.origin.y.as_f32(),
+        first_bounds.origin.y.as_f32() + pitch,
+        "flat rows meet on the hairline: first {first_bounds:?}, second {second_bounds:?}"
     );
 }
 
@@ -15761,7 +15370,7 @@ fn library_row_lamp_paints_in_every_state(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, &format!("row-dot-{}", seeded.id));
+    assert_painted(cx, &format!("row-lead-{}", seeded.id));
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -15775,12 +15384,11 @@ fn library_row_lamp_paints_in_every_state(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, &format!("row-dot-{}", seeded.id));
+    assert_painted(cx, &format!("row-lead-{}", seeded.id));
 }
 
 #[gpui_kit::test]
 fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
-    use crate::library_row_cells;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let running = store
@@ -15813,9 +15421,14 @@ fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     for row in [&running, &stopped, &dead] {
-        assert_painted(cx, &format!("row-card-{}", row.id));
-        assert_painted(cx, &format!("row-dot-{}", row.id));
-        assert_painted(cx, &format!("check-{}", row.id));
+        assert_painted(cx, &format!("row-surface-{}", row.id));
+        assert_painted(cx, &format!("row-lead-{}", row.id));
+        assert_painted(cx, &format!("row-name-text-{}", row.id));
+        assert_painted(cx, &format!("row-endpoint-chip-{}", row.id));
+        assert_painted(cx, &format!("row-health-{}", row.id));
+        assert_painted(cx, &format!("row-group-{}", row.id));
+        // The lead is status only: no checkbox rides the row.
+        assert_absent(cx, format!("check-{}", row.id));
     }
 
     let (lamp_x, card_h): (Vec<_>, Vec<_>) = cx.update(|window, _| {
@@ -15823,11 +15436,11 @@ fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
             .iter()
             .map(|row| {
                 let lamp = window
-                    .try_find(format!("row-dot-{}", row.id))
+                    .try_find(format!("row-lead-{}", row.id))
                     .expect("lamp finds")
                     .bounds();
                 let card = window
-                    .try_find(format!("row-card-{}", row.id))
+                    .try_find(format!("row-surface-{}", row.id))
                     .expect("card finds")
                     .bounds();
                 (lamp.origin.x, card.size.height)
@@ -15843,39 +15456,26 @@ fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
         "cards share one height: {card_h:?}"
     );
 
-    for (row, upstream, health, serving) in [
-        (&running, "a.example.com:443", Some("87ms"), true),
-        (&stopped, "b.example.com:443", None, false),
-        (&dead, "c.example.com:443", Some("dead"), true),
-    ] {
-        let cells = library_row_cells(row, upstream, health, serving, false, None, false);
-        assert_eq!(cells[0], upstream, "upstream cell in row");
-        assert_painted(cx, &format!("row-upstream-{}", row.id));
-        if serving {
-            assert!(
-                !cells[1].is_empty(),
-                "serving rows carry health text:\n{cells:?}"
-            );
-            assert_painted(cx, &format!("row-health-{}", row.id));
-        } else {
-            assert!(
-                cells[1].is_empty(),
-                "stopped health cell stays empty — gray lamp carries stopped"
-            );
-        }
-    }
-    let live = library_row_cells(
-        &running,
-        "a.example.com:443",
-        Some("87ms"),
-        true,
-        false,
-        None,
-        false,
-    );
+    // Health is the serving state's word; a stopped row keeps the empty cell
+    // and lets the gray lead carry the state, so the grid never shifts.
+    assert_painted(cx, &format!("row-health-{}", running.id));
+    assert_painted(cx, &format!("row-health-{}", stopped.id));
+    assert_painted(cx, &format!("row-health-{}", dead.id));
+
+    // Protocol and Upstream are opt-in columns. The default row paints neither.
+    assert_painted(cx, &format!("row-endpoint-chip-{}", running.id));
+    assert_absent(cx, format!("row-upstream-{}", running.id));
+    assert_absent(cx, format!("row-protocol-{}", running.id));
+
+    // Clicking the name selects the row; the lead is not a target.
+    cx.update(|window, cx| {
+        window.click(format!("row-name-text-{}", stopped.id), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
     assert!(
-        live[1].contains("87ms"),
-        "health number rides running row:\n{live:?}"
+        view.read_with(cx, |view, _| view.is_selected(&stopped.id)),
+        "the name click selects its row"
     );
 }
 
@@ -15925,7 +15525,7 @@ fn t02_row_anatomy_stress_stays_uniform(cx: &mut TestAppContext) {
     fn painted_cards(cx: &mut VisualTestContext, ids: &[String]) -> Vec<(String, String)> {
         cx.update(|window, _| {
             ids.iter()
-                .filter_map(|id| window.try_find(format!("row-card-{id}")))
+                .filter_map(|id| window.try_find(format!("row-surface-{id}")))
                 .map(|snapshot| {
                     let bounds = snapshot.bounds();
                     (
@@ -15945,8 +15545,8 @@ fn t02_row_anatomy_stress_stays_uniform(cx: &mut TestAppContext) {
         );
         let lamps = cx.update(|window, _| {
             ids.iter()
-                .filter(|id| window.try_find(format!("row-card-{id}")).is_some())
-                .filter(|id| window.try_find(format!("row-dot-{id}")).is_some())
+                .filter(|id| window.try_find(format!("row-surface-{id}")).is_some())
+                .filter(|id| window.try_find(format!("row-lead-{id}")).is_some())
                 .count()
         });
         assert_eq!(lamps, cards.len(), "{label}: every card keeps its lamp");
@@ -16084,8 +15684,9 @@ fn facet_group_choice_releases_the_state_filter(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.set_facet_menu(None, Some(FacetStatus::Disabled));
+                state
+                    .delegate_mut()
+                    .set_facet_menu(None, Some(FacetStatus::Disabled));
                 list_cx.notify();
             });
         });
@@ -16374,79 +15975,9 @@ fn t05_latency_facet_restores_from_store(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn lamp_click_toggles_endpoint_state_filter(cx: &mut TestAppContext) {
-    use crate::FacetStatus;
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let seeded = store
-        .add(facet_seed("Work", "vless", "travel", "10801"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    // Never run, no probe verdict: the gray lamp stands for "stopped", and the
-    // click filters on exactly the state the lamp paints.
-    let lamp = format!("row-dot-{}", seeded.id);
-    assert_painted(cx, &lamp);
-    cx.update(|window, cx| {
-        window.click(lamp.clone(), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let status = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().facet_status
-    });
-    assert_eq!(status, Some(FacetStatus::Stopped));
-    // The dropdown can name the filter the lamp wrote; otherwise its collapsed
-    // label would lie while the list shows only one state.
-    let (display, picked) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        let (choices, current) = crate::FacetMenu::Group.choices(delegate);
-        let picked = choices
-            .into_iter()
-            .find(|choice| choice.value == current)
-            .map(|choice| choice.id);
-        (crate::FacetMenu::Group.current_display(delegate), picked)
-    });
-    assert_eq!(display, "Status: Stopped");
-    assert_eq!(picked.as_deref(), Some("facet-status-stopped"));
-    // The clicked row carries that lamp, so the filter cannot hide it.
-    assert_painted(cx, &format!("library-row-{}", seeded.id));
-
-    cx.update(|window, cx| {
-        window.click(lamp.clone(), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let status = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().facet_status
-    });
-    assert_eq!(status, None, "a second click releases the filter");
-
-    // The target is the 24px wrapper, not the 12px dot: a click near the
-    // wrapper's edge still toggles.
-    cx.update(|window, cx| {
-        window.click_at(lamp.clone(), point(px(1.), px(12.)), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let status = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().facet_status
-    });
-    assert_eq!(
-        status,
-        Some(FacetStatus::Stopped),
-        "the enlarged target owns its edge"
-    );
-}
-
-#[gpui_kit::test]
 fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::point;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16457,10 +15988,7 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
 
@@ -16535,7 +16063,7 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::point;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16546,10 +16074,7 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
             view.inspector_tab = crate::InspectorTab::Health;
             cx.notify();
         });
@@ -16627,7 +16152,6 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -16643,10 +16167,7 @@ fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
     ] {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                view.libraries.update(cx, |state, list_cx| {
-                    state.delegate_mut().selected = Some(IndexPath::new(0));
-                    list_cx.notify();
-                });
+                view.select_visible_row(0, cx);
                 view.inspector_tab = tab;
                 cx.notify();
             });
@@ -16738,10 +16259,7 @@ fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -16775,7 +16293,7 @@ fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
         );
     });
 
-    let card = format!("row-card-{}", row.id);
+    let card = format!("row-surface-{}", row.id);
     cx.update(|window, cx| window.right_click(card, cx));
     cx.run_until_parked();
     paint_frame(cx);
@@ -16834,12 +16352,9 @@ fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
     );
 
     // enabled-when is the table's too: no selection, no selection target.
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = None;
-                list_cx.notify();
-            });
+            view.clear_selection(window, cx);
         });
     });
     cx.update(|_, cx| {
@@ -16915,29 +16430,21 @@ fn f08_palette_rows_stop_lying(cx: &mut TestAppContext) {
     );
     assert_eq!(
         matched(cx, "selection"),
-        0,
-        "no row says 'selection' any more"
-    );
-    assert_eq!(
-        matched(cx, "checked"),
         1,
-        "the renamed row matches on its label"
+        "the Clear selection row matches on its label"
     );
-    assert_eq!(
-        matched(cx, "uncheck"),
-        1,
-        "the rename's keyword resolves too"
-    );
+    assert_eq!(matched(cx, "checked"), 0, "no row says 'checked' any more");
+    assert_eq!(matched(cx, "uncheck"), 0, "no row says 'uncheck' any more");
     assert_eq!(
         matched(cx, "escape"),
         1,
         "the Esc binding keyword still finds the row"
     );
-    // The surviving row is the ClearChecked op, at its renumbered path.
+    // The surviving row is the ClearSelection op, at its renumbered path.
     assert_eq!(
         crate::AppView::palette_op_at(gpui_kit::component::IndexPath::new(9).section(0)),
-        Some("clear-checked"),
-        "Clear checked stays on the op it names"
+        Some("clear-selection"),
+        "Clear selection stays on the op it names"
     );
 }
 
@@ -17335,7 +16842,7 @@ fn t08_refresh_batch_progress_and_streaming_rows(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -17345,10 +16852,7 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
             view.inspector_tab = crate::InspectorTab::Health;
             cx.notify();
         });
@@ -17414,7 +16918,7 @@ fn laneb_serving_tone_single_evidence_rule() {
 #[gpui_kit::test]
 fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::point;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -17425,10 +16929,7 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -17535,7 +17036,6 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
 
 #[gpui_kit::test]
 fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -17544,10 +17044,7 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     for (tab, name) in [
@@ -17629,7 +17126,6 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -17639,10 +17135,7 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
     let select_health_tab = |view: &Entity<AppView>, cx: &mut gpui_kit::VisualTestContext| {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                view.libraries.update(cx, |state, list_cx| {
-                    state.delegate_mut().selected = Some(IndexPath::new(0));
-                    list_cx.notify();
-                });
+                view.select_visible_row(0, cx);
                 view.inspector_tab = crate::InspectorTab::Health;
                 cx.notify();
             });
@@ -17729,7 +17222,6 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
 
 #[gpui_kit::test]
 fn t04_detail_fits_minimum_window(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -17738,10 +17230,7 @@ fn t04_detail_fits_minimum_window(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -17780,7 +17269,6 @@ fn t04_detail_fits_minimum_window(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -17789,10 +17277,7 @@ fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -17843,7 +17328,7 @@ fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
 fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     use crate::health::FakeHealthProber;
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -17852,10 +17337,7 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
             let (engine, _) = EngineController::fake();
             view.engine = engine;
             let (prober, _) = FakeHealthProber::shared();
@@ -17940,10 +17422,7 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -18004,38 +17483,21 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.toggle_checked(&first.id);
-                delegate.toggle_checked(&second.id);
-                list_cx.notify();
-            });
+            view.select_rows(&[first.id.clone(), second.id.clone()], cx);
         });
     });
     cx.run_until_parked();
     paint_frame_min(cx);
     cx.run_until_parked();
     paint_frame_min(cx);
-    assert_painted(cx, "bulk-bar");
-    assert_painted(cx, "bulk-label");
+    assert_painted(cx, "batch-bar");
+    assert_painted(cx, "batch-count");
 
-    let verbs = ["bulk-start", "bulk-stop", "bulk-more"];
+    let verbs = ["batch-start", "batch-stop", "batch-more"];
     for id in verbs {
         assert_painted(cx, id);
         assert_within_frame_min(cx, id);
     }
-    for id in [
-        "bulk-select-visible",
-        "bulk-clear",
-        "bulk-enable",
-        "bulk-disable",
-        "bulk-move",
-        "bulk-copy",
-        "bulk-delete",
-    ] {
-        assert_absent(cx, id.to_string());
-    }
-
     let mut order = Vec::new();
     for id in verbs {
         let bounds = cx.update(|window, _| {
@@ -18052,20 +17514,15 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
             "bulk bar reads Start | Stop | More: {order:?}"
         );
     }
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().bulk_label()
-        }),
-        "2 checked (of 2)"
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 2);
 
     let (bar_bounds, button_height) = cx.update(|window, _| {
         let bar = window
-            .try_find("bulk-bar".to_string())
+            .try_find("batch-bar".to_string())
             .expect("bulk bar renders")
             .bounds();
         let button = window
-            .try_find("bulk-start".to_string())
+            .try_find("batch-start".to_string())
             .expect("bulk start renders")
             .bounds();
         (bar, button.size.height)
@@ -18076,7 +17533,7 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
     );
 
     cx.update(|window, cx| {
-        window.click("bulk-more", cx);
+        window.click("batch-more", cx);
     });
     cx.run_until_parked();
     paint_frame_min(cx);
@@ -18084,7 +17541,7 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
     paint_frame_min(cx);
     // F6: Enable/Disable left the bulk menu — the flag is restore-on-launch,
     // not a bulk operation.
-    let menu = ["bulk-more-move", "bulk-more-copy", "bulk-more-delete"];
+    let menu = ["batch-more-copy", "batch-more-move", "batch-more-delete"];
     let mut menu_order = Vec::new();
     for id in menu {
         assert_painted(cx, id);
@@ -18108,12 +17565,11 @@ fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame_min(cx);
-    assert_absent(cx, "bulk-more-delete".to_string());
+    assert_absent(cx, "batch-more-delete".to_string());
 }
 
 #[gpui_kit::test]
 fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -18122,10 +17578,7 @@ fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -18180,7 +17633,6 @@ fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -18196,10 +17648,7 @@ fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
     ] {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                view.libraries.update(cx, |state, list_cx| {
-                    state.delegate_mut().selected = Some(IndexPath::new(0));
-                    list_cx.notify();
-                });
+                view.select_visible_row(0, cx);
                 view.inspector_tab = tab;
                 cx.notify();
             });
@@ -18224,7 +17673,6 @@ fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
 
@@ -18235,10 +17683,7 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -18307,7 +17752,6 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -18339,10 +17783,7 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
     ] {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                view.libraries.update(cx, |state, list_cx| {
-                    state.delegate_mut().selected = Some(IndexPath::new(0));
-                    list_cx.notify();
-                });
+                view.select_visible_row(0, cx);
                 view.inspector_tab = tab;
                 cx.notify();
             });
@@ -18407,7 +17848,6 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t10_copy_selected_urls_carry_binds_not_secrets(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
 
@@ -18418,10 +17858,7 @@ fn t10_copy_selected_urls_carry_binds_not_secrets(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -18464,7 +17901,6 @@ fn t10_copy_selected_urls_carry_binds_not_secrets(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -18474,10 +17910,7 @@ fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let has_spinner = |cx: &mut VisualTestContext, id: &str| {
@@ -18679,7 +18112,7 @@ fn b18_row_accent_is_off_under_reduce_motion(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert!(
-        finds(cx, format!("row-card-{}", settled_quiet.id)),
+        finds(cx, format!("row-surface-{}", settled_quiet.id)),
         "the row itself still paints"
     );
     assert!(
@@ -18715,7 +18148,7 @@ fn b18_row_accent_keeps_row_pitch_and_count(cx: &mut TestAppContext) {
     let cards = |cx: &mut VisualTestContext, rows: &[String]| {
         cx.update(|window, _| {
             rows.iter()
-                .filter_map(|id| window.try_find(format!("row-card-{id}")))
+                .filter_map(|id| window.try_find(format!("row-surface-{id}")))
                 .map(|snapshot| {
                     let bounds = snapshot.bounds();
                     (bounds.origin.y.as_f32(), bounds.size.height.as_f32())
@@ -18732,7 +18165,7 @@ fn b18_row_accent_keeps_row_pitch_and_count(cx: &mut TestAppContext) {
     assert!(
         quiet
             .iter()
-            .all(|(_, height)| *height == crate::RowMetrics::CARD_HEIGHT),
+            .all(|(_, height)| *height == crate::Density::Comfortable.row_height()),
         "quiet rows keep their card height: {quiet:?}"
     );
 
@@ -18756,13 +18189,13 @@ fn b18_row_accent_keeps_row_pitch_and_count(cx: &mut TestAppContext) {
     assert!(
         accented
             .windows(2)
-            .all(|pair| pair[1].0 - pair[0].0 == crate::RowMetrics::ROW_PITCH),
+            .all(|pair| pair[1].0 - pair[0].0 == crate::Density::Comfortable.pitch()),
         "the pitch is untouched: {accented:?}"
     );
     let (card, accent) = cx.update(|window, _| {
         (
             window
-                .try_find(format!("row-card-{}", rows[1]))
+                .try_find(format!("row-surface-{}", rows[1]))
                 .expect("the settled row paints")
                 .bounds(),
             window
@@ -18777,14 +18210,13 @@ fn b18_row_accent_keeps_row_pitch_and_count(cx: &mut TestAppContext) {
         "the accent is the card's own leading edge"
     );
     assert_eq!(
-        accent.origin.x - card.origin.x,
-        px(1.),
-        "the strip rides the card's inside edge, past its hairline"
+        accent.origin.x, card.origin.x,
+        "the strip is the row's own leading edge"
     );
     assert_eq!(
-        card.size.height - accent.size.height,
-        px(2.),
-        "the strip fills the card inside its hairline, not the row"
+        accent.size.height + px(1.),
+        card.size.height,
+        "the strip runs the row's full interior, inside its hairline"
     );
 }
 
@@ -18844,8 +18276,6 @@ fn t09_import_double_commit_ignored(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
-
     use crate::InspectorTab;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -18857,10 +18287,7 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
 
@@ -18895,37 +18322,26 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&row_id);
-                list_cx.notify();
-            });
+            view.select_row(&row_id, cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_painted(cx, "bulk-bar");
-    assert_painted(cx, "bulk-label");
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().bulk_label()
-        }),
-        "1 checked (of 1)"
-    );
+    assert_painted(cx, "batch-bar");
+    assert_painted(cx, "batch-count");
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_checked(window, cx));
+        view.update(cx, |view, cx| view.clear_selection(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
 
     assert!(
-        cx.update(|window, _| window.try_find("bulk-bar".to_string()).is_some()),
-        "bulk anchor persists while empty"
+        cx.update(|window, _| window.try_find("batch-bar".to_string()).is_none()),
+        "the batch bar leaves the slot when the selection empties"
     );
-    assert!(
-        cx.update(|window, _| window.try_find("bulk-label".to_string()).is_none()),
-        "cleared set hides the bulk label"
-    );
+    assert_painted(cx, "library-search");
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.open_add_dialog(window, cx));
@@ -18949,17 +18365,14 @@ fn t09_bulk_clear_returns_focus_to_shell(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&row_id);
-                list_cx.notify();
-            });
+            view.select_row(&row_id, cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "bulk-label");
+    assert_painted(cx, "batch-count");
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_checked(window, cx));
+        view.update(cx, |view, cx| view.clear_selection(window, cx));
     });
     let home = cx.update(|window, cx| {
         let shell = view.read(cx).focus.clone();
@@ -18970,7 +18383,6 @@ fn t09_bulk_clear_returns_focus_to_shell(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -18980,10 +18392,7 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -19176,7 +18585,6 @@ fn library_paints_empty_state(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -19191,10 +18599,7 @@ fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let third_id = cx.update(|window, cx| {
@@ -19551,8 +18956,10 @@ fn t26_engine_seed(name: &str, port: &str) -> NewConfig {
     }
 }
 
+/// A filter narrows the visible set; the selection is the app's, and a
+/// hidden row stays selected so the batch still acts on it.
 #[test]
-fn filter_selection_follows_id_never_wrong_row() {
+fn filter_narrows_the_visible_set_never_the_wrong_row() {
     use crate::store::ProxyConfig;
     use crate::LibraryDelegate;
     fn row(id: &str, name: &str) -> ProxyConfig {
@@ -19561,7 +18968,7 @@ fn filter_selection_follows_id_never_wrong_row() {
             name: name.to_string(),
             protocol: "vless".to_string(),
             params: "{}".to_string().into(),
-            group: "default".to_string(),
+            group: "team".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
             port: 10801,
@@ -19570,34 +18977,24 @@ fn filter_selection_follows_id_never_wrong_row() {
             preset_id: None,
         }
     }
-    use gpui_kit::component::IndexPath;
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta"), row("3", "Gamma")]);
-    delegate.selected = Some(IndexPath::new(0));
-    assert_eq!(
-        delegate.selected_row().map(|row| row.id),
-        Some("1".to_string())
-    );
+    assert_eq!(delegate.visible_ids().len(), 3, "no filter shows every row");
 
     delegate.query = "gamma".to_string();
     delegate.apply_filter();
     assert_eq!(
-        delegate.selected_row(),
-        None,
-        "filtered-out selection clears"
+        delegate.visible_ids(),
+        vec!["3".to_string()],
+        "the filter narrows the visible set"
     );
 
-    delegate.query = String::new();
-    delegate.apply_filter();
-    assert_eq!(delegate.selected_row(), None);
-
-    delegate.selected = Some(IndexPath::new(0));
-    delegate.query = "a".to_string();
+    delegate.query = "alpha".to_string();
     delegate.apply_filter();
     assert_eq!(
-        delegate.selected_row().map(|row| row.id),
-        Some("1".to_string()),
-        "visible selection preserved by id"
+        delegate.visible_ids(),
+        vec!["1".to_string()],
+        "the filter names the rows it kept"
     );
 }
 
@@ -20333,16 +19730,13 @@ fn enabled_flag_message_names_row_and_meaning() {
 
 #[gpui_kit::test]
 fn toggle_success_toasts_flag_meaning(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -20361,7 +19755,7 @@ fn toggle_success_toasts_flag_meaning(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn start_selected_flag_write_failure_is_loud(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
@@ -20375,9 +19769,7 @@ fn start_selected_flag_write_failure_is_loud(cx: &mut TestAppContext) {
                 .expect("readonly works");
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let id = view.read_with(cx, |view, cx| {
@@ -20589,7 +19981,7 @@ fn keyboard_shortcuts_open_and_guard_dialogs(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn keyboard_f5_starts_selected(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -20604,9 +19996,7 @@ fn keyboard_f5_starts_selected(cx: &mut TestAppContext) {
             view.engine = engine;
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -20625,7 +20015,6 @@ fn keyboard_f5_starts_selected(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -20639,10 +20028,7 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -20700,6 +20086,7 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
         "search focus opens nothing"
     );
 
+    cx.update(|window, cx| window.focus(&focus, cx));
     press(cx, "ctrl-e");
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
@@ -20736,10 +20123,7 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
     // row, open its editor, and Delete must refuse instead of acting.
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     press(cx, "ctrl-e");
@@ -20762,12 +20146,9 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
 
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = None;
-                list_cx.notify();
-            });
+            view.clear_selection(window, cx);
         });
     });
     cx.update(|window, cx| window.focus(&focus, cx));
@@ -21251,26 +20632,30 @@ fn inspector_badge_copy() {
 
 #[test]
 fn t01_status_text_equivalents() {
-    use crate::{lamp_access_label, ServingTone};
-    use manyproxy_core::check_chip_tip;
+    use crate::store::ProxyConfig;
+    use manyproxy_core::{library_row_lines, serving_badge};
+    let row = ProxyConfig {
+        id: "1".to_string(),
+        name: "paris".to_string(),
+        protocol: "vless".to_string(),
+        params: "{}".to_string().into(),
+        group: "g".to_string(),
+        enabled: true,
+        bind_ip: "127.0.0.1".to_string(),
+        port: 10801,
+        subscription_id: None,
+        identity_key: None,
+        preset_id: None,
+    };
     assert_eq!(
-        lamp_access_label(ServingTone::Serving, "paris"),
-        "Serving — paris"
+        serving_badge(true, "127.0.0.1", 10801, Some("live")),
+        "● Running · 127.0.0.1:10801 · live"
     );
-    assert_eq!(
-        lamp_access_label(ServingTone::Stopped, "paris"),
-        "Stopped — paris"
+    let lines = library_row_lines(&row, Some("live"), true, None);
+    assert!(
+        lines.iter().any(|line| line.contains("paris")),
+        "the row names itself: {lines:?}"
     );
-    assert_eq!(
-        lamp_access_label(ServingTone::Failed, "paris"),
-        "Failed — paris (dead while serving)"
-    );
-    assert_ne!(
-        lamp_access_label(ServingTone::Serving, "paris"),
-        lamp_access_label(ServingTone::Stopped, "paris")
-    );
-    assert_eq!(check_chip_tip(1, 3), "Checked 1 of 3 — bulk action target");
-    assert_eq!(check_chip_tip(3, 3), "Checked 3 of 3 — bulk action target");
 }
 
 #[test]
@@ -21420,10 +20805,10 @@ fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
 
-    // T-03: the row is one line. It keeps the quiet `row-port-<id>` pill and
+    // T-03: the row is one line. It keeps the quiet endpoint chip and
     // nothing else framed — the editors moved to the inspector.
     for id in [&alpha.id, &beta.id] {
-        assert_painted(cx, &format!("row-port-{id}"));
+        assert_painted(cx, &format!("row-endpoint-chip-{id}"));
         for slot in ["row-bind-", "row-port-input-", "row-serve-", "row-edit-"] {
             assert_absent(cx, format!("{slot}{id}"));
         }
@@ -21559,24 +20944,29 @@ fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppCon
         "the table keeps its 640px floor in the drawer, got {narrow_table}"
     );
 
-    // Esc closes the drawer and hands focus back to the list.
+    // Esc closes layers in order: the drawer first, the selection second.
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.clear_checked_unless_dialog(window, cx);
+            view.clear_selection_unless_dialog(window, cx);
         });
     });
     cx.run_until_parked();
-    let (open, checked) = view.read_with(cx, |view, cx| {
-        (
-            view.inspector_visible,
-            view.libraries.read(cx).delegate().checked.len(),
-        )
+    let (open, selected) = view.read_with(cx, |view, _cx| {
+        (view.inspector_visible, view.selection_count())
     });
-    assert!(!open, "Esc closed the drawer");
-    assert_eq!(
-        checked, 0,
-        "Esc closed one layer - the checked set survived"
-    );
+    assert!(!open, "the first Esc closes the drawer");
+    assert_eq!(selected, 1, "the selection survives the first Esc");
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.clear_selection_unless_dialog(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let (open, selected) = view.read_with(cx, |view, _cx| {
+        (view.inspector_visible, view.selection_count())
+    });
+    assert!(!open, "the drawer stays closed");
+    assert_eq!(selected, 0, "the second Esc clears the selection");
 }
 
 /// F1: the drawer is an input-occluding overlay. A click on its blank padding
@@ -21607,7 +20997,7 @@ fn t03_inspector_drawer_occludes_blank_clicks(cx: &mut TestAppContext) {
             .expect("the drawer paints")
             .bounds();
         let covered = window
-            .try_find(format!("row-card-{}", other_row.id))
+            .try_find(format!("row-surface-{}", other_row.id))
             .expect("the non-selected row paints")
             .bounds();
         point(px(3.), covered.center().y - drawer.origin.y)
@@ -21616,13 +21006,7 @@ fn t03_inspector_drawer_occludes_blank_clicks(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    let selected = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .selected_row()
-            .map(|row| row.id)
-    });
+    let selected = view.read_with(cx, |view, _cx| view.selection_focus.clone());
     assert_eq!(
         selected.as_deref(),
         Some(selected_row.id.as_str()),
@@ -21733,7 +21117,7 @@ fn f19_selection_opens_and_esc_closes_in_both_presentations(cx: &mut TestAppCont
     assert_painted(cx, "inspector-drawer");
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.clear_checked_unless_dialog(window, cx);
+            view.clear_selection_unless_dialog(window, cx);
         });
     });
     cx.run_until_parked();
@@ -21743,14 +21127,14 @@ fn f19_selection_opens_and_esc_closes_in_both_presentations(cx: &mut TestAppCont
 
     // Docked: the same click opens the split pane, the same Esc closes it.
     paint_frame_at(cx, 1400., 800.);
-    cx.update(|window, cx| window.click(format!("library-row-{}", next.id), cx));
+    cx.update(|window, cx| window.click(format!("row-name-text-{}", next.id), cx));
     cx.run_until_parked();
     paint_frame_at(cx, 1400., 800.);
     assert_painted(cx, "config-detail");
     assert_absent(cx, "inspector-drawer".to_string());
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.clear_checked_unless_dialog(window, cx);
+            view.clear_selection_unless_dialog(window, cx);
         });
     });
     cx.run_until_parked();
@@ -21807,8 +21191,6 @@ fn f19_inspector_shortcut_toggles_presence(cx: &mut TestAppContext) {
 /// their own unavailability.
 #[gpui_kit::test]
 fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
-
     let has_spinner = |cx: &mut VisualTestContext, id: &str| {
         cx.update(|window, _| window.try_find(id.to_string()).is_some())
     };
@@ -21824,10 +21206,7 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
             view.engine = engine;
             let (prober, _) = crate::health::FakeHealthProber::shared();
             view.prober = Box::new(prober);
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -21893,8 +21272,6 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
 /// group tags that used to bracket them are gone.
 #[gpui_kit::test]
 fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
-
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -21903,10 +21280,7 @@ fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppCon
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -21918,37 +21292,38 @@ fn f11_inspector_header_is_the_acting_echo_and_serving_badge(cx: &mut TestAppCon
     assert_painted(cx, "detail-serving");
 }
 
-/// F2: upstream is the third budget drop. At 740 the protocol column is gone
-/// but upstream still fits; at the 640 floor it goes too, so the minimum row
-/// (586px) never overflows the table.
+/// F2: upstream is the optional cell the width budget gives up. With the
+/// default row (name, endpoint, health, group) it needs 780px; at 740 it is
+/// gone, so the 640 floor never overflows.
 #[test]
-fn t03_row_budget_drops_upstream_after_protocol() {
+fn t03_row_budget_drops_upstream_at_the_floor() {
     use crate::{LibraryColumns, RowColumns, RowMetrics};
 
-    let columns = RowColumns::default();
+    let columns = RowColumns {
+        upstream: true,
+        ..RowColumns::default()
+    };
     let layout = LibraryColumns::default();
+    let at_780 = RowMetrics::for_table_width(780., columns, layout);
+    assert!(at_780.show_upstream, "upstream fits at 780");
+    assert!(at_780.show_health, "health is never budgeted away");
+
     let at_740 = RowMetrics::for_table_width(740., columns, layout);
-    assert!(!at_740.show_protocol, "protocol drops at 740");
-    assert!(at_740.show_upstream, "upstream still fits at 740");
+    assert!(!at_740.show_upstream, "upstream drops at 740");
     assert!(at_740.show_health, "health is never budgeted away");
 
-    let at_640 = RowMetrics::for_table_width(640., columns, layout);
-    assert!(!at_640.show_protocol, "protocol drops at 640");
-    assert!(!at_640.show_upstream, "upstream drops at 640");
-    assert!(at_640.show_health, "health is never budgeted away");
-
-    // Name, endpoint, health and copy never drop. The row that remains once
-    // protocol and upstream are gone fits the floor with room to spare.
-    let min_row = RowMetrics::LAMP_CHECK
-        + RowMetrics::CHECK_SLOT
+    // Name, endpoint, health and group never drop. The row that remains once
+    // upstream is gone fits the floor with room to spare.
+    let min_row = RowMetrics::LEAD
         + RowMetrics::NAME_MIN
         + RowMetrics::ENDPOINT
         + RowMetrics::HEALTH
-        + RowMetrics::COPY
+        + RowMetrics::GROUP
+        + RowMetrics::ACTIONS
         + 5. * RowMetrics::GAP;
-    assert_eq!(min_row, 586.);
+    assert_eq!(min_row, 610.);
     assert!(min_row <= RowMetrics::TABLE_MIN);
-    assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 734.);
+    assert_eq!(min_row + RowMetrics::UPSTREAM + RowMetrics::GAP, 758.);
 }
 
 /// T-03: one gesture from edge to edge: the delegate follows every move, the
@@ -22111,9 +21486,13 @@ fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    view.update(cx, |view, cx| {
-        view.inspector_visible = false;
-        cx.notify();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.inspector_visible = false;
+            // Protocol is an opt-in column; the drag needs it painted.
+            view.set_row_column("protocol", true, window, cx);
+            cx.notify();
+        });
     });
     paint_frame(cx);
 
@@ -22144,8 +21523,9 @@ fn t04_column_drag_reorders_persists_and_keeps_sort(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(layout, saved, "the new order is written on release");
-    assert_eq!(layout.order()[1], LibraryColumn::Health);
-    assert_eq!(layout.order()[2], LibraryColumn::Protocol);
+    assert_eq!(layout.order()[1], LibraryColumn::Group);
+    assert_eq!(layout.order()[2], LibraryColumn::Health);
+    assert_eq!(layout.order()[3], LibraryColumn::Protocol);
 
     let health = left(cx, "sort-header-health");
     assert!(
@@ -22183,9 +21563,14 @@ fn t04_column_drag_cannot_cross_fixed_columns(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    view.update(cx, |view, cx| {
-        view.inspector_visible = false;
-        cx.notify();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.inspector_visible = false;
+            // Both opt-in columns must paint for the drag to cross them.
+            view.set_row_column("protocol", true, window, cx);
+            view.set_row_column("upstream", true, window, cx);
+            cx.notify();
+        });
     });
     paint_frame(cx);
 
@@ -22227,7 +21612,7 @@ fn t03_drawer_table_keeps_copy_left_of_the_drawer(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     assert_painted(cx, "inspector-drawer");
-    let copy_id = format!("row-copy-{}", row.id);
+    let copy_id = format!("row-endpoint-chip-{}", row.id);
     assert_painted(cx, &copy_id);
 
     let (copy_right, drawer_left) = cx.update(|window, _| {
@@ -22266,7 +21651,7 @@ fn t03_row_pitch_holds_at_the_minimum_window(cx: &mut TestAppContext) {
     let measured = cx.update(|window, _| {
         let mut rows: Vec<(f32, f32)> = Vec::new();
         for id in &ids {
-            let card = window.try_find(format!("row-card-{id}"));
+            let card = window.try_find(format!("row-surface-{id}"));
             if let Some(card) = card {
                 let card = card.bounds();
                 rows.push((card.origin.y.as_f32(), card.size.height.as_f32()));
@@ -22279,17 +21664,18 @@ fn t03_row_pitch_holds_at_the_minimum_window(cx: &mut TestAppContext) {
         "the minimum frame paints a screenful of rows, got {}",
         measured.len()
     );
+    let pitch = crate::Density::Comfortable.pitch();
     for (_, height) in &measured {
         assert!(
-            *height <= 32.,
-            "no row is taller than 32px at the minimum, got {height}"
+            *height <= pitch,
+            "no row is taller than the density pitch at the minimum, got {height}"
         );
     }
     for pair in measured.windows(2) {
         let gap = pair[1].0 - pair[0].0;
         assert!(
-            gap > 0. && gap <= 32.,
-            "the row pitch stays inside the 32px budget at the minimum, got {gap}"
+            gap > 0. && gap <= pitch,
+            "the row pitch stays on the density pitch at the minimum, got {gap}"
         );
     }
 }
@@ -22323,7 +21709,7 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
     let measured: Vec<(f32, f32)> = cx.update(|window, _| {
         let mut rows: Vec<(f32, f32)> = Vec::new();
         for id in &ids {
-            let card = window.try_find(format!("row-card-{id}"));
+            let card = window.try_find(format!("row-surface-{id}"));
             let name = window.try_find(format!("row-name-{id}"));
             if let (Some(card), Some(name)) = (card, name) {
                 let card = card.bounds();
@@ -22342,41 +21728,44 @@ fn t03_dense_rows_measure_pitch_and_header_alignment(cx: &mut TestAppContext) {
         "20+ rows paint at 1920x1032, got {}",
         measured.len()
     );
+    let density_pitch = crate::Density::Comfortable.pitch();
     let mut pitch: f32 = 0.;
     for pair in measured.windows(2) {
         let gap = pair[1].0 - pair[0].0;
         assert!(
-            gap > 0. && gap <= 32.,
-            "the row pitch stays inside the 32px budget, got {gap}"
+            gap > 0. && gap <= density_pitch,
+            "the row pitch stays on the density pitch, got {gap}"
         );
         pitch = pitch.max(gap);
     }
     for (_, height) in &measured {
-        assert!(*height <= 32., "no row is taller than 32px, got {height}");
+        assert!(
+            *height <= density_pitch,
+            "no row is taller than the density pitch, got {height}"
+        );
     }
     assert!(pitch > 0., "the pitch is measurable");
 
-    // The row's only framed control besides the checkbox is Copy, and it
-    // holds its fixed cell with the whole label visible.
+    // The endpoint chip is the row's one framed control; it holds its fixed
+    // cell with the whole label visible.
     let copy_label = cx.update(|window, _| {
         window
-            .try_find(format!("row-copy-{}", ids[0]))
+            .try_find(format!("row-endpoint-chip-{}", ids[0]))
             .and_then(|snapshot| snapshot.label().map(str::to_string))
     });
-    assert!(
-        copy_label
-            .as_deref()
-            .is_some_and(|label| label.starts_with("Copy SOCKS")),
-        "the row carries a Copy SOCKS action, got {copy_label:?}"
+    assert_eq!(
+        copy_label.as_deref(),
+        Some("Click to copy SOCKS"),
+        "the chip names its copy action"
     );
     let copy_width = cx.update(|window, _| {
         window
-            .try_find(format!("row-copy-{}", ids[0]))
+            .try_find(format!("row-endpoint-chip-{}", ids[0]))
             .map(|snapshot| snapshot.bounds().size.width.as_f32())
     });
     assert!(
-        copy_width.is_some_and(|width| width <= 96.),
-        "Copy holds its 96px cell, got {copy_width:?}"
+        copy_width.is_some_and(|width| width <= 120.),
+        "the chip holds its 120px cell, got {copy_width:?}"
     );
 
     // Every header label sits at its column's first character.
@@ -22475,7 +21864,7 @@ fn t03_row_copy_proxy_copies_that_row(cx: &mut TestAppContext) {
             .bind_ip
     });
     cx.update(|window, cx| {
-        window.click(format!("row-copy-{}", alpha.id), cx);
+        window.click(format!("row-endpoint-chip-{}", alpha.id), cx);
     });
     cx.run_until_parked();
     let clip = cx.update(|_, cx| {
@@ -23054,7 +22443,7 @@ fn t41_restart_crashed_recovers_and_idle_quiet(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn double_start_while_busy_is_ignored(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -23071,9 +22460,7 @@ fn double_start_while_busy_is_ignored(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let checks_before = handle.check_calls();
@@ -23097,7 +22484,7 @@ fn double_start_while_busy_is_ignored(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn start_on_running_restarts_honestly(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -23110,9 +22497,7 @@ fn start_on_running_restarts_honestly(cx: &mut TestAppContext) {
             view.engine = engine;
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let id = view.read_with(cx, |view, cx| {
@@ -23240,7 +22625,7 @@ fn search_no_hits_vs_empty_counts() {
             name: name.to_string(),
             protocol: "vless".to_string(),
             params: "{}".to_string().into(),
-            group: "default".to_string(),
+            group: "team".to_string(),
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
             port: 10801,
@@ -23264,7 +22649,6 @@ fn search_no_hits_vs_empty_counts() {
 
 #[gpui_kit::test]
 fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store.add(seed_input("Work")).expect("seed works");
@@ -23277,9 +22661,7 @@ fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
                 delegate.apply_filter();
                 list_cx.notify();
             });
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
 
@@ -23289,9 +22671,9 @@ fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
                 let delegate = state.delegate_mut();
                 delegate.query = String::new();
                 delegate.apply_filter();
-                delegate.selected = Some(IndexPath::new(0));
                 list_cx.notify();
             });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -23455,9 +22837,9 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
             view.libraries.update(cx, |state, list_cx| {
                 let delegate = state.delegate_mut();
                 delegate.set_facet_menu(Some("travel".to_string()), Some(FacetStatus::Enabled));
-                delegate.toggle_checked(&work.id);
                 list_cx.notify();
             });
+            view.select_row(&work.id, cx);
         });
     });
     cx.run_until_parked();
@@ -23468,7 +22850,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
             delegate.query.clone(),
             delegate.facet_group.clone(),
             delegate.facet_status,
-            delegate.checked.contains(&work.id),
+            view.is_selected(&work.id),
             delegate.facets_active(),
         )
     });
@@ -23481,7 +22863,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
     // that replaces it owns them.
     assert_absent(cx, "clear-search".to_string());
     assert_absent(cx, "clear-facets".to_string());
-    assert_painted(cx, "bulk-more");
+    assert_painted(cx, "batch-more");
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.clear_library_search(window, cx));
@@ -23494,7 +22876,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
             delegate.query.clone(),
             delegate.facet_group.clone(),
             delegate.facet_status,
-            delegate.checked.contains(&work.id),
+            view.is_selected(&work.id),
         )
     });
     assert_eq!(
@@ -23534,7 +22916,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
             delegate.query.clone(),
             delegate.facet_group.clone(),
             delegate.facet_status,
-            delegate.checked.contains(&work.id),
+            view.is_selected(&work.id),
         )
     });
     assert_eq!(after_facets.0, "Work", "Clear facets keeps the query");
@@ -23554,12 +22936,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     cx.update(|window, cx| {
-        window.click("bulk-more", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.click("bulk-more-clear", cx);
+        window.click("batch-clear", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -23569,7 +22946,7 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
             delegate.query.clone(),
             delegate.facet_group.clone(),
             delegate.facet_status,
-            delegate.checked.is_empty(),
+            view.selection_count() == 0,
         )
     });
     assert_eq!(after_checked.0, "Work", "Clear checked keeps the query");
@@ -23753,8 +23130,6 @@ fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
 // width, on the wide side panel, and at the 240px panel floor.
 #[gpui_kit::test]
 fn t20_inspector_tab_row_fits_the_narrowest_drawer(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
-
     const SLUGS: [&str; 5] = ["details", "health", "logs", "links", "traffic"];
 
     cx.update(gpui_kit::init);
@@ -23765,10 +23140,7 @@ fn t20_inspector_tab_row_fits_the_narrowest_drawer(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -23829,7 +23201,6 @@ fn t20_inspector_tab_row_fits_the_narrowest_drawer(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     use gpui_kit::point;
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
@@ -23848,10 +23219,7 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -23991,7 +23359,7 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn throne04_inspector_overview_shared_across_panes(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -24000,10 +23368,7 @@ fn throne04_inspector_overview_shared_across_panes(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
 
@@ -24704,7 +24069,12 @@ fn preset_attach_and_detach_commit(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.commit_preset_attach(&row.id, Some(preset.id.clone()), window, cx);
+            view.commit_preset_attach_ids(
+                std::slice::from_ref(&row.id),
+                Some(preset.id.clone()),
+                window,
+                cx,
+            );
         });
     });
     let attached = view.read_with(cx, |view, _| {
@@ -24716,7 +24086,7 @@ fn preset_attach_and_detach_commit(cx: &mut TestAppContext) {
     assert_eq!(attached.preset_id.as_deref(), Some(preset.id.as_str()));
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.commit_preset_attach(&row.id, None, window, cx);
+            view.commit_preset_attach_ids(std::slice::from_ref(&row.id), None, window, cx);
         });
     });
     let detached = view.read_with(cx, |view, _| {
@@ -24748,7 +24118,7 @@ fn laneb_preset_attach_dialog_detaches_inline_with_rule_count(cx: &mut TestAppCo
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let config = view.row_config(&row.id).expect("row reads");
-            view.open_preset_attach_dialog(config, window, cx);
+            view.open_preset_attach_dialog(config.clone(), vec![config.id.clone()], window, cx);
         });
     });
     cx.run_until_parked();
@@ -24784,7 +24154,7 @@ fn laneb_preset_attach_dialog_detaches_inline_with_rule_count(cx: &mut TestAppCo
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let config = view.row_config(&row.id).expect("row reads");
-            view.open_preset_attach_dialog(config, window, cx);
+            view.open_preset_attach_dialog(config.clone(), vec![config.id.clone()], window, cx);
         });
     });
     cx.run_until_parked();
@@ -25685,7 +25055,7 @@ fn window_corner_choice_persists_and_paints_in_settings(cx: &mut TestAppContext)
 #[gpui_kit::test]
 fn attached_start_serves_preset_rules_first(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let row = store
@@ -25720,18 +25090,14 @@ fn attached_start_serves_preset_rules_first(cx: &mut TestAppContext) {
             view.engine = engine;
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.reload_quiet(cx);
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -26198,7 +25564,7 @@ fn t60_completion_lists_valid_exits_only(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let config = view.row_config(&row.id).expect("row reads");
-            view.open_preset_attach_dialog(config, window, cx);
+            view.open_preset_attach_dialog(config.clone(), vec![config.id.clone()], window, cx);
         });
     });
     cx.run_until_parked();
@@ -26287,10 +25653,7 @@ fn t64_dialog_monitor_section_renders_top_five(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(gpui_kit::component::IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -26376,7 +25739,7 @@ fn t64_dialog_monitor_hidden_for_empty_group(cx: &mut TestAppContext) {
     };
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.open_preset_attach_dialog(phantom.clone(), window, cx);
+            view.open_preset_attach_dialog(phantom.clone(), vec![phantom.id.clone()], window, cx);
         });
     });
     cx.run_until_parked();
@@ -26394,7 +25757,7 @@ fn t64_dialog_monitor_hidden_for_empty_group(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let config = view.row_config(&only.id).expect("row reads");
-            view.open_preset_attach_dialog(config, window, cx);
+            view.open_preset_attach_dialog(config.clone(), vec![config.id.clone()], window, cx);
         });
     });
     cx.run_until_parked();
@@ -26492,10 +25855,7 @@ fn t64_no_switching_behavior_added(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(gpui_kit::component::IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -26968,7 +26328,6 @@ fn t10_stats_dialogs_open_with_matching_bars(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(tick12_seed("Work", "10871")).expect("seed works");
@@ -26983,9 +26342,7 @@ fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.update(|window, cx| {
@@ -27000,12 +26357,9 @@ fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
         "chooser opens the attach picker"
     );
     cx.update(|window, cx| window.close_all_dialogs(cx));
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = None;
-                list_cx.notify();
-            });
+            view.clear_selection(window, cx);
         });
     });
     let before = notification_count(cx);
@@ -29689,7 +29043,6 @@ fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
 
 #[gpui_kit::test]
 fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -29705,10 +29058,7 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -29819,7 +29169,6 @@ fn assert_within_frame_min(cx: &mut VisualTestContext, id: &str) {
 
 #[gpui_kit::test]
 fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let first = store
@@ -29832,10 +29181,7 @@ fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -29908,7 +29254,6 @@ fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -29917,10 +29262,7 @@ fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -29943,7 +29285,7 @@ fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn laneb_engine_bar_counts_the_running_rows(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -29962,13 +29304,12 @@ fn laneb_engine_bar_counts_the_running_rows(cx: &mut TestAppContext) {
         });
         view.update(cx, |view, cx| {
             view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-
                 state
                     .delegate_mut()
                     .set_facet_status(Some(crate::FacetStatus::Stopped));
                 list_cx.notify();
             });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -30173,7 +29514,6 @@ fn f04_settings_offer_the_core_guide(cx: &mut TestAppContext) {
 /// renamed toggle.
 #[gpui_kit::test]
 fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let on = store
@@ -30194,9 +29534,7 @@ fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
     );
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     open_inspector(&view, cx);
@@ -30252,7 +29590,7 @@ fn t11_engine_bar_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t10_engine_bar_slots_hold_width_across_value_changes(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
-    use gpui_kit::component::IndexPath;
+
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -30271,10 +29609,7 @@ fn t10_engine_bar_slots_hold_width_across_value_changes(cx: &mut TestAppContext)
             view.engine = engine;
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -30329,10 +29664,7 @@ fn t10_engine_bar_slots_hold_width_across_value_changes(cx: &mut TestAppContext)
                 .add_traffic_batch(&accruals)
                 .expect("traffic accrues");
             view.reload(window, cx);
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
@@ -30739,7 +30071,6 @@ fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     use gpui_kit::Focusable as _;
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
@@ -30757,6 +30088,11 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Delete selected", "Delete"),
         ("Extend selection up", "Shift-Up"),
         ("Extend selection down", "Shift-Down"),
+        ("Move focus up", "Up"),
+        ("Move focus down", "Down"),
+        ("Move focus to first row", "Home"),
+        ("Move focus to last row", "End"),
+        ("Toggle focused row", "Space"),
         ("Select all visible", "Ctrl-A"),
         ("Focus search", "Ctrl-F"),
         ("Inspector details", "Ctrl-1"),
@@ -30766,7 +30102,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Inspector links", "Ctrl-5"),
         ("Inspector traffic", "Ctrl-6"),
         ("Toggle inspector", "Ctrl-I"),
-        ("Uncheck all", "Esc"),
+        ("Clear selection", "Esc"),
         ("Copy URLs", "Ctrl-U"),
         ("Command palette", "Ctrl-K"),
         ("Update the group in focus", "Ctrl-R"),
@@ -30818,9 +30154,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -30893,10 +30227,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&id);
-                list_cx.notify();
-            });
+            view.select_row(&id, cx);
         });
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
@@ -30905,27 +30236,20 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     press(cx, "escape");
     cx.run_until_parked();
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .bulk_label()),
-        "",
-        "Escape clears the checked set"
+        view.read_with(cx, |view, _| view.selection_count()),
+        0,
+        "Escape clears the selection"
     );
     assert_eq!(notification_count(cx), before, "Escape clear is silent");
     assert_eq!(
         view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
         None,
-        "Escape clears the selection with the checks"
+        "Escape clears the selection"
     );
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().toggle_checked(&id);
-                list_cx.notify();
-            });
+            view.select_row(&id, cx);
         });
     });
     cx.update(|window, cx| {
@@ -30934,17 +30258,12 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     let kept = cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
+        view.update(cx, |view, cx| {
+            view.clear_selection_unless_dialog(window, cx)
+        })
     });
     assert!(!kept, "escape keeps the set while a dialog is open");
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .bulk_label()),
-        "1 checked (of 1)"
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
     cx.update(|window, cx| window.close_all_dialogs(cx));
     cx.run_until_parked();
 
@@ -30965,13 +30284,9 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         "arrows keep the selection"
     );
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .bulk_label()),
-        "1 checked (of 1)",
-        "arrows keep the checks"
+        view.read_with(cx, |view, _| view.selection_count()),
+        1,
+        "the guard probe leaves its one-row selection in place"
     );
 }
 
@@ -31313,28 +30628,36 @@ fn t67_shortcut_lines_lists_stop_testing_key() {
     );
 }
 
-/// Every key the app binds in its own context, in the canonical form
-/// `KeyBinding::unparse` writes: lower-case modifiers, then the key.
+/// Every key the app binds in its own contexts, in the canonical form
+/// `KeyBinding::unparse` writes: lower-case modifiers, then the key. One key
+/// can be bound more than once (Escape clears from both the shell and the
+/// list), but the reference lists each shortcut once.
 fn bound_key_strings(cx: &mut TestAppContext) -> Vec<String> {
     cx.update(|cx| {
         let keymap = cx.key_bindings();
         let map = keymap.borrow();
-        map.bindings()
-            .filter(|binding| {
-                binding
-                    .predicate()
-                    .map(|predicate| predicate.to_string() == crate::keys::APP_KEY_CONTEXT)
-                    .unwrap_or(false)
-            })
-            .map(|binding| {
-                binding
-                    .keystrokes()
-                    .iter()
-                    .map(|keystroke| keystroke.unparse())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect()
+        let mut keys: Vec<String> = Vec::new();
+        for binding in map.bindings().filter(|binding| {
+            binding
+                .predicate()
+                .map(|predicate| {
+                    predicate
+                        .to_string()
+                        .starts_with(crate::keys::APP_KEY_CONTEXT)
+                })
+                .unwrap_or(false)
+        }) {
+            let key = binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.unparse())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
     })
 }
 
@@ -31500,7 +30823,6 @@ fn t67_show_security_toggles_in_place_without_toast(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
-    use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     fn secret_seed(name: &str, port: &str) -> NewConfig {
         NewConfig {
@@ -31532,10 +30854,7 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
         });
     });
     let row = view.read_with(cx, |view, cx| view.selected_config(cx).expect("selected"));
@@ -32443,7 +31762,6 @@ fn t65_mount_with_failed_probe<'a>(
 ) {
     use crate::engine::EngineController;
     use crate::health::FakeHealthProber;
-    use gpui_kit::component::IndexPath;
 
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let failed = store.add(t65_seed("Alpha", ports[0])).expect("seed works");
@@ -32464,10 +31782,7 @@ fn t65_mount_with_failed_probe<'a>(
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().selected = Some(IndexPath::new(0));
-                list_cx.notify();
-            });
+            view.select_visible_row(0, cx);
             // F19: setting the selection by hand skips the row pick that opens
             // the inspector.
             view.open_inspector();
@@ -35033,7 +34348,7 @@ fn t06_selected_row_wears_the_kit_focus_ring(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     select_library_row(&view, cx, &seeded.id);
-    assert_painted(cx, &format!("row-card-{}", seeded.id));
+    assert_painted(cx, &format!("row-surface-{}", seeded.id));
 
     let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
     cx.update(|window, cx| window.focus(&list_handle, cx));
@@ -35052,7 +34367,7 @@ fn t06_selected_row_wears_the_kit_focus_ring(cx: &mut TestAppContext) {
         Some(list_handle),
         "the frame hands the live list handle to the delegate"
     );
-    assert_painted(cx, &format!("row-card-{}", seeded.id));
+    assert_painted(cx, &format!("row-surface-{}", seeded.id));
 
     // Focus elsewhere: the row stays selected, the ring decision turns off.
     let shell = view.read_with(cx, |view, _| view.focus.clone());
@@ -35064,7 +34379,7 @@ fn t06_selected_row_wears_the_kit_focus_ring(cx: &mut TestAppContext) {
         Some(shell),
         "the shell can take the keyboard back"
     );
-    assert_painted(cx, &format!("row-card-{}", seeded.id));
+    assert_painted(cx, &format!("row-surface-{}", seeded.id));
 }
 
 /// T-06: once the list holds the keyboard, Up/Down walk the rows, and the
@@ -35090,9 +34405,7 @@ fn t06_list_arrows_traverse_and_report_the_selected_row(cx: &mut TestAppContext)
     let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, state_cx| {
-                state.set_selected_index(Some(IndexPath::new(0)), window, state_cx);
-            });
+            view.select_visible_row(0, cx);
         });
         window.focus(&list_handle, cx);
     });
@@ -35107,32 +34420,26 @@ fn t06_list_arrows_traverse_and_report_the_selected_row(cx: &mut TestAppContext)
     }
 
     press(cx, "down");
-    let (kit_index, delegate_index, second_id) = view.read_with(cx, |view, cx| {
-        let state = view.libraries.read(cx);
-        let delegate = state.delegate();
+    let (focus, second_id) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
         let second = delegate
             .visible
             .get(1)
             .and_then(|&row| delegate.rows.get(row))
             .map(|row| row.id.clone());
-        (state.selected_index(), delegate.selected, second)
+        (view.selection_focus.clone(), second)
     });
     assert_eq!(
-        kit_index,
-        Some(IndexPath::new(1)),
-        "Down moves the list's own selection - the value aria_selected and ListItem::selected are computed from"
-    );
-    assert_eq!(
-        delegate_index,
-        Some(IndexPath::new(1)),
-        "the delegate renders the row the kit selected"
+        focus,
+        second_id.clone(),
+        "Down moves the app's focus to the next row"
     );
     let second_id = second_id.expect("second row exists");
-    assert_painted(cx, &format!("row-card-{second_id}"));
+    assert_painted(cx, &format!("row-surface-{second_id}"));
 
     press(cx, "up");
-    let kit_index = view.read_with(cx, |view, cx| view.libraries.read(cx).selected_index());
-    assert_eq!(kit_index, Some(IndexPath::new(0)), "Up walks back");
+    let focus = view.read_with(cx, |view, _| view.selection_focus.clone());
+    assert!(focus.is_some(), "Up walks back");
 }
 
 /// T-06: removing the selected row clears the list's own selection too, so UIA
@@ -35154,10 +34461,9 @@ fn t06_removing_the_selected_row_clears_the_lists_selection(cx: &mut TestAppCont
     paint_frame(cx);
 
     select_library_row(&view, cx, &doomed.id);
-    let before = view.read_with(cx, |view, cx| view.libraries.read(cx).selected_index());
     assert!(
-        before.is_some(),
-        "the click selects the row in the list itself"
+        view.read_with(cx, |view, _| view.is_selected(&doomed.id)),
+        "the click selects the row"
     );
 
     cx.update(|window, cx| {
@@ -35166,16 +34472,17 @@ fn t06_removing_the_selected_row_clears_the_lists_selection(cx: &mut TestAppCont
     cx.run_until_parked();
     paint_frame(cx);
 
-    let (kit_index, delegate_index) = view.read_with(cx, |view, cx| {
-        let state = view.libraries.read(cx);
-        (state.selected_index(), state.delegate().selected)
+    let (focus, count, still_selected) = view.read_with(cx, |view, _| {
+        (
+            view.selection_focus.clone(),
+            view.selection_count(),
+            view.is_selected(&doomed.id),
+        )
     });
-    assert_eq!(
-        kit_index, None,
-        "the removed row is no longer the list's selection"
-    );
-    assert_eq!(delegate_index, None, "the delegate agrees");
-    assert_absent(cx, format!("row-card-{}", doomed.id));
+    assert_eq!(focus, None, "the removed row is no longer the focus");
+    assert_eq!(count, 0, "the selection is pruned with the row");
+    assert!(!still_selected, "the removed row is no longer selected");
+    assert_absent(cx, format!("row-surface-{}", doomed.id));
 }
 
 /// T-08: a data folder that refuses a write raises the standing banner, names
@@ -35757,7 +35064,9 @@ fn k5_delete_is_immediate_and_undo_restores_the_row(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
 
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_remove_confirm(row, window, cx));
+        view.update(cx, |view, cx| {
+            view.delete_row_immediately(&row.id, window, cx)
+        });
     });
     cx.run_until_parked();
     assert_eq!(
@@ -35807,7 +35116,9 @@ fn k5_undo_expiry_is_permanent(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
 
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_remove_confirm(row, window, cx));
+        view.update(cx, |view, cx| {
+            view.delete_row_immediately(&row.id, window, cx)
+        });
     });
     cx.run_until_parked();
     assert_eq!(
@@ -36214,8 +35525,8 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     select_library_row(&view, cx, &work.id);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.select_visible_checked(window, cx));
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.select_all_visible_rows(cx));
     });
     paint_frame(cx);
 
@@ -36241,9 +35552,9 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
         ("engine-bar-start-all", "Start all"),
         ("engine-bar-stop-all", "Stop all"),
         ("engine-bar-overflow", "More actions"),
-        ("bulk-start", "Start"),
-        ("bulk-stop", "Stop"),
-        ("bulk-more", "More bulk actions"),
+        ("batch-start", "Start"),
+        ("batch-stop", "Stop"),
+        ("batch-more", "More batch actions"),
         ("row-menu", "More actions"),
         ("inspector-drawer-close", "Close inspector"),
     ] {
@@ -36268,7 +35579,7 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
     }
 
     // Static segments: no action, but each still names itself.
-    for id in ["bulk-label", "action-bar-count", "engine-bar-status"] {
+    for id in ["batch-count", "action-bar-count", "engine-bar-status"] {
         let (_, label) = snapshot(cx, id);
         assert!(
             label.as_ref().is_some_and(|label| !label.is_empty()),
@@ -36293,8 +35604,8 @@ fn b19_action_bar_controls_fit_their_row(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     select_library_row(&view, cx, &work.id);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.select_visible_checked(window, cx));
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.select_all_visible_rows(cx));
     });
 
     for (width, height) in [(1200., 700.), (1100., 640.)] {
@@ -36353,7 +35664,7 @@ fn single_instance_argv_line_round_trips() {
 #[gpui_kit::test]
 fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
     use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -36361,10 +35672,7 @@ fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
-        view.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().selected = Some(IndexPath::new(0));
-            list_cx.notify();
-        });
+        view.select_visible_row(0, cx);
         view.inspector_tab = crate::InspectorTab::Logs;
         view.open_inspector();
         let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
@@ -36423,7 +35731,7 @@ fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
     use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -36431,10 +35739,7 @@ fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
-        view.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().selected = Some(IndexPath::new(0));
-            list_cx.notify();
-        });
+        view.select_visible_row(0, cx);
         view.inspector_tab = crate::InspectorTab::Logs;
         let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
         let tag = crate::inbound_tag(&seeded.id);
@@ -36467,7 +35772,7 @@ fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
     use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -36475,10 +35780,7 @@ fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
-        view.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().selected = Some(IndexPath::new(0));
-            list_cx.notify();
-        });
+        view.select_visible_row(0, cx);
         view.inspector_tab = crate::InspectorTab::Logs;
         view.open_inspector();
         let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
@@ -36538,7 +35840,7 @@ fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn b3_traffic_pane_windows_a_large_library(cx: &mut TestAppContext) {
     use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
-    use gpui_kit::component::IndexPath;
+
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     for ix in 0..150 {
@@ -36553,10 +35855,7 @@ fn b3_traffic_pane_windows_a_large_library(cx: &mut TestAppContext) {
     }
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
-        view.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().selected = Some(IndexPath::new(0));
-            list_cx.notify();
-        });
+        view.select_visible_row(0, cx);
         view.inspector_tab = crate::InspectorTab::Traffic;
         view.open_inspector();
         cx.notify();
@@ -36925,7 +36224,6 @@ fn task13_text_size_slider_commits_a_stop_on_click(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn task13_text_size_slider_holds_list_and_settings_at_150(cx: &mut TestAppContext) {
     use crate::store::TextSize;
-    use crate::RowMetrics;
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -36970,7 +36268,7 @@ fn task13_text_size_slider_holds_list_and_settings_at_150(cx: &mut TestAppContex
     });
     assert_eq!(
         tops[1] - tops[0],
-        px(RowMetrics::ROW_PITCH),
+        px(crate::Density::Comfortable.pitch()),
         "the row pitch stays fixed at 150%"
     );
 
@@ -37231,9 +36529,7 @@ fn drag_column_header(
 }
 
 fn selected_ids(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
-    view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().selected_ids()
-    })
+    view.read_with(cx, |view, _| view.selection_ids())
 }
 
 fn row_aria_selected(cx: &mut VisualTestContext, id: &str) -> bool {
@@ -37273,7 +36569,7 @@ fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     let click = |cx: &mut VisualTestContext, id: &str, modifiers: Modifiers| {
-        click_row_with(cx, &format!("library-row-{id}"), modifiers);
+        click_row_with(cx, &format!("row-name-text-{id}"), modifiers);
     };
 
     click(cx, &alpha.id, Modifiers::default());
@@ -37310,10 +36606,16 @@ fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
     );
     assert_eq!(
         selected_ids(&view, cx),
-        vec![charlie.id.clone(), delta.id.clone()],
-        "Shift+click draws from the last-clicked anchor"
+        vec![
+            alpha.id.clone(),
+            bravo.id.clone(),
+            charlie.id.clone(),
+            delta.id.clone()
+        ],
+        "Shift+click draws from the anchor the Ctrl click kept"
     );
-    assert!(!row_aria_selected(cx, &alpha.id));
+    assert!(row_aria_selected(cx, &alpha.id));
+    assert!(row_aria_selected(cx, &bravo.id));
     assert!(row_aria_selected(cx, &charlie.id));
     assert!(row_aria_selected(cx, &delta.id));
 
@@ -37327,7 +36629,7 @@ fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
     );
     assert_eq!(
         selected_ids(&view, cx),
-        vec![bravo.id.clone(), charlie.id.clone()],
+        vec![alpha.id.clone(), bravo.id.clone()],
         "a second Shift+click re-drags the same anchor"
     );
 
@@ -37341,7 +36643,7 @@ fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
     );
     assert_eq!(
         selected_ids(&view, cx),
-        vec![charlie.id.clone()],
+        vec![alpha.id.clone()],
         "Ctrl+click removes a row already in the set"
     );
 
@@ -37351,12 +36653,16 @@ fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
 
     let list_handle = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
     cx.update(|window, cx| window.focus(&list_handle, cx));
-    cx.update(|window, cx| {
-        let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
-        window.dispatch_keystroke(escape, cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
+    // The first Escape closes the inspector — the top layer — and the second
+    // clears the selection.
+    for _ in 0..2 {
+        cx.update(|window, cx| {
+            let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
     assert!(
         selected_ids(&view, cx).is_empty(),
         "Esc clears the transient selection"
@@ -37368,80 +36674,89 @@ fn multi_select_click_ctrl_and_shift_build_the_set(cx: &mut TestAppContext) {
 
 /// Task 1: the anchor outlives a filter that still shows it, and leaves with
 /// it. Hidden rows are never silently acted on by a later Shift range.
-#[test]
-fn multi_select_anchor_survives_filters_and_prunes_hidden_rows() {
-    use crate::store::ProxyConfig;
-    fn row(id: &str, name: &str) -> ProxyConfig {
-        ProxyConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            protocol: "vless".to_string(),
-            params: r#"{"server":"a.example.com"}"#.to_string().into(),
-            group: "team".to_string(),
-            enabled: true,
-            bind_ip: "127.0.0.1".to_string(),
-            port: 10801,
-            subscription_id: None,
-            identity_key: None,
-            preset_id: None,
-        }
-    }
-    let mut delegate = LibraryDelegate::new();
-    delegate.set_rows(vec![
-        row("1", "Alpha"),
-        row("2", "Bravo"),
-        row("3", "Charlie"),
-    ]);
+/// The one selection model: a range grows from the anchor, a filter never
+/// prunes it, and a row that stops existing leaves it.
+#[gpui_kit::test]
+fn selection_prunes_deleted_rows_but_not_filtered_rows(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let bravo = store
+        .add(row19_seed("Bravo", "b.example.com", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(row19_seed("Charlie", "c.example.com", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
 
-    delegate.select_only("2");
-    delegate.extend_selection_to("3");
-    assert_eq!(delegate.selected_ids(), vec!["2", "3"]);
+    // A plain click, then a Shift click: the range replaces the set and the
+    // anchor stays where it was.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_row(&bravo.id, cx);
+            view.extend_to_row(&charlie.id, cx);
+        });
+    });
     assert_eq!(
-        delegate.selection_anchor.as_deref(),
-        Some("2"),
+        view.read_with(cx, |view, _| view.selection_ids()),
+        vec![bravo.id.clone(), charlie.id.clone()],
+        "the range replaces the set"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        Some(bravo.id.clone()),
         "the range keeps its origin"
     );
 
-    delegate.query = "r".to_string();
-    delegate.apply_filter();
+    // A filter that hides the set leaves the selection alone: a hidden
+    // selected row still counts.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().query = "alpha".to_string();
+                state.delegate_mut().apply_filter();
+                list_cx.notify();
+            });
+        });
+    });
     assert_eq!(
-        delegate.selected_ids(),
-        vec!["2", "3"],
-        "a filter that keeps the set leaves it alone"
+        view.read_with(cx, |view, _| view.selection_ids()),
+        vec![bravo.id.clone(), charlie.id.clone()],
+        "a filter that hides the set leaves it alone"
     );
     assert_eq!(
-        delegate.selection_anchor.as_deref(),
-        Some("2"),
-        "the anchor survives while its row is visible"
+        view.read_with(cx, |view, cx| view.selection_hidden_count(cx)),
+        2,
+        "the hidden count names them"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        Some(bravo.id.clone()),
+        "a hidden row keeps the anchor"
     );
 
-    delegate.query = "alpha".to_string();
-    delegate.apply_filter();
-    assert!(
-        delegate.selected_ids().is_empty(),
-        "a filter that hides the set empties it"
-    );
-    assert_eq!(delegate.selection_anchor, None, "the hidden anchor leaves");
-
-    delegate.query.clear();
-    delegate.apply_filter();
-    delegate.select_only("2");
-    delegate.extend_selection_to("3");
-    delegate.set_rows(vec![row("1", "Alpha"), row("3", "Charlie")]);
+    // A row that stops existing leaves the set.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().query.clear();
+                state.delegate_mut().apply_filter();
+                list_cx.notify();
+            });
+            view.store.remove(&bravo.id).expect("the row is removed");
+            view.reload(window, cx);
+        });
+    });
     assert_eq!(
-        delegate.selected_ids(),
-        vec!["3"],
+        view.read_with(cx, |view, _| view.selection_ids()),
+        vec![charlie.id.clone()],
         "deleting a selected row prunes only that row"
     );
     assert_eq!(
-        delegate.selection_anchor, None,
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        None,
         "the deleted anchor does not linger"
-    );
-
-    delegate.set_facet_group(Some("ghost".to_string()));
-    assert!(
-        delegate.selected_ids().is_empty(),
-        "a facet that empties the list clears the set"
     );
 }
 
@@ -37469,12 +36784,12 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
 
     click_row_with(
         cx,
-        &format!("library-row-{}", alpha.id),
+        &format!("row-name-text-{}", alpha.id),
         Modifiers::default(),
     );
     click_row_with(
         cx,
-        &format!("library-row-{}", charlie.id),
+        &format!("row-name-text-{}", charlie.id),
         Modifiers {
             shift: true,
             ..Modifiers::default()
@@ -37485,7 +36800,7 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
         vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()]
     );
 
-    cx.update(|window, cx| window.right_click(format!("row-card-{}", bravo.id), cx));
+    cx.update(|window, cx| window.right_click(format!("row-surface-{}", bravo.id), cx));
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
@@ -37495,7 +36810,7 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
         ("start", "Start 3 configurations"),
         ("stop", "Stop 3 configurations"),
         ("test", "Test 3 configurations"),
-        ("copy-proxy", "Copy 3 SOCKS URLs"),
+        ("copy-urls", "Copy 3 URLs"),
         ("edit", "Edit"),
         ("delete", "Delete 3 configurations"),
     ] {
@@ -37579,7 +36894,7 @@ fn multi_select_shift_arrows_extend_and_collapse(cx: &mut TestAppContext) {
 
     click_row_with(
         cx,
-        &format!("library-row-{}", alpha.id),
+        &format!("row-name-text-{}", alpha.id),
         Modifiers::default(),
     );
     focus_library(&view, cx);
@@ -37601,12 +36916,7 @@ fn multi_select_shift_arrows_extend_and_collapse(cx: &mut TestAppContext) {
         "Shift+Up shrinks the range instead of starting a new one"
     );
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .selection_anchor
-            .clone()),
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
         Some(alpha.id.clone()),
         "the anchor never moves while the range is redrawn"
     );
@@ -37655,12 +36965,7 @@ fn multi_select_ctrl_a_takes_visible_rows_only(cx: &mut TestAppContext) {
         "the hidden home row is not selected"
     );
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .selection_anchor
-            .clone()),
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
         Some(alpha.id.clone()),
         "the first visible row anchors the set"
     );
@@ -37707,12 +37012,12 @@ fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
 
     click_row_with(
         cx,
-        &format!("library-row-{}", alpha.id),
+        &format!("row-name-text-{}", alpha.id),
         Modifiers::default(),
     );
     click_row_with(
         cx,
-        &format!("library-row-{}", bravo.id),
+        &format!("row-name-text-{}", bravo.id),
         Modifiers {
             shift: true,
             ..Modifiers::default()
@@ -37727,9 +37032,13 @@ fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
     let before = notification_count(cx);
     press_key(cx, "delete");
     assert!(
-        !cx.update(|window, cx| window.has_active_dialog(cx)),
-        "multi-delete is immediate, not a confirm per row"
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "two or more rows confirm once, not per row"
     );
+    // The confirm names the rows it will remove.
+    cx.update(|window, cx| window.click("ok", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
     assert_eq!(
         view.read_with(cx, |view, cx| view.config_count(cx)),
         1,
@@ -37745,10 +37054,7 @@ fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
             .libraries
             .read(cx)
             .delegate()
-            .visible_rows()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect::<Vec<_>>()),
+            .visible_ids()),
         vec![charlie.id.clone()],
         "the untouched row remains"
     );
@@ -37758,9 +37064,13 @@ fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
 
 /// Task 2: the bulk bar shows the selection count only when it disagrees with
 /// the checked count, so one browser of checked rows keeps its compact label.
+/// One selection model: there is no second set, so there is no second
+/// count. The delegate keeps rows and visibility; the app keeps the
+/// selection.
 #[test]
-fn bulk_label_adds_the_selection_count_when_it_differs() {
+fn the_delegate_keeps_no_selection_of_its_own() {
     use crate::store::ProxyConfig;
+    use crate::LibraryDelegate;
     fn row(id: &str, name: &str) -> ProxyConfig {
         ProxyConfig {
             id: id.to_string(),
@@ -37782,28 +37092,10 @@ fn bulk_label_adds_the_selection_count_when_it_differs() {
         row("2", "Bravo"),
         row("3", "Charlie"),
     ]);
-
-    delegate.toggle_checked("1");
-    delegate.select_only("2");
-    delegate.extend_selection_to("3");
     assert_eq!(
-        delegate.bulk_label(),
-        "1 checked · 2 selected (of 3)",
-        "both sets are named when they disagree"
-    );
-
-    delegate.select_only("1");
-    assert_eq!(
-        delegate.bulk_label(),
-        "1 checked (of 3)",
-        "equal counts collapse back to the checked label"
-    );
-
-    delegate.clear_selection();
-    assert_eq!(
-        delegate.bulk_label(),
-        "1 checked (of 3)",
-        "a checks-only bulk session never shows a zero selection"
+        delegate.visible_ids().len(),
+        3,
+        "the delegate keeps the rows"
     );
 }
 
@@ -38185,4 +37477,808 @@ fn engine_bar_actions_use_the_existing_confirmations(cx: &mut TestAppContext) {
     paint_frame(cx);
     assert_painted(cx, "engine-bar-test-all");
     assert_painted(cx, "engine-bar-stop-testing");
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 — one selection model, flat rows and the batch bar
+// ---------------------------------------------------------------------------
+
+fn clipboard_text(cx: &mut VisualTestContext) -> String {
+    cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+/// The keyboard owns one focus and one set: Down/Up move the focus and the
+/// selection together, Shift grows from the anchor, Home/End jump, Space
+/// toggles the focused row, Ctrl+A takes the visible rows and Escape clears.
+#[gpui_kit::test]
+fn keyboard_selection_moves_focus_and_range(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let delta = store
+        .add(facet_seed("Delta", "vless", "team", "10804"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    focus_library(&view, cx);
+
+    press_key(cx, "down");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_focus.clone()),
+        Some(alpha.id.clone()),
+        "Down enters at the first row"
+    );
+    assert_eq!(selected_ids(&view, cx), vec![alpha.id.clone()]);
+
+    press_key(cx, "down");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_focus.clone()),
+        Some(bravo.id.clone()),
+        "Down moves the focus"
+    );
+    assert_eq!(selected_ids(&view, cx), vec![bravo.id.clone()]);
+
+    press_key(cx, "shift-down");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![bravo.id.clone(), charlie.id.clone()],
+        "Shift+Down grows from the anchor"
+    );
+    press_key(cx, "shift-up");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![bravo.id.clone()],
+        "Shift+Up shrinks the same range without re-anchoring"
+    );
+
+    press_key(cx, "end");
+    assert_eq!(selected_ids(&view, cx), vec![delta.id.clone()]);
+    press_key(cx, "home");
+    assert_eq!(selected_ids(&view, cx), vec![alpha.id.clone()]);
+
+    press_key(cx, "space");
+    assert_eq!(selected_ids(&view, cx), Vec::<String>::new());
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        None,
+        "emptying the set drops the anchor"
+    );
+
+    press_key(cx, "ctrl-a");
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![
+            alpha.id.clone(),
+            bravo.id.clone(),
+            charlie.id.clone(),
+            delta.id.clone()
+        ],
+        "Ctrl+A takes every visible row"
+    );
+
+    // Escape clears with the list focused too: the app's binding names the
+    // list as a descendant of the app, so it outranks the kit's Cancel. It
+    // then hands the keyboard back to the shell.
+    press_key(cx, "escape");
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 0);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        None
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_focus.clone()),
+        None
+    );
+    let list_focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    assert_ne!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(list_focus),
+        "Escape hands the keyboard back to the shell, not the list"
+    );
+
+    // The shell's own context keeps the shortcut when the table does not hold
+    // the keyboard.
+    press_key(cx, "ctrl-a");
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 4);
+    press_key(cx, "escape");
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 0);
+}
+
+/// The kit List can be handed an index; it must not become a second
+/// selection. The delegate keeps no index and writes nothing to AppView.
+#[gpui_kit::test]
+fn delegate_never_writes_selection(cx: &mut TestAppContext) {
+    use gpui_kit::component::list::ListDelegate as _;
+    use gpui_kit::component::IndexPath;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &alpha.id);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state
+                    .delegate_mut()
+                    .set_selected_index(Some(IndexPath::new(1)), window, list_cx);
+                list_cx.notify();
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone()],
+        "the delegate cannot move the selection"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.libraries.read(cx).selected_index()),
+        None,
+        "the list never keeps an index of its own"
+    );
+    assert!(!row_aria_selected(cx, &bravo.id));
+}
+
+/// A scope change is not a filter: the rows the old scope held are gone, so
+/// the set, the anchor and the focus all go with it.
+#[gpui_kit::test]
+fn scope_change_clears_selection_anchor_and_focus(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_rows(&[alpha.id.clone(), bravo.id.clone()], cx);
+            view.extend_to_row(&charlie.id, cx);
+        });
+    });
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone(), bravo.id.clone(), charlie.id.clone()]
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        Some(alpha.id.clone())
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_focus.clone()),
+        Some(charlie.id.clone())
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.clear_selection_for_scope_change(window, cx);
+        });
+    });
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 0);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_anchor.clone()),
+        None
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_focus.clone()),
+        None
+    );
+}
+
+/// R29: `Show failures` narrows the table to the ids the batch failed on and
+/// leaves the selection alone; the ordinary filter controls clear it.
+#[gpui_kit::test]
+fn show_failures_filters_to_the_last_batch_failed_ids(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_rows(&[alpha.id.clone(), bravo.id.clone()], cx);
+            view.batch = Some(crate::BatchRun {
+                kind: crate::BatchKind::Test,
+                ids: vec![alpha.id.clone(), bravo.id.clone()],
+                done: 2,
+                ok: 1,
+                failed: vec![bravo.id.clone()],
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "batch-show-failures");
+
+    cx.update(|window, cx| window.click("batch-show-failures", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.visible_row_ids(cx)),
+        vec![bravo.id.clone()],
+        "the table holds exactly the batch's failures"
+    );
+    assert_painted(cx, &format!("row-name-text-{}", bravo.id));
+    assert_absent(cx, format!("row-name-text-{}", alpha.id));
+    assert_absent(cx, format!("row-name-text-{}", charlie.id));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        2,
+        "the filter does not touch the selection"
+    );
+
+    // The ordinary filter controls take the failure filter away again.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries.update(cx, |state, list_cx| {
+                state.delegate_mut().clear_facets();
+                list_cx.notify();
+            });
+            view.reload(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.visible_row_ids(cx))
+            .len(),
+        3,
+        "clearing the facets restores every row"
+    );
+}
+
+/// The chip copies the row's SOCKS URL; its chevron offers HTTP and both.
+/// Neither click selects the row.
+#[gpui_kit::test]
+fn endpoint_chip_copies_socks_and_chevron_copies_http_and_both(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let chip = format!("row-endpoint-chip-{}", row.id);
+    let menu = format!("row-endpoint-menu-{}", row.id);
+    assert_painted(cx, &chip);
+    assert_eq!(
+        label_of(&chip, cx),
+        "Click to copy SOCKS",
+        "the chip names its copy action"
+    );
+
+    cx.update(|window, cx| window.click(chip.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(clipboard_text(cx), "socks5://127.0.0.1:10801");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        0,
+        "the chip owns its click; the row does not select"
+    );
+
+    cx.update(|window, cx| window.click(menu.clone(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    let http = format!("row-endpoint-copy-http-{}", row.id);
+    assert_painted(cx, &http);
+    cx.update(|window, cx| window.click(http, cx));
+    cx.run_until_parked();
+    assert_eq!(clipboard_text(cx), "http://127.0.0.1:10801");
+
+    cx.update(|window, cx| window.click(menu, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    let both = format!("row-endpoint-copy-both-{}", row.id);
+    assert_painted(cx, &both);
+    cx.update(|window, cx| window.click(both, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        clipboard_text(cx),
+        "socks5://127.0.0.1:10801\nhttp://127.0.0.1:10801",
+        "both forms travel, SOCKS first"
+    );
+}
+
+/// The batch bar takes the search's 36px slot: same origin, same height, and
+/// the table below never moves.
+#[gpui_kit::test]
+fn batch_bar_swaps_into_the_same_slot_without_moving_the_table(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let slot = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            let bounds = window
+                .try_find("filter-slot")
+                .expect("slot paints")
+                .bounds();
+            (
+                bounds.origin.x.as_f32(),
+                bounds.origin.y.as_f32(),
+                bounds.size.height.as_f32(),
+            )
+        })
+    };
+    let header_top = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find("library-column-headers")
+                .expect("header paints")
+                .bounds()
+                .origin
+                .y
+                .as_f32()
+        })
+    };
+    let first_row_top = |cx: &mut VisualTestContext, id: &str| {
+        cx.update(|window, _| {
+            window
+                .try_find(format!("row-surface-{id}"))
+                .expect("row paints")
+                .bounds()
+                .origin
+                .y
+                .as_f32()
+        })
+    };
+
+    assert_painted(cx, "library-search");
+    let search_slot = slot(cx);
+    let search_header = header_top(cx);
+    let search_row = first_row_top(cx, &alpha.id);
+    assert_eq!(search_slot.2, 36., "the filter slot is 36px");
+
+    select_library_row(&view, cx, &alpha.id);
+    paint_frame(cx);
+    assert_painted(cx, "batch-bar");
+    assert_absent(cx, "library-search".to_string());
+
+    assert_eq!(
+        slot(cx),
+        search_slot,
+        "the slot keeps its origin and height"
+    );
+    assert_eq!(header_top(cx), search_header, "the header never moves");
+    assert_eq!(
+        first_row_top(cx, &alpha.id),
+        search_row,
+        "the first row never moves"
+    );
+    let bar_bounds = cx.update(|window, _| {
+        window
+            .try_find("batch-bar")
+            .expect("batch bar paints")
+            .bounds()
+    });
+    assert!(
+        bar_bounds.size.height.as_f32() <= 36.,
+        "the batch bar fits inside the 36px slot, got {}",
+        bar_bounds.size.height.as_f32()
+    );
+}
+
+/// A batch captures its ids when it is invoked. Changing the selection while
+/// it runs never edits the snapshot, and the next batch captures the new set.
+#[gpui_kit::test]
+fn batch_actions_snapshot_selection(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10991"))
+        .expect("seed works");
+    let bravo = store
+        .add(t30_engine_seed("Bravo", "10992"))
+        .expect("seed works");
+    let gamma = store
+        .add(t30_engine_seed("Gamma", "10993"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let (engine, _stock) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| view.engine = engine);
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_rows(&[alpha.id.clone(), gamma.id.clone()], cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.click("batch-start", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    assert!(serving.contains(&alpha.id) && serving.contains(&gamma.id));
+    assert!(
+        !serving.contains(&bravo.id),
+        "the unselected row never enters the snapshot"
+    );
+
+    // The finished batch's result belongs to its snapshot: a selection change
+    // drops it, and a new batch captures the new set.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_rows(std::slice::from_ref(&bravo.id), cx)
+        });
+    });
+    assert!(
+        view.read_with(cx, |view, _| view.batch.is_none()),
+        "a finished batch is not re-attributed to a new selection"
+    );
+    cx.update(|window, cx| window.click("batch-start", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    assert!(serving.contains(&bravo.id), "the new snapshot starts Beta");
+    assert!(
+        serving.contains(&alpha.id) && serving.contains(&gamma.id),
+        "starting Beta leaves the earlier rows serving"
+    );
+}
+
+/// R22: density owns every chrome height and the row pitch, and the choice
+/// survives a store reopen.
+#[gpui_kit::test]
+fn density_round_trips_and_changes_row_pitch(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "manyproxy-density-{}-{stamp}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut store = Store::open_file(&path).expect("file store opens");
+        store
+            .add(facet_seed("Alpha", "vless", "team", "10801"))
+            .expect("seed works");
+        store
+            .add(facet_seed("Bravo", "vless", "team", "10802"))
+            .expect("seed works");
+        store
+            .set_row_density(crate::Density::Compact)
+            .expect("density saves");
+    }
+    let store = Store::open_file(&path).expect("reopen works");
+    assert_eq!(store.row_density(), crate::Density::Compact);
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.density),
+        crate::Density::Compact
+    );
+
+    let row = |cx: &mut VisualTestContext, id: &str| {
+        cx.update(|window, _| {
+            window
+                .try_find(format!("row-surface-{id}"))
+                .expect("row paints")
+                .bounds()
+        })
+    };
+    let slot_height = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find("filter-slot")
+                .expect("slot paints")
+                .bounds()
+                .size
+                .height
+                .as_f32()
+        })
+    };
+    let header_height = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            window
+                .try_find("library-column-headers")
+                .expect("header paints")
+                .bounds()
+                .size
+                .height
+                .as_f32()
+        })
+    };
+
+    let ids: Vec<String> = view.read_with(cx, |view, cx| view.visible_row_ids(cx));
+    assert!(ids.len() >= 2, "two seeded rows are visible");
+    let first = row(cx, &ids[0]);
+    let second = row(cx, &ids[1]);
+    assert_eq!(first.size.height.as_f32(), 30., "compact row height");
+    assert_eq!(
+        second.origin.y.as_f32() - first.origin.y.as_f32(),
+        30.,
+        "compact row pitch"
+    );
+    assert_eq!(slot_height(cx), 34., "compact filter slot");
+    assert_eq!(header_height(cx), 30., "compact header");
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.set_density(crate::Density::Comfortable, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.density),
+        crate::Density::Comfortable
+    );
+    let first = row(cx, &ids[0]);
+    let second = row(cx, &ids[1]);
+    assert_eq!(first.size.height.as_f32(), 36., "comfortable row height");
+    assert_eq!(
+        second.origin.y.as_f32() - first.origin.y.as_f32(),
+        36.,
+        "comfortable row pitch"
+    );
+    assert_eq!(slot_height(cx), 36., "comfortable filter slot");
+    assert_eq!(header_height(cx), 32., "comfortable header");
+
+    let reopened = Store::open_file(&path).expect("the density is readable");
+    assert_eq!(
+        reopened.row_density(),
+        crate::Density::Comfortable,
+        "the choice is written on change"
+    );
+}
+
+/// The retired checkbox left no copy behind: no label says "checked" and the
+/// shortcut reference names selection, not checking.
+#[gpui_kit::test]
+fn no_checked_copy_or_control_remains(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    select_library_row(&view, cx, &row.id);
+    paint_frame(cx);
+
+    let labels: Vec<String> = cx.update(|window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .iter()
+            .filter_map(|snapshot| snapshot.label().map(str::to_string))
+            .collect()
+    });
+    for label in &labels {
+        let lowered = label.to_lowercase();
+        assert!(
+            !lowered.contains("uncheck"),
+            "no copy says Uncheck: {label:?}"
+        );
+        assert!(
+            !lowered.contains("checked"),
+            "no copy says checked: {label:?}"
+        );
+    }
+    assert_eq!(label_of("batch-count", cx), "1 selected");
+    assert!(
+        crate::SHORTCUT_LINES.contains(&("Clear selection", "Esc")),
+        "the reference names Esc as Clear selection"
+    );
+    assert!(
+        !crate::SHORTCUT_LINES
+            .iter()
+            .any(|(action, _)| action.to_lowercase().contains("uncheck")),
+        "no shortcut is named Uncheck"
+    );
+}
+
+/// The row's trailing reserve holds Start or Stop plus More. Start is the
+/// row's own verb, never the selection's, and More opens that row's menu.
+#[gpui_kit::test]
+fn row_hover_actions_start_stop_and_more(cx: &mut TestAppContext) {
+    use crate::engine::EngineController;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10991"))
+        .expect("seed works");
+    let bravo = store
+        .add(t30_engine_seed("Bravo", "10992"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let (engine, _stock) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| view.engine = engine);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    // The focused row shows its reserve: Start/Stop plus More.
+    select_library_row(&view, cx, &alpha.id);
+    paint_frame(cx);
+    let start = format!("row-start-{}", alpha.id);
+    let more = format!("row-more-{}", alpha.id);
+    assert_painted(cx, &format!("row-actions-{}", alpha.id));
+    assert_painted(cx, &start);
+    assert_painted(cx, &more);
+
+    cx.update(|window, cx| window.click(start, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    assert!(
+        serving.contains(&alpha.id),
+        "the row's Start starts the row it belongs to"
+    );
+    assert!(
+        !serving.contains(&bravo.id),
+        "another row never starts by accident"
+    );
+    assert_eq!(
+        selected_ids(&view, cx),
+        vec![alpha.id.clone()],
+        "the click does not move the selection"
+    );
+    assert_painted(cx, &format!("row-stop-{}", alpha.id));
+
+    cx.update(|window, cx| window.click(format!("row-stop-{}", alpha.id), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.engine.is_running(&alpha.id)),
+        "Stop stops the same row"
+    );
+    assert_painted(cx, &format!("row-start-{}", alpha.id));
+
+    cx.update(|window, cx| window.click(format!("row-more-{}", alpha.id), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, &format!("rowctx-test-{}", alpha.id));
+    assert_absent(cx, format!("rowctx-test-{}", bravo.id));
+}
+
+/// A click near the bottom of the table, below the rows.
+fn click_blank_table(cx: &mut VisualTestContext) {
+    use gpui_kit::gpui::{InputEvent as _, MouseButton, MouseDownEvent, MouseUpEvent};
+    let position = cx.update(|window, _| {
+        let bounds = window
+            .try_find("library-scroll")
+            .expect("the table paints")
+            .bounds();
+        point(
+            bounds.origin.x + bounds.size.width / 2.,
+            bounds.origin.y + bounds.size.height - px(8.),
+        )
+    });
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+}
+
+/// The header and the blank area under the rows are outside the selection:
+/// a plain click there clears it and hands the keyboard back to the shell.
+#[gpui_kit::test]
+fn header_and_blank_table_clicks_clear_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    select_library_row(&view, cx, &alpha.id);
+    paint_frame(cx);
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
+
+    // The Name header cell has no verb of its own; the strip owns the click.
+    cx.update(|window, cx| window.click("header-name", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        0,
+        "a header click clears the selection"
+    );
+
+    select_library_row(&view, cx, &alpha.id);
+    paint_frame(cx);
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 1);
+
+    click_blank_table(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_count()),
+        0,
+        "a blank-table click clears the selection"
+    );
 }
