@@ -484,41 +484,23 @@ impl AppView {
         });
     }
 
-    pub(crate) fn toggle_library_sort_direction(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self.libraries.read(cx).delegate().sort;
-        self.commit_library_sort(
-            LibrarySort::new(current.key, current.direction.toggled()),
-            window,
-            cx,
-        );
-    }
-
-    /// T-27: a header's primary key when the column is not already sorting.
-    /// The first non-`None` key is the column's natural order (latency for
-    /// health, total traffic for traffic), so a click never lands on "no sort".
+    /// R7: every visible header sorts on click. The first click on a column
+    /// sorts ascending by that column's natural key; clicking the active
+    /// column again reverses it.
     pub(crate) fn sort_by_header(
         &mut self,
-        column: &'static str,
+        column: ColumnId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let key = column.sort_key();
         let current = self.libraries.read(cx).delegate().sort;
-        if sort_header_keys(column).contains(&current.key) && current.key != LibrarySortKey::None {
-            self.toggle_library_sort_direction(window, cx);
-            return;
-        }
-        let Some(key) = sort_header_keys(column)
-            .iter()
-            .copied()
-            .find(|key| *key != LibrarySortKey::None)
-        else {
-            return;
+        let direction = if current.key == key {
+            current.direction.toggled()
+        } else {
+            SortDirection::Ascending
         };
-        self.set_library_sort(key, window, cx);
+        self.commit_library_sort(LibrarySort::new(key, direction), window, cx);
     }
 
     pub(crate) fn drain_engine_logs(&mut self, active: &[ProxyConfig]) {

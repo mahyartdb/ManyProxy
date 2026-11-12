@@ -51,6 +51,7 @@ impl AppView {
                         data_traffic: &delegate.data_traffic,
                         totals: &delegate.traffic,
                         out_ips: &delegate.out_ips,
+                        upstreams: &delegate.upstream_cache,
                     };
                     visible.sort_by(|&a, &b| {
                         compare_library_rows(

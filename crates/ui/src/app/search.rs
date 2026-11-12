@@ -1,61 +1,16 @@
-use crate::app::columns::WidthAction;
 use crate::*;
 
 impl AppView {
-    pub(crate) fn sort_menu_item(
-        column: &'static str,
-        id_suffix: &'static str,
-        label: String,
-        tip: String,
-        checked: bool,
-        action: SortMenuAction,
-        view: &Entity<AppView>,
-    ) -> PopupMenuItem {
-        let id = format!("sort-header-{column}-{id_suffix}");
-        let view = view.clone();
-        PopupMenuItem::element(move |_, _| {
-            let text = label.clone();
-            let tip = tip.clone();
-            // The check mark is the menu's own state, not a glyph in the label:
-            // the visual row gets the check slot and screen readers hear the
-            // same fact as words.
-            let aria = if checked {
-                t!("sort-current-aria", label = &text)
-            } else {
-                text.clone()
-            };
-            div()
-                .id(id.clone())
-                .test_support()
-                .role(Role::MenuItem)
-                .aria_label(aria)
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                .child(text)
-        })
-        .checked(checked)
-        .on_click(move |_, window, cx| {
-            view.update(cx, |view, cx| match action {
-                SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
-                SortMenuAction::Direction => view.toggle_library_sort_direction(window, cx),
-            });
-        })
-    }
-
     pub(crate) fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.focus_handle(cx).focus(window, cx);
     }
 
-    /// T-27: the library list's column header strip. The visible columns come
-    /// from `library_columns`; the health and traffic cells are sortable and
-    /// carry the picker menu, the rest are labels that keep the strip lined up.
+    /// R7/R11: the library list's column header strip. Every visible column in
+    /// the layout's order paints one sortable header; the lead and the trailing
+    /// reserve are explicit spacers, never columns.
     ///
     /// T-03: the strip reads the same `RowMetrics` the row reads, so every
-    /// label sits at its column's first character instead of at a second,
-    /// disagreeing set of widths.
+    /// label sits at its column's first character.
     pub(crate) fn render_library_column_headers(
         &self,
         window: &mut Window,
@@ -77,18 +32,35 @@ impl AppView {
                 .test_support()
                 .into_any_element();
         }
-        let mut strip = div()
+        let mut headers: Vec<AnyElement> = Vec::new();
+        for column in *metrics.layout.order() {
+            if !metrics.column_visible(column) {
+                continue;
+            }
+            let drop_side =
+                column_drop.and_then(|(target, side)| (target == column).then_some(side));
+            headers.push(column_header_cell(
+                column,
+                sort,
+                metrics,
+                drop_side,
+                view.clone(),
+                window,
+                cx,
+            ));
+        }
+        let strip = div()
             .id("library-column-headers")
             .test_support()
             .relative()
+            .w_full()
             .flex()
             .flex_row()
             .flex_nowrap()
             .items_center()
-            .gap(px(RowMetrics::GAP))
-            // A drag move outside any movable header must clear the indicator;
-            // parent listeners register before child listeners, so the headers
-            // below can put it back when the pointer is over one of them.
+            // A drag move outside any header must clear the indicator; parent
+            // listeners register before child listeners, so the headers below
+            // can put it back when the pointer is over one of them.
             .on_drag_move(
                 cx.listener(move |view, _: &DragMoveEvent<ColumnDrag>, _, cx| {
                     view.clear_column_drop(cx);
@@ -104,9 +76,6 @@ impl AppView {
                     }
                 });
             })
-            // The row's content starts after the list item's 4px inset and
-            // the card's 8px padding — the strip starts at the same place.
-            .px_3()
             .h(px(self.density.header_height()))
             .border_b_1()
             .border_color(cx.theme().border)
@@ -120,134 +89,123 @@ impl AppView {
             )
             .child(
                 div()
-                    .id("header-name")
+                    .id("header-columns")
                     .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(rems(ROW_NAME_REMS))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("column-name")),
-            );
-        for column in *metrics.layout.order() {
-            if !metrics.column_visible(column) {
-                continue;
-            }
-            let drop_side =
-                column_drop.and_then(|(target, side)| (target == column).then_some(side));
-            let width = metrics.column_width(column);
-            strip = strip.child(match column {
-                LibraryColumn::Group
-                | LibraryColumn::Protocol
-                | LibraryColumn::Upstream
-                | LibraryColumn::Endpoint => {
-                    column_header_label(column, width, drop_side, view.clone(), cx)
-                }
-                LibraryColumn::Health | LibraryColumn::Traffic => {
-                    sort_header_cell(column, sort, width, drop_side, view.clone(), window, cx)
-                }
-            });
-        }
-        // The row's trailing reserve holds the hover actions; the strip keeps
-        // the same width so the columns line up.
-        strip = strip.child(
-            div()
-                .id("header-actions")
-                .test_support()
-                .w(px(metrics.actions))
-                .flex_shrink_0(),
-        );
-        strip = strip.child(column_drag_canvas(view));
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(RowMetrics::GAP))
+                    .flex_shrink_0()
+                    .children(headers),
+            )
+            // The row's trailing reserve holds the hover actions; the strip
+            // keeps the same width so the columns line up.
+            .child(
+                div()
+                    .id("header-actions")
+                    .test_support()
+                    .w(px(metrics.actions))
+                    .flex_shrink_0(),
+            )
+            .child(column_drag_canvas(view));
         strip.into_any_element()
     }
 
-    /// T-27: the header picker — the key list for this column plus the direction
-    /// toggle, with the live choice marked. Item ids are pinned
-    /// (`sort-header-{column}-{key|direction}`) for the UI test.
-    pub(crate) fn sort_header_menu(
-        menu: PopupMenu,
-        column: &'static str,
-        sort: LibrarySort,
-        view: &Entity<AppView>,
-    ) -> PopupMenu {
-        let mut menu = menu;
-        for key in sort_header_keys(column) {
-            let current = *key == sort.key;
-            let label = library_sort_key_label(*key);
-            menu = menu.item(Self::sort_menu_item(
-                column,
-                key.token(),
-                label.clone(),
-                t!("sort-by", label = label),
-                current,
-                SortMenuAction::Key(*key),
-                view,
-            ));
-        }
-        let next = sort.direction.toggled();
-        menu = menu.item(Self::sort_menu_item(
-            column,
-            "direction",
-            t!(
-                "sort-direction",
-                from = sort_direction_label(sort.direction),
-                to = sort_direction_label(next)
-            ),
-            t!("sort-direction-tip"),
-            false,
-            SortMenuAction::Direction,
-            view,
-        ));
-        match LibraryColumn::from_id(column) {
-            Some(column) => Self::width_menu_items(menu.separator(), column, view),
-            None => menu,
-        }
-    }
-
-    /// T-03: the same three verbs every header exposes, minus the sort half for
-    /// the columns that have no sort key.
-    pub(crate) fn width_header_menu(
-        menu: PopupMenu,
-        column: LibraryColumn,
-        view: &Entity<AppView>,
-    ) -> PopupMenu {
-        Self::width_menu_items(menu, column, view)
-    }
-
-    fn width_menu_items(
+    /// R11: the one Explorer-style menu every header opens. The same items and
+    /// the same ids on every column; only the fit target differs.
+    pub(crate) fn column_header_menu(
         mut menu: PopupMenu,
-        column: LibraryColumn,
+        column: ColumnId,
+        layout: ColumnLayout,
         view: &Entity<AppView>,
     ) -> PopupMenu {
-        for action in WidthAction::ALL {
-            menu = menu.item(Self::width_menu_item(column, action, view));
+        menu = menu.item(Self::column_menu_action(
+            "columns-menu-size-this",
+            t!("columns-size-this"),
+            view.clone(),
+            move |view, window, cx| view.fit_column_to_content(column, window, cx),
+        ));
+        menu = menu.item(Self::column_menu_action(
+            "columns-menu-size-all",
+            t!("columns-size-all"),
+            view.clone(),
+            |view, window, cx| view.fit_all_columns_to_content(window, cx),
+        ));
+        menu = menu.separator();
+        // The menu lists the signed default order; only the sheet follows the
+        // live order, so the two surfaces stay distinguishable.
+        for column in ColumnId::ALL {
+            menu = menu.item(Self::column_visibility_item(column, layout, view));
         }
-        menu
+        menu = menu.separator();
+        menu.item(Self::column_menu_action(
+            "columns-menu-more",
+            t!("columns-more"),
+            view.clone(),
+            |view, window, cx| view.open_columns_sheet(window, cx),
+        ))
     }
 
-    fn width_menu_item(
-        column: LibraryColumn,
-        action: WidthAction,
-        view: &Entity<AppView>,
+    fn column_menu_action(
+        id: &'static str,
+        label: String,
+        view: Entity<AppView>,
+        act: impl Fn(&mut AppView, &mut Window, &mut Context<AppView>) + 'static,
     ) -> PopupMenuItem {
-        let id = format!("column-menu-{}-{}", column.id(), action.id_suffix());
-        let label = action.label();
-        let aria = t!(
-            "column-width-aria",
-            action = label.clone(),
-            column = library_column_label(column)
-        );
-        let view = view.clone();
         PopupMenuItem::element(move |_, _| {
             div()
-                .id(id.clone())
+                .id(id)
                 .test_support()
                 .role(Role::MenuItem)
-                .aria_label(aria.clone())
+                .aria_label(label.clone())
                 .child(label.clone())
         })
         .on_click(move |_, window, cx| {
-            action.apply(&view, column, window, cx);
+            view.update(cx, |view, cx| act(view, window, cx));
+        })
+    }
+
+    fn column_visibility_item(
+        column: ColumnId,
+        layout: ColumnLayout,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let label = library_column_label(column);
+        let checked = layout.is_visible(column);
+        let locked = column.locked();
+        let hint = locked.then(|| t!("columns-always-visible"));
+        let aria = hint
+            .as_ref()
+            .map_or_else(|| label.clone(), |hint| format!("{label}, {hint}"));
+        let item_label = label.clone();
+        let view = view.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let mut row = div()
+                .id(format!("columns-menu-{}", column.id()))
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(aria.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(item_label.clone());
+            if let Some(hint) = hint.clone() {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
+                );
+            }
+            row
+        })
+        .checked(checked)
+        .disabled(locked)
+        .on_click(move |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_column_visible(column, !checked, window, cx);
+            });
         })
     }
 }

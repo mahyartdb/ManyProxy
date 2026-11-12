@@ -10,9 +10,12 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - The filter row searches configs and narrows by Status, Protocol, and a Filter popover for latency, bind, port range and custom endpoints, with `N of M` always visible and a no-match state that clears in place. Search is session-only.
 - The nav collapses to its letters below 1200px and expands again at 1200px, so the window's new minimum still fits the table beside it.
 - `Ctrl+I` opens the inspector and closes it again.
+- The library table has seven columns — Name, Group, Protocol, Upstream, Endpoint, Health and Traffic. Every header opens one menu with Size Column to Fit, Size All Columns to Fit, per-column visibility and `More…`; the Columns sheet adds order buttons and Reset width, order, visibility and all.
+- The table scrolls horizontally when the chosen widths exceed the pane, with the header and rows sharing one offset. Name and Endpoint stay visible, and no column is dropped to fit.
 
 ### Changed
 
+- Column order, visibility and widths persist as one `library_column_layout` value. The Row columns dialog and the eight standalone palette sort commands are retired; every visible header sorts on click and reverses on a second click.
 - The five-menu toolbar, the three-segment status strip and the facet band are gone. Export, About and `Check for updates` live in the action bar's `⋯`, Routing presets and Settings at the bottom of the nav, and the transport controls in the engine bar.
 - The window's minimum size is 1100×640 and it opens at 1200×700, so the nav starts expanded.
 - Toasts park above the engine bar, so a toast never covers the engine's own controls.

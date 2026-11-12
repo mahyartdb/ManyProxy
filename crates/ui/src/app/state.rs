@@ -370,13 +370,10 @@ impl AppView {
                 }
             },
         );
-        let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
-        let layout = store.library_column_layout();
+        let column_layout = store.library_column_layout();
         let sort = store.library_sort();
         let density = store.row_density();
         libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_row_columns(row_columns);
-            state.delegate_mut().set_layout(layout);
             state.delegate_mut().set_sort(sort);
             state.delegate_mut().set_density(density);
             state.delegate_mut().set_bind_hosts(bind_hosts);
@@ -525,9 +522,10 @@ impl AppView {
             port_fields_stale: false,
             protocol_filter,
             _protocol_filter_subscription,
-            row_columns,
+            column_layout,
             column_resize: None,
             column_drop: None,
+            table_scroll: ScrollHandle::new(),
             inspector_tab: InspectorTab::Details,
             conn: ConnectionState {
                 selected_only: true,
@@ -1706,33 +1704,20 @@ impl AppView {
         })
     }
 
-    pub(crate) fn set_row_column(
+    /// Toggle one column's visibility from the header menu or the columns
+    /// sheet. Locked columns refuse the change in the layout, so the UI's
+    /// disabled controls are a convenience, not the guard.
+    pub(crate) fn set_column_visible(
         &mut self,
-        column: &'static str,
-        enabled: bool,
+        column: ColumnId,
+        visible: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut columns = self.row_columns;
-        match column {
-            "protocol" => columns.protocol = enabled,
-            "upstream" => columns.upstream = enabled,
-            "health" => columns.health = enabled,
-            "group" => columns.group = enabled,
-            _ => columns.traffic = enabled,
+        let mut layout = self.column_layout;
+        if layout.set_hidden(column, !visible) {
+            self.commit_column_layout(layout, window, cx);
         }
-        self.row_columns = columns;
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_row_columns(columns);
-            list_cx.notify();
-        });
-        if let Err(error) = self.store.set_library_columns(&columns.display()) {
-            window.push_notification(
-                Notification::error(t!("row-columns-save-failed", error = error.to_string())),
-                cx,
-            );
-        }
-        cx.notify();
     }
 
     pub(crate) fn browse_for_import_files(

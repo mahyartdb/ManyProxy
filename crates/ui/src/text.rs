@@ -70,20 +70,26 @@ pub fn empty_library_text() -> String {
 
 /// The core enums keep their labels for persistence and core tests; the UI
 /// names them through these wrappers so the visible words come from Fluent.
-pub(crate) fn library_column_label(column: LibraryColumn) -> String {
+pub(crate) fn library_column_label(column: ColumnId) -> String {
     match column {
-        LibraryColumn::Group => t!("column-group"),
-        LibraryColumn::Protocol => t!("column-protocol"),
-        LibraryColumn::Upstream => t!("column-upstream"),
-        LibraryColumn::Endpoint => t!("column-endpoint"),
-        LibraryColumn::Health => t!("column-health"),
-        LibraryColumn::Traffic => t!("column-traffic"),
+        ColumnId::Name => t!("column-name"),
+        ColumnId::Group => t!("column-group"),
+        ColumnId::Protocol => t!("column-protocol"),
+        ColumnId::Upstream => t!("column-upstream"),
+        ColumnId::Endpoint => t!("column-endpoint"),
+        ColumnId::Health => t!("column-health"),
+        ColumnId::Traffic => t!("column-traffic"),
     }
 }
 
 pub(crate) fn library_sort_key_label(key: LibrarySortKey) -> String {
     match key {
         LibrarySortKey::None => t!("sort-key-none"),
+        LibrarySortKey::Name => t!("sort-key-name"),
+        LibrarySortKey::Group => t!("sort-key-group"),
+        LibrarySortKey::Protocol => t!("sort-key-protocol"),
+        LibrarySortKey::Upstream => t!("sort-key-upstream"),
+        LibrarySortKey::Endpoint => t!("sort-key-endpoint"),
         LibrarySortKey::Latency => t!("sort-key-latency"),
         LibrarySortKey::Download => t!("sort-key-download"),
         LibrarySortKey::Upload => t!("sort-key-upload"),

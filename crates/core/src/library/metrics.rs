@@ -78,40 +78,24 @@ impl Density {
     }
 }
 
-/// T-03: the one geometry spec for the library row.
+/// T-03/R11: the one geometry spec for the library row.
 ///
-/// The header strip and the row used to hardcode their widths twice and
-/// disagree; now both read this struct, so a column's label always sits at
-/// its value's first character.
-///
-/// `RowColumns` stays the VISIBILITY flags (what the user toggled in
-/// Tools → Row columns); `RowMetrics` is the GEOMETRY (how wide each cell
-/// is and which optional cells the width budget still affords).
+/// The header strip and the row both read this struct, so a column's label
+/// always sits at its value's first character. `layout` is the visibility and
+/// order the user chose; `widths` is that layout resolved against the table's
+/// width once per frame. The table never hides a column to make the widths
+/// fit: a too-wide layout scrolls.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RowMetrics {
     /// The leading gutter. It holds one state glyph and nothing else.
     pub lead: f32,
-    /// The name column's minimum width; it flexes into the leftover space.
-    pub name_min: f32,
-    pub group: f32,
-    pub protocol: f32,
-    pub upstream: f32,
-    pub endpoint: f32,
-    pub health: f32,
-    pub traffic: f32,
     /// The trailing reserve. It is empty until the row is hovered or focused,
     /// but it is always there, so the grid never shifts.
     pub actions: f32,
-
-    pub show_group: bool,
-    pub show_protocol: bool,
-    pub show_upstream: bool,
-    pub show_health: bool,
-    pub show_traffic: bool,
-
-    /// The user's width and order overrides; the row and the header both
-    /// iterate this, so a reorder cannot desynchronise their grids.
-    pub layout: LibraryColumns,
+    /// The effective width per column, in `ColumnId::index` order.
+    pub widths: [f32; 7],
+    /// The user's order, visibility and width overrides.
+    pub layout: ColumnLayout,
 }
 
 impl RowMetrics {
@@ -136,97 +120,24 @@ impl RowMetrics {
     /// width the inspector stops taking space from the list.
     pub const TABLE_MIN: f32 = 640.;
 
-    /// The geometry both readers share. `show_group` and `show_protocol` are
-    /// the width budget's decisions; the rest are the user's column toggles.
-    pub fn widths(
-        show_group: bool,
-        show_protocol: bool,
-        columns: RowColumns,
-        layout: LibraryColumns,
-    ) -> RowMetrics {
+    /// Resolve the layout against the table width. Every visible column keeps
+    /// a width; the caller scrolls when the sum exceeds the table.
+    pub fn for_table_width(table_width: f32, layout: ColumnLayout) -> RowMetrics {
         RowMetrics {
             lead: RowMetrics::LEAD,
-            name_min: RowMetrics::NAME_MIN,
-            group: layout.width(LibraryColumn::Group),
-            protocol: layout.width(LibraryColumn::Protocol),
-            upstream: layout.width(LibraryColumn::Upstream),
-            endpoint: layout.width(LibraryColumn::Endpoint),
-            health: layout.width(LibraryColumn::Health),
-            traffic: layout.width(LibraryColumn::Traffic),
             actions: RowMetrics::ACTIONS,
-            show_group,
-            show_protocol,
-            show_upstream: columns.upstream,
-            show_health: columns.health,
-            show_traffic: columns.traffic,
+            widths: layout.effective_widths(table_width),
             layout,
         }
     }
 
-    /// The width budget: which optional columns fit the table. The upstream
-    /// column is the widest optional cell, so it is the one the budget gives
-    /// up when the table is narrow; every other column is the user's own
-    /// choice.
-    pub fn for_table_width(
-        table_width: f32,
-        columns: RowColumns,
-        layout: LibraryColumns,
-    ) -> RowMetrics {
-        let base = RowMetrics::row_width(columns, layout);
-        let upstream = layout.width(LibraryColumn::Upstream);
-        let show_upstream = columns.upstream && table_width >= base + upstream;
-        let mut metrics = RowMetrics::widths(columns.group, columns.protocol, columns, layout);
-        metrics.show_upstream = show_upstream;
-        metrics
+    /// The effective width for one column.
+    pub fn column_width(&self, column: ColumnId) -> f32 {
+        self.widths[column.index()]
     }
 
-    /// The effective width for one movable column.
-    pub fn column_width(&self, column: LibraryColumn) -> f32 {
-        match column {
-            LibraryColumn::Group => self.group,
-            LibraryColumn::Protocol => self.protocol,
-            LibraryColumn::Upstream => self.upstream,
-            LibraryColumn::Endpoint => self.endpoint,
-            LibraryColumn::Health => self.health,
-            LibraryColumn::Traffic => self.traffic,
-        }
-    }
-
-    /// Whether the budget kept this column visible.
-    pub fn column_visible(&self, column: LibraryColumn) -> bool {
-        match column {
-            LibraryColumn::Group => self.show_group,
-            LibraryColumn::Protocol => self.show_protocol,
-            LibraryColumn::Upstream => self.show_upstream,
-            LibraryColumn::Endpoint | LibraryColumn::Health => true,
-            LibraryColumn::Traffic => self.show_traffic,
-        }
-    }
-
-    /// The row's minimum width: every cell at its width, the name at its
-    /// minimum, and the gaps between them.
-    fn row_width(columns: RowColumns, layout: LibraryColumns) -> f32 {
-        let mut width = RowMetrics::LEAD
-            + RowMetrics::NAME_MIN
-            + layout.width(LibraryColumn::Endpoint)
-            + RowMetrics::ACTIONS;
-        let mut cells = 4;
-        if columns.health {
-            width += layout.width(LibraryColumn::Health);
-            cells += 1;
-        }
-        if columns.group {
-            width += layout.width(LibraryColumn::Group);
-            cells += 1;
-        }
-        if columns.protocol {
-            width += layout.width(LibraryColumn::Protocol);
-            cells += 1;
-        }
-        if columns.traffic {
-            width += layout.width(LibraryColumn::Traffic);
-            cells += 1;
-        }
-        width + (cells - 1) as f32 * RowMetrics::GAP
+    /// Whether the user kept this column visible.
+    pub fn column_visible(&self, column: ColumnId) -> bool {
+        self.layout.is_visible(column)
     }
 }
