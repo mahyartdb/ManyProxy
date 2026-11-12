@@ -847,6 +847,7 @@ impl AppView {
             state.delegate_mut().set_sort(sort);
             list_cx.notify();
         });
+        self.apply_query(cx);
         if let Err(error) = self.store.set_library_sort(sort) {
             window.push_notification(
                 Notification::error(t!("cannot-save-sort", error = error.to_string())),

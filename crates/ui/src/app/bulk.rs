@@ -429,26 +429,18 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let failed: HashSet<String> = failed.iter().cloned().collect();
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_failure_filter(Some(failed));
-            list_cx.notify();
-        });
+        self.failure_filter = Some(failed);
         self.reload(window, cx);
     }
 
     /// The hidden count's button: the filter goes away and the first hidden
     /// selected row comes into view. The selection does not change.
     pub(crate) fn reveal_hidden_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.clear_library_search(window, cx);
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().clear_facets();
-            list_cx.notify();
-        });
+        let visible = self.visible_row_ids(cx);
         let hidden = {
-            let libraries = self.libraries.read(cx);
-            let delegate = libraries.delegate();
-            let visible = delegate.visible_ids();
+            let delegate = self.libraries.read(cx);
             delegate
+                .delegate()
                 .row_ids()
                 .into_iter()
                 .find(|id| self.selection.contains(id) && !visible.contains(id))
@@ -456,14 +448,8 @@ impl AppView {
         let Some(id) = hidden else {
             return;
         };
-        let index = {
-            let libraries = self.libraries.read(cx);
-            libraries
-                .delegate()
-                .visible_ids()
-                .iter()
-                .position(|row| row == &id)
-        };
+        self.clear_query(window, cx);
+        let index = self.visible_row_ids(cx).iter().position(|row| row == &id);
         if let Some(index) = index {
             self.libraries.update(cx, |state, list_cx| {
                 state.scroll_to_item(
@@ -474,24 +460,6 @@ impl AppView {
                 );
             });
         }
-    }
-
-    /// The retired facet band's "Clear facet filters" action. The band is
-    /// gone with the toolbar; the filter row that replaces it owns this
-    /// control, so the handler waits for it.
-    #[allow(dead_code)]
-    pub(crate) fn clear_facets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().clear_facets();
-            list_cx.notify();
-        });
-        if let Err(error) = self.store.set_latency_facet(LatencyFacet::default()) {
-            window.push_notification(
-                Notification::error(t!("cannot-save-latency-filter", error = error.to_string())),
-                cx,
-            );
-        }
-        cx.notify();
     }
 
     /// Escape: the top layer goes first, then the selection.
@@ -509,9 +477,21 @@ impl AppView {
         if self.close_inspector(window, cx) {
             return false;
         }
-        self.clear_selection(window, cx);
-        cx.notify();
-        true
+        // Slice 3: field first, then the selection, then the facets.
+        if !self.query.search.is_empty() {
+            self.clear_search(window, cx);
+            return true;
+        }
+        if self.selection_count() > 0 {
+            self.clear_selection(window, cx);
+            cx.notify();
+            return true;
+        }
+        if self.query.is_active() {
+            self.clear_filters(cx);
+            return true;
+        }
+        false
     }
 
     /// Shift+Up/Down: the focus moves one row and the range from the anchor
@@ -1028,10 +1008,6 @@ impl AppView {
                 _ => failed.push(name.clone()),
             }
         }
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().clear_facets();
-            list_cx.notify();
-        });
         self.clear_selection(window, cx);
         self.reload(window, cx);
 
@@ -1177,7 +1153,6 @@ impl AppView {
             Ok(moved) => {
                 self.reload(window, cx);
 
-                self.sync_facet_pickers(window, cx);
                 window.push_notification(
                     Notification::success(t!(
                         "moved-to-group",
@@ -1530,14 +1505,6 @@ impl AppView {
         }
         self.reload(window, cx);
 
-        self.libraries.update(cx, |state, list_cx| {
-            let delegate = state.delegate_mut();
-            if delegate.facet_group.as_deref() == Some(old) {
-                delegate.set_facet_group(Some(renamed.clone()));
-            }
-            list_cx.notify();
-        });
-        self.sync_facet_pickers(window, cx);
         window.push_notification(
             Notification::success(t!("group-updated", name = renamed)),
             cx,
@@ -1567,14 +1534,6 @@ impl AppView {
                 let renamed = new.trim().to_string();
                 self.reload(window, cx);
 
-                self.libraries.update(cx, |state, list_cx| {
-                    let delegate = state.delegate_mut();
-                    if delegate.facet_group.as_deref() == Some(old) {
-                        delegate.set_facet_group(Some(renamed.clone()));
-                    }
-                    list_cx.notify();
-                });
-                self.sync_facet_pickers(window, cx);
                 let mut moved = Vec::new();
                 if outcome.rows > 0 {
                     moved.push(t!("group-rows-count", count = outcome.rows));
@@ -1614,14 +1573,6 @@ impl AppView {
         match self.store.delete_group(name) {
             Ok(()) => {
                 self.reload(window, cx);
-                self.libraries.update(cx, |state, list_cx| {
-                    let delegate = state.delegate_mut();
-                    if delegate.facet_group.as_deref() == Some(name) {
-                        delegate.set_facet_group(None);
-                    }
-                    list_cx.notify();
-                });
-                self.sync_facet_pickers(window, cx);
                 window.push_notification(
                     Notification::success(t!("group-deleted-empty", name = name)),
                     cx,

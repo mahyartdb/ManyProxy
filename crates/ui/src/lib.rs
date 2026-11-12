@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::description_list::DescriptionList;
@@ -43,6 +44,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, ResizableState};
@@ -57,6 +59,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Selectable as _;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
@@ -351,14 +354,37 @@ struct AppView {
 
     _libraries_subscription: Subscription,
 
-    facet_group: FacetPicker,
-
-    /// T-05: the latency bucket picker, separate from the group/status menu so
-    /// the two facets compose.
-    facet_latency: FacetPicker,
+    /// Slice 3: the one query. Session-only, never written to the store.
+    pub(crate) query: FilterQuery,
+    /// Slice 3: `All` until the nav starts owning group/source scopes.
+    pub(crate) scope: LibraryScope,
+    /// Slice 3: the rows the query keeps, in paint order. Owned here so the
+    /// filter row, the batch bar and the empty state read one list.
+    pub(crate) visible: Vec<usize>,
+    /// R29: the last batch's failures, narrowed to themselves until an
+    /// ordinary filter control takes the filter away.
+    pub(crate) failure_filter: Option<HashSet<String>>,
 
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
+    /// Slice 3: one cancellable 80ms task and the epoch that retires it.
+    search_debounce: Option<Task<()>>,
+    search_epoch: u64,
+
+    /// The Filter popover's port fields. They are two views of `query.port`;
+    /// editing either updates the query without rewriting the search bytes.
+    port_from: Entity<InputState>,
+    port_to: Entity<InputState>,
+    _port_from_subscription: Subscription,
+    _port_to_subscription: Subscription,
+    port_error: Option<String>,
+    /// A `port=` token in the search changed the predicate; the next frame
+    /// writes it into the popover's From/To fields.
+    port_fields_stale: bool,
+
+    /// The protocol popover's local filter field, shown above eight options.
+    protocol_filter: Entity<InputState>,
+    _protocol_filter_subscription: Subscription,
 
     row_columns: RowColumns,
 

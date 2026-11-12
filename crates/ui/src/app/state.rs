@@ -333,40 +333,55 @@ impl AppView {
                 // selection the app never asked for.
                 .selectable(false)
         });
-        let last_query = store.library_last_query().unwrap_or_default();
-        let search_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(crate::search_placeholder())
-                .default_value(last_query.clone())
+        let search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(crate::search_placeholder()));
+        let port_from = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
+        let port_to = cx.new(|cx| InputState::new(window, cx).placeholder("65535"));
+        let protocol_filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("filter-protocol-filter-placeholder"))
         });
+        let _port_from_subscription = cx.subscribe(
+            &port_from,
+            |view: &mut Self, _emitter: Entity<InputState>, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let from = view.port_from.read(cx).value().to_string();
+                let to = view.port_to.read(cx).value().to_string();
+                view.set_port_range(&from, &to, cx);
+            },
+        );
+        let _port_to_subscription = cx.subscribe(
+            &port_to,
+            |view: &mut Self, _emitter: Entity<InputState>, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let from = view.port_from.read(cx).value().to_string();
+                let to = view.port_to.read(cx).value().to_string();
+                view.set_port_range(&from, &to, cx);
+            },
+        );
+        let _protocol_filter_subscription = cx.subscribe(
+            &protocol_filter,
+            |view: &mut Self, _emitter: Entity<InputState>, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    view.protocol_filter_changed(cx);
+                }
+            },
+        );
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
         let layout = store.library_column_layout();
         let sort = store.library_sort();
-        let latency_facet = store.latency_facet();
         let density = store.row_density();
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
             state.delegate_mut().set_layout(layout);
             state.delegate_mut().set_sort(sort);
-            state.delegate_mut().set_latency_facet(latency_facet);
             state.delegate_mut().set_density(density);
-            state.delegate_mut().query = last_query;
             state.delegate_mut().set_bind_hosts(bind_hosts);
             list_cx.notify();
         });
-
-        let mut empty_delegate = LibraryDelegate::new();
-        empty_delegate.set_latency_facet(latency_facet);
-        let (choices, current) = FacetMenu::Group.choices(&empty_delegate);
-        let facet_group = FacetPicker::new(FacetMenu::Group, choices, current, window, cx);
-        let (latency_choices, latency_current) = FacetMenu::Latency.choices(&empty_delegate);
-        let facet_latency = FacetPicker::new(
-            FacetMenu::Latency,
-            latency_choices,
-            latency_current,
-            window,
-            cx,
-        );
 
         apply_appearance(&store.appearance(), store.accent(), Some(window), cx);
         apply_text_size(store.text_size(), cx);
@@ -479,22 +494,37 @@ impl AppView {
             _search_subscription: cx.subscribe(
                 &search_input,
                 |view: &mut Self, emitter: Entity<InputState>, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        let text = emitter.read(cx).value().to_string();
+                        view.apply_search_now(text, cx);
+                        return;
+                    }
                     if !matches!(event, InputEvent::Change) {
                         return;
                     }
-                    let query = emitter.read(cx).value().to_string();
-                    view.remember_library_query(&query);
-                    view.libraries.update(cx, |state, list_cx| {
-                        let delegate = state.delegate_mut();
-                        delegate.query = query;
-                        delegate.apply_filter();
-                        list_cx.notify();
-                    });
-                    cx.notify();
+                    let text = emitter.read(cx).value().to_string();
+                    // A programmatic write that matches the live query (the
+                    // clear path) must not schedule a second apply.
+                    if text == view.query.search {
+                        return;
+                    }
+                    view.schedule_search(text, cx);
                 },
             ),
-            facet_group,
-            facet_latency,
+            query: FilterQuery::default(),
+            scope: LibraryScope::All,
+            visible: Vec::new(),
+            failure_filter: None,
+            search_debounce: None,
+            search_epoch: 0,
+            port_from,
+            port_to,
+            _port_from_subscription,
+            _port_to_subscription,
+            port_error: None,
+            port_fields_stale: false,
+            protocol_filter,
+            _protocol_filter_subscription,
             row_columns,
             column_resize: None,
             column_drop: None,
@@ -556,8 +586,8 @@ impl AppView {
 
             list_cx.notify();
         });
+        view.apply_query(cx);
 
-        view.sync_facet_pickers(window, cx);
         cx.notify();
         view
     }
@@ -2490,9 +2520,6 @@ impl AppView {
     }
 
     pub(crate) fn current_group(&self, cx: &App) -> Option<String> {
-        if let Some(group) = self.libraries.read(cx).delegate().facet_group.clone() {
-            return Some(group);
-        }
         self.selected_config(cx).map(|config| config.group)
     }
 

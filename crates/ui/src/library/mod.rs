@@ -65,8 +65,6 @@ pub(crate) struct LibraryDelegate {
     pub(crate) rows: Vec<ProxyConfig>,
     pub(crate) search_index: Vec<RowSearchIndex>,
     pub(crate) upstream_cache: HashMap<String, String>,
-    pub(crate) visible: Vec<usize>,
-    pub(crate) query: String,
 
     /// T-06: the list's own focus handle, handed in by the frame that owns the
     /// `ListState`. The selected row wears the kit focus ring while this handle
@@ -90,15 +88,6 @@ pub(crate) struct LibraryDelegate {
 
     pub(crate) sub_labels: HashMap<String, String>,
     pub(crate) preset_names: HashMap<String, String>,
-
-    pub(crate) facet_group: Option<String>,
-    pub(crate) facet_status: Option<FacetStatus>,
-    /// R29: the ids the last batch failed on. While it is set the table keeps
-    /// only those rows, and the ordinary filter controls take it away again.
-    pub(crate) failure_filter: Option<HashSet<String>>,
-    /// T-05: the latest-probe latency filter. Kept whole so the picker and the
-    /// unprobed switch write the same persisted value.
-    pub(crate) latency_facet: LatencyFacet,
 
     pub(crate) show_security: bool,
 
@@ -149,67 +138,6 @@ pub(crate) struct LibraryDelegate {
     settle_seq: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FacetStatus {
-    Enabled,
-    Disabled,
-    /// K11/A2-1: the lamp's three tones are the endpoint-state facet. Matches
-    /// reads the same `serving_tone(..)` the lamp paints, so a lamp click
-    /// always shows the rows that carry that lamp.
-    Running,
-    Dead,
-    Stopped,
-}
-
-impl FacetStatus {
-    #[cfg(test)]
-    pub(crate) const ALL: [FacetStatus; 5] = [
-        FacetStatus::Enabled,
-        FacetStatus::Disabled,
-        FacetStatus::Running,
-        FacetStatus::Dead,
-        FacetStatus::Stopped,
-    ];
-
-    pub(crate) fn label(self) -> String {
-        match self {
-            FacetStatus::Enabled => t!("facet-status-enabled"),
-            FacetStatus::Disabled => t!("facet-status-disabled"),
-            FacetStatus::Running => t!("facet-status-running"),
-            FacetStatus::Dead => t!("facet-status-dead"),
-            FacetStatus::Stopped => t!("facet-status-stopped"),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_label(label: &str) -> Option<FacetStatus> {
-        Self::ALL.into_iter().find(|status| status.label() == label)
-    }
-
-    pub(crate) fn matches(
-        self,
-        row: &ProxyConfig,
-        running: &HashSet<String>,
-        health: &HashMap<String, String>,
-        crashed: &HashSet<String>,
-    ) -> bool {
-        let tone = || {
-            serving_tone(
-                running.contains(&row.id),
-                health.get(&row.id).map(String::as_str),
-                crashed.contains(&row.id),
-            )
-        };
-        match self {
-            FacetStatus::Enabled => row.enabled,
-            FacetStatus::Disabled => !row.enabled,
-            FacetStatus::Running => tone() == ServingTone::Serving,
-            FacetStatus::Dead => tone() == ServingTone::Failed,
-            FacetStatus::Stopped => tone() == ServingTone::Stopped,
-        }
-    }
-}
-
 impl LibraryDelegate {
     pub(crate) fn new() -> Self {
         Self {
@@ -217,8 +145,6 @@ impl LibraryDelegate {
             rows: Vec::new(),
             search_index: Vec::new(),
             upstream_cache: HashMap::new(),
-            visible: Vec::new(),
-            query: String::new(),
             list_focus: None,
             health: HashMap::new(),
             health_errors: HashMap::new(),
@@ -228,10 +154,6 @@ impl LibraryDelegate {
             traffic: HashMap::new(),
             sub_labels: HashMap::new(),
             preset_names: HashMap::new(),
-            facet_group: None,
-            facet_status: None,
-            failure_filter: None,
-            latency_facet: LatencyFacet::default(),
             show_security: false,
             sort: LibrarySort::default(),
             latency: HashMap::new(),
@@ -272,17 +194,6 @@ impl LibraryDelegate {
         true
     }
 
-    /// B16: `0 of 0` reads as "your library is empty" while the rows are still
-    /// on the wire, so the count line names the wait instead.
-    /// The retired facet band's count. Slice 3's filter row owns it.
-    #[allow(dead_code)]
-    pub(crate) fn count_label(&self) -> String {
-        match &self.load {
-            LibraryLoad::Loading(_) if self.rows.is_empty() => t!("library-loading"),
-            _ => search_count_text(self.visible.len(), self.rows.len()),
-        }
-    }
-
     pub(crate) fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
         self.search_index = rows.iter().map(RowSearchIndex::of).collect();
         self.upstream_cache = rows
@@ -303,21 +214,11 @@ impl LibraryDelegate {
         self.pending_endpoint_commits
             .retain(|id| live.contains(id.as_str()));
         self.refresh_search_words();
-        self.apply_filter();
     }
 
     /// R22: the density owns the row pitch and every chrome height.
     pub(crate) fn set_density(&mut self, density: Density) {
         self.density = density;
-    }
-
-    /// The rows the filters keep, in the order the table paints them.
-    pub(crate) fn visible_ids(&self) -> Vec<String> {
-        self.visible
-            .iter()
-            .filter_map(|&index| self.rows.get(index))
-            .map(|row| row.id.clone())
-            .collect()
     }
 
     /// Every row's id, in library order.
@@ -565,161 +466,6 @@ impl LibraryDelegate {
         dirty
     }
 
-    pub(crate) fn apply_filter(&mut self) {
-        let (port, text) = split_port_query(self.query.trim());
-        let lowered = text.to_lowercase();
-        let mut visible = Vec::new();
-        for (index, blob) in self.search_index.iter().enumerate() {
-            if !blob.matches_lowered(&lowered) {
-                continue;
-            }
-            if let Some(failed) = &self.failure_filter {
-                // R29: the batch's failures narrow the table to themselves.
-                if !self
-                    .rows
-                    .get(index)
-                    .is_some_and(|row| failed.contains(&row.id))
-                {
-                    continue;
-                }
-            }
-            if let Some(predicate) = port {
-                let in_range = self
-                    .rows
-                    .get(index)
-                    .is_some_and(|row| predicate.matches(row.port));
-                if !in_range {
-                    continue;
-                }
-            }
-            if !self.row_matches_facets(index) {
-                continue;
-            }
-            visible.push(index);
-        }
-
-        if !self.sort.is_none() {
-            if self.sort.key == LibrarySortKey::TypeSecurity {
-                // T-27: the retired toggle's ordering, unchanged — protocol
-                // ascending, then transport security descending, then name.
-                visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
-            } else {
-                let context = SortContext {
-                    latency: &self.latency,
-                    data_traffic: &self.data_traffic,
-                    totals: &self.traffic,
-                    out_ips: &self.out_ips,
-                };
-                visible.sort_by(|&a, &b| {
-                    compare_library_rows(&context, self.sort, &self.rows[a], &self.rows[b])
-                });
-            }
-        }
-        self.visible = visible;
-    }
-
-    pub(crate) fn row_matches_facets(&self, index: usize) -> bool {
-        let Some(row) = self.rows.get(index) else {
-            return false;
-        };
-        if let Some(group) = &self.facet_group {
-            if &row.group != group {
-                return false;
-            }
-        }
-        if let Some(status) = &self.facet_status {
-            if !status.matches(row, &self.running, &self.health, &self.crashed) {
-                return false;
-            }
-        }
-        if !self
-            .latency_facet
-            .matches(self.latency.get(&row.id).copied())
-        {
-            return false;
-        }
-        true
-    }
-
-    /// The retired facet band's state. Slice 3's filter row owns it.
-    #[allow(dead_code)]
-    pub(crate) fn facets_active(&self) -> bool {
-        self.facet_group.is_some()
-            || self.facet_status.is_some()
-            || self.latency_facet.bucket != LatencyBucket::Any
-            || !self.latency_facet.include_unprobed
-    }
-
-    pub(crate) fn active_filter_text(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(group) = &self.facet_group {
-            parts.push(t!("filter-group", group = group));
-        }
-        if let Some(status) = &self.facet_status {
-            parts.push(t!("filter-status", status = status.label()));
-        }
-        if self.latency_facet.bucket != LatencyBucket::Any {
-            let bucket = latency_bucket_label(self.latency_facet.bucket);
-            if self.latency_facet.include_unprobed {
-                parts.push(t!("filter-latency", bucket = bucket));
-            } else {
-                parts.push(t!("filter-latency-probed", bucket = bucket));
-            }
-        } else if !self.latency_facet.include_unprobed {
-            parts.push(t!("filter-latency-probed-only"));
-        }
-        let query = self.query.trim();
-        if !query.is_empty() {
-            let (port, text) = split_port_query(query);
-            if let Some(predicate) = port {
-                parts.push(predicate.label());
-            }
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(t!("filter-search", text = text));
-            }
-        }
-        parts.join(" · ")
-    }
-
-    pub(crate) fn group_options(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for row in &self.rows {
-            *counts.entry(row.group.as_str()).or_default() += 1;
-        }
-        let mut options: Vec<(String, usize)> = counts
-            .into_iter()
-            .map(|(group, count)| (group.to_string(), count))
-            .collect();
-        options.sort();
-        options
-    }
-
-    pub(crate) fn set_facet_group(&mut self, group: Option<String>) {
-        self.facet_group = group;
-        self.apply_filter();
-    }
-
-    /// K11/A2-1: the group dropdown owns both slots — one pick writes group
-    /// and status disjointly in a single re-rank, so the menu can never show
-    /// two active choices at once.
-    pub(crate) fn set_facet_menu(&mut self, group: Option<String>, status: Option<FacetStatus>) {
-        self.facet_group = group;
-        self.facet_status = status;
-        self.apply_filter();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_facet_status(&mut self, status: Option<FacetStatus>) {
-        self.facet_status = status;
-        self.apply_filter();
-    }
-
-    pub(crate) fn set_latency_facet(&mut self, facet: LatencyFacet) {
-        self.latency_facet = facet;
-        self.apply_filter();
-    }
-
     pub(crate) fn set_show_security(&mut self, show: bool) {
         self.show_security = show;
     }
@@ -729,44 +475,29 @@ impl LibraryDelegate {
     /// meta row, matching how the column toggles work.
     pub(crate) fn set_sort(&mut self, sort: LibrarySort) {
         self.sort = sort;
-        self.apply_filter();
     }
 
     pub(crate) fn set_latency(&mut self, latency: HashMap<String, u64>) {
         self.latency = latency;
-        self.apply_filter();
     }
 
     pub(crate) fn set_data_traffic(&mut self, data_traffic: HashMap<String, (u64, u64)>) {
         self.data_traffic = data_traffic;
-        self.apply_filter();
     }
 
     pub(crate) fn set_out_ips(&mut self, out_ips: HashMap<String, String>) {
         self.out_ips = out_ips;
-        self.apply_filter();
-    }
-
-    pub(crate) fn clear_facets(&mut self) {
-        self.facet_group = None;
-        self.facet_status = None;
-        self.latency_facet = LatencyFacet::default();
-        self.failure_filter = None;
-        self.apply_filter();
-    }
-
-    /// R29: the batch's failures become the table's filter.
-    pub(crate) fn set_failure_filter(&mut self, failed: Option<HashSet<String>>) {
-        self.failure_filter = failed;
-        self.apply_filter();
     }
 
     /// Borrowed row for per-frame rendering: `render_item` copies only the
-    /// fields it needs instead of cloning a whole config every frame.
-    pub(crate) fn row_ref(&self, index: IndexPath) -> Option<&ProxyConfig> {
-        self.visible
-            .get(index.row)
-            .and_then(|&row| self.rows.get(row))
+    /// fields it needs instead of cloning a whole config every frame. The
+    /// visible order is the app's; the delegate only paints it.
+    pub(crate) fn row_ref(&self, index: IndexPath, cx: &App) -> Option<&ProxyConfig> {
+        let row = {
+            let app = self.app_view.as_ref()?.read(cx);
+            *app.visible.get(index.row)?
+        };
+        self.rows.get(row)
     }
 
     /// One row by id, borrowed.
@@ -777,7 +508,6 @@ impl LibraryDelegate {
     pub(crate) fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
         self.refresh_search_words();
-        self.apply_filter();
     }
 
     pub(crate) fn set_health_tone(&mut self, health_tone: HashMap<String, LatencyTone>) {
@@ -800,7 +530,6 @@ impl LibraryDelegate {
         };
         self.running = next;
         self.refresh_search_words();
-        self.apply_filter();
     }
 
     /// B18: the accent strip for the row the engine just started or stopped —
@@ -830,7 +559,6 @@ impl LibraryDelegate {
 
     pub(crate) fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
         self.traffic = traffic;
-        self.apply_filter();
     }
 
     pub(crate) fn set_search_context(
@@ -841,7 +569,6 @@ impl LibraryDelegate {
         self.sub_labels = sub_labels;
         self.preset_names = preset_names;
         self.refresh_search_words();
-        self.apply_filter();
     }
 
     pub(crate) fn refresh_search_words(&mut self) {
@@ -862,16 +589,26 @@ impl LibraryDelegate {
             self.rows.iter().filter(|row| row.enabled).count(),
         )
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn visible_counts(&self) -> (usize, usize) {
-        (self.visible.len(), self.rows.len())
+/// Group names become stable ids by keeping ASCII alphanumerics and folding
+/// every other run into one dash. Empty input still needs a usable id.
+pub(crate) fn slugify_group_id(group: &str) -> String {
+    let mut slug = String::with_capacity(group.len());
+    for ch in group.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
     }
-
-    /// The retired facet band's counts. Slice 3's filter row owns them.
-    #[allow(dead_code)]
-    pub(crate) fn delegate_counts_for_search(&self) -> (usize, usize, String) {
-        (self.visible.len(), self.rows.len(), self.query.clone())
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "group".to_string()
+    } else {
+        slug
     }
 }
 
@@ -920,8 +657,10 @@ impl ListDelegate for LogLinesDelegate {
 impl ListDelegate for LibraryDelegate {
     type Item = ListItem;
 
-    fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.visible.len()
+    fn items_count(&self, _section: usize, cx: &App) -> usize {
+        self.app_view
+            .as_ref()
+            .map_or(0, |view| view.read(cx).visible.len())
     }
 
     /// The kit owns one selected index and confirms it here. The selection
@@ -941,9 +680,10 @@ impl ListDelegate for LibraryDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Task<()> {
-        self.query = query.to_string();
-        self.apply_filter();
-        cx.notify();
+        if let Some(app) = self.app_view.clone() {
+            let query = query.to_string();
+            app.update(cx, |view, cx| view.apply_search_now(query, cx));
+        }
         Task::ready(())
     }
 
@@ -953,7 +693,7 @@ impl ListDelegate for LibraryDelegate {
         window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
-        let row = self.row_ref(index)?;
+        let row = self.row_ref(index, cx)?;
         let row_id = row.id.clone();
         let density = self.density;
         let metrics = self.row_metrics;
@@ -1437,8 +1177,7 @@ impl ListDelegate for LibraryDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
-        let list_view = cx.entity();
-        // B16: with no rows at all, the list is either waiting or it failed —
+        // B16: with no rows at all, the list is either waiting or it failed -
         // neither may wear the "no configurations yet" or "no matches" copy.
         if self.rows.is_empty() {
             match self.load.clone() {
@@ -1528,17 +1267,13 @@ impl ListDelegate for LibraryDelegate {
                 LibraryLoad::Ready => {}
             }
         }
-        if !self.rows.is_empty() && self.visible.is_empty() {
-            let (visible, total) = (self.visible.len(), self.rows.len());
-            let mut description = search_count_text(visible, total);
-            let filters = self.active_filter_text();
-            if !filters.is_empty() {
-                description.push_str(&format!(" · {filters}"));
-            }
-            let hint_view = list_view.clone();
-            let all_view = list_view.clone();
-            let hint_sync = self.app_view.clone();
-            let all_sync = self.app_view.clone();
+        let visible = self
+            .app_view
+            .as_ref()
+            .map_or(0, |view| view.read(cx).visible.len());
+        if !self.rows.is_empty() && visible == 0 {
+            let description = search_count_text(visible, self.rows.len());
+            let clear = self.app_view.clone();
             return div()
                 .id("library-empty")
                 .test_support()
@@ -1554,42 +1289,17 @@ impl ListDelegate for LibraryDelegate {
                         )
                         .content(
                             EmptyContent::new().child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("clear-search-hint")
-                                            .small()
-                                            .label(t!("status-clear-search"))
-                                            .tooltip(t!("status-clear-search-tip"))
-                                            .on_click(move |_, window, cx| {
-                                                hint_view.update(cx, |state, list_cx| {
-                                                    state.set_query("", window, list_cx);
-                                                });
-                                                if let Some(app) = hint_sync.clone() {
-                                                    AppView::sync_search_box(&app, "", window, cx);
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("clear-search-facets")
-                                            .small()
-                                            .label(t!("library-clear-all"))
-                                            .tooltip(t!("library-clear-all-tip"))
-                                            .on_click(move |_, window, cx| {
-                                                all_view.update(cx, |state, list_cx| {
-                                                    state.set_query("", window, list_cx);
-                                                    state.delegate_mut().clear_facets();
-                                                    list_cx.notify();
-                                                });
-                                                if let Some(app) = all_sync.clone() {
-                                                    AppView::sync_search_box(&app, "", window, cx);
-                                                }
-                                            }),
-                                    ),
+                                Button::new("library-clear-filters")
+                                    .small()
+                                    .label(t!("filter-clear-all"))
+                                    .tooltip(t!("filter-clear-all-tip"))
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(view) = clear.clone() {
+                                            view.update(cx, |view, cx| {
+                                                view.clear_query(window, cx);
+                                            });
+                                        }
+                                    }),
                             ),
                         ),
                 );
@@ -1615,106 +1325,5 @@ impl ListDelegate for LibraryDelegate {
             .flex_col()
             .size_full()
             .child(empty)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FacetStatus, LibraryDelegate};
-    use crate::store::ProxyConfig;
-    use std::collections::{HashMap, HashSet};
-
-    fn row(id: &str, name: &str, group: &str, enabled: bool) -> ProxyConfig {
-        ProxyConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            protocol: "vless".to_string(),
-            params: "{}".to_string().into(),
-            group: group.to_string(),
-            enabled,
-            bind_ip: "127.0.0.1".to_string(),
-            port: 10801,
-            subscription_id: None,
-            identity_key: None,
-            preset_id: None,
-        }
-    }
-
-    fn delegate(rows: Vec<ProxyConfig>) -> LibraryDelegate {
-        let mut delegate = LibraryDelegate::new();
-        delegate.set_rows(rows);
-        delegate
-    }
-
-    /// Search and facet gating decide which rows the list paints. The
-    /// selection is not a visible-row set, so filtering never touches it.
-    #[test]
-    fn filter_facets_and_visible_scope_agree() {
-        let mut delegate = delegate(vec![
-            row("1", "alpha", "work", true),
-            row("2", "beta", "home", false),
-            row("3", "alpine", "work", true),
-        ]);
-        assert_eq!(delegate.visible_ids().len(), 3, "unfiltered shows all");
-
-        delegate.query = "alp".to_string();
-        delegate.apply_filter();
-        assert_eq!(delegate.counts(), (3, 2), "counts ignore the filter");
-        assert_eq!(
-            delegate
-                .visible_ids()
-                .iter()
-                .map(|id| id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["1", "3"],
-            "name search narrows the visible set"
-        );
-
-        delegate.set_facet_status(Some(FacetStatus::Disabled));
-        assert!(delegate.visible_ids().is_empty(), "no disabled alp rows");
-
-        delegate.clear_facets();
-        delegate.query.clear();
-        delegate.set_facet_group(Some("work".to_string()));
-        assert_eq!(
-            delegate.visible_ids(),
-            vec!["1".to_string(), "3".to_string()],
-            "the group facet keeps the two work rows"
-        );
-    }
-
-    /// R29: the batch's failures narrow the table to themselves, and the
-    /// ordinary filter controls take the filter away again.
-    #[test]
-    fn the_failure_filter_narrows_the_table() {
-        let mut delegate = delegate(vec![
-            row("1", "alpha", "work", true),
-            row("2", "beta", "work", true),
-            row("3", "alpine", "work", true),
-        ]);
-        delegate.set_failure_filter(Some(HashSet::from(["2".to_string()])));
-        assert_eq!(delegate.visible_ids(), vec!["2".to_string()]);
-        delegate.clear_facets();
-        assert_eq!(delegate.visible_ids().len(), 3, "clear all takes it away");
-    }
-
-    /// A status facet reads the same serving tone the row lamp paints, so a
-    /// running row can never answer `Dead`.
-    #[test]
-    fn status_facet_matches_the_lamp_tone() {
-        let row = row("1", "alpha", "work", true);
-        let empty = HashSet::new();
-        let no_health = HashMap::new();
-        let running: HashSet<String> = ["1".to_string()].into_iter().collect();
-        let dead: HashMap<String, String> = [("1".to_string(), "dead".to_string())]
-            .into_iter()
-            .collect();
-
-        assert!(FacetStatus::Running.matches(&row, &running, &no_health, &empty));
-        assert!(FacetStatus::Dead.matches(&row, &running, &dead, &empty));
-        assert!(!FacetStatus::Running.matches(&row, &running, &dead, &empty));
-        assert!(FacetStatus::Stopped.matches(&row, &empty, &no_health, &empty));
-        assert!(FacetStatus::Enabled.matches(&row, &empty, &no_health, &empty));
-        assert!(!FacetStatus::Disabled.matches(&row, &empty, &no_health, &empty));
     }
 }

@@ -7,6 +7,7 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 ### Added
 
 - A workbench shell: a left nav carrying `All configs` and the bottom utilities, an action bar with the view title, its count, `Import`, `Add`, the command palette and a `⋯` overflow, a 36px filter slot above the table, and an engine bar under the table with the engine's state, the running count, the session traffic, `Start all`, `Stop all` and a `⋯` menu with `Test all` and `Stop testing`.
+- The filter row searches configs and narrows by Status, Protocol, and a Filter popover for latency, bind, port range and custom endpoints, with `N of M` always visible and a no-match state that clears in place. Search is session-only.
 - The nav collapses to its letters below 1200px and expands again at 1200px, so the window's new minimum still fits the table beside it.
 - `Ctrl+I` opens the inspector and closes it again.
 

@@ -79,6 +79,13 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
         ClearSelection,
         Some(LIST_CONTEXT),
     ));
+    // The search field is not inside the list context, so it needs the same
+    // layered handler one scope up.
+    keys.push(KeyBinding::new(
+        "escape",
+        ClearSelection,
+        Some(APP_KEY_CONTEXT),
+    ));
     bind(&mut keys, "focus-search", FocusSearch);
     bind(&mut keys, "inspector-details", InspectorDetails);
     bind(&mut keys, "inspector-health", InspectorHealth);

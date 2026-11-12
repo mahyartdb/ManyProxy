@@ -50,7 +50,7 @@ pub(crate) fn topbar_menu_row(
 }
 
 pub(crate) fn search_placeholder() -> String {
-    t!("search-placeholder")
+    t!("filter-search-placeholder")
 }
 
 /// T-23: the one hint that the `port=` grammar exists — a tooltip on the search

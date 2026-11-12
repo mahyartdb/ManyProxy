@@ -5,6 +5,7 @@ mod facets;
 #[path = "match.rs"]
 mod matching;
 mod metrics;
+pub mod query;
 mod row;
 mod rows;
 
@@ -12,5 +13,6 @@ pub use columns::*;
 pub use facets::*;
 pub use matching::*;
 pub use metrics::*;
+pub use query::*;
 pub use row::*;
 pub use rows::*;

@@ -134,7 +134,7 @@ impl Render for AppView {
         let current_title = window_title_text(self.engine.running_count());
         let nav = self.render_nav(window, cx);
         let action_bar = self.render_action_bar(cx);
-        let filter_slot = self.render_filter_slot(cx);
+        let filter_slot = self.render_filter_slot(window, cx);
         let engine_bar = self.render_engine_bar(cx);
         let column_headers = self.render_library_column_headers(window, cx);
         let mut list_pane = div()

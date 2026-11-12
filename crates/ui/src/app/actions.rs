@@ -466,8 +466,8 @@ fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String
         ActionTarget::Selection => {
             let libraries = view.libraries.read(cx);
             let delegate = libraries.delegate();
-            let visible = delegate.visible_ids();
-            let mut ids: Vec<String> = visible
+            let mut ids: Vec<String> = view
+                .visible_row_ids(cx)
                 .into_iter()
                 .filter(|id| view.is_selected(id))
                 .collect();

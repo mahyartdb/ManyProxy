@@ -83,6 +83,7 @@ impl AppView {
 
             list_cx.notify();
         });
+        self.apply_query(cx);
         // A row that stopped existing leaves the selection; a row that is
         // merely filtered out stays.
         self.prune_selection_to_live_rows(cx);

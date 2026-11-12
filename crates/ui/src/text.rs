@@ -161,16 +161,7 @@ pub(crate) fn bulk_delete_note(removed: &[String], failed: &[String]) -> ToastSp
         ToastSpec::warning(text)
     }
 }
-pub(crate) fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> ServingTone {
-    let dead_evidence = crashed || health.map(str::trim) == Some("dead");
-    if is_running && dead_evidence {
-        ServingTone::Failed
-    } else if is_running {
-        ServingTone::Serving
-    } else {
-        ServingTone::Stopped
-    }
-}
+
 /// T-33: the message a Settings field shows inline — the field's own sentence
 /// when the store named one, otherwise the error's display text.
 pub(crate) fn store_error_text(error: &StoreError) -> String {

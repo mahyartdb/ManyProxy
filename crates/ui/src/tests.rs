@@ -32,6 +32,62 @@ fn seed_input(name: &str) -> NewConfig {
     }
 }
 
+fn test_facts(delegate: &crate::LibraryDelegate) -> crate::QueryFacts<'_> {
+    crate::QueryFacts {
+        running: &delegate.running,
+        health: &delegate.health,
+        crashed: &delegate.crashed,
+        latency: &delegate.latency,
+    }
+}
+
+/// The pure query over a delegate's mirrors, for tests that exercise matching
+/// without mounting a window.
+fn test_visible(delegate: &crate::LibraryDelegate, query: &crate::FilterQuery) -> Vec<usize> {
+    crate::filter(
+        &delegate.rows,
+        &delegate.search_index,
+        &test_facts(delegate),
+        &crate::LibraryScope::All,
+        query,
+    )
+}
+
+/// The app's filter-then-sort order, reproduced without an `AppView`.
+fn test_sorted(delegate: &crate::LibraryDelegate, query: &crate::FilterQuery) -> Vec<usize> {
+    let mut visible = test_visible(delegate, query);
+    if !delegate.sort.is_none() {
+        if delegate.sort.key == crate::store::LibrarySortKey::TypeSecurity {
+            visible.sort_by(|&a, &b| {
+                crate::compare_type_security(&delegate.rows[a], &delegate.rows[b])
+            });
+        } else {
+            let context = crate::SortContext {
+                latency: &delegate.latency,
+                data_traffic: &delegate.data_traffic,
+                totals: &delegate.traffic,
+                out_ips: &delegate.out_ips,
+            };
+            visible.sort_by(|&a, &b| {
+                crate::compare_library_rows(
+                    &context,
+                    delegate.sort,
+                    &delegate.rows[a],
+                    &delegate.rows[b],
+                )
+            });
+        }
+    }
+    visible
+}
+
+fn test_names(delegate: &crate::LibraryDelegate, query: &crate::FilterQuery) -> Vec<String> {
+    test_sorted(delegate, query)
+        .into_iter()
+        .map(|index| delegate.rows[index].name.clone())
+        .collect()
+}
+
 #[test]
 fn window_options_carry_app_title() {
     let options = crate::app_window_options(crate::startup_window_bounds(None, None), None);
@@ -11181,19 +11237,27 @@ fn library_search_matches_host_bind_port() {
 
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![alpha, beta]);
-    delegate.query = "10.0.0.5".to_string();
-    delegate.apply_filter();
+    let mut query = crate::FilterQuery {
+        search: "10.0.0.5".to_string(),
+        ..Default::default()
+    };
     assert_eq!(
-        delegate.visible.len(),
+        test_visible(&delegate, &query).len(),
         1,
         "filter narrows to the bind/host row"
     );
-    delegate.query = "10801".to_string();
-    delegate.apply_filter();
-    assert_eq!(delegate.visible.len(), 1, "filter narrows by port");
-    delegate.query = String::new();
-    delegate.apply_filter();
-    assert_eq!(delegate.visible.len(), 2, "empty query shows all");
+    query.search = "10801".to_string();
+    assert_eq!(
+        test_visible(&delegate, &query).len(),
+        1,
+        "filter narrows by port"
+    );
+    query.search.clear();
+    assert_eq!(
+        test_visible(&delegate, &query).len(),
+        2,
+        "empty query shows all"
+    );
 }
 
 #[test]
@@ -11303,12 +11367,13 @@ fn t47_search_index_matches_scan_parity() {
     ] {
         let mut delegate = LibraryDelegate::new();
         delegate.set_rows(rows.clone());
-        delegate.query = query.to_string();
-        delegate.apply_filter();
-        let cached: Vec<String> = delegate
-            .visible
-            .iter()
-            .map(|&i| delegate.rows[i].id.clone())
+        let filter_query = crate::FilterQuery {
+            search: query.to_string(),
+            ..Default::default()
+        };
+        let cached: Vec<String> = test_visible(&delegate, &filter_query)
+            .into_iter()
+            .map(|i| delegate.rows[i].id.clone())
             .collect();
         let expected: Vec<String> = rows
             .iter()
@@ -11368,12 +11433,13 @@ fn t47_search_index_matches_full_with_context() {
         "alpha",
         "zzz-no-match",
     ] {
-        delegate.query = query.to_string();
-        delegate.apply_filter();
-        let cached: Vec<String> = delegate
-            .visible
-            .iter()
-            .map(|&i| delegate.rows[i].id.clone())
+        let filter_query = crate::FilterQuery {
+            search: query.to_string(),
+            ..Default::default()
+        };
+        let cached: Vec<String> = test_visible(&delegate, &filter_query)
+            .into_iter()
+            .map(|i| delegate.rows[i].id.clone())
             .collect();
         let expected: Vec<String> = rows
             .iter()
@@ -11406,20 +11472,22 @@ fn t73_port_row(
     }
 }
 
-fn t73_visible_ports(delegate: &crate::LibraryDelegate) -> Vec<u16> {
-    delegate
-        .visible
-        .iter()
-        .map(|&index| delegate.rows[index].port)
+fn t73_visible_ports(delegate: &crate::LibraryDelegate, query: &crate::FilterQuery) -> Vec<u16> {
+    test_visible(delegate, query)
+        .into_iter()
+        .map(|index| delegate.rows[index].port)
         .collect()
 }
 
-fn t73_filtered(rows: Vec<crate::store::ProxyConfig>, query: &str) -> (Vec<u16>, String) {
+fn t73_filtered(
+    rows: Vec<crate::store::ProxyConfig>,
+    query: &str,
+) -> (Vec<u16>, crate::FilterQuery) {
     let mut delegate = crate::LibraryDelegate::new();
     delegate.set_rows(rows);
-    delegate.query = query.to_string();
-    delegate.apply_filter();
-    (t73_visible_ports(&delegate), delegate.active_filter_text())
+    let mut filter_query = crate::FilterQuery::default();
+    filter_query.set_search(query);
+    (t73_visible_ports(&delegate, &filter_query), filter_query)
 }
 
 fn t73_rows() -> Vec<crate::store::ProxyConfig> {
@@ -11452,13 +11520,31 @@ fn t73_port_filter_exact_and_ranges() {
         "exact token is a one-wide range"
     );
 
-    let (exact, text) = t73_filtered(t73_rows(), "port=10801");
+    let (exact, parsed) = t73_filtered(t73_rows(), "port=10801");
     assert_eq!(exact, vec![10801], "exact port matches only that port");
-    assert_eq!(text, "port: 10801..10801", "canonical filter text");
+    assert_eq!(
+        parsed.port,
+        Some(PortPredicate {
+            lo: 10801,
+            hi: 10801
+        }),
+        "the token seeds the port facet"
+    );
+    assert!(
+        parsed.search_text().is_empty(),
+        "the token leaves free text"
+    );
 
-    let (range, text) = t73_filtered(t73_rows(), "port=10801:10910");
+    let (range, parsed) = t73_filtered(t73_rows(), "port=10801:10910");
     assert_eq!(range, vec![10801, 10802, 10910], "range is inclusive");
-    assert_eq!(text, "port: 10801..10910", "canonical range text");
+    assert_eq!(
+        parsed.port,
+        Some(PortPredicate {
+            lo: 10801,
+            hi: 10910
+        }),
+        "the range is inclusive"
+    );
 
     let (case_insensitive, _) = t73_filtered(t73_rows(), "PORT=10802");
     assert_eq!(
@@ -11467,14 +11553,16 @@ fn t73_port_filter_exact_and_ranges() {
         "port key is case-insensitive"
     );
 
-    let (reversed, text) = t73_filtered(t73_rows(), "port=10910:10801");
+    let (reversed, parsed) = t73_filtered(t73_rows(), "port=10910:10801");
     assert!(
         reversed.is_empty(),
         "reversed bounds never behave as a range"
     );
+    assert_eq!(parsed.port, None, "reversed bounds stay literal text");
     assert_eq!(
-        text, "search: \"port=10910:10801\"",
-        "reversed bounds stay literal text"
+        parsed.search_text(),
+        "port=10910:10801",
+        "the malformed token remains search text"
     );
 
     let (as_text, _) = t73_filtered(t73_rows(), "1080");
@@ -11487,13 +11575,24 @@ fn t73_port_filter_exact_and_ranges() {
 
 #[test]
 fn t73_port_filter_open_ended_forms() {
-    let (open_top, text) = t73_filtered(t73_rows(), "port=10801:");
+    let (open_top, parsed) = t73_filtered(t73_rows(), "port=10801:");
     assert_eq!(open_top, vec![10801, 10802, 10910, 20000], "N..=65535");
-    assert_eq!(text, "port: 10801..65535", "open top renders the ceiling");
+    assert_eq!(
+        parsed.port,
+        Some(crate::PortPredicate {
+            lo: 10801,
+            hi: u16::MAX
+        }),
+        "open top reaches the ceiling"
+    );
 
-    let (open_bottom, text) = t73_filtered(t73_rows(), "port=:10802");
+    let (open_bottom, parsed) = t73_filtered(t73_rows(), "port=:10802");
     assert_eq!(open_bottom, vec![10801, 10802], "0..=M");
-    assert_eq!(text, "port: 0..10802", "open bottom renders the floor");
+    assert_eq!(
+        parsed.port,
+        Some(crate::PortPredicate { lo: 0, hi: 10802 }),
+        "open bottom starts at the floor"
+    );
 
     let (everything, _) = t73_filtered(t73_rows(), "port=0:");
     assert_eq!(
@@ -11532,16 +11631,14 @@ fn t73_malformed_port_token_renders_literal() {
         t73_port_row("c", "port=5:1", "vless", "g1", 10804),
     ];
 
-    let (hits, text) = t73_filtered(rows.clone(), "port=x");
+    let (hits, parsed) = t73_filtered(rows.clone(), "port=x");
     assert_eq!(
         hits,
         vec![10803],
         "port=x matches the row literally named port=x, not by port"
     );
-    assert_eq!(
-        text, "search: \"port=x\"",
-        "a malformed token keeps today's filter phrasing"
-    );
+    assert_eq!(parsed.port, None, "a malformed token stays literal text");
+    assert_eq!(parsed.search_text(), "port=x");
 
     let (reversed, _) = t73_filtered(rows.clone(), "port=5:1");
     assert_eq!(
@@ -11568,17 +11665,18 @@ fn t73_malformed_port_token_renders_literal() {
 
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(rows);
-    delegate.query = "port=".to_string();
-    delegate.apply_filter();
+    let mut parsed = crate::FilterQuery::default();
+    parsed.set_search("port=");
     assert_eq!(
-        delegate.query, "port=",
+        parsed.search, "port=",
         "the query string itself is never rewritten"
     );
+    assert_eq!(parsed.port, None, "port= is not a predicate");
 }
 
 #[test]
 fn t73_port_composes_with_facets() {
-    use crate::{FacetStatus, LibraryDelegate};
+    use crate::{FilterQuery, LibraryDelegate, StatusFacet};
 
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![
@@ -11586,60 +11684,52 @@ fn t73_port_composes_with_facets() {
         t73_port_row("2", "Alpha Two", "vless", "g2", 10802),
         t73_port_row("3", "Beta", "vmess", "g1", 10803),
     ]);
-    delegate.query = "port=10801:10803 alpha".to_string();
-    delegate.apply_filter();
+    let mut query = FilterQuery::default();
+    query.set_search("port=10801:10803 alpha");
     assert_eq!(
-        t73_visible_ports(&delegate),
+        t73_visible_ports(&delegate, &query),
         vec![10801, 10802],
         "the text part keeps today's substring behavior inside the range"
     );
 
-    delegate.set_facet_group(Some("g1".to_string()));
-    assert_eq!(
-        t73_visible_ports(&delegate),
-        vec![10801],
-        "group facet ANDs with the port predicate"
-    );
-    delegate.set_facet_group(Some("g2".to_string()));
-    assert_eq!(t73_visible_ports(&delegate), vec![10802]);
-    delegate.set_facet_group(None);
-
-    // K11: the protocol dropdown retired; the search text still matches
-    // protocol words through the row search index.
-    delegate.query = "port=10801:10803 alpha vmess".to_string();
-    delegate.apply_filter();
+    query.protocols.insert("vmess".to_string());
     assert!(
-        t73_visible_ports(&delegate).is_empty(),
-        "protocol words match as text and AND with the other tokens — no alpha row is vmess"
+        t73_visible_ports(&delegate, &query).is_empty(),
+        "the protocol facet ANDs with the port predicate and the text"
     );
+    query.protocols.clear();
+    query.protocols.insert("vless".to_string());
+    assert_eq!(
+        t73_visible_ports(&delegate, &query),
+        vec![10801, 10802],
+        "vless keeps the two alpha rows"
+    );
+    query.protocols.clear();
 
-    delegate.query = "port=10801:10803".to_string();
-    delegate.apply_filter();
+    query.set_search("port=10801:10803");
     delegate.set_running(vec!["3".to_string()]);
     delegate.set_health(
         [("3".to_string(), "dead".to_string())]
             .into_iter()
             .collect(),
     );
-    delegate.set_facet_status(Some(FacetStatus::Dead));
-    assert_eq!(t73_visible_ports(&delegate), vec![10803]);
-    delegate.set_facet_status(None);
+    query.statuses.insert(StatusFacet::Dead);
+    assert_eq!(t73_visible_ports(&delegate, &query), vec![10803]);
+    query.statuses.clear();
 
-    delegate.query = "port=10801:10803 port=99999".to_string();
-    delegate.apply_filter();
+    query.set_search("port=10801:10803 port=99999");
     assert!(
-        t73_visible_ports(&delegate).is_empty(),
+        t73_visible_ports(&delegate, &query).is_empty(),
         "a second port= token degrades to literal text (pinned)"
     );
 
-    delegate.query = "port=10801:10803".to_string();
-    delegate.apply_filter();
-    let mut unsorted = t73_visible_ports(&delegate);
+    query.set_search("port=10801:10803");
+    let mut unsorted = t73_visible_ports(&delegate, &query);
     delegate.set_sort(crate::store::LibrarySort::new(
         crate::store::LibrarySortKey::TypeSecurity,
         crate::store::SortDirection::Ascending,
     ));
-    let mut sorted = t73_visible_ports(&delegate);
+    let mut sorted = t73_visible_ports(&delegate, &query);
     unsorted.sort_unstable();
     sorted.sort_unstable();
     assert_eq!(
@@ -11648,46 +11738,20 @@ fn t73_port_composes_with_facets() {
     );
 }
 
+/// R14: the search is session-only. Typing narrows the list but leaves no
+/// meta row behind, and a restart opens with an empty field and the whole
+/// library.
 #[gpui_kit::test]
-fn t73_last_query_meta_restores_on_launch(cx: &mut TestAppContext) {
+fn search_is_not_persisted(cx: &mut TestAppContext) {
     use gpui_kit::Focusable as _;
 
     cx.update(gpui_kit::init);
-    // Fixed name (no PID suffix): the delete below runs before any
-    // connection exists, so it self-heals the previous run's leftovers;
-    // a PID suffix made the final delete fail while the view still held
-    // the connection and accumulated one run's files per suite pass.
-    let path = std::env::temp_dir().join("manyproxy-t73-last-query.db");
+    let path = std::env::temp_dir().join("manyproxy-slice3-session-search.db");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
     {
         let mut store = Store::open_file(&path).expect("file store opens");
-        assert_eq!(
-            store.library_last_query(),
-            None,
-            "a fresh store remembers nothing"
-        );
-        store
-            .set_library_last_query("port=10801")
-            .expect("memory writes");
-        assert_eq!(
-            store.library_last_query().as_deref(),
-            Some("port=10801"),
-            "memory round-trips"
-        );
-        store.clear_library_last_query().expect("clear writes");
-        assert_eq!(store.library_last_query(), None, "cleared reads as absent");
-        store
-            .set_library_last_query("   ")
-            .expect("blank write is accepted");
-        assert_eq!(
-            store
-                .get_meta(Store::META_LIBRARY_LAST_QUERY)
-                .expect("meta read"),
-            None,
-            "a blank query never leaves a meta row behind"
-        );
         store
             .add(facet_seed("Alpha", "vless", "travel", "10801"))
             .expect("seed works");
@@ -11700,110 +11764,59 @@ fn t73_last_query_meta_restores_on_launch(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .search_input
-            .read(cx)
-            .value()
-            .to_string()),
-        "",
-        "empty default opens with an empty search field"
-    );
-    assert_eq!(
-        view.read_with(cx, |view, _| view
-            .store
-            .get_meta(Store::META_LIBRARY_LAST_QUERY)
-            .expect("meta read")),
-        None,
-        "the empty default writes no meta row"
-    );
 
-    // Type through the real input: `set_value` emits no Change event, so
-    // keystrokes are the honest way to exercise the persistence path.
     let handle = view.read_with(cx, |view, cx| view.search_input.read(cx).focus_handle(cx));
     cx.update(|window, cx| {
         window.focus(&handle, cx);
     });
     cx.simulate_input("port=10801");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(80));
     cx.run_until_parked();
     paint_frame(cx);
-    let (typed_query, typed_ports) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (delegate.query.clone(), t73_visible_ports(delegate))
-    });
     assert_eq!(
-        typed_query, "port=10801",
-        "typed query reaches the delegate"
+        view.read_with(cx, |view, _| view.visible.len()),
+        1,
+        "the typed port filter applies"
     );
-    assert_eq!(typed_ports, vec![10801], "typed port filter applies");
     assert_eq!(
-        view.read_with(cx, |view, _| view.store.library_last_query())
-            .as_deref(),
-        Some("port=10801"),
-        "typing remembers the query"
+        view.read_with(cx, |view, _| view
+            .store
+            .get_meta("library_last_query")
+            .expect("meta read")),
+        None,
+        "the search never writes a meta row"
     );
 
     drop(view);
     let store = Store::open_file(&path).expect("restart reopen works");
-    assert_eq!(
-        store.library_last_query().as_deref(),
-        Some("port=10801"),
-        "the memory survives a clean restart"
-    );
     let (restarted, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
-    let (input_value, restored_query, restored_ports) = restarted.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (
-            view.search_input.read(cx).value().to_string(),
-            delegate.query.clone(),
-            t73_visible_ports(delegate),
-        )
-    });
     assert_eq!(
-        input_value, "port=10801",
-        "the search field opens holding the last filter"
-    );
-    assert_eq!(restored_query, "port=10801", "the delegate adopts it");
-    assert_eq!(
-        restored_ports,
-        vec![10801],
-        "the last filter is applied on launch"
-    );
-
-    cx.update(|window, cx| {
-        restarted.update(cx, |view, cx| view.clear_library_search(window, cx));
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let (cleared_query, cleared_memory) = restarted.read_with(cx, |view, cx| {
-        (
-            view.libraries.read(cx).delegate().query.clone(),
-            view.store
-                .get_meta(Store::META_LIBRARY_LAST_QUERY)
-                .expect("meta read"),
-        )
-    });
-    assert_eq!(
-        cleared_query,
-        String::new(),
-        "clear search empties the query"
+        restarted.read_with(cx, |view, cx| view
+            .search_input
+            .read(cx)
+            .value()
+            .to_string()),
+        "",
+        "a restart opens with an empty search field"
     );
     assert_eq!(
-        cleared_memory, None,
-        "clear search clears the visible memory too"
+        restarted.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "the whole library is visible after a restart"
     );
-    // Drop the view (and its store connection) before deleting so the
-    // final cleanup actually succeeds on Windows.
     drop(restarted);
     let _ = std::fs::remove_file(&path);
 }
 
+/// OR within a facet, AND across facets and the search. Counts are
+/// self-excluded: each menu still sees what the other facets keep.
 #[test]
 fn t44_facets_and_with_text_query() {
     use crate::store::ProxyConfig;
-    use crate::{FacetStatus, LibraryDelegate};
+    use crate::{FilterQuery, LibraryDelegate, StatusFacet};
     fn row(id: &str, name: &str, protocol: &str, group: &str, enabled: bool) -> ProxyConfig {
         ProxyConfig {
             id: id.to_string(),
@@ -11832,82 +11845,84 @@ fn t44_facets_and_with_text_query() {
     health.insert("3".to_string(), "dead".to_string());
     delegate.set_health(health);
 
-    delegate.query = "vless".to_string();
-    delegate.apply_filter();
-    assert_eq!(delegate.visible.len(), 2);
+    let ids = |delegate: &LibraryDelegate, query: &FilterQuery| {
+        test_visible(delegate, query)
+            .into_iter()
+            .map(|index| delegate.rows[index].id.clone())
+            .collect::<Vec<_>>()
+    };
 
-    delegate.set_facet_group(Some("team".to_string()));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["1".to_string()]);
+    let mut query = FilterQuery::default();
+    query.set_search("vless");
+    assert_eq!(test_visible(&delegate, &query).len(), 2);
 
-    delegate.set_facet_status(Some(FacetStatus::Disabled));
-    assert!(delegate.visible.is_empty(), "all predicates must hold");
-    delegate.set_facet_status(Some(FacetStatus::Enabled));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["1".to_string()]);
+    query.protocols.insert("vless".to_string());
+    query.statuses.insert(StatusFacet::Enabled);
+    assert_eq!(
+        ids(&delegate, &query),
+        vec!["1".to_string(), "3".to_string()]
+    );
 
-    // K11: the enabled/disabled axis is a group-menu pick — one write sets both
-    // slots, so the menu can never show two active choices.
-    delegate.query = String::new();
-    delegate.set_facet_menu(Some("team".to_string()), Some(FacetStatus::Disabled));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["2".to_string()]);
-    delegate.set_facet_menu(Some("lab".to_string()), Some(FacetStatus::Enabled));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["3".to_string()]);
+    query.statuses.insert(StatusFacet::Disabled);
+    assert_eq!(
+        ids(&delegate, &query),
+        vec!["1".to_string(), "3".to_string()],
+        "OR inside the status set: the protocol still excludes Beta"
+    );
 
-    // K11: the lamp tones are the endpoint-state axis. Row 1 serves with a live
-    // probe, row 3 serves dead, row 2 is stopped — exactly the three lamps.
-    delegate.set_running(vec!["1".to_string(), "3".to_string()]);
-    delegate.set_facet_menu(None, Some(FacetStatus::Running));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["1".to_string()]);
-    delegate.set_facet_status(Some(FacetStatus::Dead));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["3".to_string()]);
-    delegate.set_facet_status(Some(FacetStatus::Stopped));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["2".to_string()]);
-    delegate.set_facet_status(Some(FacetStatus::Disabled));
-    let shown: Vec<String> = delegate
-        .visible
-        .iter()
-        .map(|&i| delegate.rows[i].id.clone())
-        .collect();
-    assert_eq!(shown, vec!["2".to_string()]);
+    query.protocols.clear();
+    query.set_search("");
+    query.protocols.insert("vmess".to_string());
+    assert_eq!(
+        ids(&delegate, &query),
+        vec!["2".to_string()],
+        "the protocol set ANDs with the status set"
+    );
 
-    delegate.query = "a".to_string();
-    delegate.clear_facets();
-    assert_eq!(delegate.visible.len(), 3);
-    assert_eq!(delegate.query, "a");
+    query.protocols.clear();
+    query.statuses.clear();
+    query.statuses.insert(StatusFacet::Running);
+    assert_eq!(ids(&delegate, &query), vec!["1".to_string()]);
+
+    // Self-exclusion: the status menu counts the statuses with its own set
+    // released but the search still applied.
+    let mut query = FilterQuery::default();
+    query.set_search("vless");
+    let counts = crate::status_counts(
+        &delegate.rows,
+        &delegate.search_index,
+        &test_facts(&delegate),
+        &crate::LibraryScope::All,
+        &query,
+    );
+    let count = |status: StatusFacet| {
+        counts
+            .iter()
+            .find(|(candidate, _)| *candidate == status)
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    };
+    assert_eq!(count(StatusFacet::Enabled), 2);
+    assert_eq!(count(StatusFacet::Disabled), 0, "the search excludes Beta");
+
+    query.statuses.insert(StatusFacet::Enabled);
+    let protocols = crate::protocol_counts(
+        &delegate.rows,
+        &delegate.search_index,
+        &test_facts(&delegate),
+        &crate::LibraryScope::All,
+        &query,
+    );
+    assert_eq!(
+        protocols,
+        vec![("vless".to_string(), 2), ("vmess".to_string(), 0)],
+        "the protocol menu ignores its own set but respects the status set"
+    );
+
+    query = FilterQuery::default();
+    assert_eq!(test_visible(&delegate, &query).len(), 3);
+    query.set_search("a");
+    assert_eq!(test_visible(&delegate, &query).len(), 3);
 }
 
 #[test]
@@ -11943,13 +11958,7 @@ fn t09_show_security_and_type_security_sort() {
         row("2", "Vtls", "vless", r#"{"security":"tls"}"#),
         row("3", "Vreal", "vless", r#"{"security":"reality"}"#),
     ]);
-    let order = |delegate: &LibraryDelegate| {
-        delegate
-            .visible
-            .iter()
-            .map(|&index| delegate.rows[index].name.clone())
-            .collect::<Vec<_>>()
-    };
+    let order = |delegate: &LibraryDelegate| test_names(delegate, &crate::FilterQuery::default());
     assert_eq!(order(&delegate), vec!["T", "Vtls", "Vreal"]);
     // T-27: the toggle retired into the sort picker; the equivalent key
     // (direction is fixed for it) must order exactly as the toggle did.
@@ -12005,7 +12014,7 @@ fn library_row_ref_borrows_the_stored_row() {
         identity_key: None,
         preset_id: None,
     }]);
-    let borrowed = delegate.row_ref(IndexPath::new(0)).expect("row is visible");
+    let borrowed = delegate.row_by_id("1").expect("row is found");
     assert!(
         std::ptr::eq(borrowed, &delegate.rows[0]),
         "render reads the stored row, not a copy"
@@ -12114,95 +12123,6 @@ fn t01_detail_header_names_acting_row() {
     let acting = row("2", "Beta");
     assert_eq!(acting_on_label(&acting), "Acting on: Beta");
     assert_ne!(acting.id, "1", "the header names the selection");
-}
-
-#[test]
-fn t44_facet_options_inventory_rows() {
-    use crate::store::ProxyConfig;
-    use crate::LibraryDelegate;
-    fn row(id: &str, protocol: &str, group: &str) -> ProxyConfig {
-        ProxyConfig {
-            id: id.to_string(),
-            name: format!("n{id}"),
-            protocol: protocol.to_string(),
-            params: "{}".to_string().into(),
-            group: group.to_string(),
-            enabled: true,
-            bind_ip: "127.0.0.1".to_string(),
-            port: 10801,
-            subscription_id: None,
-            identity_key: None,
-            preset_id: None,
-        }
-    }
-    let mut delegate = LibraryDelegate::new();
-    delegate.set_rows(vec![
-        row("1", "VLESS", "team"),
-        row("2", "vmess", "team"),
-        row("3", "vless", "lab"),
-    ]);
-    assert_eq!(
-        delegate.group_options(),
-        vec![("lab".to_string(), 1), ("team".to_string(), 2)]
-    );
-
-    use crate::FacetMenu;
-    let (group_choices, _) = FacetMenu::Group.choices(&delegate);
-    assert_eq!(
-        group_choices.first().map(|choice| choice.title.as_str()),
-        Some("All groups (3)"),
-        "the header row carries the total"
-    );
-    let team = group_choices
-        .iter()
-        .find(|choice| choice.value.as_deref() == Some("team"))
-        .expect("team choice exists");
-    assert_eq!(
-        team.display, "Group: team",
-        "K11: the collapsed label carries no count"
-    );
-    assert!(
-        team.title.contains("(2)"),
-        "the dropdown row shows the count: {}",
-        team.title
-    );
-    // K11: enabled/disabled ride this menu as sentinels, counts included.
-    assert_eq!(
-        group_choices
-            .iter()
-            .find(|choice| choice.id == "facet-status-enabled")
-            .map(|choice| choice.title.as_str()),
-        Some("Enabled (3)")
-    );
-    assert_eq!(
-        group_choices
-            .iter()
-            .find(|choice| choice.id == "facet-status-disabled")
-            .map(|choice| choice.title.as_str()),
-        Some("Disabled (0)")
-    );
-    // K11: the lamp's three states ride the same menu, counts included.
-    for (id, title) in [
-        ("facet-status-running", "Running (0)"),
-        ("facet-status-dead", "Dead (0)"),
-        ("facet-status-stopped", "Stopped (3)"),
-    ] {
-        assert_eq!(
-            group_choices
-                .iter()
-                .find(|choice| choice.id == id)
-                .map(|choice| choice.title.as_str()),
-            Some(title),
-            "{id} carries its own count"
-        );
-    }
-    assert!(
-        !group_choices
-            .iter()
-            .find(|choice| choice.id == "facet-status-stopped")
-            .is_some_and(|choice| choice.display == "Group: All"),
-        "a status choice never collapses to the group-all label"
-    );
 }
 
 #[gpui_kit::test]
@@ -13003,10 +12923,8 @@ fn row_lead_reports_phase_without_being_clickable(cx: &mut TestAppContext) {
         before,
         "the lead is status only"
     );
-    let status = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().facet_status
-    });
-    assert_eq!(status, None, "the lead is not a filter trigger");
+    let status = view.read_with(cx, |view, _| view.query.statuses.clone());
+    assert!(status.is_empty(), "the lead is not a filter trigger");
     cx.update(|window, cx| window.click_at(id, point(px(1.), px(12.)), cx));
     cx.run_until_parked();
     paint_frame(cx);
@@ -13015,10 +12933,8 @@ fn row_lead_reports_phase_without_being_clickable(cx: &mut TestAppContext) {
         before,
         "the whole 24px lead is inert"
     );
-    let status = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().facet_status
-    });
-    assert_eq!(status, None, "the lead never writes the status facet");
+    let status = view.read_with(cx, |view, _| view.query.statuses.clone());
+    assert!(status.is_empty(), "the lead never writes the status facet");
 }
 
 #[gpui_kit::test]
@@ -13162,32 +13078,10 @@ fn t44_ui_rename_group_refreshes_facets_and_inspector(cx: &mut TestAppContext) {
     });
     assert!(renamed, "rename commits");
 
-    let options = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().group_options()
+    let groups = view.read_with(cx, |view, _| {
+        view.store.group_counts().expect("counts work")
     });
-    assert_eq!(options, vec![("cabin".to_string(), 2)]);
-    let (choices, _) = view.read_with(cx, |view, cx| {
-        crate::FacetMenu::Group.choices(view.libraries.read(cx).delegate())
-    });
-    assert!(
-        choices.iter().any(|choice| choice.title == "cabin (2)"),
-        "picker shows the new name with counts"
-    );
-    assert!(
-        !choices.iter().any(|choice| choice.title.contains("home")),
-        "old name leaves the picker"
-    );
-    let synced: Vec<String> = view.read_with(cx, |view, _| {
-        view.facet_group
-            .synced
-            .iter()
-            .map(|choice| choice.id.clone())
-            .collect()
-    });
-    assert!(
-        synced.iter().any(|id| id == "facet-group-cabin"),
-        "synced picker ids follow the rename: {synced:?}"
-    );
+    assert_eq!(groups, vec![("cabin".to_string(), 2)]);
 
     let selected = view.read_with(cx, |view, cx| view.selected_config(cx));
     assert_eq!(
@@ -13226,25 +13120,6 @@ fn t44_ui_delete_group_refuses_while_rows_remain(cx: &mut TestAppContext) {
         rows.iter().all(|row| row.group == "site/east"),
         "rows keep the verbatim label"
     );
-
-    let (choices, _) = view.read_with(cx, |view, cx| {
-        crate::FacetMenu::Group.choices(view.libraries.read(cx).delegate())
-    });
-    let slashed = choices
-        .iter()
-        .find(|choice| choice.value.as_deref() == Some("site/east"))
-        .expect("slashed group stays a real choice");
-    assert_eq!(
-        slashed.id, "facet-group-site-east",
-        "slash slugified: {}",
-        slashed.id
-    );
-    assert_eq!(
-        slashed.title, "site/east (2)",
-        "display verbatim: {}",
-        slashed.title
-    );
-    assert!(!slashed.id.contains('/'), "no raw slash in element ids");
 }
 
 #[gpui_kit::test]
@@ -13322,57 +13197,44 @@ fn t44_ui_facets_filter_and_clear(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("travel".to_string()));
-                list_cx.notify();
-            });
+            view.set_bind_facet("127.0.0.1".to_string(), true, cx)
         });
     });
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().visible.len()
-        }),
-        2
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 2);
+
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("nope".to_string()));
-                list_cx.notify();
-            });
+            view.set_bind_facet("10.9.9.9".to_string(), true, cx)
         });
     });
     assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().visible.len()
-        }),
-        0
-    );
-    assert!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().facets_active()
-        }),
-        "missing label still counts as active"
-    );
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_facets(window, cx));
-    });
-    assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().visible.len()
-        }),
-        2
+        view.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "the binds OR inside the facet, so the first host keeps its rows"
     );
 
-    for status in crate::FacetStatus::ALL {
-        let parsed = crate::FacetStatus::from_label(&status.label());
-        assert_eq!(parsed, Some(status), "label round-trips");
-    }
-    assert_eq!(crate::FacetStatus::from_label("Nope"), None);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_bind_facet("127.0.0.1".to_string(), false, cx)
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        0,
+        "an absent bind still counts as active and shows nothing"
+    );
+    assert!(view.read_with(cx, |view, _| view.query.is_active()));
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.clear_filters(cx));
+    });
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 2);
+    assert!(!view.read_with(cx, |view, _| view.query.is_active()));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.clear_query(window, cx));
+    });
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 2);
 }
 
 #[test]
@@ -13413,17 +13275,20 @@ fn w1_search_never_matches_credentials() {
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![row]);
     for secret in ["hunter2", "SECRET-UUID", "abc123"] {
-        delegate.query = secret.to_string();
-        delegate.apply_filter();
+        let mut query = crate::FilterQuery::default();
+        query.set_search(secret);
         assert!(
-            delegate.visible.is_empty(),
-            "index leaks {secret}: {:?}",
-            delegate.visible
+            test_visible(&delegate, &query).is_empty(),
+            "index leaks {secret}"
         );
     }
-    delegate.query = "a.example.com".to_string();
-    delegate.apply_filter();
-    assert_eq!(delegate.visible.len(), 1, "upstream still searchable");
+    let mut query = crate::FilterQuery::default();
+    query.set_search("a.example.com");
+    assert_eq!(
+        test_visible(&delegate, &query).len(),
+        1,
+        "upstream still searchable"
+    );
 }
 
 #[gpui_kit::test]
@@ -13439,15 +13304,7 @@ fn w1_library_fifty_rows_paint_and_filter(cx: &mut TestAppContext) {
     }
     let (view, cx) = mount_view(store, cx);
     assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 50);
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .visible
-            .len()),
-        50
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 50);
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
@@ -13458,42 +13315,14 @@ fn w1_library_fifty_rows_paint_and_filter(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "row-01".to_string();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now("row-01".to_string(), cx)
         });
     });
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .visible
-            .len()),
-        1
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 1);
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = String::new();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-        });
+        view.update(cx, |view, cx| view.apply_search_now(String::new(), cx));
     });
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .visible
-            .len()),
-        50
-    );
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 50);
 }
 
 #[test]
@@ -13538,10 +13367,10 @@ fn t47_delegate_caches_survive_params_poison() {
     assert_eq!(before.as_deref(), Some("a.example.com:443"));
 
     delegate.rows[0].params = "not json{{{".to_string().into();
-    delegate.query = "a.example.com".to_string();
-    delegate.apply_filter();
+    let mut query = crate::FilterQuery::default();
+    query.set_search("a.example.com");
     assert_eq!(
-        delegate.visible.len(),
+        test_visible(&delegate, &query).len(),
         1,
         "filter served from the index, not a live parse"
     );
@@ -14564,15 +14393,12 @@ fn bug07_prune_keeps_rows_whose_stop_failed(cx: &mut TestAppContext) {
     engine.start_all(&rows).expect("fake rows active");
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
+        view.update(cx, |view, _| {
             view.engine = engine;
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("default".to_string()));
-                list_cx.notify();
-            });
         });
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.select_visible_row(0, cx));
     });
 
     stock.fail_check("re-gen broke");
@@ -14841,11 +14667,9 @@ fn f12_add_under_excluding_filter_keeps_selection(cx: &mut TestAppContext) {
         .add(row19_seed("Alpha", "a.example.com", "10801"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
-    cx.update(|window, cx| {
+    cx.update(|_window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("alpha", window, list_cx);
-            });
+            view.apply_search_now("alpha".to_string(), cx);
         });
     });
     cx.run_until_parked();
@@ -15555,12 +15379,7 @@ fn t02_row_anatomy_stress_stays_uniform(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "node-4".to_string();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now("node-4".to_string(), cx)
         });
     });
     cx.run_until_parked();
@@ -15585,148 +15404,11 @@ fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig 
     }
 }
 
-#[gpui_kit::test]
-fn facet_group_filters_the_list_without_a_picker(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let travel = store
-        .add(facet_seed("Work", "vless", "travel", "10801"))
-        .expect("seed works");
-    let team = store
-        .add(facet_seed("Office", "vless", "team", "10802"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    // The facet band is retired; the filter slot owns the search and the
-    // group scope arrives with the nav in slice 7.
-    assert_absent(cx, "facet-group".to_string());
-    assert_painted(cx, "filter-slot");
-    assert_painted(cx, "library-search");
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.set_facet_group(Some("travel".to_string()));
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .facet_group
-            .clone()),
-        Some("travel".to_string()),
-        "the group facet still filters the list"
-    );
-    assert_painted(cx, &format!("library-row-{}", travel.id));
-    assert!(
-        cx.update(|window, _| window
-            .try_find(format!("library-row-{}", team.id))
-            .is_none()),
-        "the team row filters out of the visible list"
-    );
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.clear_facets();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .facet_group
-            .clone()),
-        None,
-        "clearing the facets restores the unfiltered library"
-    );
-    assert_painted(cx, &format!("library-row-{}", team.id));
-}
-
-#[gpui_kit::test]
-fn facet_group_choice_releases_the_state_filter(cx: &mut TestAppContext) {
-    use crate::FacetStatus;
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let travel = store
-        .add(facet_seed("Work", "vless", "travel", "10801"))
-        .expect("seed works");
-    store
-        .add(facet_seed("Office", "vmess", "team", "10802"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    // The facet band is retired; the delegate keeps the mutual exclusion the
-    // band enforced, and slice 3's filter row reads it.
-    assert_absent(cx, "facet-group".to_string());
-    assert_absent(cx, "facet-status".to_string());
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_menu(None, Some(FacetStatus::Disabled));
-                list_cx.notify();
-            });
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let (status, group) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (delegate.facet_status, delegate.facet_group.clone())
-    });
-    assert_eq!(status, Some(FacetStatus::Disabled), "the sentinel applies");
-    assert_eq!(group, None, "the state pick releases the group choice");
-
-    // Picking a group releases the sentinel in the same write.
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.set_facet_menu(Some("travel".to_string()), None);
-                list_cx.notify();
-            });
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let (status, group) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (delegate.facet_status, delegate.facet_group.clone())
-    });
-    assert_eq!(status, None, "the group pick releases the state filter");
-    assert_eq!(group, Some("travel".to_string()));
-    assert_painted(cx, &format!("library-row-{}", travel.id));
-}
-
-/// T-05: latency buckets are inclusive, compose with group/status/search, and
-/// the unprobed toggle is an independent predicate instead of a no-op under
-/// `Any`.
+/// T-05: latency buckets are inclusive, compose with the search and the
+/// other facets, and the unprobed toggle is an independent predicate.
 #[test]
 fn t05_latency_facet_filters_inclusively_and_composes() {
-    use crate::{FacetStatus, LatencyBucket, LatencyFacet};
+    use crate::{FilterQuery, LatencyBucket, LatencyFacet, StatusFacet};
 
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![
@@ -15743,86 +15425,85 @@ fn t05_latency_facet_filters_inclusively_and_composes() {
         ("toolow", 1001),
     ]));
     delegate.rows[3].enabled = false;
-    delegate.apply_filter();
 
-    delegate.set_latency_facet(LatencyFacet {
-        bucket: LatencyBucket::Ms100,
-        include_unprobed: true,
-    });
+    let mut query = FilterQuery {
+        latency: LatencyFacet {
+            bucket: LatencyBucket::Ms100,
+            include_unprobed: true,
+        },
+        ..FilterQuery::default()
+    };
     assert_eq!(
-        t77_names(&delegate),
+        test_names(&delegate, &query),
         vec!["Fast", "Unprobed"],
         "exactly 100 ms is in the bucket and unprobed defaults in"
     );
 
-    delegate.set_latency_facet(LatencyFacet {
+    query.latency = LatencyFacet {
         bucket: LatencyBucket::Ms300,
         include_unprobed: true,
-    });
-    assert_eq!(t77_names(&delegate), vec!["Fast", "Edge", "Unprobed"]);
+    };
+    assert_eq!(
+        test_names(&delegate, &query),
+        vec!["Fast", "Edge", "Unprobed"]
+    );
 
-    delegate.set_latency_facet(LatencyFacet {
+    query.latency = LatencyFacet {
         bucket: LatencyBucket::Ms1000,
         include_unprobed: true,
-    });
+    };
     assert_eq!(
-        t77_names(&delegate),
+        test_names(&delegate, &query),
         vec!["Fast", "Edge", "Slow", "Unprobed"],
         "1000 ms is in; 1001 ms is out"
     );
 
-    delegate.set_latency_facet(LatencyFacet {
+    query.latency = LatencyFacet {
         bucket: LatencyBucket::Ms300,
         include_unprobed: false,
-    });
-    assert_eq!(t77_names(&delegate), vec!["Fast", "Edge"]);
+    };
+    assert_eq!(test_names(&delegate, &query), vec!["Fast", "Edge"]);
 
-    delegate.set_facet_group(Some("travel".to_string()));
-    delegate.query = "vmess".to_string();
-    delegate.apply_filter();
+    query.protocols.insert("vmess".to_string());
+    query.set_search("vless");
     assert!(
-        delegate.visible.is_empty(),
-        "search AND group AND latency all have to agree"
+        test_visible(&delegate, &query).is_empty(),
+        "search AND protocol AND latency all have to agree"
     );
 
-    delegate.query = "vless".to_string();
-    delegate.apply_filter();
+    query.protocols.clear();
     delegate.set_running(vec!["fast".to_string()]);
-    delegate.set_facet_status(Some(FacetStatus::Running));
+    query.statuses.insert(StatusFacet::Running);
     assert_eq!(
-        t77_names(&delegate),
+        test_names(&delegate, &query),
         vec!["Fast"],
         "the status facet narrows the latency survivors"
     );
+
+    query = FilterQuery::default();
     assert_eq!(
-        delegate.active_filter_text(),
-        "group: travel · status: Running · latency: ≤300 ms (probed only) · search: \"vless\""
+        test_names(&delegate, &query).len(),
+        5,
+        "Clear restores the library"
     );
 
-    delegate.clear_facets();
-    delegate.query.clear();
-    delegate.apply_filter();
-    assert_eq!(delegate.latency_facet, LatencyFacet::default());
-    assert!(!delegate.facets_active());
-    assert_eq!(t77_names(&delegate).len(), 5, "Clear restores the library");
-
-    delegate.set_latency_facet(LatencyFacet {
+    query.latency = LatencyFacet {
         bucket: LatencyBucket::Any,
         include_unprobed: false,
-    });
+    };
     assert_eq!(
-        t77_names(&delegate),
+        test_names(&delegate, &query),
         vec!["Fast", "Edge", "Slow", "TooLow"],
         "excluding unprobed filters even without a bucket"
     );
-    assert!(delegate.facets_active(), "the toggle alone is a live facet");
-    assert_eq!(delegate.active_filter_text(), "latency: probed only");
+    assert!(query.is_active(), "the toggle alone is a live facet");
+    assert_eq!(query.long_tail_count(), 1);
 }
 
-/// T-05: the picker writes the delegate and the store, the switch releases
-/// unprobed rows, and Clear resets both surfaces.
+/// The picker writes the session query; a stored latency facet from an older
+/// build never seeds the launch.
 #[gpui_kit::test]
-fn t05_latency_facet_filters_persists_and_clears(cx: &mut TestAppContext) {
+fn t05_latency_facet_filters_and_clears(cx: &mut TestAppContext) {
     use crate::{LatencyBucket, LatencyFacet};
 
     cx.update(gpui_kit::init);
@@ -15836,11 +15517,20 @@ fn t05_latency_facet_filters_persists_and_clears(cx: &mut TestAppContext) {
     let unprobed = store
         .add(facet_seed("Unprobed", "vless", "team", "10803"))
         .expect("seed works");
+    store
+        .set_latency_facet(LatencyFacet {
+            bucket: LatencyBucket::Ms300,
+            include_unprobed: false,
+        })
+        .expect("old facet writes");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.query.latency),
+        LatencyFacet::default(),
+        "a stored facet never seeds the launch"
+    );
 
     view.update(cx, |view, cx| {
         view.libraries.update(cx, |state, list_cx| {
@@ -15850,47 +15540,16 @@ fn t05_latency_facet_filters_persists_and_clears(cx: &mut TestAppContext) {
             ]));
             list_cx.notify();
         });
-        cx.notify();
+        view.set_latency_facet(
+            LatencyFacet {
+                bucket: LatencyBucket::Ms100,
+                include_unprobed: true,
+            },
+            cx,
+        );
     });
     cx.run_until_parked();
     paint_frame(cx);
-
-    // The facet band is retired; the latency facet moves into slice 3's
-    // filter row.
-    assert_absent(cx, "facet-latency".to_string());
-    assert_absent(cx, "facet-latency-unprobed-switch".to_string());
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.set_latency_facet(
-                LatencyFacet {
-                    bucket: LatencyBucket::Ms100,
-                    include_unprobed: true,
-                },
-                cx,
-            );
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    let facet = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().latency_facet
-    });
-    assert_eq!(
-        facet,
-        LatencyFacet {
-            bucket: LatencyBucket::Ms100,
-            include_unprobed: true,
-        },
-        "the picker keeps the default include-unprobed"
-    );
-    assert_eq!(
-        view.read_with(cx, |view, _| view.store.latency_facet()),
-        facet,
-        "the choice is remembered"
-    );
     assert_painted(cx, &format!("library-row-{}", fast.id));
     assert_absent(cx, format!("library-row-{}", mid.id));
     assert_painted(cx, &format!("library-row-{}", unprobed.id));
@@ -15908,70 +15567,20 @@ fn t05_latency_facet_filters_persists_and_clears(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let facet = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().latency_facet
-    });
-    assert!(!facet.include_unprobed, "the switch narrows the facet");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.store.latency_facet()),
-        facet
-    );
     assert_absent(cx, format!("library-row-{}", unprobed.id));
 
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_facets(window, cx));
+        view.update(cx, |view, cx| view.clear_query(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
-        view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().latency_facet
-        }),
+        view.read_with(cx, |view, _| view.query.latency),
         LatencyFacet::default()
-    );
-    assert_eq!(
-        view.read_with(cx, |view, _| view.store.latency_facet()),
-        LatencyFacet::default(),
-        "Clear persists the unfiltered choice"
     );
     for row in [&fast, &mid, &unprobed] {
         assert_painted(cx, &format!("library-row-{}", row.id));
     }
-}
-
-/// T-05: an earlier latency choice seeds the delegate and the picker label on
-/// the next launch, including the unprobed half of the state.
-#[gpui_kit::test]
-fn t05_latency_facet_restores_from_store(cx: &mut TestAppContext) {
-    use crate::{LatencyBucket, LatencyFacet};
-
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    store
-        .add(facet_seed("Fast", "vless", "travel", "10801"))
-        .expect("seed works");
-    let facet = LatencyFacet {
-        bucket: LatencyBucket::Ms300,
-        include_unprobed: false,
-    };
-    store.set_latency_facet(facet).expect("facet writes");
-    let (view, cx) = mount_view(store, cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    let (restored, display) = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        (
-            delegate.latency_facet,
-            crate::FacetMenu::Latency.current_display(delegate),
-        )
-    });
-    assert_eq!(restored, facet);
-    assert_eq!(display, "Latency: ≤300 ms");
-    assert_absent(cx, "facet-latency".to_string());
-    assert_absent(cx, "facet-latency-unprobed-switch".to_string());
 }
 
 #[gpui_kit::test]
@@ -16892,27 +16501,6 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "detail-operate");
-}
-
-#[test]
-fn laneb_serving_tone_single_evidence_rule() {
-    use crate::{serving_tone, ServingTone};
-    assert_eq!(serving_tone(true, Some("dead"), false), ServingTone::Failed);
-    assert_eq!(
-        serving_tone(true, Some(" dead "), true),
-        ServingTone::Failed
-    );
-    assert_eq!(
-        serving_tone(true, Some("87ms"), false),
-        ServingTone::Serving
-    );
-    assert_eq!(serving_tone(true, None, false), ServingTone::Serving);
-    assert_eq!(
-        serving_tone(false, Some("dead"), false),
-        ServingTone::Stopped
-    );
-    assert_eq!(serving_tone(false, None, true), ServingTone::Stopped);
-    assert_eq!(serving_tone(false, None, false), ServingTone::Stopped);
 }
 
 #[gpui_kit::test]
@@ -18490,7 +18078,7 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn clear_search_hint_clears_query(cx: &mut TestAppContext) {
+fn clear_filters_hint_clears_query(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -18498,32 +18086,25 @@ fn clear_search_hint_clears_query(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
 
-    cx.update(|window, cx| {
+    cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("zzz-no-hit", window, list_cx);
-            });
+            view.apply_search_now("zzz-no-hit".to_string(), cx)
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "clear-search-hint");
+    assert_painted(cx, "library-clear-filters");
     cx.update(|window, cx| {
-        window.click("clear-search-hint", cx);
+        window.click("library-clear-filters", cx);
     });
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .query
-            .clone()),
+        view.read_with(cx, |view, _| view.query.search.clone()),
         String::new(),
-        "hint click clears the query"
+        "the hint clears the query"
     );
     assert_painted(cx, &format!("library-row-{}", seeded.id));
 }
@@ -18650,14 +18231,7 @@ fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
     );
 
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "home".to_string();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-        });
+        view.update(cx, |view, cx| view.apply_search_now("home".to_string(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -18665,14 +18239,7 @@ fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
     assert_absent(cx, format!("library-row-{}", first.id));
 
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = String::new();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-        });
+        view.update(cx, |view, cx| view.apply_search_now(String::new(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -18979,21 +18546,24 @@ fn filter_narrows_the_visible_set_never_the_wrong_row() {
     }
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta"), row("3", "Gamma")]);
-    assert_eq!(delegate.visible_ids().len(), 3, "no filter shows every row");
-
-    delegate.query = "gamma".to_string();
-    delegate.apply_filter();
     assert_eq!(
-        delegate.visible_ids(),
-        vec!["3".to_string()],
+        test_visible(&delegate, &crate::FilterQuery::default()).len(),
+        3,
+        "no filter shows every row"
+    );
+
+    let mut query = crate::FilterQuery::default();
+    query.set_search("gamma");
+    assert_eq!(
+        test_names(&delegate, &query),
+        vec!["Gamma"],
         "the filter narrows the visible set"
     );
 
-    delegate.query = "alpha".to_string();
-    delegate.apply_filter();
+    query.set_search("alpha");
     assert_eq!(
-        delegate.visible_ids(),
-        vec!["1".to_string()],
+        test_names(&delegate, &query),
+        vec!["Alpha"],
         "the filter names the rows it kept"
     );
 }
@@ -19621,7 +19191,7 @@ fn t08_due_subscriptions_respect_skip_flag(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t08_current_group_prefers_facet(cx: &mut TestAppContext) {
+fn t08_current_group_follows_the_selection(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store.add(seed_input("Work")).expect("seed works");
@@ -19632,18 +19202,12 @@ fn t08_current_group_prefers_facet(cx: &mut TestAppContext) {
         "nothing focused"
     );
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("travel".to_string()));
-            });
-        });
+        view.update(cx, |view, cx| view.select_visible_row(0, cx));
     });
     assert_eq!(
         view.read_with(cx, |view, cx| view.current_group(cx)),
-        Some("travel".to_string()),
-        "facet wins"
+        Some("default".to_string()),
+        "the selected row names its group"
     );
 }
 
@@ -20756,18 +20320,13 @@ fn honest_engine_feedback_copies() {
     assert_eq!(search_count_text(0, 5), "0 of 5");
     assert_eq!(search_count_text(4, 5), "4 of 5");
     assert!(
-        no_matches_text().contains("No matches"),
-        "{}",
-        no_matches_text()
-    );
-    assert!(
-        no_matches_text().contains("Clear search"),
+        no_matches_text().contains("No configs match"),
         "{}",
         no_matches_text()
     );
     let empty = empty_library_text();
     assert!(empty.contains("Add"), "{empty}");
-    assert!(empty.contains("Import"), "{empty}");
+    assert!(empty.contains("import"), "{empty}");
     let detail = EngineController::crash_detail(&[
         ("stock".to_string(), "signal: killed".to_string()),
         ("xray".to_string(), "signal: segmentation fault".to_string()),
@@ -22636,15 +22195,18 @@ fn search_no_hits_vs_empty_counts() {
     }
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta")]);
-    delegate.query = "zzz-no-hit".to_string();
-    delegate.apply_filter();
-    assert_eq!(delegate.visible_counts(), (0, 2));
+    let mut query = crate::FilterQuery::default();
+    query.set_search("zzz-no-hit");
+    assert_eq!(test_visible(&delegate, &query).len(), 0);
     assert_eq!(crate::search_count_text(0, 2), "0 of 2");
-    assert!(crate::no_matches_text().contains("Clear search"));
-    let mut empty = LibraryDelegate::new();
-    empty.set_rows(Vec::new());
-    assert_eq!(empty.visible_counts(), (0, 0));
-    assert!(crate::empty_library_text().contains("Add"));
+    assert_eq!(crate::no_matches_text(), "No configs match");
+    assert_eq!(crate::empty_library_title(), "No configs yet");
+    let empty = LibraryDelegate::new();
+    assert_eq!(
+        crate::scope_total(&empty.rows, &crate::LibraryScope::All),
+        0
+    );
+    assert!(crate::empty_library_text().contains("Add or import a config"));
 }
 
 #[gpui_kit::test]
@@ -22655,24 +22217,13 @@ fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "zzz-no-hit".to_string();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
-            view.select_visible_row(0, cx);
+            view.apply_search_now("zzz-no-hit".to_string(), cx);
         });
     });
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = String::new();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now(String::new(), cx);
             view.select_visible_row(0, cx);
         });
     });
@@ -22695,21 +22246,13 @@ fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "zzz-no-hit".to_string();
-                delegate.apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now("zzz-no-hit".to_string(), cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    assert!(
-        cx.update(|window, _| window.try_find("clear-search-hint".to_string()).is_some()),
-        "no-hits names the Clear search affordance"
-    );
+    assert_painted(cx, "library-clear-filters");
     assert!(
         cx.update(|window, _| window.try_find("action-bar-count".to_string()).is_some()),
         "the action bar keeps the count"
@@ -22730,38 +22273,22 @@ fn laneb_facet_empty_and_clear_all(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("nope".to_string()));
-                list_cx.notify();
-            });
+            view.set_bind_facet("10.9.9.9".to_string(), true, cx)
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    assert_painted(cx, "clear-search-hint");
-    assert_painted(cx, "clear-search-facets");
+    assert_painted(cx, "library-clear-filters");
     assert!(
         cx.update(|window, _| window.try_find("empty-library-ctas".to_string()).is_none()),
         "filtered-to-zero never offers Add/Import"
     );
-    let named = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().active_filter_text()
-    });
-    assert!(
-        named.contains("group: nope"),
-        "empty state names the facet: {named}"
-    );
     cx.update(|window, cx| {
-        window.click("clear-search-facets", cx);
+        window.click("library-clear-filters", cx);
     });
     cx.run_until_parked();
-    let visible = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().visible.len()
-    });
-    assert_eq!(visible, 2, "Clear all restores every row");
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 2);
 }
 
 #[gpui_kit::test]
@@ -22780,28 +22307,22 @@ fn ticket03_search_count_persistent_with_live_count(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    assert_eq!(
-        crate::search_placeholder(),
-        "Search configurations",
-        "search field placeholder pinned"
-    );
+    assert_eq!(crate::search_placeholder(), "Search configs");
 
-    let (visible, total, query) = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .delegate_counts_for_search()
+    let (visible, total) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        (
+            view.visible.len(),
+            crate::scope_total(&delegate.rows, &crate::LibraryScope::All),
+        )
     });
     assert_eq!((visible, total), (2, 2), "unfiltered library counts");
-    assert!(query.trim().is_empty(), "no query active");
     assert_eq!(crate::search_count_text(visible, total), "2 of 2");
 
     assert_painted(cx, "filter-slot");
     assert_painted(cx, "library-search");
+    assert_painted(cx, "filter-count");
     assert_painted(cx, "action-bar-count");
-    // The facet band is retired; its count row moves to the filter row in
-    // slice 3.
-    assert_absent(cx, "search-count".to_string());
     assert_absent(cx, "facet-bar".to_string());
     assert_absent(cx, "facet-group".to_string());
     assert_absent(cx, "facet-protocol".to_string());
@@ -22810,7 +22331,6 @@ fn ticket03_search_count_persistent_with_live_count(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
-    use crate::FacetStatus;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let work = store
@@ -22825,57 +22345,36 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("Work", window, list_cx);
-            });
-        });
-    });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.set_facet_menu(Some("travel".to_string()), Some(FacetStatus::Enabled));
-                list_cx.notify();
-            });
+            view.apply_search_now("Work".to_string(), cx);
+            view.set_bind_facet("127.0.0.1".to_string(), true, cx);
             view.select_row(&work.id, cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let pre = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
+    let pre = view.read_with(cx, |view, _| {
         (
-            delegate.query.clone(),
-            delegate.facet_group.clone(),
-            delegate.facet_status,
+            view.query.search.clone(),
+            view.query.binds.clone(),
             view.is_selected(&work.id),
-            delegate.facets_active(),
         )
     });
     assert_eq!(pre.0, "Work", "query established");
-    assert_eq!(pre.1, Some("travel".to_string()), "group facet established");
-    assert_eq!(pre.2, Some(FacetStatus::Enabled), "state facet established");
-    assert!(pre.3, "row checked");
-    assert!(pre.4, "facets active");
-    // The facet band's clear buttons are gone with the band; the filter row
-    // that replaces it owns them.
-    assert_absent(cx, "clear-search".to_string());
-    assert_absent(cx, "clear-facets".to_string());
+    assert!(pre.1.contains("127.0.0.1"), "bind facet established");
+    assert!(pre.2, "row selected");
     assert_painted(cx, "batch-more");
 
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_library_search(window, cx));
+        view.update(cx, |view, cx| view.clear_search(window, cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let after_query = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
+    let after_query = view.read_with(cx, |view, _| {
         (
-            delegate.query.clone(),
-            delegate.facet_group.clone(),
-            delegate.facet_status,
+            view.query.search.clone(),
+            view.query.binds.clone(),
             view.is_selected(&work.id),
         )
     });
@@ -22884,53 +22383,37 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
         String::new(),
         "Clear search empties the query"
     );
-    assert_eq!(
-        after_query.1,
-        Some("travel".to_string()),
-        "Clear search keeps the group facet"
+    assert!(
+        after_query.1.contains("127.0.0.1"),
+        "Clear search keeps the bind facet"
     );
-    assert_eq!(
-        after_query.2,
-        Some(FacetStatus::Enabled),
-        "Clear search keeps the state facet"
-    );
-    assert!(after_query.3, "Clear search keeps the checked set");
+    assert!(after_query.2, "Clear search keeps the selection");
 
-    cx.update(|window, cx| {
+    cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("Work", window, list_cx);
-            });
+            view.apply_search_now("Work".to_string(), cx);
+            view.clear_filters(cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.clear_facets(window, cx));
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let after_facets = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
+    let after_filters = view.read_with(cx, |view, _| {
         (
-            delegate.query.clone(),
-            delegate.facet_group.clone(),
-            delegate.facet_status,
+            view.query.search.clone(),
+            view.query.binds.clone(),
             view.is_selected(&work.id),
         )
     });
-    assert_eq!(after_facets.0, "Work", "Clear facets keeps the query");
-    assert_eq!(after_facets.1, None, "Clear facets drops group");
-    assert_eq!(after_facets.2, None, "Clear facets drops status");
-    assert!(after_facets.3, "Clear facets keeps the checked set");
+    assert_eq!(after_filters.0, "Work", "Clear filters keeps the search");
+    assert!(
+        after_filters.1.is_empty(),
+        "Clear filters drops the bind facet"
+    );
+    assert!(after_filters.2, "Clear filters keeps the selection");
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.set_facet_menu(Some("travel".to_string()), Some(FacetStatus::Enabled));
-                list_cx.notify();
-            });
+            view.set_bind_facet("127.0.0.1".to_string(), true, cx)
         });
     });
     cx.run_until_parked();
@@ -22940,71 +22423,19 @@ fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let after_checked = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
+    let after_checked = view.read_with(cx, |view, _| {
         (
-            delegate.query.clone(),
-            delegate.facet_group.clone(),
-            delegate.facet_status,
+            view.query.search.clone(),
+            view.query.binds.clone(),
             view.selection_count() == 0,
         )
     });
     assert_eq!(after_checked.0, "Work", "Clear checked keeps the query");
-    assert_eq!(
-        after_checked.1,
-        Some("travel".to_string()),
-        "Clear checked keeps the group facet"
-    );
-    assert_eq!(
-        after_checked.2,
-        Some(FacetStatus::Enabled),
-        "Clear checked keeps the state facet"
-    );
-    assert!(after_checked.3, "Clear checked empties the set");
-}
-
-#[gpui_kit::test]
-fn ticket03_facet_triggers_show_active_choice_with_count(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    store
-        .add(facet_seed("Work", "vless", "travel", "10801"))
-        .expect("seed works");
-    let office = store
-        .add(facet_seed("Office", "vmess", "travel", "10802"))
-        .expect("seed works");
-    // Fresh rows land disabled; flip one so both state counts are non-zero.
-    store.set_enabled(&office.id, true).expect("enable office");
-    let (view, cx) = mount_view(store, cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    let (group_choices, _) = view.read_with(cx, |view, cx| {
-        crate::FacetMenu::Group.choices(view.libraries.read(cx).delegate())
-    });
-    let travel = group_choices
-        .iter()
-        .find(|choice| choice.value == Some("travel".to_string()))
-        .expect("travel group option");
     assert!(
-        travel.title.contains("(2)"),
-        "group dropdown row carries its count: {}",
-        travel.title
+        after_checked.1.contains("127.0.0.1"),
+        "Clear checked keeps the bind facet"
     );
-    assert_eq!(
-        travel.display, "Group: travel",
-        "K11: the collapsed trigger names the choice, not a count"
-    );
-    let enabled = group_choices
-        .iter()
-        .find(|choice| choice.id == "facet-status-enabled")
-        .expect("enabled sentinel rides the group menu");
-    assert_eq!(enabled.title, "Enabled (1)");
-    assert_eq!(
-        enabled.display, "Status: Enabled",
-        "the sentinel selection names its dimension"
-    );
+    assert!(after_checked.2, "Clear checked empties the set");
 }
 
 #[gpui_kit::test]
@@ -23025,11 +22456,7 @@ fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_eq!(
-        crate::search_placeholder(),
-        "Search configurations",
-        "search field placeholder pinned"
-    );
+    assert_eq!(crate::search_placeholder(), "Search configs");
     assert_painted(cx, "filter-slot");
     assert_painted(cx, "library-search");
 
@@ -23046,81 +22473,472 @@ fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
     });
     assert!(query_focused, "Ctrl-F lands in the library search field");
 
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("Work", window, list_cx);
-            });
-        });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.apply_search_now("Work".to_string(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let (visible, total, query) = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .delegate_counts_for_search()
+    let (visible, total) = view.read_with(cx, |view, cx| {
+        let delegate = view.libraries.read(cx).delegate();
+        (
+            view.visible.len(),
+            crate::scope_total(&delegate.rows, &crate::LibraryScope::All),
+        )
     });
     assert_eq!((visible, total), (1, 2), "query filters the library");
-    assert_eq!(query, "Work", "query established");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.query.search.clone()),
+        "Work",
+        "query established"
+    );
     assert_eq!(crate::search_count_text(visible, total), "1 of 2");
     assert_painted(cx, "library-search");
-    assert_absent(cx, "search-count".to_string());
+    assert_painted(cx, "filter-count");
 }
 
+// ---------------------------------------------------------------------------
+// Slice 3 — the filter row
+// ---------------------------------------------------------------------------
+
 #[gpui_kit::test]
-fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
+fn filter_row_renders_search_status_protocol_filter_count_clear(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
         .add(facet_seed("Work", "vless", "travel", "10801"))
         .expect("seed works");
     store
-        .add(facet_seed("Office", "vmess", "travel", "10802"))
+        .add(facet_seed("Office", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    for width in [1100., 1440.] {
+        paint_frame_at(cx, width, 700.);
+        assert_painted(cx, "filter-slot");
+        assert_painted(cx, "library-search");
+        assert_painted(cx, "filter-status");
+        assert_painted(cx, "filter-protocol");
+        assert_painted(cx, "filter-more");
+        assert_painted(cx, "filter-count");
+        assert_eq!(label_of("filter-status", cx), "Status");
+        assert_eq!(label_of("filter-protocol", cx), "Protocol");
+        assert_eq!(label_of("filter-more", cx), "Filter");
+        assert_eq!(label_of("filter-count", cx), "2 of 2");
+        assert_absent(cx, "filter-clear".to_string());
+        assert_absent(cx, "filter-chips".to_string());
+        assert_absent(cx, "facet-bar".to_string());
+        let height = cx.update(|window, _| {
+            window
+                .try_find("filter-slot".to_string())
+                .expect("filter slot paints")
+                .bounds()
+                .size
+                .height
+        });
+        assert_eq!(height, px(36.), "the row is exactly 36px at {width}px");
+    }
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.set_compact_density(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1100., 700.);
+    let height = cx.update(|window, _| {
+        window
+            .try_find("filter-slot".to_string())
+            .expect("filter slot paints")
+            .bounds()
+            .size
+            .height
+    });
+    assert_eq!(height, px(34.), "compact density keeps the row at 34px");
+}
+
+#[gpui_kit::test]
+fn search_debounces_80ms(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    use std::time::Duration;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Work", "vless", "travel", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Office", "vmess", "team", "10802"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
+
+    let handle = view.read_with(cx, |view, cx| view.search_input.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&handle, cx));
+
+    cx.simulate_input("zzz");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "a keystroke does not filter before the 80ms window"
+    );
+    cx.executor().advance_clock(Duration::from_millis(79));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "79ms is still inside the window"
+    );
+
+    // A second keystroke inside the window retires the first task: the old
+    // text never applies even when its own 80ms elapses.
+    for _ in 0..3 {
+        let backspace = gpui_kit::Keystroke::parse("backspace").expect("test keystroke parses");
+        cx.update(|window, cx| window.dispatch_keystroke(backspace, cx));
+    }
+    cx.simulate_input("Work");
+    cx.executor().advance_clock(Duration::from_millis(79));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "the replaced zzz task did not apply"
+    );
+    cx.executor().advance_clock(Duration::from_millis(2));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        1,
+        "the latest text applies once, 80ms after the last keystroke"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.query.search.clone()),
+        "Work",
+        "the field and the query agree"
+    );
+}
+
+#[gpui_kit::test]
+fn enter_and_clear_apply_immediately(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    use gpui_kit::Keystroke;
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Work", "vless", "travel", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Office", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     paint_frame(cx);
 
-    // The facet band is retired; the tip's wording lives on until slice 3's
-    // filter row carries it.
-    assert_absent(cx, "facet-group-tip".to_string());
-    assert_absent(cx, "facet-protocol-tip".to_string());
-    assert_absent(cx, "facet-status-tip".to_string());
+    let handle = view.read_with(cx, |view, cx| view.search_input.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&handle, cx));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.search_input.update(cx, |input, cx| {
+                input.set_value("Work".to_string(), window, cx);
+            });
+        });
+    });
+    let enter = Keystroke::parse("enter").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(enter, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        1,
+        "Enter applies without waiting for the timer"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.query.search.clone()),
+        "Work"
+    );
+
+    // The field's clear path is immediate too.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.clear_search(window, cx));
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "clearing the field restores every row at once"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view
+            .search_input
+            .read(cx)
+            .value()
+            .to_string()),
+        "",
+        "the field empties with the query"
+    );
+
+    // `Clear` is the same immediate path.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.search_input.update(cx, |input, cx| {
+                input.set_value("Work".to_string(), window, cx);
+            });
+        });
+    });
+    let enter = Keystroke::parse("enter").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(enter, cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|window, cx| window.click("filter-clear", cx));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        2,
+        "Clear drops the query without waiting for the timer"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.query.search.clone()),
+        "",
+        "Clear empties the search"
+    );
+}
+
+#[gpui_kit::test]
+fn status_and_protocol_buttons_show_active_values_and_clear_with_x(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Work", "vless", "travel", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Office", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.set_facet_group(Some("travel".to_string()));
-                list_cx.notify();
-            });
+            view.set_status_facet(crate::StatusFacet::Running, true, cx)
         });
     });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-status", cx),
+        "Status · Running",
+        "the button carries the one active value"
+    );
+    assert_painted(cx, "filter-status-clear");
+    cx.update(|window, cx| window.click("filter-status-clear", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(label_of("filter-status", cx), "Status");
+    assert!(
+        view.read_with(cx, |view, _| view.query.statuses.is_empty()),
+        "the x clears only the status facet"
+    );
+    assert_absent(cx, "filter-status-clear".to_string());
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_protocol_facet("vless".to_string(), true, cx)
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-protocol", cx),
+        "Protocol · VLESS",
+        "the button carries the one active protocol"
+    );
+    assert_painted(cx, "filter-protocol-clear");
+    cx.update(|window, cx| window.click("filter-protocol-clear", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(label_of("filter-protocol", cx), "Protocol");
+    assert!(
+        view.read_with(cx, |view, _| view.query.protocols.is_empty()),
+        "the x clears only the protocol facet"
+    );
+}
+
+#[gpui_kit::test]
+fn filter_button_counts_the_long_tail(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Work", "vless", "travel", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Office", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(label_of("filter-more", cx), "Filter");
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_latency_facet(
+                crate::LatencyFacet {
+                    bucket: crate::LatencyBucket::Ms100,
+                    include_unprobed: false,
+                },
+                cx,
+            );
+            view.set_bind_facet("127.0.0.1".to_string(), true, cx);
+            view.set_port_range("10800", "10900", cx);
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-more", cx),
+        "Filter · 3",
+        "latency, bind and port each count one"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.set_port_range("", "", cx));
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-more", cx),
+        "Filter · 2",
+        "clearing one control drops its count"
+    );
+}
+
+#[gpui_kit::test]
+fn count_reads_n_of_m(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    let rows: Vec<_> = (0..1_037)
+        .map(|index| {
+            t77_row(
+                &(index + 1).to_string(),
+                &format!("Row {}", index + 1),
+                "vless",
+                "g",
+                10_801 + index as u16,
+            )
+        })
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries
+                .update(cx, |state, _| state.delegate_mut().set_rows(rows));
+            view.apply_query(cx);
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-count", cx),
+        "1037 of 1037",
+        "with no query N = M"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_search_now("port=10801:10842".to_string(), cx)
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-count", cx),
+        "42 of 1037",
+        "N is the visible set, M the scope before the query"
+    );
+}
+
+#[gpui_kit::test]
+fn no_match_is_not_empty_library(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_painted(cx, "library-empty");
+    assert_painted(cx, "empty-add");
+    assert_painted(cx, "empty-import");
+    assert_absent(cx, "library-clear-filters".to_string());
+
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("Work", window, list_cx);
-            });
+            view.store
+                .add(facet_seed("Work", "vless", "travel", "10801"))
+                .expect("seed works");
+            view.reload(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_search_now("zzz-no-hit".to_string(), cx)
+        });
+    });
+    paint_frame(cx);
+    assert_painted(cx, "library-empty");
+    assert_painted(cx, "library-clear-filters");
+    assert_eq!(label_of("filter-count", cx), "0 of 1");
+    assert_absent(cx, "empty-add".to_string());
+    assert_absent(cx, "empty-import".to_string());
+}
+
+#[gpui_kit::test]
+fn batch_bar_restores_filter_values(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Work", "vless", "travel", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Office", "vmess", "team", "10802"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_search_now("Work".to_string(), cx);
+            view.set_status_facet(crate::StatusFacet::Disabled, true, cx);
+            view.set_bind_facet("127.0.0.1".to_string(), true, cx);
+            view.select_visible_row(0, cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let group_tip = view.read_with(cx, |view, cx| {
-        let delegate = view.libraries.read(cx).delegate();
-        let (visible, total, _) = delegate.delegate_counts_for_search();
-        crate::facet_tip_text(
-            "group or status",
-            &crate::FacetMenu::Group.current_display(delegate),
-            visible,
-            total,
-        )
-    });
     assert_eq!(
-        group_tip, "Filter by group or status: Group: travel · 1 of 2 shown",
-        "K11: the tip names the choice without the retired count chip"
+        view.read_with(cx, |view, _| view.selection_count()),
+        1,
+        "the selected row arms the batch bar"
+    );
+    assert_painted(cx, "batch-clear");
+    assert_absent(cx, "filter-status".to_string());
+
+    cx.update(|window, cx| window.click("batch-clear", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.query.search.clone()),
+        "Work",
+        "the search query returns"
+    );
+    assert_eq!(
+        label_of("filter-status", cx),
+        "Status · Disabled",
+        "the status returns"
+    );
+    assert_eq!(
+        label_of("filter-more", cx),
+        "Filter · 1",
+        "the bind returns"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        1,
+        "the filter still narrows the list"
     );
 }
 
@@ -23520,13 +23338,8 @@ fn t04_density_anchors_paint(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                let delegate = state.delegate_mut();
-                delegate.query = "work".to_string();
-                delegate.set_facet_group(Some("nope".to_string()));
-                delegate.apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now("work".to_string(), cx);
+            view.set_bind_facet("nope".to_string(), true, cx);
         });
     });
     cx.run_until_parked();
@@ -29303,12 +29116,7 @@ fn laneb_engine_bar_counts_the_running_rows(cx: &mut TestAppContext) {
             view.engine = engine;
         });
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_status(Some(crate::FacetStatus::Stopped));
-                list_cx.notify();
-            });
+            view.set_status_facet(crate::StatusFacet::Stopped, true, cx);
             view.select_visible_row(0, cx);
         });
     });
@@ -30390,9 +30198,9 @@ fn t69_sweep_clears_only_dead_excluding_running_and_editing(cx: &mut TestAppCont
     });
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().set_facet_group(Some("g".to_string()));
-            });
+            // A filter hides every row; the sweep must still reach the
+            // library, not the visible slice.
+            view.set_status_facet(crate::StatusFacet::Running, true, cx);
             view.start_row(&live.id, window, cx);
         });
     });
@@ -30405,8 +30213,11 @@ fn t69_sweep_clears_only_dead_excluding_running_and_editing(cx: &mut TestAppCont
     // runs: opened after the starts above (commit_start_selected's
     // reload drops a stale marker before the dialog truly opened).
     cx.update(|_, cx| {
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
             view.edit_form_open = Some(guarded.id.clone());
+            // The sweep is group-scoped, and the group now comes from the
+            // selection.
+            view.select_visible_row(0, cx);
         });
     });
     let running = view.read_with(cx, |view, _| view.engine.running_ids());
@@ -30523,9 +30334,7 @@ fn t69_sweep_auto_clear_needs_the_group_opt_in(cx: &mut TestAppContext) {
     let before = notification_count(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, _| {
-                state.delegate_mut().set_facet_group(Some("g".to_string()));
-            });
+            view.set_status_facet(crate::StatusFacet::Running, true, cx);
             view.test_group_health(window, cx);
         });
     });
@@ -32029,10 +31838,13 @@ fn t77_row(id: &str, name: &str, protocol: &str, group: &str, port: u16) -> Prox
 }
 
 fn t77_names(delegate: &LibraryDelegate) -> Vec<String> {
-    delegate
-        .visible
-        .iter()
-        .map(|&index| delegate.rows[index].name.clone())
+    t77_names_q(delegate, &crate::FilterQuery::default())
+}
+
+fn t77_names_q(delegate: &LibraryDelegate, query: &crate::FilterQuery) -> Vec<String> {
+    test_sorted(delegate, query)
+        .into_iter()
+        .map(|index| delegate.rows[index].name.clone())
         .collect()
 }
 
@@ -32205,7 +32017,6 @@ fn t77_unknown_values_sort_deterministically_last() {
     // A second tick carrying the same mirrors must not move anything.
     let first = t77_names(&delegate);
     for _ in 0..3 {
-        delegate.apply_filter();
         delegate.set_latency(t77_map_u64(&[("10", 50)]));
         assert_eq!(t77_names(&delegate), first, "no flicker between ticks");
     }
@@ -32228,7 +32039,6 @@ fn t77_unknown_values_sort_deterministically_last() {
     );
     let tail = t77_names(&delegate);
     for _ in 0..3 {
-        delegate.apply_filter();
         assert_eq!(t77_names(&delegate), tail, "out-IP tail is stable too");
     }
 }
@@ -32328,23 +32138,23 @@ fn t77_sort_composes_with_facets_and_port_filter() {
         "no filter: the whole library ranks by latency"
     );
 
-    delegate.query = "port=10801:10803".to_string();
-    delegate.apply_filter();
+    let mut query = crate::FilterQuery::default();
+    query.set_search("port=10801:10803");
     assert_eq!(
-        t77_names(&delegate),
+        t77_names_q(&delegate, &query),
         vec!["Two", "Three", "One"],
         "the port predicate keeps its rows and the sort ranks them"
     );
 
-    delegate.set_facet_group(Some("travel".to_string()));
+    query.protocols.insert("vless".to_string());
     assert_eq!(
-        t77_names(&delegate),
-        vec!["Two", "Three", "One"],
-        "the group facet ANDs with the port predicate before the sort"
+        t77_names_q(&delegate, &query),
+        vec!["Two", "One"],
+        "the protocol facet ANDs with the port predicate before the sort"
     );
 
-    // K11: the protocol dropdown retired; the status facet does the same
-    // narrowing — Three serves dead, One and Two serve live.
+    // K11: the status facet narrows the survivors — Three serves dead, One
+    // and Two serve live.
     delegate.set_running(vec!["1".to_string(), "2".to_string(), "3".to_string()]);
     delegate.set_health(
         [("1", "20ms"), ("2", "30ms"), ("3", "dead")]
@@ -32352,25 +32162,23 @@ fn t77_sort_composes_with_facets_and_port_filter() {
             .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
             .collect(),
     );
-    delegate.set_facet_status(Some(crate::FacetStatus::Running));
+    query.statuses.insert(crate::StatusFacet::Running);
     assert_eq!(
-        t77_names(&delegate),
+        t77_names_q(&delegate, &query),
         vec!["Two", "One"],
         "status facet removes Three, latency order holds"
     );
 
     delegate.set_sort(t77_sort(Key::Latency, Dir::Descending));
     assert_eq!(
-        t77_names(&delegate),
+        t77_names_q(&delegate, &query),
         vec!["One", "Two"],
         "direction change re-ranks only what the filters kept"
     );
 
-    delegate.clear_facets();
-    delegate.query.clear();
-    delegate.apply_filter();
+    query = crate::FilterQuery::default();
     assert_eq!(
-        t77_names(&delegate),
+        t77_names_q(&delegate, &query),
         vec!["One", "Five", "Three", "Two", "Four"],
         "clearing the filters restores the full sorted set"
     );
@@ -34422,7 +34230,7 @@ fn t06_list_arrows_traverse_and_report_the_selected_row(cx: &mut TestAppContext)
     press(cx, "down");
     let (focus, second_id) = view.read_with(cx, |view, cx| {
         let delegate = view.libraries.read(cx).delegate();
-        let second = delegate
+        let second = view
             .visible
             .get(1)
             .and_then(|&row| delegate.rows.get(row))
@@ -35153,17 +34961,14 @@ fn k5_undo_expiry_is_permanent(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn k5_paste_imports_direct_into_current_group_no_dialog(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let store = Store::open_in_memory().expect("in-memory store opens");
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Base", "vless", "travel", "10800"))
+        .expect("seed works");
     let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("travel".to_string()));
-                list_cx.notify();
-            });
-        });
+        view.update(cx, |view, cx| view.select_visible_row(0, cx));
     });
 
     let link = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one";
@@ -35180,12 +34985,16 @@ fn k5_paste_imports_direct_into_current_group_no_dialog(cx: &mut TestAppContext)
     let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
     assert_eq!(
         rows.len(),
-        1,
+        2,
         "the paste landed: {:?}",
         rows.first().map(|row| row.name.clone())
     );
+    let imported = rows
+        .iter()
+        .find(|row| row.name == "one")
+        .expect("the pasted row is in the library");
     assert_eq!(
-        rows[0].group, "travel",
+        imported.group, "travel",
         "direct import targets the current group"
     );
 
@@ -35904,11 +35713,7 @@ fn b16_fetch_in_flight_paints_skeletons_not_the_empty_canvas(cx: &mut TestAppCon
     assert_absent(cx, "library-empty".to_string());
     assert_absent(cx, "empty-add".to_string());
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .count_label()),
+        view.read_with(cx, |view, cx| view.filter_count_text(cx)),
         "Loading…".to_string(),
         "the count line names the wait instead of 0 of 0"
     );
@@ -36002,18 +35807,16 @@ fn b16_search_no_matches_keeps_its_copy_while_a_refresh_is_in_flight(cx: &mut Te
     cx.run_until_parked();
     paint_frame(cx);
 
-    cx.update(|window, cx| {
+    cx.update(|_window, cx| {
         view.update(cx, |view, cx| {
             view.mark_library_loading(cx);
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("zzz-no-hit", window, list_cx);
-            });
+            view.apply_search_now("zzz-no-hit".to_string(), cx);
         });
     });
     cx.run_until_parked();
     paint_frame(cx);
     assert_painted(cx, "library-empty");
-    assert_painted(cx, "clear-search-hint");
+    assert_painted(cx, "library-clear-filters");
     assert_absent(cx, "library-loading".to_string());
     assert_absent(cx, "skeleton-row-0".to_string());
 }
@@ -36713,11 +36516,7 @@ fn selection_prunes_deleted_rows_but_not_filtered_rows(cx: &mut TestAppContext) 
     // selected row still counts.
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().query = "alpha".to_string();
-                state.delegate_mut().apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now("alpha".to_string(), cx)
         });
     });
     assert_eq!(
@@ -36739,11 +36538,7 @@ fn selection_prunes_deleted_rows_but_not_filtered_rows(cx: &mut TestAppContext) 
     // A row that stops existing leaves the set.
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().query.clear();
-                state.delegate_mut().apply_filter();
-                list_cx.notify();
-            });
+            view.apply_search_now(String::new(), cx);
             view.store.remove(&bravo.id).expect("the row is removed");
             view.reload(window, cx);
         });
@@ -36945,14 +36740,7 @@ fn multi_select_ctrl_a_takes_visible_rows_only(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state
-                    .delegate_mut()
-                    .set_facet_group(Some("team".to_string()));
-                list_cx.notify();
-            });
-        });
+        view.update(cx, |view, cx| view.apply_search_now("team".to_string(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -36971,12 +36759,7 @@ fn multi_select_ctrl_a_takes_visible_rows_only(cx: &mut TestAppContext) {
     );
 
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().clear_facets();
-                list_cx.notify();
-            });
-        });
+        view.update(cx, |view, cx| view.apply_search_now(String::new(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
@@ -37050,11 +36833,7 @@ fn multi_select_delete_uses_the_bulk_path(cx: &mut TestAppContext) {
         "the deleted rows leave the selection"
     );
     assert_eq!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .visible_ids()),
+        view.read_with(cx, |view, cx| view.visible_row_ids(cx)),
         vec![charlie.id.clone()],
         "the untouched row remains"
     );
@@ -37092,11 +36871,7 @@ fn the_delegate_keeps_no_selection_of_its_own() {
         row("2", "Bravo"),
         row("3", "Charlie"),
     ]);
-    assert_eq!(
-        delegate.visible_ids().len(),
-        3,
-        "the delegate keeps the rows"
-    );
+    assert_eq!(delegate.rows.len(), 3, "the delegate keeps the rows");
 }
 
 // ---------------------------------------------------------------------------
@@ -37376,18 +37151,12 @@ fn old_table_still_filters_through_the_slot_search(cx: &mut TestAppContext) {
         "the action bar counts the whole library"
     );
 
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.set_query("Work", window, list_cx);
-            });
-        });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.apply_search_now("Work".to_string(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
-    let visible = view.read_with(cx, |view, cx| {
-        view.libraries.read(cx).delegate().visible.len()
-    });
+    let visible = view.read_with(cx, |view, _| view.visible.len());
     assert_eq!(visible, 1, "the slot's query still filters the rows");
     assert_eq!(
         label_of("action-bar-count", cx),
@@ -37755,14 +37524,8 @@ fn show_failures_filters_to_the_last_batch_failed_ids(cx: &mut TestAppContext) {
     );
 
     // The ordinary filter controls take the failure filter away again.
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |state, list_cx| {
-                state.delegate_mut().clear_facets();
-                list_cx.notify();
-            });
-            view.reload(window, cx);
-        });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.apply_search_now(String::new(), cx));
     });
     cx.run_until_parked();
     paint_frame(cx);
