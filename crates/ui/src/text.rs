@@ -171,13 +171,6 @@ pub(crate) fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool
         ServingTone::Stopped
     }
 }
-pub(crate) fn lamp_access_label(tone: ServingTone, name: &str) -> String {
-    match tone {
-        ServingTone::Failed => t!("lamp-failed", name = name),
-        ServingTone::Serving => t!("lamp-serving", name = name),
-        ServingTone::Stopped => t!("lamp-stopped", name = name),
-    }
-}
 /// T-33: the message a Settings field shows inline — the field's own sentence
 /// when the store named one, otherwise the error's display text.
 pub(crate) fn store_error_text(error: &StoreError) -> String {
@@ -809,7 +802,13 @@ pub(crate) fn shortcut_action_label(action: &str) -> String {
         "Delete selected" => t!("shortcut-delete-selected"),
         "Extend selection up" => t!("shortcut-extend-up"),
         "Extend selection down" => t!("shortcut-extend-down"),
+        "Move focus up" => t!("shortcut-focus-up"),
+        "Move focus down" => t!("shortcut-focus-down"),
+        "Move focus to first row" => t!("shortcut-focus-first"),
+        "Move focus to last row" => t!("shortcut-focus-last"),
+        "Toggle focused row" => t!("shortcut-toggle-focused"),
         "Select all visible" => t!("shortcut-select-all"),
+        "Clear selection" => t!("shortcut-clear-selection"),
         "Focus search" => t!("shortcut-focus-search"),
         "Inspector details" => t!("shortcut-inspector-details"),
         "Inspector health" => t!("shortcut-inspector-health"),
@@ -817,7 +816,6 @@ pub(crate) fn shortcut_action_label(action: &str) -> String {
         "Inspector links" => t!("shortcut-inspector-links"),
         "Inspector traffic" => t!("shortcut-inspector-traffic"),
         "Toggle inspector" => t!("shortcut-toggle-inspector"),
-        "Uncheck all" => t!("shortcut-uncheck-all"),
         "Copy URLs" => t!("shortcut-copy-urls"),
         "Command palette" => t!("shortcut-command-palette"),
         "Update the group in focus" => t!("shortcut-update-group"),
@@ -846,6 +844,14 @@ pub(crate) fn appearance_choice_label(value: &str) -> String {
         "dark" => t!("settings-appearance-dark"),
         "light" => t!("settings-appearance-light"),
         _ => t!("settings-appearance-system"),
+    }
+}
+
+/// R22: the density's name. The same words the palette command uses.
+pub(crate) fn density_label(density: Density) -> String {
+    match density {
+        Density::Comfortable => t!("density-comfortable"),
+        Density::Compact => t!("density-compact"),
     }
 }
 pub(crate) fn appearance_choice_tip(value: &str) -> String {
@@ -967,24 +973,6 @@ pub(crate) fn bulk_start_refused_message(
         requested = requested,
         detail = detail.join("; ")
     )
-}
-pub(crate) fn bulk_copy_proxies_message(copied: usize, skipped: usize) -> String {
-    if skipped == 0 {
-        t!("bulk-copy-proxies-toast", copied = copied)
-    } else {
-        t!(
-            "bulk-copy-proxies-skipped",
-            copied = copied,
-            skipped = skipped
-        )
-    }
-}
-pub(crate) fn bulk_copy_nothing_message(skipped: usize) -> String {
-    if skipped == 0 {
-        t!("bulk-copy-nothing")
-    } else {
-        t!("bulk-copy-nothing-skipped", skipped = skipped)
-    }
 }
 pub(crate) fn no_selection_message() -> String {
     t!("no-selection")

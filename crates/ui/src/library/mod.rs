@@ -16,6 +16,36 @@ pub(crate) use host::*;
 pub(crate) use shard::*;
 pub(crate) use tone::*;
 
+/// R17: the type scale is fixed at 14 / 13 / 12. The values are rems, so the
+/// user's text-size setting still scales the table.
+pub(crate) const ROW_NAME_REMS: f32 = 0.875;
+pub(crate) const ROW_CELL_REMS: f32 = 0.8125;
+pub(crate) const ROW_GROUP_REMS: f32 = 0.75;
+
+/// One entry of the endpoint chip's chevron menu: a copy format and the row
+/// it belongs to.
+fn endpoint_copy_item(
+    id: String,
+    label: String,
+    view: Option<Entity<AppView>>,
+    row_id: String,
+    act: fn(&mut AppView, &str, &mut Window, &mut Context<AppView>),
+) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, _| {
+        div()
+            .id(id.clone())
+            .test_support()
+            .role(Role::MenuItem)
+            .aria_label(label.clone())
+            .child(label.clone())
+    })
+    .on_click(move |_, window, cx| {
+        if let Some(app) = view.clone() {
+            app.update(cx, |view, cx| act(view, &row_id, window, cx));
+        }
+    })
+}
+
 /// B16: what the list paints when it has no rows to show. A fetch that has not
 /// landed is never "empty" — the list holds skeleton rows at the row pitch so
 /// the first real row does not appear from nowhere — and a failed one names the
@@ -37,29 +67,6 @@ pub(crate) struct LibraryDelegate {
     pub(crate) upstream_cache: HashMap<String, String>,
     pub(crate) visible: Vec<usize>,
     pub(crate) query: String,
-    pub(crate) selected: Option<IndexPath>,
-
-    /// The transient multi-selection. Checked stays the persistent bulk scope;
-    /// this set only drives the wash, context verbs, and keyboard work.
-    pub(crate) selection: BTreeSet<String>,
-
-    /// `false` until a pointer, keyboard, or kit selection gesture writes the
-    /// set. Direct `selected` writes (tests, boot restore) keep the old
-    /// single-selection behavior; an explicit empty set stays empty.
-    pub(crate) selection_explicit: bool,
-
-    /// Shift ranges grow from this row. It survives filtering while the row
-    /// stays visible, so a facet change never silently re-anchors the range.
-    pub(crate) selection_anchor: Option<String>,
-
-    /// Set by the row's pointer handler immediately before the kit confirms the
-    /// same click. The kit's `set_selected_index` must not fold that click back
-    /// down to one row (Ctrl+click can deselect the row it reports).
-    pub(crate) pending_pointer_sync: Option<String>,
-
-    /// The kit resets its index to row 0 after a search. That is a focus reset,
-    /// not a new selection, so the next index sync leaves the set alone.
-    search_reset_pending: bool,
 
     /// T-06: the list's own focus handle, handed in by the frame that owns the
     /// `ListState`. The selected row wears the kit focus ring while this handle
@@ -68,6 +75,10 @@ pub(crate) struct LibraryDelegate {
     pub(crate) list_focus: Option<FocusHandle>,
 
     pub(crate) health: HashMap<String, String>,
+
+    /// The probe's last failure cause per row. The health cell folds it into
+    /// the two words it knows: `timeout` and `refused`.
+    pub(crate) health_errors: HashMap<String, String>,
 
     pub(crate) health_tone: HashMap<String, LatencyTone>,
 
@@ -80,10 +91,11 @@ pub(crate) struct LibraryDelegate {
     pub(crate) sub_labels: HashMap<String, String>,
     pub(crate) preset_names: HashMap<String, String>,
 
-    pub(crate) checked: HashSet<String>,
-
     pub(crate) facet_group: Option<String>,
     pub(crate) facet_status: Option<FacetStatus>,
+    /// R29: the ids the last batch failed on. While it is set the table keeps
+    /// only those rows, and the ordinary filter controls take it away again.
+    pub(crate) failure_filter: Option<HashSet<String>>,
     /// T-05: the latest-probe latency filter. Kept whole so the picker and the
     /// unprobed switch write the same persisted value.
     pub(crate) latency_facet: LatencyFacet,
@@ -113,6 +125,10 @@ pub(crate) struct LibraryDelegate {
     /// decides it once per frame (the table's width decides which optional
     /// columns fit) and hands it to both readers.
     pub(crate) row_metrics: RowMetrics,
+
+    /// R22: the density. It owns the row pitch and every chrome height, so
+    /// the row, the header strip and the bars cannot disagree.
+    pub(crate) density: Density,
 
     pub(crate) app_view: Option<Entity<AppView>>,
 
@@ -203,23 +219,18 @@ impl LibraryDelegate {
             upstream_cache: HashMap::new(),
             visible: Vec::new(),
             query: String::new(),
-            selected: None,
-            selection: BTreeSet::new(),
-            selection_explicit: false,
-            selection_anchor: None,
-            pending_pointer_sync: None,
-            search_reset_pending: false,
             list_focus: None,
             health: HashMap::new(),
+            health_errors: HashMap::new(),
             health_tone: HashMap::new(),
             running: HashSet::new(),
             crashed: HashSet::new(),
             traffic: HashMap::new(),
             sub_labels: HashMap::new(),
             preset_names: HashMap::new(),
-            checked: HashSet::new(),
             facet_group: None,
             facet_status: None,
+            failure_filter: None,
             latency_facet: LatencyFacet::default(),
             show_security: false,
             sort: LibrarySort::default(),
@@ -234,6 +245,7 @@ impl LibraryDelegate {
                 RowColumns::default(),
                 LibraryColumns::default(),
             ),
+            density: Density::default(),
             app_view: None,
             endpoint_inputs: HashMap::new(),
             pending_endpoint_commits: Vec::new(),
@@ -272,7 +284,6 @@ impl LibraryDelegate {
     }
 
     pub(crate) fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
-        let selected_id = self.selected_row().map(|row| row.id.clone());
         self.search_index = rows.iter().map(RowSearchIndex::of).collect();
         self.upstream_cache = rows
             .iter()
@@ -286,7 +297,6 @@ impl LibraryDelegate {
         self.rows = rows;
 
         let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
-        self.checked.retain(|id| live.contains(id.as_str()));
 
         self.endpoint_inputs
             .retain(|id, _| live.contains(id.as_str()));
@@ -294,12 +304,25 @@ impl LibraryDelegate {
             .retain(|id| live.contains(id.as_str()));
         self.refresh_search_words();
         self.apply_filter();
-        self.selected = selected_id.and_then(|id| {
-            self.visible
-                .iter()
-                .position(|&index| self.rows[index].id == id)
-                .map(IndexPath::new)
-        });
+    }
+
+    /// R22: the density owns the row pitch and every chrome height.
+    pub(crate) fn set_density(&mut self, density: Density) {
+        self.density = density;
+    }
+
+    /// The rows the filters keep, in the order the table paints them.
+    pub(crate) fn visible_ids(&self) -> Vec<String> {
+        self.visible
+            .iter()
+            .filter_map(|&index| self.rows.get(index))
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// Every row's id, in library order.
+    pub(crate) fn row_ids(&self) -> Vec<String> {
+        self.rows.iter().map(|row| row.id.clone()).collect()
     }
 
     pub(crate) fn upstream_for(&self, id: &str) -> Option<&str> {
@@ -543,13 +566,22 @@ impl LibraryDelegate {
     }
 
     pub(crate) fn apply_filter(&mut self) {
-        let selected_id = self.selected_row().map(|row| row.id.clone());
         let (port, text) = split_port_query(self.query.trim());
         let lowered = text.to_lowercase();
         let mut visible = Vec::new();
         for (index, blob) in self.search_index.iter().enumerate() {
             if !blob.matches_lowered(&lowered) {
                 continue;
+            }
+            if let Some(failed) = &self.failure_filter {
+                // R29: the batch's failures narrow the table to themselves.
+                if !self
+                    .rows
+                    .get(index)
+                    .is_some_and(|row| failed.contains(&row.id))
+                {
+                    continue;
+                }
             }
             if let Some(predicate) = port {
                 let in_range = self
@@ -584,36 +616,6 @@ impl LibraryDelegate {
             }
         }
         self.visible = visible;
-        self.selected = selected_id.and_then(|id| {
-            self.visible
-                .iter()
-                .position(|&index| self.rows[index].id == id)
-                .map(IndexPath::new)
-        });
-        self.prune_selection();
-    }
-
-    /// Selection is a view over what the filters kept: a hidden row cannot be
-    /// acted on, so it leaves the set. The anchor only leaves when its own row
-    /// did — otherwise the next Shift+click still extends from the same row.
-    fn prune_selection(&mut self) {
-        let live: HashSet<&str> = self
-            .visible
-            .iter()
-            .filter_map(|&index| self.rows.get(index))
-            .map(|row| row.id.as_str())
-            .collect();
-        self.selection.retain(|id| live.contains(id.as_str()));
-        if self
-            .selection_anchor
-            .as_deref()
-            .is_some_and(|id| !live.contains(id))
-        {
-            self.selection_anchor = None;
-        }
-        if self.selection.is_empty() {
-            self.selection_anchor = None;
-        }
     }
 
     pub(crate) fn row_matches_facets(&self, index: usize) -> bool {
@@ -680,39 +682,6 @@ impl LibraryDelegate {
         parts.join(" · ")
     }
 
-    pub(crate) fn bulk_label(&self) -> String {
-        if self.checked.is_empty() {
-            return String::new();
-        }
-        // F3: M is the visible row count, so it must read as the current
-        // scope of the bar, never as the library total.
-        let checked = self.checked.len();
-        let selected = self.selection_count();
-        // Checked is the bulk set; selection is the pointer set. Two counts
-        // only earn their width when both exist and disagree.
-        if self.selection_explicit && selected > 0 && selected != checked {
-            return t!(
-                "bulk-checked-selected",
-                checked = checked,
-                selected = selected,
-                visible = self.visible.len()
-            );
-        }
-        t!(
-            "bulk-checked",
-            checked = checked,
-            visible = self.visible.len()
-        )
-    }
-
-    pub(crate) fn checked_rows(&self) -> Vec<ProxyConfig> {
-        self.rows
-            .iter()
-            .filter(|row| self.checked.contains(&row.id))
-            .cloned()
-            .collect()
-    }
-
     pub(crate) fn group_options(&self) -> Vec<(String, usize)> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for row in &self.rows {
@@ -740,6 +709,7 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
+    #[cfg(test)]
     pub(crate) fn set_facet_status(&mut self, status: Option<FacetStatus>) {
         self.facet_status = status;
         self.apply_filter();
@@ -781,47 +751,14 @@ impl LibraryDelegate {
         self.facet_group = None;
         self.facet_status = None;
         self.latency_facet = LatencyFacet::default();
+        self.failure_filter = None;
         self.apply_filter();
     }
 
-    pub(crate) fn toggle_checked(&mut self, id: &str) {
-        if self.checked.contains(id) {
-            self.checked.remove(id);
-            return;
-        }
-        if self.rows.iter().any(|row| row.id == id) {
-            self.checked.insert(id.to_string());
-        }
-    }
-
-    pub(crate) fn check_ids(&mut self, ids: &[String]) {
-        for id in ids {
-            if self.rows.iter().any(|row| &row.id == id) {
-                self.checked.insert(id.clone());
-            }
-        }
-    }
-
-    pub(crate) fn clear_checked(&mut self) {
-        self.checked.clear();
-    }
-
-    /// K4: rows no longer paint numeral chips, but the checked set keeps its
-    /// insertion order and the tests pin it through this helper.
-    #[cfg(test)]
-    pub(crate) fn checked_position(&self, id: &str) -> Option<usize> {
-        self.rows
-            .iter()
-            .filter(|row| self.checked.contains(&row.id))
-            .position(|row| row.id == id)
-            .map(|position| position + 1)
-    }
-
-    pub(crate) fn visible_rows(&self) -> Vec<ProxyConfig> {
-        self.visible
-            .iter()
-            .filter_map(|&index| self.rows.get(index).cloned())
-            .collect()
+    /// R29: the batch's failures become the table's filter.
+    pub(crate) fn set_failure_filter(&mut self, failed: Option<HashSet<String>>) {
+        self.failure_filter = failed;
+        self.apply_filter();
     }
 
     /// Borrowed row for per-frame rendering: `render_item` copies only the
@@ -832,159 +769,9 @@ impl LibraryDelegate {
             .and_then(|&row| self.rows.get(row))
     }
 
-    pub(crate) fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
-        self.row_ref(index).cloned()
-    }
-
-    pub(crate) fn selected_row(&self) -> Option<ProxyConfig> {
-        self.selected.and_then(|index| self.row_at(index))
-    }
-
-    pub(crate) fn is_selected(&self, id: &str) -> bool {
-        if self.selection_explicit {
-            return self.selection.contains(id);
-        }
-        self.selected_row().is_some_and(|row| row.id == id)
-    }
-
-    /// The rows an action targets. A set the pointer built wins; with no set
-    /// (direct `selected` writes in tests and the boot restore) the list's
-    /// single focus row is the selection, preserving every existing caller.
-    pub(crate) fn selected_ids(&self) -> Vec<String> {
-        if !self.selection_explicit {
-            return self
-                .selected_row()
-                .map(|row| vec![row.id])
-                .unwrap_or_default();
-        }
-        self.visible
-            .iter()
-            .filter_map(|&index| self.rows.get(index))
-            .filter(|row| self.selection.contains(&row.id))
-            .map(|row| row.id.clone())
-            .collect()
-    }
-
-    /// Plain click: the set is this row, and the next Shift range grows here.
-    pub(crate) fn select_only(&mut self, id: &str) {
-        self.selection_explicit = true;
-        self.selection.clear();
-        if self.rows.iter().any(|row| row.id == id) {
-            self.selection.insert(id.to_string());
-        }
-        self.selection_anchor = Some(id.to_string());
-    }
-
-    /// Ctrl+click: add or remove one row without disturbing the rest.
-    pub(crate) fn toggle_selected(&mut self, id: &str) {
-        self.selection_explicit = true;
-        if !self.selection.remove(id) && self.rows.iter().any(|row| row.id == id) {
-            self.selection.insert(id.to_string());
-        }
-        self.selection_anchor = Some(id.to_string());
-    }
-
-    /// Shift+click: replace the set with the visible range between the anchor
-    /// and the picked row, and keep the anchor so the range can be re-dragged.
-    pub(crate) fn extend_selection_to(&mut self, id: &str) {
-        self.selection_explicit = true;
-        let anchor = self
-            .selection_anchor
-            .clone()
-            .unwrap_or_else(|| id.to_string());
-        let position = |wanted: &str| {
-            self.visible
-                .iter()
-                .position(|&index| self.rows.get(index).is_some_and(|row| row.id == wanted))
-        };
-        let (Some(from), Some(to)) = (position(&anchor), position(id)) else {
-            self.select_only(id);
-            return;
-        };
-        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-        self.selection = self.visible[lo..=hi]
-            .iter()
-            .filter_map(|&index| self.rows.get(index))
-            .map(|row| row.id.clone())
-            .collect();
-        self.selection_anchor = Some(anchor);
-    }
-
-    pub(crate) fn clear_selection(&mut self) {
-        self.selection_explicit = true;
-        self.selection.clear();
-        self.selection_anchor = None;
-    }
-
-    /// Shift+Up/Down: move the focus row one step and re-draw the range from
-    /// the anchor. Returns the new focus index for the kit to confirm.
-    pub(crate) fn shift_focus(&mut self, delta: isize) -> Option<IndexPath> {
-        let len = self.visible.len();
-        if len == 0 {
-            return None;
-        }
-        let position = |delegate: &Self, id: &str| {
-            delegate
-                .visible
-                .iter()
-                .position(|&index| delegate.rows.get(index).is_some_and(|row| row.id == id))
-        };
-        let current = self
-            .selected
-            .map(|index| index.row)
-            .filter(|&row| row < len);
-        let anchor = self
-            .selection_anchor
-            .as_deref()
-            .and_then(|id| position(self, id));
-        let base = current.or(anchor);
-        let target_row = match base {
-            Some(row) => (row as isize + delta).clamp(0, len as isize - 1) as usize,
-            // No focus and no anchor: Shift+Down enters at the top, Shift+Up
-            // at the bottom, matching the kit's plain Up/Down.
-            None => {
-                if delta < 0 {
-                    len - 1
-                } else {
-                    0
-                }
-            }
-        };
-        let target_id = self.row_ref(IndexPath::new(target_row))?.id.clone();
-        match base {
-            Some(row) => {
-                if self.selection_anchor.is_none() {
-                    self.selection_anchor =
-                        self.row_ref(IndexPath::new(row)).map(|row| row.id.clone());
-                }
-                self.extend_selection_to(&target_id);
-            }
-            None => self.select_only(&target_id),
-        }
-        // The kit confirms this index right after the caller sets it; the flag
-        // tells its sync this move is a range extension, not a fresh pick.
-        self.pending_pointer_sync = Some(target_id);
-        Some(IndexPath::new(target_row))
-    }
-
-    /// Ctrl+A: every row the filters keep, with the first one as the anchor.
-    pub(crate) fn select_all_visible(&mut self) {
-        self.selection_explicit = true;
-        self.selection = self
-            .visible
-            .iter()
-            .filter_map(|&index| self.rows.get(index))
-            .map(|row| row.id.clone())
-            .collect();
-        self.selection_anchor = self
-            .visible
-            .first()
-            .and_then(|&index| self.rows.get(index))
-            .map(|row| row.id.clone());
-    }
-
-    pub(crate) fn selection_count(&self) -> usize {
-        self.selected_ids().len()
+    /// One row by id, borrowed.
+    pub(crate) fn row_by_id(&self, id: &str) -> Option<&ProxyConfig> {
+        self.rows.iter().find(|row| row.id == id)
     }
 
     pub(crate) fn set_health(&mut self, health: HashMap<String, String>) {
@@ -1088,30 +875,6 @@ impl LibraryDelegate {
     }
 }
 
-pub(crate) fn select_first_visible(
-    state: &mut ListState<LibraryDelegate>,
-    ids: &[String],
-    window: &mut Window,
-    cx: &mut Context<ListState<LibraryDelegate>>,
-) -> bool {
-    let picked = {
-        let delegate = state.delegate_mut();
-        delegate.visible.iter().position(|&visible_ix| {
-            delegate
-                .rows
-                .get(visible_ix)
-                .is_some_and(|row| ids.contains(&row.id))
-        })
-    };
-    match picked {
-        Some(position) => {
-            state.set_selected_index(Some(IndexPath::new(position)), window, cx);
-            true
-        }
-        None => false,
-    }
-}
-
 pub(crate) struct LogLinesDelegate {
     pub(crate) lines: Vec<String>,
 }
@@ -1161,49 +924,15 @@ impl ListDelegate for LibraryDelegate {
         self.visible.len()
     }
 
+    /// The kit owns one selected index and confirms it here. The selection
+    /// lives on `AppView`, so this confirmation writes nothing: the app's
+    /// own model decides what a click, a range or a keyboard move selects.
     fn set_selected_index(
         &mut self,
-        index: Option<IndexPath>,
-        window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
+        _index: Option<IndexPath>,
+        _window: &mut Window,
+        _cx: &mut Context<ListState<Self>>,
     ) {
-        let preserve_selection = self.search_reset_pending;
-        self.search_reset_pending = false;
-        self.selected = index;
-        if let Some(index) = index {
-            let Some(row_id) = self.row_ref(index).map(|row| row.id.clone()) else {
-                return;
-            };
-            let pointer_owned = self.pending_pointer_sync.as_deref() == Some(row_id.as_str());
-            self.pending_pointer_sync = None;
-            // Arrows and the import restore land here too. A row the pointer
-            // already folded into the set (or toggled out of it) must not be
-            // reduced back to a single selection by the kit's confirmation.
-            if !pointer_owned && !preserve_selection {
-                self.selection_explicit = true;
-                self.selection.clear();
-                self.selection.insert(row_id.clone());
-                self.selection_anchor = Some(row_id);
-            }
-        } else {
-            self.pending_pointer_sync = None;
-            if !preserve_selection {
-                self.clear_selection();
-            }
-        }
-        // F19: picking a row opens the inspector again — it is the only way
-        // back to the row's controls once Esc closed it. The update is
-        // deferred: the selection often changes inside the shell's own
-        // update, and an entity cannot be updated while it is updating.
-        if index.is_some() {
-            if let Some(app_view) = self.app_view.clone() {
-                window.defer(cx, move |_, cx| {
-                    app_view.update(cx, |view, _| {
-                        view.open_inspector();
-                    });
-                });
-            }
-        }
     }
 
     fn perform_search(
@@ -1214,10 +943,6 @@ impl ListDelegate for LibraryDelegate {
     ) -> Task<()> {
         self.query = query.to_string();
         self.apply_filter();
-        // The kit follows this call by resetting its index to row 0. That is a
-        // focus reset: the pointer's selection and its anchor stay put when
-        // the filtered set still holds them.
-        self.search_reset_pending = true;
         cx.notify();
         Task::ready(())
     }
@@ -1230,79 +955,53 @@ impl ListDelegate for LibraryDelegate {
     ) -> Option<ListItem> {
         let row = self.row_ref(index)?;
         let row_id = row.id.clone();
-        let row_name = row.name.clone();
-        let row_protocol = row.protocol.clone();
-        let row_bind_ip = row.bind_ip.clone();
-        let row_port = row.port;
-        let port_stored = row_port.to_string();
-        let selected = self.is_selected(&row_id);
-        let focused_row = self
-            .selected
-            .is_some_and(|current| current.section == index.section && current.row == index.row);
-
-        let health = self
-            .health
-            .get(&row_id)
-            .filter(|summary| !summary.is_empty())
-            .cloned();
-        let is_running = self.running.contains(&row_id);
-        let crashed = self.crashed.contains(&row_id);
-
-        let traffic = self.traffic.get(&row_id).copied();
+        let density = self.density;
+        let metrics = self.row_metrics;
         let upstream = self
             .upstream_for(&row_id)
             .map(str::to_string)
             .unwrap_or_else(|| t!("library-no-upstream"));
+        // The app owns the selection, the focus and the start-in-flight
+        // signal. The delegate reads them and paints what they say.
+        let (selected, focused_row, start_in_flight) = match self.app_view.as_ref() {
+            Some(app_view) => {
+                let view = app_view.read(cx);
+                (
+                    view.is_selected(&row_id),
+                    view.is_focused(&row_id),
+                    view.start_in_flight,
+                )
+            }
+            None => (false, false, false),
+        };
+        // The pure row view: plain fields only, never the config's secret.
+        let view = {
+            let inputs = RowViewInputs {
+                running: &self.running,
+                crashed: &self.crashed,
+                starting: start_in_flight,
+                health: &self.health,
+                health_errors: &self.health_errors,
+                latency: &self.latency,
+                traffic: &self.traffic,
+                sub_labels: &self.sub_labels,
+                preset_names: &self.preset_names,
+            };
+            RowView::of(row, &inputs)
+        };
+        let row_name = view.name.clone();
+        let bind = view.bind.clone();
+        let port_stored = view.port.to_string();
+        let traffic_text = view
+            .traffic
+            .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
+            .unwrap_or_default();
         // Everything below the helpers mutates the delegate, so the row borrow
         // ends here; the copies above are the fields the frame actually paints.
         let full_route = library_row_full_route(row, &upstream);
-        let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
-            row,
-            &upstream,
-            health.as_deref(),
-            is_running,
-            crashed,
-            traffic,
-            self.show_security,
-        );
 
-        let list_view = cx.entity();
-        // The checkbox's and the lamp's handlers are separate closures; both
-        // update this list state, so both need their own handle.
-        let lamp_view = list_view.clone();
-        let lamp_app = self.app_view.clone();
-        let is_checked = self.checked.contains(&row_id);
-        let toggle_id = row_id.clone();
-        let checkbox = Checkbox::new(format!("check-{row_id}"))
-            .small()
-            .checked(is_checked)
-            .accessibility_label(if is_checked {
-                t!("row-checked-aria", name = &row_name)
-            } else {
-                t!("row-check-aria", name = &row_name)
-            })
-            .on_change(move |_, _, cx| {
-                let toggle_id = toggle_id.clone();
-                list_view.update(cx, |state, cx| {
-                    state.delegate_mut().toggle_checked(&toggle_id);
-                    cx.notify();
-                });
-                // F3: checking is a bulk-set edit, not a selection gesture.
-                // The parent list item would otherwise select the row and
-                // move the inspector on every check/uncheck.
-                cx.stop_propagation();
-            });
-        // The kit checkbox owns no observed element id, so tests click this
-        // content-sized wrapper; it only exists in the test build.
-        #[cfg(test)]
-        let checkbox = div()
-            .id(format!("check-target-{row_id}"))
-            .test_support()
-            .flex()
-            .child(checkbox);
-
-        self.ensure_row_inputs(&row_id, &row_bind_ip, &port_stored, window, cx);
-        self.sync_row_inputs(&row_id, &row_bind_ip, &port_stored, window, cx);
+        self.ensure_row_inputs(&row_id, &bind, &port_stored, window, cx);
+        self.sync_row_inputs(&row_id, &bind, &port_stored, window, cx);
 
         if self.pending_endpoint_commits.contains(&row_id) {
             self.pending_endpoint_commits.retain(|id| id != &row_id);
@@ -1319,234 +1018,219 @@ impl ListDelegate for LibraryDelegate {
         let item = ListItem::new(format!("library-row-{}", row_id))
             .selected(selected)
             .aria_selected(selected)
-            .px_1()
-            // T-03: the row carries a definite height and the card leaves a
-            // hairline of room above and below it, so the pitch is fixed and
-            // two cards never touch.
-            .py(px(RowMetrics::CARD_GAP))
-            .h(px(RowMetrics::ROW_PITCH));
+            .px_2()
+            // The row is flat: a definite height and a hairline, never a card
+            // with a gap under it.
+            .py_0()
+            .h(px(density.row_height()));
 
         let selected_bg = if cx.theme().list.active_highlight {
             cx.theme().list_active
         } else {
             cx.theme().accent
         };
-        // T-03: one line per config. The card carries a definite height, so
-        // a long name or a crowded column truncates instead of stacking the
-        // row into a column of cards.
-        let mut card = div()
-            .id(format!("row-card-{row_id}"))
+        // The row is flat: no card, no shadow, no gap. Two rows are separated
+        // by a hairline, and the row carries the hover group the trailing
+        // actions watch.
+        let mut surface = div()
+            .id(format!("row-surface-{row_id}"))
             .test_support()
-            .h(px(RowMetrics::CARD_HEIGHT))
-            .px_2()
-            .rounded(cx.theme().radius)
-            .overflow_hidden()
-            .bg(if selected {
-                selected_bg
-            } else {
-                cx.theme().group_box
-            });
+            .group(format!("row-hover-{row_id}"))
+            .relative()
+            // The surface fills the row's height on its own: the kit's item
+            // centers its content, so a percentage height would collapse to
+            // the content box.
+            .h(px(density.row_height()))
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_nowrap()
+            .items_center()
+            .gap(px(RowMetrics::GAP))
+            .border_b_1()
+            .border_color(cx.theme().border);
 
-        // K4: the checked set no longer borrows selection's rim. The card keeps
-        // its hairline and carries a 3px signal-blue bar on the leading edge;
-        // the kit checkbox fills when checked. Selection alone keeps its 2px
-        // rim, so the two grammars never collide.
-        card = card.relative();
+        // Selection paints a wash plus a rim over the whole row. Focus paints
+        // the kit ring inside it — the two are independent reads, so a row that
+        // holds the focus without being selected still shows its ring.
         if selected {
-            card = card.border_2().border_color(cx.theme().list_active_border);
+            surface = surface
+                .bg(selected_bg)
+                .border_1()
+                .border_color(cx.theme().list_active_border);
         } else {
-            card = card.border_1().border_color(cx.theme().border);
+            surface = surface.hover(|this| this.bg(cx.theme().list_hover));
         }
-        if is_checked {
-            card = card.child(
-                div()
-                    .id(format!("row-check-bar-{row_id}"))
-                    .test_support()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(3.))
-                    .bg(cx.theme().list_active_border),
-            );
-        } else if let Some(accent) = self.row_accent(&row_id, cx) {
-            // B18: one accent blink on the row whose engine state just settled.
-            // Checked wins the edge — one grammar per row.
-            card = card.child(accent);
-        }
-        if !selected {
-            card = card.hover(|this| this.bg(cx.theme().list_hover));
-        }
-        // T-06: focus is the kit's ring, not a hand-rolled accent rim. The
-        // keyboard lands on the list, so the selected row wears the ring while
-        // that handle is focused.
-        if selected
-            && focused_row
+        if focused_row
             && self
                 .list_focus
                 .as_ref()
                 .is_some_and(|handle| handle.is_focused(window))
         {
-            card = card.focus_ring_style(window, cx);
+            surface = surface.focus_ring_style(window, cx);
         }
-        let tone = serving_tone(is_running, health.as_deref(), crashed);
+        if let Some(accent) = self.row_accent(&row_id, cx) {
+            // B18: one accent blink on the row whose engine state just settled.
+            surface = surface.child(accent);
+        }
         let probe_tone = self
             .health_tone
             .get(&row_id)
             .copied()
             .unwrap_or(LatencyTone::Unknown);
         // The cell text and the color carry the same verdict: a crashed row
-        // never probed still reads `● Failed` in the failure tone.
-        let health_text_color = if crashed || tone == ServingTone::Failed {
+        // never probed still reads `Failed` in the failure tone.
+        let health_text_color = if view.state == RowPhase::Failed {
             health_tone_color(LatencyTone::Failed, cx.theme())
         } else {
             health_tone_color(probe_tone, cx.theme())
         };
-        let lamp_color = serving_tone_color(tone, cx.theme());
-        let lamp_label = lamp_access_label(tone, &row_name);
-        // K11/A2-1: the occupancy lamp doubles as the health filter's toggle —
-        // its tone names the verdict a click filters by.
-        let lamp_status = match tone {
-            ServingTone::Serving => FacetStatus::Running,
-            ServingTone::Failed => FacetStatus::Dead,
-            ServingTone::Stopped => FacetStatus::Stopped,
-        };
-        let lamp_active = self.facet_status == Some(lamp_status);
-        let lamp_hint = if lamp_active {
-            t!("row-lamp-active-tip", label = lamp_label)
-        } else {
-            t!(
-                "row-lamp-idle-tip",
-                label = lamp_label,
-                status = lamp_status.label().to_lowercase()
-            )
-        };
-        // One activation path for pointer and assistive tech: the lamp now
-        // carries a real button role, and a role without an action is a lie.
-        let lamp_activate = Rc::new(move |window: &mut Window, cx: &mut App| {
-            lamp_view.update(cx, |state, cx| {
-                let delegate = state.delegate_mut();
-                if delegate.facet_status == Some(lamp_status) {
-                    delegate.set_facet_status(None);
-                } else {
-                    delegate.set_facet_status(Some(lamp_status));
-                }
-                cx.notify();
-            });
-            // Keep the one facet menu honest: the lamp is its second input,
-            // so the collapsed display must re-sync in the same click.
-            if let Some(app) = lamp_app.as_ref() {
-                app.update(cx, |view, cx| {
-                    view.sync_facet_pickers(window, cx);
-                });
-            }
-        });
         {
             let name = row_name.clone();
-            let metrics = self.row_metrics;
             let mut cells: Vec<AnyElement> = Vec::new();
+            // The lead: one state glyph and nothing else. It reports what the
+            // row is doing — it is not a button, so it has no hit target and
+            // no hover state.
+            cells.push(
+                div()
+                    .id(format!("row-lead-{row_id}"))
+                    .test_support()
+                    .w(px(metrics.lead))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    // The lead is status, never a control: it owns no action,
+                    // so a click on it must not select the row either.
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(state_glyph(view.state, cx.theme()))
+                    .into_any_element(),
+            );
+            // The name flexes into the leftover space and truncates.
+            cells.push(
+                div()
+                    .id(format!("row-name-{row_id}"))
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .child(
+                        div()
+                            .id(format!("row-name-text-{row_id}"))
+                            .test_support()
+                            .max_w(relative(1.))
+                            .truncate()
+                            .text_size(rems(ROW_NAME_REMS))
+                            .text_color(if view.enabled {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            // F14: the tooltip belongs to the text, not the
+                            // flexible cell, so blank space after a short
+                            // name does not open the full route.
+                            .tooltip({
+                                let tip = full_route.clone();
+                                move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                            })
+                            .child(Label::new(name)),
+                    )
+                    .into_any_element(),
+            );
+            // The movable cells follow the user's order, so a drag still
+            // moves them. The endpoint is the chip; the rest are quiet text.
             for column in *metrics.layout.order() {
                 if !metrics.column_visible(column) {
                     continue;
                 }
-                let width = metrics.column_width(column);
-                cells.push(match column {
-                    LibraryColumn::Group => div()
-                        .id(format!("row-group-{row_id}"))
-                        .test_support()
-                        .w(px(width))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(group_text.clone())
-                        .into_any_element(),
-                    LibraryColumn::Protocol => div()
-                        .id(format!("row-protocol-{row_id}"))
-                        .test_support()
-                        .w(px(width))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(row_protocol.clone())
-                        .into_any_element(),
-                    LibraryColumn::Upstream => div()
-                        .id(format!("row-upstream-{row_id}"))
-                        .test_support()
-                        .w(px(width))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .tooltip({
-                            let tip = upstream_text.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .child(upstream_text.clone())
-                        .into_any_element(),
-                    // T-03: the endpoint is read, not edited — the bind rides as
-                    // muted small text and the port as the quiet `row-port-<id>` pill.
-                    LibraryColumn::Endpoint => div()
-                        .id(format!("row-endpoint-{row_id}"))
-                        .test_support()
-                        .w(px(width))
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id(format!("row-bind-text-{row_id}"))
-                                .test_support()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .tooltip({
-                                    let tip = t!("row-bind-tip", bind = row_bind_ip.clone());
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .child(row_bind_ip.clone()),
-                        )
-                        .child(
-                            div()
-                                .id(format!("row-port-{row_id}"))
-                                .test_support()
-                                .flex_shrink_0()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .tooltip({
-                                    let tip = t!(
-                                        "row-port-tip",
-                                        bind = row_bind_ip.clone(),
-                                        port = i64::from(row_port)
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .aria_label(t!(
-                                    "row-port-aria",
-                                    port = i64::from(row_port),
-                                    bind = row_bind_ip.clone()
-                                ))
-                                .child(format!(":{}", row_port)),
-                        )
-                        .into_any_element(),
+                let cell: AnyElement = match column {
+                    LibraryColumn::Endpoint => {
+                        let chip_view = self.app_view.clone();
+                        let chip_id = row_id.clone();
+                        let menu_view = self.app_view.clone();
+                        let menu_id = row_id.clone();
+                        div()
+                            .id(format!("row-endpoint-{row_id}"))
+                            .test_support()
+                            .w(px(metrics.endpoint))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .overflow_hidden()
+                            .child(
+                                Button::new(format!("row-endpoint-chip-{row_id}"))
+                                    .small()
+                                    .compact()
+                                    .label(view.endpoint_display())
+                                    .accessibility_label(t!("endpoint-chip-tip"))
+                                    .tooltip(t!("endpoint-chip-tip"))
+                                    .on_click(move |_, window, cx| {
+                                        // The chip owns its click: it copies,
+                                        // and the row does not select.
+                                        cx.stop_propagation();
+                                        if let Some(app) = chip_view.clone() {
+                                            app.update(cx, |view, cx| {
+                                                view.copy_row_socks(&chip_id, window, cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new(format!("row-endpoint-menu-{row_id}"))
+                                    .small()
+                                    .compact()
+                                    .label("▾")
+                                    .accessibility_label(t!("endpoint-chip-menu-aria"))
+                                    .tooltip(t!("endpoint-chip-tip"))
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let socks_view = menu_view.clone();
+                                        let socks_id = menu_id.clone();
+                                        let http_view = menu_view.clone();
+                                        let http_id = menu_id.clone();
+                                        let both_view = menu_view.clone();
+                                        let both_id = menu_id.clone();
+                                        menu.item(endpoint_copy_item(
+                                            format!("row-endpoint-copy-socks-{menu_id}"),
+                                            t!("copy-socks"),
+                                            socks_view,
+                                            socks_id,
+                                            AppView::copy_row_socks,
+                                        ))
+                                        .item(endpoint_copy_item(
+                                            format!("row-endpoint-copy-http-{menu_id}"),
+                                            t!("copy-http"),
+                                            http_view,
+                                            http_id,
+                                            AppView::copy_row_http,
+                                        ))
+                                        .item(
+                                            endpoint_copy_item(
+                                                format!("row-endpoint-copy-both-{menu_id}"),
+                                                t!("copy-both"),
+                                                both_view,
+                                                both_id,
+                                                AppView::copy_row_both,
+                                            ),
+                                        )
+                                    }),
+                            )
+                            .into_any_element()
+                    }
                     LibraryColumn::Health => {
+                        let health_text = view.health_text.clone();
                         let mut cell = div()
                             .id(format!("row-health-{row_id}"))
                             .test_support()
-                            .w(px(width))
+                            .w(px(metrics.health))
                             .flex_shrink_0()
                             .truncate()
-                            .text_sm()
+                            .text_size(rems(ROW_CELL_REMS))
                             .text_color(health_text_color)
                             .child(health_text.clone());
-                        // A stopped row's cell is empty by design; an empty tooltip
-                        // is a popover that names nothing.
+                        // A stopped row's cell is empty by design; an empty
+                        // tooltip is a popover that names nothing.
                         if !health_text.is_empty() {
                             let tip = health_text.clone();
                             cell = cell
@@ -1554,176 +1238,138 @@ impl ListDelegate for LibraryDelegate {
                         }
                         cell.into_any_element()
                     }
+                    LibraryColumn::Group => div()
+                        .id(format!("row-group-{row_id}"))
+                        .test_support()
+                        .w(px(metrics.group))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_size(rems(ROW_GROUP_REMS))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(view.group.clone())
+                        .into_any_element(),
+                    LibraryColumn::Protocol => div()
+                        .id(format!("row-protocol-{row_id}"))
+                        .test_support()
+                        .w(px(metrics.protocol))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_size(rems(ROW_CELL_REMS))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(view.protocol.clone())
+                        .into_any_element(),
+                    LibraryColumn::Upstream => div()
+                        .id(format!("row-upstream-{row_id}"))
+                        .test_support()
+                        .w(px(metrics.upstream))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_size(rems(ROW_CELL_REMS))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(upstream.clone())
+                        .into_any_element(),
                     LibraryColumn::Traffic => div()
                         .id(format!("row-traffic-{row_id}"))
                         .test_support()
-                        .w(px(width))
+                        .w(px(metrics.traffic))
                         .flex_shrink_0()
                         .truncate()
-                        .text_sm()
+                        .text_size(rems(ROW_CELL_REMS))
                         .text_color(cx.theme().muted_foreground)
                         .child(traffic_text.clone())
                         .into_any_element(),
-                });
+                };
+                cells.push(cell);
             }
-            // T-03: the trailing cell holds the row-scoped copy action; the
-            // header strip reserves the same width, so the columns line up.
-            let copy_view = self.app_view.clone();
-            let copy_id = row_id.clone();
-            let copy_name = row_name;
-            let copy_bind = row_bind_ip;
-            let copy_port = row_port;
-            cells.push(
-                div()
-                    .id(format!("row-copy-cell-{row_id}"))
+            // The trailing reserve. It is always there, so the grid never
+            // shifts; the buttons appear on hover or keyboard focus.
+            let transport_view = self.app_view.clone();
+            let transport_id = row_id.clone();
+            let transport: AnyElement = match view.state {
+                RowPhase::Starting => div()
+                    .id(format!("row-start-{row_id}"))
                     .test_support()
-                    .w(px(metrics.copy))
-                    .flex_shrink_0()
+                    .w(px(22.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Spinner::new().small())
+                    .into_any_element(),
+                RowPhase::Running => {
+                    let stop_view = transport_view.clone();
+                    let stop_id = transport_id.clone();
+                    Button::new(format!("row-stop-{row_id}"))
+                        .small()
+                        .compact()
+                        .label(t!("action-stop"))
+                        .accessibility_label(t!("action-stop"))
+                        .on_click(move |_, window, cx| {
+                            if let Some(app) = stop_view.clone() {
+                                app.update(cx, |view, cx| view.stop_row(&stop_id, window, cx));
+                            }
+                        })
+                        .into_any_element()
+                }
+                _ => {
+                    let start_view = transport_view.clone();
+                    let start_id = transport_id.clone();
+                    Button::new(format!("row-start-{row_id}"))
+                        .small()
+                        .compact()
+                        .label(t!("action-start"))
+                        .accessibility_label(t!("action-start"))
+                        .on_click(move |_, window, cx| {
+                            if let Some(app) = start_view.clone() {
+                                app.update(cx, |view, cx| view.start_row(&start_id, window, cx));
+                            }
+                        })
+                        .into_any_element()
+                }
+            };
+            let more_view = self.app_view.clone();
+            let more_id = row_id.clone();
+            let mut actions = div()
+                .id(format!("row-actions-{row_id}"))
+                .test_support()
+                .w(px(metrics.actions))
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap_1()
+                .opacity(0.)
+                .group_hover(format!("row-hover-{row_id}"), |style| style.opacity(1.));
+            if focused_row {
+                actions = actions.opacity(1.);
+            }
+            cells.push(
+                actions
+                    .child(transport)
                     .child(
-                        Button::new(format!("row-copy-{row_id}"))
+                        Button::new(format!("row-more-{row_id}"))
                             .small()
-                            // Pinned row test: the fixed cell holds the full
-                            // "Copy SOCKS" label; the default small padding
-                            // clipped it at the old 72px width.
                             .compact()
-                            .label(t!("row-copy-socks"))
-                            .accessibility_label(t!("row-copy-socks-aria", name = copy_name))
-                            .tooltip(t!(
-                                "row-copy-socks-tip",
-                                bind = copy_bind,
-                                port = i64::from(copy_port)
-                            ))
-                            .on_click(move |_, window, cx| {
-                                if let Some(app) = copy_view.clone() {
-                                    app.update(cx, |view, cx| {
-                                        view.copy_row_socks(&copy_id, window, cx);
-                                    });
+                            .label("⋯")
+                            .accessibility_label(t!("row-more-aria"))
+                            .tooltip(t!("row-more-tip"))
+                            .dropdown_menu(move |menu, window, cx| match more_view.clone() {
+                                Some(app) => {
+                                    AppView::row_more_menu(menu, &more_id, &app, window, cx)
                                 }
+                                None => menu,
                             }),
                     )
                     .into_any_element(),
             );
-            let header = div()
-                .flex()
-                .flex_row()
-                .flex_nowrap()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .h_full()
-                .child(
-                    div()
-                        .w(px(metrics.lamp_check))
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .id(format!("row-dot-{row_id}"))
-                                .test_support()
-                                .size(px(RowMetrics::LAMP_TARGET))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .role(Role::Button)
-                                .aria_label(lamp_hint.clone())
-                                .aria_toggled(if lamp_active {
-                                    Toggled::True
-                                } else {
-                                    Toggled::False
-                                })
-                                .cursor_pointer()
-                                .tooltip({
-                                    let tip = lamp_hint.clone();
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .on_click({
-                                    let activate = lamp_activate.clone();
-                                    move |_, window, cx| {
-                                        // The lamp owns its click; the card's
-                                        // double-click-to-edit must not swallow it.
-                                        cx.stop_propagation();
-                                        activate(window, cx);
-                                    }
-                                })
-                                .on_a11y_action(AccessibleAction::Click, move |_, window, cx| {
-                                    lamp_activate(window, cx);
-                                })
-                                .child(
-                                    div()
-                                        .size(px(RowMetrics::LAMP_DOT))
-                                        .rounded_full()
-                                        .bg(lamp_color),
-                                ),
-                        )
-                        .child(checkbox),
-                )
-                // The check chip's slot stays reserved for the column grid;
-                // K4 removed the numeral chip itself, so nothing paints here.
-                .child(div().w(px(metrics.check_slot)).flex_shrink_0())
-                .child(
-                    div()
-                        .id(format!("row-name-{row_id}"))
-                        .test_support()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .child(
-                            div()
-                                .id(format!("row-name-text-{row_id}"))
-                                .test_support()
-                                .max_w(relative(1.))
-                                .truncate()
-                                // F14: the tooltip belongs to the text, not the
-                                // flexible cell, so blank space after a short
-                                // name does not open the full route.
-                                .tooltip({
-                                    let tip = full_route.clone();
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .child(Label::new(name)),
-                        ),
-                )
-                .children(cells);
-            card = card.child(header);
+            surface = surface.children(cells);
         }
 
-        let right_view = cx.entity();
+        let right_view = self.app_view.clone();
         let right_id = row_id.clone();
-        let item = item.on_mouse_down(MouseButton::Right, move |_, _, cx| {
-            right_view.update(cx, |state, cx| {
-                let delegate = state.delegate_mut();
-                // Right-clicking outside the set makes that row the subject;
-                // right-clicking inside a multi-selection keeps the set whole.
-                if !delegate.is_selected(&right_id) {
-                    delegate.select_only(&right_id);
-                    cx.notify();
-                }
-            });
-        });
-        let click_view = cx.entity();
+        let click_view = self.app_view.clone();
         let click_id = row_id.clone();
-        let item = item.on_click(move |event, _, cx| {
-            let modifiers = event.modifiers();
-            let id = click_id.clone();
-            click_view.update(cx, |state, cx| {
-                let delegate = state.delegate_mut();
-                if modifiers.shift {
-                    delegate.extend_selection_to(&id);
-                } else if modifiers.secondary() {
-                    delegate.toggle_selected(&id);
-                } else {
-                    delegate.select_only(&id);
-                }
-                delegate.pending_pointer_sync = Some(id.clone());
-                cx.notify();
-            });
-        });
 
         let rendered = match self.app_view.clone() {
             Some(app_view) => {
@@ -1732,20 +1378,56 @@ impl ListDelegate for LibraryDelegate {
                 let menu_view = app_view.clone();
                 let menu_id = row_id.clone();
                 item.child(
-                    card.on_click(move |event, window, cx| {
-                        if event.click_count() == 2 {
-                            let id = edit_id.clone();
-                            edit_view.update(cx, |view, cx| {
-                                view.open_edit_for_row(&id, window, cx);
-                            });
-                        }
-                    })
-                    .context_menu(move |menu, window, cx| {
-                        AppView::row_context_menu(menu, &menu_id, &menu_view, window, cx)
-                    }),
+                    surface
+                        // The row's own click. It lives on the surface, not on
+                        // the list item, so the endpoint chip keeps its own
+                        // click: the chip copies, the rest of the row selects.
+                        .on_click(move |event, window, cx| {
+                            let modifiers = event.modifiers();
+                            let id = click_id.clone();
+                            if let Some(app) = click_view.clone() {
+                                app.update(cx, |view, cx| {
+                                    if modifiers.shift {
+                                        view.extend_to_row(&id, cx);
+                                    } else if modifiers.secondary() {
+                                        view.toggle_row(&id, cx);
+                                    } else {
+                                        view.select_row(&id, cx);
+                                    }
+                                    // F19: picking a row opens the inspector
+                                    // again — it is the only way back to the
+                                    // row's controls once Esc closed it.
+                                    view.open_inspector();
+                                });
+                            }
+                            if event.click_count() == 2 {
+                                let id = edit_id.clone();
+                                edit_view.update(cx, |view, cx| {
+                                    view.open_edit_for_row(&id, window, cx);
+                                });
+                            }
+                            // The table's blank area clears the selection; a
+                            // click that landed on a row is not blank.
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                            if let Some(app) = right_view.clone() {
+                                app.update(cx, |view, cx| {
+                                    // Right-clicking outside the set makes that
+                                    // row the subject; right-clicking inside a
+                                    // multi-selection keeps the set whole.
+                                    if !view.is_selected(&right_id) {
+                                        view.select_row(&right_id, cx);
+                                    }
+                                });
+                            }
+                        })
+                        .context_menu(move |menu, window, cx| {
+                            AppView::row_more_menu(menu, &menu_id, &menu_view, window, cx)
+                        }),
                 )
             }
-            None => item.child(card),
+            None => item.child(surface),
         };
         Some(rendered)
     }
@@ -1798,7 +1480,7 @@ impl ListDelegate for LibraryDelegate {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .h(px(RowMetrics::ROW_PITCH))
+                                .h(px(self.density.row_height()))
                                 .px_3()
                                 .child(
                                     div()
@@ -1964,56 +1646,56 @@ mod tests {
         delegate
     }
 
-    /// Search and facet gating decide which rows the list paints, and the bulk
-    /// bar's scope is the visible set — never the library total.
+    /// Search and facet gating decide which rows the list paints. The
+    /// selection is not a visible-row set, so filtering never touches it.
     #[test]
-    fn filter_facets_and_bulk_scope_agree() {
+    fn filter_facets_and_visible_scope_agree() {
         let mut delegate = delegate(vec![
             row("1", "alpha", "work", true),
             row("2", "beta", "home", false),
             row("3", "alpine", "work", true),
         ]);
-        assert_eq!(delegate.visible_rows().len(), 3, "unfiltered shows all");
+        assert_eq!(delegate.visible_ids().len(), 3, "unfiltered shows all");
 
         delegate.query = "alp".to_string();
         delegate.apply_filter();
         assert_eq!(delegate.counts(), (3, 2), "counts ignore the filter");
         assert_eq!(
             delegate
-                .visible_rows()
+                .visible_ids()
                 .iter()
-                .map(|row| row.name.as_str())
+                .map(|id| id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["alpha", "alpine"],
+            vec!["1", "3"],
             "name search narrows the visible set"
         );
 
         delegate.set_facet_status(Some(FacetStatus::Disabled));
-        assert!(delegate.visible_rows().is_empty(), "no disabled alp rows");
+        assert!(delegate.visible_ids().is_empty(), "no disabled alp rows");
 
         delegate.clear_facets();
         delegate.query.clear();
         delegate.set_facet_group(Some("work".to_string()));
-        delegate.check_ids(&["1".to_string(), "2".to_string()]);
         assert_eq!(
-            delegate.bulk_label(),
-            "2 checked (of 2)",
-            "checked counts the whole set, of M is the visible scope"
+            delegate.visible_ids(),
+            vec!["1".to_string(), "3".to_string()],
+            "the group facet keeps the two work rows"
         );
-        assert_eq!(
-            delegate.checked_position("1"),
-            Some(1),
-            "positions follow the library order"
-        );
-        assert_eq!(
-            delegate
-                .checked_rows()
-                .iter()
-                .map(|row| row.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["1", "2"],
-            "checked rows come back in library order"
-        );
+    }
+
+    /// R29: the batch's failures narrow the table to themselves, and the
+    /// ordinary filter controls take the filter away again.
+    #[test]
+    fn the_failure_filter_narrows_the_table() {
+        let mut delegate = delegate(vec![
+            row("1", "alpha", "work", true),
+            row("2", "beta", "work", true),
+            row("3", "alpine", "work", true),
+        ]);
+        delegate.set_failure_filter(Some(HashSet::from(["2".to_string()])));
+        assert_eq!(delegate.visible_ids(), vec!["2".to_string()]);
+        delegate.clear_facets();
+        assert_eq!(delegate.visible_ids().len(), 3, "clear all takes it away");
     }
 
     /// A status facet reads the same serving tone the row lamp paints, so a

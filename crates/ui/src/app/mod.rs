@@ -18,6 +18,7 @@ pub(crate) mod open;
 pub(crate) mod os;
 pub(crate) mod render;
 pub(crate) mod search;
+pub(crate) mod selection;
 pub(crate) mod settings;
 pub(crate) mod shell;
 pub(crate) mod state;

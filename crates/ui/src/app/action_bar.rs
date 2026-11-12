@@ -6,9 +6,6 @@
 //! which live in the engine bar.
 use crate::*;
 
-/// The action bar's height. The title, the count and four controls share it.
-pub(crate) const ACTION_BAR_HEIGHT: f32 = 44.;
-
 impl AppView {
     /// The empty canvas and the action bar share these two handlers.
     pub(crate) fn open_add_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -57,7 +54,7 @@ impl AppView {
             .items_center()
             .gap_2()
             .w_full()
-            .h(px(ACTION_BAR_HEIGHT))
+            .h(px(self.density.action_bar_height()))
             .flex_shrink_0()
             .min_w_0()
             .px_3()

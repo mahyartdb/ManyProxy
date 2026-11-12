@@ -136,7 +136,6 @@ impl Render for AppView {
         let action_bar = self.render_action_bar(cx);
         let filter_slot = self.render_filter_slot(cx);
         let engine_bar = self.render_engine_bar(cx);
-        let bulk_bar = self.render_bulk_bar(cx);
         let column_headers = self.render_library_column_headers(window, cx);
         let mut list_pane = div()
             .id("config-list")
@@ -151,10 +150,24 @@ impl Render for AppView {
             .min_w_0()
             .child(action_bar)
             .child(filter_slot)
-            .child(bulk_bar)
             .children(self.render_writable_banner(cx))
             .child(column_headers)
-            .child(List::new(&self.libraries).flex_1());
+            // The blank area below the rows belongs to the table, not to a
+            // row: a plain click there clears the selection. Rows stop their
+            // own clicks so selecting one never reaches this.
+            .child(
+                div()
+                    .id("library-scroll")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if view.selection_count() > 0 {
+                            view.clear_selection(window, cx);
+                        }
+                    }))
+                    .child(List::new(&self.libraries).size_full()),
+            );
         if !docked && inspector_visible {
             list_pane = list_pane.pr(px(layout.drawer_w));
         }

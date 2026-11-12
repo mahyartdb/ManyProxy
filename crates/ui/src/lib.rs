@@ -18,7 +18,7 @@ mod update;
 use manyproxy_core::*;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::description_list::DescriptionList;
@@ -57,6 +56,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
@@ -125,6 +125,7 @@ use app::bits::*;
 use app::focus::*;
 use app::kit_bits::*;
 use app::open::*;
+use app::selection::{BatchKind, BatchRun};
 use app::state::{ConnectionState, LogsState, PaneWindow, RefreshBatch};
 use app::window::*;
 use appearance::*;
@@ -145,27 +146,26 @@ pub(crate) use text::bulk_delete_result_message;
 pub(crate) use text::{
     about_body, addsub_error_message, already_running_message, already_stopped_message,
     already_subscribed_message, auto_clear_opt_in_note, auto_clear_summary_toast,
-    bind_port_collision_warning, bulk_copy_nothing_message, bulk_copy_proxies_message,
-    bulk_start_enable_flag_failed_message, bulk_start_failed_message, bulk_start_refused_message,
-    bulk_start_unreadable_message, clear_group_tests_confirm_text, close_confirm_description,
-    crash_notification_text, db_list_error_message, dirty_endpoint_message, enabled_flag_message,
-    export_confirm_description, export_count_message, export_overwrite_confirm_description,
-    export_preview_description, group_delete_confirm_description, group_row_views,
-    group_test_summary_toast, http_subscription_warning, import_files_label,
-    import_preview_message, inspector_badge_text, inspector_tab_label, lan_confirm_description,
-    lan_confirm_text, lan_confirm_title, lan_exposure_warning, lan_hint_for_bind,
-    log_level_tooltip, logs_overwrite_text, logs_save_path_text, no_selection_message,
-    preset_delete_confirm_description, preset_error_message, preset_imported_message,
-    preset_row_summary, preset_summary_text, probe_batched_toast, probe_result_toast,
-    probe_start_toast, prune_duplicates_confirm_text, prune_invalid_confirm_text,
-    prune_unavailable_confirm_text, refresh_summary_text, removed_message,
-    restart_to_apply_message, restore_done_message, row_action_message, rule_set_summary,
-    settings_clear_health_text, settings_clear_snapshot_text, settings_clear_traffic_text,
-    sidecar_presence_line, skipped_dirty_message, start_all_message, start_all_partial_message,
-    start_busy_message, stop_all_confirm_description, stop_all_message, subscription_failures_text,
-    subscription_interval_failure_message, traffic_other_line, traffic_stats_summary_text,
-    undo_failed_message, undo_restored_message, unreadable_drop_message, update_all_confirm_text,
-    update_feed_failure_message,
+    bind_port_collision_warning, bulk_start_enable_flag_failed_message, bulk_start_failed_message,
+    bulk_start_refused_message, bulk_start_unreadable_message, clear_group_tests_confirm_text,
+    close_confirm_description, crash_notification_text, db_list_error_message,
+    dirty_endpoint_message, enabled_flag_message, export_confirm_description, export_count_message,
+    export_overwrite_confirm_description, export_preview_description,
+    group_delete_confirm_description, group_row_views, group_test_summary_toast,
+    http_subscription_warning, import_files_label, import_preview_message, inspector_badge_text,
+    inspector_tab_label, lan_confirm_description, lan_confirm_text, lan_confirm_title,
+    lan_exposure_warning, lan_hint_for_bind, log_level_tooltip, logs_overwrite_text,
+    logs_save_path_text, no_selection_message, preset_delete_confirm_description,
+    preset_error_message, preset_imported_message, preset_row_summary, preset_summary_text,
+    probe_batched_toast, probe_result_toast, probe_start_toast, prune_duplicates_confirm_text,
+    prune_invalid_confirm_text, prune_unavailable_confirm_text, refresh_summary_text,
+    removed_message, restart_to_apply_message, restore_done_message, row_action_message,
+    rule_set_summary, settings_clear_health_text, settings_clear_snapshot_text,
+    settings_clear_traffic_text, sidecar_presence_line, skipped_dirty_message, start_all_message,
+    start_all_partial_message, start_busy_message, stop_all_confirm_description, stop_all_message,
+    subscription_failures_text, subscription_interval_failure_message, traffic_other_line,
+    traffic_stats_summary_text, undo_failed_message, undo_restored_message,
+    unreadable_drop_message, update_all_confirm_text, update_feed_failure_message,
 };
 use update::*;
 
@@ -179,11 +179,16 @@ actions!(
         StopSelected,
         TestSelected,
         StopTesting,
-        ClearChecked,
+        ClearSelection,
         EditSelected,
         DeleteSelected,
         SelectPreviousRow,
         SelectNextRow,
+        FocusPreviousRow,
+        FocusNextRow,
+        FocusFirstRow,
+        FocusLastRow,
+        ToggleFocused,
         SelectAllRows,
         FocusSearch,
         InspectorDetails,
@@ -236,6 +241,24 @@ struct AppView {
     settings_last_check: Option<Rc<RefCell<Option<i64>>>>,
 
     expanded_subs: HashSet<String>,
+
+    /// The one selection model: the set, the anchor a range grows from, and
+    /// the focus the keyboard is on. Session-only — nothing about it is
+    /// persisted, and it never survives a launch.
+    selection: HashSet<String>,
+
+    selection_anchor: Option<String>,
+
+    selection_focus: Option<String>,
+
+    /// The last batch: the ids it snapshotted, how far it got and what it
+    /// found. Transient — the bar shows it until the selection changes or
+    /// the user clears the result.
+    batch: Option<BatchRun>,
+
+    /// The row density. It owns every chrome height and the row pitch, and
+    /// it is persisted under `row_density`.
+    density: Density,
 
     /// T-27: resolved out-IP text per row id, session-only. The resolution
     /// action already computes it; keeping it per row is what `out_ip` sorts by.

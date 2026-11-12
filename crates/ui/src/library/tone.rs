@@ -113,6 +113,45 @@ impl From<BadgeState> for ServingTone {
     }
 }
 
+/// The lead's state glyph: one 14px mark that says what the row is doing.
+/// It is status, not a control — it carries no button role, no hit target
+/// and no hover state.
+pub(crate) fn state_glyph(state: RowPhase, theme: &Theme) -> AnyElement {
+    let glyph: AnyElement = match state {
+        RowPhase::Running => div()
+            .size(px(8.))
+            .rounded_full()
+            .bg(success_text_color(theme))
+            .into_any_element(),
+        RowPhase::Stopped => div()
+            .size(px(8.))
+            .rounded_full()
+            .border_1()
+            .border_color(theme.muted_foreground)
+            .into_any_element(),
+        RowPhase::Starting => div()
+            .size(px(8.))
+            .rounded_full()
+            .border_1()
+            .border_color(theme.primary)
+            .child(div().w(px(4.)).h(px(8.)).bg(theme.primary))
+            .into_any_element(),
+        RowPhase::Failed => div()
+            .text_size(px(12.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(danger_text_color(theme))
+            .child("!")
+            .into_any_element(),
+    };
+    div()
+        .size(px(RowMetrics::GLYPH))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(glyph)
+        .into_any_element()
+}
+
 #[cfg(test)]
 pub(crate) fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
     match filter {

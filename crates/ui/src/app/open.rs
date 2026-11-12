@@ -81,7 +81,8 @@ impl AppView {
         self.open_edit_dialog(config, window, cx);
     }
 
-    pub(crate) fn open_remove_for_row(
+    /// The row menu's `Assign preset`: the attach sheet for one config.
+    pub(crate) fn open_preset_attach_for_row(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -91,7 +92,27 @@ impl AppView {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
-        self.open_remove_confirm(config, window, cx);
+        let ids = vec![config.id.clone()];
+        self.open_preset_attach_dialog(config, ids, window, cx);
+    }
+
+    /// The batch bar's `Assign preset`: the same sheet, applied to every
+    /// selected config.
+    pub(crate) fn open_preset_attach_for_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        let Some(first) = ids.first().cloned() else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        };
+        let Some(config) = self.row_config(&first) else {
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
+            return;
+        };
+        self.open_preset_attach_dialog(config, ids, window, cx);
     }
 
     pub(crate) fn open_traffic_reset_for_row(
@@ -345,7 +366,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         match self.selected_config(cx) {
-            Some(config) => self.open_preset_attach_dialog(config, window, cx),
+            Some(config) => {
+                let ids = vec![config.id.clone()];
+                self.open_preset_attach_dialog(config, ids, window, cx);
+            }
             None => window.push_notification(Notification::info(no_selection_message()), cx),
         }
     }
@@ -1378,6 +1402,12 @@ impl AppView {
             let mut body = div().flex().flex_col().gap_2();
             for (id, label, tip, enabled) in [
                 (
+                    "columns-protocol",
+                    t!("columns-protocol"),
+                    t!("columns-protocol-tip"),
+                    current.protocol,
+                ),
+                (
                     "columns-upstream",
                     t!("columns-upstream"),
                     t!("columns-upstream-tip"),
@@ -1403,6 +1433,7 @@ impl AppView {
                 ),
             ] {
                 let column = match id {
+                    "columns-protocol" => "protocol",
                     "columns-upstream" => "upstream",
                     "columns-health" => "health",
                     "columns-group" => "group",
@@ -1421,6 +1452,7 @@ impl AppView {
                             {
                                 let mut current = live.borrow_mut();
                                 match column {
+                                    "protocol" => current.protocol = enabled,
                                     "upstream" => current.upstream = enabled,
                                     "health" => current.health = enabled,
                                     "group" => current.group = enabled,
@@ -1663,19 +1695,6 @@ impl AppView {
                         ),
                 )
         });
-    }
-
-    pub(crate) fn open_remove_confirm(
-        &mut self,
-        config: ProxyConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // K5: deletion is immediate — no blocking confirm for a single row.
-        // The undo toast (commit_remove) is the safety net; the rows stay in
-        // memory for its lifetime and vanish with it. K17 ruling: the bulk
-        // More ▾ path is immediate too (spec line 91) — same pipeline.
-        self.commit_remove(&config.id, window, cx);
     }
 
     pub(crate) fn open_usage_reset_confirm(
@@ -2485,6 +2504,7 @@ impl AppView {
     pub(crate) fn open_preset_attach_dialog(
         &mut self,
         config: ProxyConfig,
+        config_ids: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2569,6 +2589,7 @@ impl AppView {
             for preset in &presets {
                 let attach_view = view.clone();
                 let attach_config = config_id.clone();
+                let attach_ids = config_ids.clone();
                 let attach_preset = preset.id.clone();
                 let mut line = div()
                     .flex()
@@ -2584,9 +2605,11 @@ impl AppView {
                             .label(t!("preset-attach-action"))
                             .on_click(move |_, window, cx| {
                                 let config = attach_config.clone();
+                                let ids = attach_ids.clone();
                                 let preset = attach_preset.clone();
                                 attach_view.update(cx, |view, cx| {
-                                    view.commit_preset_attach(&config, Some(preset), window, cx);
+                                    view.commit_preset_attach_ids(&ids, Some(preset), window, cx);
+                                    let _ = config;
                                 });
                             }),
                     );
@@ -2595,14 +2618,14 @@ impl AppView {
             }
             if current.is_some() {
                 let detach_view = view.clone();
-                let detach_config = config_id.clone();
+                let detach_ids = config_ids.clone();
                 body = body.child(
                     Button::new("preset-detach")
                         .label(t!("preset-detach-action"))
                         .on_click(move |_, window, cx| {
-                            let config = detach_config.clone();
+                            let ids = detach_ids.clone();
                             detach_view.update(cx, |view, cx| {
-                                view.commit_preset_attach(&config, None, window, cx);
+                                view.commit_preset_attach_ids(&ids, None, window, cx);
                             });
                         }),
                 );

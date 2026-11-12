@@ -328,7 +328,10 @@ impl AppView {
         let libraries = cx.new(|cx| {
             ListState::new(LibraryDelegate::new(), window, cx)
                 .searchable(false)
-                .selectable(true)
+                // The app owns the selection and the focus, so the list's own
+                // index stays empty: a kit-selected row would paint a second
+                // selection the app never asked for.
+                .selectable(false)
         });
         let last_query = store.library_last_query().unwrap_or_default();
         let search_input = cx.new(|cx| {
@@ -340,11 +343,13 @@ impl AppView {
         let layout = store.library_column_layout();
         let sort = store.library_sort();
         let latency_facet = store.latency_facet();
+        let density = store.row_density();
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
             state.delegate_mut().set_layout(layout);
             state.delegate_mut().set_sort(sort);
             state.delegate_mut().set_latency_facet(latency_facet);
+            state.delegate_mut().set_density(density);
             state.delegate_mut().query = last_query;
             state.delegate_mut().set_bind_hosts(bind_hosts);
             list_cx.notify();
@@ -423,6 +428,11 @@ impl AppView {
             settings_subscriptions: Vec::new(),
             settings_last_check: None,
             expanded_subs: HashSet::new(),
+            selection: HashSet::new(),
+            selection_anchor: None,
+            selection_focus: None,
+            batch: None,
+            density,
             out_ip_by_row: HashMap::new(),
             traffic_last_seen: TrafficSeenMap::default(),
             traffic_tick_in_flight: false,
@@ -557,7 +567,15 @@ impl AppView {
     }
 
     pub(crate) fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
-        self.libraries.read(cx).delegate().selected_row()
+        // The one row the inspector reads: the focused row, or the only
+        // selected row when the focus is elsewhere.
+        let id = self.selection_focus.clone().or_else(|| {
+            (self.selection.len() == 1)
+                .then(|| self.selection.iter().next().cloned())
+                .flatten()
+        })?;
+        let libraries = self.libraries.read(cx);
+        libraries.delegate().row_by_id(&id).cloned()
     }
 
     pub(crate) fn cached_upstream(&self, cx: &App, config: &ProxyConfig) -> String {
@@ -1051,6 +1069,7 @@ impl AppView {
                 eprintln!("health snapshot persist failed: {error}");
             }
         }
+        self.settle_batch_test(outcomes);
     }
 
     pub(crate) fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
@@ -1666,6 +1685,7 @@ impl AppView {
     ) {
         let mut columns = self.row_columns;
         match column {
+            "protocol" => columns.protocol = enabled,
             "upstream" => columns.upstream = enabled,
             "health" => columns.health = enabled,
             "group" => columns.group = enabled,
@@ -2792,24 +2812,5 @@ impl AppView {
     pub(crate) fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
             || self.health_store.row_summary(&config.id).trim() == "dead"
-    }
-
-    pub(crate) fn select_visible_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.libraries.update(cx, |state, list_cx| {
-            let ids: Vec<String> = state
-                .delegate()
-                .visible_rows()
-                .iter()
-                .map(|row| row.id.clone())
-                .collect();
-            let delegate = state.delegate_mut();
-            for id in ids {
-                if !delegate.checked.contains(&id) {
-                    delegate.toggle_checked(&id);
-                }
-            }
-            list_cx.notify();
-        });
-        cx.notify();
     }
 }

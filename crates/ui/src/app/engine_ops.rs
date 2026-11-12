@@ -83,6 +83,9 @@ impl AppView {
 
             list_cx.notify();
         });
+        // A row that stopped existing leaves the selection; a row that is
+        // merely filtered out stays.
+        self.prune_selection_to_live_rows(cx);
         Ok(())
     }
 
@@ -140,11 +143,13 @@ impl AppView {
     pub(crate) fn start_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
+            self.settle_batch_start(&[]);
             return;
         };
 
         if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
             window.push_notification(Notification::info(dirty_endpoint_message(&config.name)), cx);
+            self.settle_batch_start(&[]);
             return;
         }
         if self.start_in_flight {
@@ -178,6 +183,7 @@ impl AppView {
         };
         let id = config.id.clone();
         let (removed, stop_error) = self.engine.stop_one_result(&id);
+        self.settle_batch_stop();
         if removed {
             if let Some(error) = stop_error {
                 self.reload(window, cx);
@@ -329,16 +335,9 @@ impl AppView {
         };
         // T-04: the scope decides which running rows the run covers.
         let rows = if self.store.test_all_scope() == TestAllScope::Checked {
-            let checked: HashSet<String> = self
-                .libraries
-                .read(cx)
-                .delegate()
-                .checked_rows()
-                .into_iter()
-                .map(|row| row.id)
-                .collect();
+            let selected: HashSet<String> = self.selection.iter().cloned().collect();
             rows.into_iter()
-                .filter(|row| checked.contains(&row.id))
+                .filter(|row| selected.contains(&row.id))
                 .collect()
         } else {
             rows
@@ -365,6 +364,7 @@ impl AppView {
     pub(crate) fn test_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
+            self.settle_batch_test(&[]);
             return;
         };
         if !self.engine.running_ids().contains(&config.id) {
@@ -372,10 +372,12 @@ impl AppView {
                 Notification::warning(t!("row-not-running", name = config.name)),
                 cx,
             );
+            self.settle_batch_test(&[]);
             return;
         }
         if self.probe_kind_in_flight(false) {
             window.push_notification(Notification::info(t!("health-test-running")), cx);
+            self.settle_batch_test(&[]);
             return;
         }
         self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
@@ -401,10 +403,12 @@ impl AppView {
             .collect();
         if rows.is_empty() {
             window.push_notification(Notification::warning(t!("no-running-endpoints")), cx);
+            self.settle_batch_test(&[]);
             return;
         }
         if self.probe_kind_in_flight(false) {
             window.push_notification(Notification::info(t!("health-test-running")), cx);
+            self.settle_batch_test(&[]);
             return;
         }
         self.spawn_probe(rows, false, true, Some(window.window_handle()), cx);

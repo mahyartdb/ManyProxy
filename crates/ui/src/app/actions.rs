@@ -90,11 +90,25 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         AppView::focus_library_search,
     ),
     selected(
-        "clear-checked",
-        "action-label-clear-checked",
-        &["clear", "uncheck", "escape"],
+        "clear-selection",
+        "action-label-clear-selection",
+        &["clear", "deselect", "escape"],
         &[("escape", "Esc")],
-        clear_checked,
+        clear_selection,
+    ),
+    selected(
+        "density-comfortable",
+        "action-label-density-comfortable",
+        &["density", "comfortable", "rows", "spacing"],
+        &[],
+        AppView::set_comfortable_density,
+    ),
+    selected(
+        "density-compact",
+        "action-label-density-compact",
+        &["density", "compact", "rows", "spacing"],
+        &[],
+        AppView::set_compact_density,
     ),
     selected(
         "update-current-group",
@@ -386,6 +400,14 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         AppView::open_share_for_row,
     ),
     row(
+        "assign-preset",
+        "action-label-assign-preset",
+        &["preset", "assign", "attach", "routing"],
+        &[],
+        "action-tip-assign-preset",
+        AppView::open_preset_attach_for_row,
+    ),
+    row(
         "duplicate",
         "action-label-duplicate",
         &["duplicate", "copy", "clone"],
@@ -441,7 +463,25 @@ fn needs_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> bool {
 fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String> {
     match target {
         ActionTarget::Row(id) => vec![id.to_string()],
-        ActionTarget::Selection => view.libraries.read(cx).delegate().selected_ids(),
+        ActionTarget::Selection => {
+            let libraries = view.libraries.read(cx);
+            let delegate = libraries.delegate();
+            let visible = delegate.visible_ids();
+            let mut ids: Vec<String> = visible
+                .into_iter()
+                .filter(|id| view.is_selected(id))
+                .collect();
+            // A selected row a filter hides still counts: the selection is not
+            // a visible-row set.
+            let mut hidden: Vec<String> = delegate
+                .row_ids()
+                .into_iter()
+                .filter(|id| view.is_selected(id))
+                .filter(|id| !ids.contains(id))
+                .collect();
+            ids.append(&mut hidden);
+            ids
+        }
     }
 }
 
@@ -515,7 +555,7 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "edit",
             "delete",
             "focus-search",
-            "clear-checked",
+            "clear-selection",
             "inspector-details",
             "inspector-health",
             "paste-import",
@@ -541,6 +581,8 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "traffic-stats",
             "row-columns",
             "text-size",
+            "density-comfortable",
+            "density-compact",
         ],
     ),
     (
@@ -627,8 +669,8 @@ pub(crate) fn palette_action_at(index: IndexPath) -> Option<&'static str> {
     PALETTE_GROUPS.get(index.section)?.1.get(index.row).copied()
 }
 
-fn clear_checked(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.clear_checked_unless_dialog(window, cx);
+fn clear_selection(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+    view.clear_selection_unless_dialog(window, cx);
 }
 
 fn open_import(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
