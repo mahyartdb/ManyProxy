@@ -8,6 +8,7 @@ pub struct RowSearchIndex {
     pub group: String,
     pub bind: String,
     pub port: String,
+    pub endpoint: String,
     pub host_server: String,
     pub host_address: String,
     pub sub_label: String,
@@ -26,6 +27,7 @@ impl RowSearchIndex {
             group: row.group.to_lowercase(),
             bind: row.bind_ip.to_lowercase(),
             port: row.port.to_string(),
+            endpoint: endpoint_full(&row.bind_ip, row.port).to_lowercase(),
             host_server,
             host_address,
             sub_label: String::new(),
@@ -48,12 +50,14 @@ impl RowSearchIndex {
         running: &HashSet<String>,
         health: &HashMap<String, String>,
     ) {
+        // R10: a config with no subscription is `Manual`, so the source label
+        // in the search index is the same word the inspector and nav use.
         self.sub_label = row
             .subscription_id
             .as_deref()
             .and_then(|id| sub_labels.get(id))
             .map(|label| label.to_lowercase())
-            .unwrap_or_default();
+            .unwrap_or_else(|| "manual".to_string());
         self.preset_name = row
             .preset_id
             .as_deref()
@@ -80,6 +84,7 @@ impl RowSearchIndex {
             || self.group.contains(lowered)
             || self.bind.contains(lowered)
             || self.port.contains(lowered)
+            || self.endpoint.contains(lowered)
             || self.host_server.contains(lowered)
             || self.host_address.contains(lowered)
             || self.sub_label.contains(lowered)
