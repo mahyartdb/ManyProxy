@@ -1,14 +1,14 @@
 use crate::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShardCaption {
+pub enum ShardCaption {
     NotRunning,
     SamplingUnavailable,
     Collecting,
 }
 
 impl ShardCaption {
-    pub(crate) fn label(self) -> String {
+    pub fn label(self) -> String {
         match self {
             ShardCaption::NotRunning => t!("shard-not-running"),
             ShardCaption::SamplingUnavailable => t!("shard-sampling-unavailable"),
@@ -20,14 +20,14 @@ impl ShardCaption {
 /// One row of the Runtime-stats per-shard section: either two plottable series
 /// or a caption saying why there is nothing to plot.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ShardStatRow {
-    pub(crate) label: String,
-    pub(crate) cpu: Vec<f32>,
-    pub(crate) ram: Vec<f32>,
-    pub(crate) caption: Option<ShardCaption>,
+pub struct ShardStatRow {
+    pub label: String,
+    pub cpu: Vec<f32>,
+    pub ram: Vec<f32>,
+    pub caption: Option<ShardCaption>,
 }
 
-pub(crate) fn shard_stat_rows(
+pub fn shard_stat_rows(
     shards: &[(String, Option<u32>)],
     rings: &BTreeMap<String, ShardRing>,
     denied: &HashSet<String>,
@@ -57,7 +57,7 @@ pub(crate) fn shard_stat_rows(
 
 /// Sparkline-shaped line for one series: same `LineChart` family and sizing as
 /// the health sparkline, one per series so CPU and RAM never share a scale.
-pub(crate) fn shard_sparkline(series: &[f32]) -> impl IntoElement {
+pub fn shard_sparkline(series: &[f32]) -> impl IntoElement {
     struct SeriesPoint {
         x: String,
         y: f64,
@@ -79,7 +79,7 @@ pub(crate) fn shard_sparkline(series: &[f32]) -> impl IntoElement {
     )
 }
 
-pub(crate) fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
+pub fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
     let mut entry = div()
         .id(format!("shard-stat-{}", row.label))
         .test_support()

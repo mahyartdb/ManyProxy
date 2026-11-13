@@ -2,7 +2,7 @@ use crate::*;
 
 impl AppView {
     /// The read-only mirrors the pure query counts against.
-    pub(crate) fn query_facts<'a>(&self, delegate: &'a LibraryDelegate) -> QueryFacts<'a> {
+    pub fn query_facts<'a>(&self, delegate: &'a LibraryDelegate) -> QueryFacts<'a> {
         QueryFacts {
             running: &delegate.running,
             health: &delegate.health,
@@ -13,7 +13,7 @@ impl AppView {
 
     /// Recompute the visible indices from the one query. The delegate keeps
     /// the row mirrors fresh; this is the only writer of `AppView::visible`.
-    pub(crate) fn apply_query(&mut self, cx: &mut Context<Self>) {
+    pub fn apply_query(&mut self, cx: &mut Context<Self>) {
         let visible = {
             let libraries = self.libraries.read(cx);
             let delegate = libraries.delegate();
@@ -70,7 +70,7 @@ impl AppView {
 
     /// One keystroke schedules the 80ms task; a newer keystroke retires it by
     /// epoch and by dropping the stored task.
-    pub(crate) fn schedule_search(&mut self, text: String, cx: &mut Context<Self>) {
+    pub fn schedule_search(&mut self, text: String, cx: &mut Context<Self>) {
         self.search_epoch = self.search_epoch.wrapping_add(1);
         let epoch = self.search_epoch;
         let weak = cx.entity().downgrade();
@@ -93,7 +93,7 @@ impl AppView {
     }
 
     /// Enter, a cleared field and `Clear` apply without waiting for the timer.
-    pub(crate) fn apply_search_now(&mut self, text: String, cx: &mut Context<Self>) {
+    pub fn apply_search_now(&mut self, text: String, cx: &mut Context<Self>) {
         self.search_debounce = None;
         self.search_epoch = self.search_epoch.wrapping_add(1);
         let before = self.query.port;
@@ -106,7 +106,7 @@ impl AppView {
 
     /// The visible rows' ids, in paint order. The one reader for the batch
     /// actions and the selection helpers.
-    pub(crate) fn visible_row_ids(&self, cx: &App) -> Vec<String> {
+    pub fn visible_row_ids(&self, cx: &App) -> Vec<String> {
         let delegate = self.libraries.read(cx).delegate();
         self.visible
             .iter()
@@ -115,7 +115,7 @@ impl AppView {
             .collect()
     }
 
-    pub(crate) fn set_status_facet(
+    pub fn set_status_facet(
         &mut self,
         status: StatusFacet,
         on: bool,
@@ -129,7 +129,7 @@ impl AppView {
         self.query_edited(cx);
     }
 
-    pub(crate) fn set_protocol_facet(
+    pub fn set_protocol_facet(
         &mut self,
         protocol: String,
         on: bool,
@@ -143,7 +143,7 @@ impl AppView {
         self.query_edited(cx);
     }
 
-    pub(crate) fn set_bind_facet(&mut self, bind: String, on: bool, cx: &mut Context<Self>) {
+    pub fn set_bind_facet(&mut self, bind: String, on: bool, cx: &mut Context<Self>) {
         if on {
             self.query.binds.insert(bind);
         } else {
@@ -153,14 +153,14 @@ impl AppView {
     }
 
     /// The latency facet is session-only; the old store write is gone.
-    pub(crate) fn set_latency_facet(&mut self, facet: LatencyFacet, cx: &mut Context<Self>) {
+    pub fn set_latency_facet(&mut self, facet: LatencyFacet, cx: &mut Context<Self>) {
         self.query.latency = facet;
         self.query_edited(cx);
     }
 
     /// The two port fields and a `port=` token are views of one value. Invalid
     /// text keeps the previous filter and shows the inline error.
-    pub(crate) fn set_port_range(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+    pub fn set_port_range(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let from = from.trim();
         let to = to.trim();
         let parsed = if from.is_empty() && to.is_empty() {
@@ -198,19 +198,19 @@ impl AppView {
         }
     }
 
-    pub(crate) fn set_custom_endpoint(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub fn set_custom_endpoint(&mut self, on: bool, cx: &mut Context<Self>) {
         self.query.custom_endpoint = on;
         self.query_edited(cx);
     }
 
     /// The protocol popover's local filter text changed; the popover content
     /// re-renders from the input's value.
-    pub(crate) fn protocol_filter_changed(&mut self, cx: &mut Context<Self>) {
+    pub fn protocol_filter_changed(&mut self, cx: &mut Context<Self>) {
         cx.notify();
     }
 
     /// A control edit takes the slice-2 failure narrowing away, then recomputes.
-    fn query_edited(&mut self, cx: &mut Context<Self>) {
+    pub fn query_edited(&mut self, cx: &mut Context<Self>) {
         self.failure_filter = None;
         self.apply_query(cx);
         cx.notify();
@@ -218,7 +218,7 @@ impl AppView {
 
     /// Clear the field. A `port=` token in the field goes with it; a port set
     /// from the popover stays when the field was already empty.
-    pub(crate) fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_debounce = None;
         self.search_epoch = self.search_epoch.wrapping_add(1);
         let before = self.query.port;
@@ -231,7 +231,7 @@ impl AppView {
     }
 
     /// `Clear`: search and every facet.
-    pub(crate) fn clear_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn clear_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_debounce = None;
         self.search_epoch = self.search_epoch.wrapping_add(1);
         self.query = FilterQuery::default();
@@ -244,7 +244,7 @@ impl AppView {
     }
 
     /// Esc after the selection is empty: filters go, the search text stays.
-    pub(crate) fn clear_filters(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_filters(&mut self, cx: &mut Context<Self>) {
         self.query.statuses.clear();
         self.query.protocols.clear();
         self.query.latency = LatencyFacet::default();
@@ -258,7 +258,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn write_search_box(
+    pub fn write_search_box(
         &mut self,
         text: &str,
         window: &mut Window,
@@ -270,7 +270,7 @@ impl AppView {
     }
 
     /// The Filter popover shows the current port; a `port=` token seeds it.
-    pub(crate) fn sync_port_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn sync_port_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (from, to) = match self.query.port {
             Some(port) => (
                 if port.lo == 0 {

@@ -78,7 +78,7 @@ pub fn autostart_command() -> Option<String> {
         .map(|path| format!("\"{}\" {AUTOSTART_MINIMIZED_FLAG}", path.display()))
 }
 
-fn autostart_command_legacy() -> Option<String> {
+pub fn autostart_command_legacy() -> Option<String> {
     std::env::current_exe()
         .ok()
         .map(|path| format!("\"{}\"", path.display()))
@@ -153,7 +153,7 @@ pub fn autostart_enabled() -> bool {
     autostart_value_is_on(read_autostart_at(AUTOSTART_RUN_KEY).as_deref())
 }
 
-fn autostart_value_is_on(stored: Option<&str>) -> bool {
+pub fn autostart_value_is_on(stored: Option<&str>) -> bool {
     match (stored, autostart_command()) {
         (Some(stored), Some(command)) => {
             stored == command || autostart_command_legacy().is_some_and(|legacy| stored == legacy)
@@ -162,7 +162,7 @@ fn autostart_value_is_on(stored: Option<&str>) -> bool {
     }
 }
 
-fn autostart_target_exe(command: &str) -> Option<String> {
+pub fn autostart_target_exe(command: &str) -> Option<String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return None;
@@ -308,7 +308,7 @@ pub fn hwnd_from_window(_window: &gpui_kit::Window) -> Option<isize> {
 }
 
 pub struct TrayHandle {
-    icon: tray_icon::TrayIcon,
+    pub icon: tray_icon::TrayIcon,
 }
 
 impl TrayHandle {

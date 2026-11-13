@@ -6,74 +6,74 @@
 use crate::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndpointHost {
+pub enum EndpointHost {
     RowPopover,
     InspectorInline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EndpointPhase {
+pub enum EndpointPhase {
     Editing,
     Restarting,
     Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndpointIntent {
+pub enum EndpointIntent {
     Apply,
 }
 
 /// The key context the shared form carries. Its Escape and Enter bindings are
 /// deeper than the kit popover's own, so the form decides what Escape means
 /// before the popover dismisses.
-pub(crate) const ENDPOINT_EDITOR_CONTEXT: &str = "endpoint-editor";
+pub const ENDPOINT_EDITOR_CONTEXT: &str = "endpoint-editor";
 
-pub(crate) struct EndpointDraft {
-    pub(crate) row_id: String,
-    pub(crate) host: EndpointHost,
-    pub(crate) bind: Entity<InputState>,
-    pub(crate) port: Entity<InputState>,
-    focus: FocusHandle,
-    pub(crate) phase: EndpointPhase,
-    pub(crate) error: Option<String>,
-    intent: Option<EndpointIntent>,
-    _subs: Vec<Subscription>,
+pub struct EndpointDraft {
+    pub row_id: String,
+    pub host: EndpointHost,
+    pub bind: Entity<InputState>,
+    pub port: Entity<InputState>,
+    pub focus: FocusHandle,
+    pub phase: EndpointPhase,
+    pub error: Option<String>,
+    pub intent: Option<EndpointIntent>,
+    pub _subs: Vec<Subscription>,
 }
 
 /// The values and verdicts one draft frame needs. Live validation is derived,
 /// never stored: every keystroke re-reads the two fields.
 #[derive(Debug, Clone)]
-pub(crate) struct EndpointCheck {
-    pub(crate) row_id: String,
-    pub(crate) parsed: Option<EndpointValue>,
-    pub(crate) error: Option<String>,
-    pub(crate) collision: Option<EndpointCollision>,
-    pub(crate) suggestion: Option<u16>,
-    pub(crate) dirty: bool,
-    pub(crate) restarting: bool,
+pub struct EndpointCheck {
+    pub row_id: String,
+    pub parsed: Option<EndpointValue>,
+    pub error: Option<String>,
+    pub collision: Option<EndpointCollision>,
+    pub suggestion: Option<u16>,
+    pub dirty: bool,
+    pub restarting: bool,
 }
 
 /// One frame of an open draft, copied out of `AppView` and the list so the
 /// row host can paint without borrowing either entity mid-render.
 #[derive(Clone)]
-pub(crate) struct EndpointFrame {
-    pub(crate) row_id: String,
-    pub(crate) host: EndpointHost,
-    pub(crate) bind: Entity<InputState>,
-    pub(crate) port: Entity<InputState>,
+pub struct EndpointFrame {
+    pub row_id: String,
+    pub host: EndpointHost,
+    pub bind: Entity<InputState>,
+    pub port: Entity<InputState>,
     /// The form itself takes focus, so its Escape and Enter bindings outrank
     /// the popover's own Cancel/Confirm.
-    pub(crate) focus: FocusHandle,
-    pub(crate) check: EndpointCheck,
-    pub(crate) name: String,
+    pub focus: FocusHandle,
+    pub check: EndpointCheck,
+    pub name: String,
     /// The engine or store message from a failed apply.
-    pub(crate) failure: Option<String>,
+    pub failure: Option<String>,
     /// The row sits too close to the bottom edge for a `TopLeft` popover.
-    pub(crate) flip: bool,
+    pub flip: bool,
 }
 
 impl EndpointCheck {
-    pub(crate) fn can_apply(&self) -> bool {
+    pub fn can_apply(&self) -> bool {
         self.dirty
             && self.parsed.is_some()
             && self.error.is_none()
@@ -83,7 +83,7 @@ impl EndpointCheck {
 }
 
 impl AppView {
-    pub(crate) fn open_endpoint_draft(
+    pub fn open_endpoint_draft(
         &mut self,
         id: &str,
         host: EndpointHost,
@@ -155,7 +155,7 @@ impl AppView {
     /// `Ctrl+E`: the inspector's inline host when it is already showing, the
     /// row's popover when the row is on screen, and the inspector inline host
     /// for a row a filter hides (never invent an off-screen anchor).
-    pub(crate) fn open_endpoint_for_row(
+    pub fn open_endpoint_for_row(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -174,7 +174,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn cancel_endpoint_draft(&mut self, cx: &mut Context<Self>) {
+    pub fn cancel_endpoint_draft(&mut self, cx: &mut Context<Self>) {
         if self.endpoint_draft.take().is_some() {
             cx.notify();
         }
@@ -184,7 +184,7 @@ impl AppView {
     /// paint a host, so it closes rather than outliving its row. The row
     /// popover also closes when the list virtualizes its row away: the
     /// popover has no anchor to follow back into view.
-    pub(crate) fn prune_endpoint_draft(&mut self, cx: &App) {
+    pub fn prune_endpoint_draft(&mut self, cx: &App) {
         let Some(draft) = self.endpoint_draft.as_ref() else {
             return;
         };
@@ -215,7 +215,7 @@ impl AppView {
 
     /// `Esc`: a dirty draft goes back to the stored values and stays open; a
     /// clean one closes. The popover's own Escape never sees it.
-    pub(crate) fn escape_endpoint_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn escape_endpoint_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.endpoint_draft.as_ref() else {
             return;
         };
@@ -241,7 +241,7 @@ impl AppView {
     }
 
     /// The first free port for the typed bind, written into the port field.
-    pub(crate) fn use_suggested_port(
+    pub fn use_suggested_port(
         &mut self,
         port: u16,
         window: &mut Window,
@@ -259,7 +259,7 @@ impl AppView {
 
     /// Everything one paint of the shared form needs, copied out of `AppView`
     /// before the list borrows itself for the frame.
-    pub(crate) fn endpoint_frame(&self, cx: &App) -> Option<EndpointFrame> {
+    pub fn endpoint_frame(&self, cx: &App) -> Option<EndpointFrame> {
         let draft = self.endpoint_draft.as_ref()?;
         let check = self.endpoint_check(cx)?;
         let row = self.row_config(&draft.row_id)?;
@@ -286,7 +286,7 @@ impl AppView {
     /// scroll offset. The library has no section rows, so index × pitch is
     /// exact; the kit's scroll handle does not expose virtual item bounds for
     /// this list, so its `bounds_for_item` always answers `None`.
-    fn endpoint_row_position(&self, index: usize, cx: &App) -> Option<(f32, f32, f32)> {
+    pub fn endpoint_row_position(&self, index: usize, cx: &App) -> Option<(f32, f32, f32)> {
         let list = self.libraries.read(cx);
         let viewport = list.scroll_handle().bounds();
         if viewport.size.height <= px(0.) {
@@ -299,7 +299,7 @@ impl AppView {
 
     /// The row popover opens below its chip unless the chip sits close enough
     /// to the bottom edge that the form would be clamped over the row.
-    fn endpoint_popover_flip(&self, id: &str, cx: &App) -> bool {
+    pub fn endpoint_popover_flip(&self, id: &str, cx: &App) -> bool {
         const FORM_HEIGHT: f32 = 260.;
         let list = self.libraries.read(cx);
         let Some(index) = self.visible.iter().position(|&row_ix| {
@@ -318,7 +318,7 @@ impl AppView {
 
     /// Enter from either field, or from the form itself, only raises a flag;
     /// the next frame consumes it once with a window in hand.
-    pub(crate) fn queue_endpoint_apply(&mut self, cx: &mut Context<Self>) {
+    pub fn queue_endpoint_apply(&mut self, cx: &mut Context<Self>) {
         if let Some(draft) = self.endpoint_draft.as_mut() {
             draft.intent = Some(EndpointIntent::Apply);
             cx.notify();
@@ -327,7 +327,7 @@ impl AppView {
 
     /// Consume an Enter intent on the frame that can push notifications and
     /// reload. The input subscription has no window, so it only raises a flag.
-    pub(crate) fn consume_endpoint_intent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn consume_endpoint_intent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let intent = self
             .endpoint_draft
             .as_mut()
@@ -337,7 +337,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn endpoint_check(&self, cx: &App) -> Option<EndpointCheck> {
+    pub fn endpoint_check(&self, cx: &App) -> Option<EndpointCheck> {
         let draft = self.endpoint_draft.as_ref()?;
         let row = self.row_config(&draft.row_id)?;
         let bind_text = draft.bind.read(cx).value().to_string();
@@ -394,7 +394,7 @@ impl AppView {
     /// Apply the draft. A stopped row is a store write; a running row also
     /// restarts, and an engine refusal rolls the store back and restores the
     /// old serving endpoint.
-    pub(crate) fn apply_endpoint_draft(
+    pub fn apply_endpoint_draft(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -525,7 +525,7 @@ impl AppView {
 /// The row host: the one popover the owning row paints, anchored to its pencil.
 /// `open` is controlled by the draft, so an outside click cancels it through
 /// `on_open_change` instead of leaving a hidden draft behind.
-pub(crate) fn render_endpoint_popover(app: Entity<AppView>, frame: EndpointFrame) -> AnyElement {
+pub fn render_endpoint_popover(app: Entity<AppView>, frame: EndpointFrame) -> AnyElement {
     let anchor = if frame.flip {
         Anchor::BottomLeft
     } else {
@@ -558,7 +558,7 @@ pub(crate) fn render_endpoint_popover(app: Entity<AppView>, frame: EndpointFrame
 
 /// The one form both hosts paint. It reads the live `InputState`s directly, so
 /// every keystroke re-validates without a third copy of the text.
-pub(crate) fn render_endpoint_form(
+pub fn render_endpoint_form(
     app: Entity<AppView>,
     frame: &EndpointFrame,
     cx: &App,

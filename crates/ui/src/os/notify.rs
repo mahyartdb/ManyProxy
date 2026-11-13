@@ -45,7 +45,7 @@ impl NoticeKind {
         }
     }
 
-    fn slot(self) -> usize {
+    pub fn slot(self) -> usize {
         match self {
             Self::EngineCrash => 0,
             Self::SubscriptionFailure => 1,
@@ -73,8 +73,8 @@ pub fn update_notice_allowed(
 /// update notice adds [`update_notice_allowed`] before this gate.
 #[derive(Debug, Default)]
 pub struct NoticePolicy {
-    last_sent: [Option<Instant>; 4],
-    recent: VecDeque<Instant>,
+    pub last_sent: [Option<Instant>; 4],
+    pub recent: VecDeque<Instant>,
 }
 
 impl NoticePolicy {

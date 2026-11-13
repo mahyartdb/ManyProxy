@@ -1,6 +1,6 @@
 use crate::*;
 
-pub(crate) fn flow_choices() -> Vec<PanelChoice> {
+pub fn flow_choices() -> Vec<PanelChoice> {
     let default = t!("choice-default-no-flow");
     panel_choices(
         "vless-flow-option",
@@ -11,7 +11,7 @@ pub(crate) fn flow_choices() -> Vec<PanelChoice> {
     )
 }
 
-pub(crate) fn packet_encoding_choices() -> Vec<PanelChoice> {
+pub fn packet_encoding_choices() -> Vec<PanelChoice> {
     let default = t!("choice-default");
     panel_choices(
         "vless-packet-encoding-option",
@@ -23,7 +23,7 @@ pub(crate) fn packet_encoding_choices() -> Vec<PanelChoice> {
     )
 }
 
-pub(crate) fn network_choices() -> Vec<PanelChoice> {
+pub fn network_choices() -> Vec<PanelChoice> {
     panel_choices(
         "s1-network-option",
         &[
@@ -37,7 +37,7 @@ pub(crate) fn network_choices() -> Vec<PanelChoice> {
     )
 }
 
-pub(crate) fn fp_choices() -> Vec<PanelChoice> {
+pub fn fp_choices() -> Vec<PanelChoice> {
     let default = t!("choice-default-no-fingerprint");
     panel_choices(
         "s2-fp-option",
@@ -57,7 +57,7 @@ pub(crate) fn fp_choices() -> Vec<PanelChoice> {
     )
 }
 
-pub(crate) fn vmess_security_choices() -> Vec<PanelChoice> {
+pub fn vmess_security_choices() -> Vec<PanelChoice> {
     use crate::store::VMESS_CIPHERS;
     let auto_default = t!("choice-auto-default");
     let mut items: Vec<(&str, &str)> = Vec::with_capacity(VMESS_CIPHERS.len());
@@ -72,7 +72,7 @@ pub(crate) fn vmess_security_choices() -> Vec<PanelChoice> {
     panel_choices("vmess-security-option", &items)
 }
 
-pub(crate) fn ss_method_choices() -> Vec<PanelChoice> {
+pub fn ss_method_choices() -> Vec<PanelChoice> {
     use crate::store::SS_METHODS;
     let default = t!("choice-select-method");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -82,7 +82,7 @@ pub(crate) fn ss_method_choices() -> Vec<PanelChoice> {
     panel_choices("ss-method-option", &items)
 }
 
-pub(crate) fn ss_plugin_choices() -> Vec<PanelChoice> {
+pub fn ss_plugin_choices() -> Vec<PanelChoice> {
     let default = t!("choice-no-plugin");
     panel_choices(
         "ss-plugin-option",
@@ -94,7 +94,7 @@ pub(crate) fn ss_plugin_choices() -> Vec<PanelChoice> {
     )
 }
 
-pub(crate) fn awg_version_choices() -> Vec<PanelChoice> {
+pub fn awg_version_choices() -> Vec<PanelChoice> {
     use crate::store::AWG_VERSIONS;
     let default = t!("choice-select-version");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -104,7 +104,7 @@ pub(crate) fn awg_version_choices() -> Vec<PanelChoice> {
     panel_choices("awg-version-option", &items)
 }
 
-pub(crate) fn hy_auth_type_choices() -> Vec<PanelChoice> {
+pub fn hy_auth_type_choices() -> Vec<PanelChoice> {
     use crate::store::HY_AUTH_TYPES;
     let default = t!("choice-default");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -114,7 +114,7 @@ pub(crate) fn hy_auth_type_choices() -> Vec<PanelChoice> {
     panel_choices("hy-auth-type-option", &items)
 }
 
-pub(crate) fn tuic_cc_choices() -> Vec<PanelChoice> {
+pub fn tuic_cc_choices() -> Vec<PanelChoice> {
     use crate::store::TUIC_CC_MODES;
     let default = t!("choice-select");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -124,7 +124,7 @@ pub(crate) fn tuic_cc_choices() -> Vec<PanelChoice> {
     panel_choices("tuic-cc-option", &items)
 }
 
-pub(crate) fn tuic_relay_choices() -> Vec<PanelChoice> {
+pub fn tuic_relay_choices() -> Vec<PanelChoice> {
     use crate::store::TUIC_RELAY_MODES;
     let default = t!("choice-select");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -134,7 +134,7 @@ pub(crate) fn tuic_relay_choices() -> Vec<PanelChoice> {
     panel_choices("tuic-relay-option", &items)
 }
 
-pub(crate) fn socks_version_choices() -> Vec<PanelChoice> {
+pub fn socks_version_choices() -> Vec<PanelChoice> {
     use crate::store::SOCKS_VERSIONS;
     let default = t!("choice-select-version-5");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -144,11 +144,11 @@ pub(crate) fn socks_version_choices() -> Vec<PanelChoice> {
     panel_choices("socks-version-option", &items)
 }
 
-pub(crate) fn socks_network_choices() -> Vec<PanelChoice> {
+pub fn socks_network_choices() -> Vec<PanelChoice> {
     panel_choices("socks-network-option", &[("tcp", "tcp"), ("udp", "udp")])
 }
 
-pub(crate) fn naive_cc_choices() -> Vec<PanelChoice> {
+pub fn naive_cc_choices() -> Vec<PanelChoice> {
     use crate::store::NAIVE_CC_MODES;
     let default = t!("choice-select");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -158,11 +158,11 @@ pub(crate) fn naive_cc_choices() -> Vec<PanelChoice> {
     panel_choices("naive-cc-option", &items)
 }
 
-pub(crate) fn ssh_key_pick_error(path: &str) -> String {
+pub fn ssh_key_pick_error(path: &str) -> String {
     t!("ssh-key-unreadable", path = path)
 }
 
-pub(crate) fn snell_version_choices() -> Vec<PanelChoice> {
+pub fn snell_version_choices() -> Vec<PanelChoice> {
     use crate::store::SNELL_VERSIONS;
     let default = t!("choice-select-version-4");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -172,7 +172,7 @@ pub(crate) fn snell_version_choices() -> Vec<PanelChoice> {
     panel_choices("snell-version-option", &items)
 }
 
-pub(crate) fn shadowtls_version_choices() -> Vec<PanelChoice> {
+pub fn shadowtls_version_choices() -> Vec<PanelChoice> {
     use crate::store::SHADOWTLS_VERSIONS;
     let default = t!("choice-select-version-1");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -182,7 +182,7 @@ pub(crate) fn shadowtls_version_choices() -> Vec<PanelChoice> {
     panel_choices("shadowtls-version-option", &items)
 }
 
-pub(crate) fn xray_network_choices() -> Vec<PanelChoice> {
+pub fn xray_network_choices() -> Vec<PanelChoice> {
     use crate::store::XRAY_NETWORKS;
     let default = t!("choice-select-network");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -192,7 +192,7 @@ pub(crate) fn xray_network_choices() -> Vec<PanelChoice> {
     panel_choices("xray-network-option", &items)
 }
 
-pub(crate) fn xray_flow_choices() -> Vec<PanelChoice> {
+pub fn xray_flow_choices() -> Vec<PanelChoice> {
     use crate::store::XRAY_FLOWS;
     let default = t!("choice-default-no-flow");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];
@@ -202,7 +202,7 @@ pub(crate) fn xray_flow_choices() -> Vec<PanelChoice> {
     panel_choices("xray-flow-option", &items)
 }
 
-pub(crate) fn xray_mux_choices() -> Vec<PanelChoice> {
+pub fn xray_mux_choices() -> Vec<PanelChoice> {
     use crate::store::XRAY_MUX_MODES;
     let default = t!("choice-keep-default");
     let mut items: Vec<(&str, &str)> = vec![("", default.as_str())];

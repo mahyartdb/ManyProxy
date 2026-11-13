@@ -6,7 +6,7 @@ impl AppView {
     /// The filter slot above the table. It always occupies its row, so the
     /// table never moves. A selection swaps the row for the batch bar; the
     /// query stays untouched underneath.
-    pub(crate) fn render_filter_slot(
+    pub fn render_filter_slot(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -36,7 +36,7 @@ impl AppView {
         self.render_filter_row(cx)
     }
 
-    fn render_filter_row(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_filter_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let active = self.query.is_active();
 
@@ -134,7 +134,7 @@ impl AppView {
         row.into_any_element()
     }
 
-    fn render_filter_count(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_filter_count(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.filter_count_text(cx);
         div()
             .id("filter-count")
@@ -149,7 +149,7 @@ impl AppView {
 
     /// R24: the count is always present. A first load with no rows names the
     /// wait instead of a lying `0 of 0`; otherwise it reads N of M.
-    pub(crate) fn filter_count_text(&self, cx: &App) -> String {
+    pub fn filter_count_text(&self, cx: &App) -> String {
         let delegate = self.libraries.read(cx).delegate();
         if delegate.rows.is_empty() && matches!(delegate.load, LibraryLoad::Loading(_)) {
             return t!("library-loading");
@@ -157,7 +157,7 @@ impl AppView {
         search_count_text(self.visible.len(), scope_total(&delegate.rows, &self.scope))
     }
 
-    fn render_status_menu(
+    pub fn render_status_menu(
         &self,
         view: &Entity<AppView>,
         counts: Vec<(StatusFacet, usize)>,
@@ -220,7 +220,7 @@ impl AppView {
         cell.into_any_element()
     }
 
-    fn render_protocol_menu(
+    pub fn render_protocol_menu(
         &self,
         view: &Entity<AppView>,
         options: Vec<(String, usize)>,
@@ -301,7 +301,7 @@ impl AppView {
         cell.into_any_element()
     }
 
-    fn render_filter_popover(
+    pub fn render_filter_popover(
         &self,
         view: &Entity<AppView>,
         latency_options: Vec<(LatencyBucket, usize)>,
@@ -526,7 +526,7 @@ impl AppView {
     }
 }
 
-fn status_label(status: StatusFacet) -> String {
+pub fn status_label(status: StatusFacet) -> String {
     match status {
         StatusFacet::Enabled => t!("facet-status-enabled"),
         StatusFacet::Disabled => t!("facet-status-disabled"),
@@ -536,7 +536,7 @@ fn status_label(status: StatusFacet) -> String {
     }
 }
 
-fn status_token(status: StatusFacet) -> &'static str {
+pub fn status_token(status: StatusFacet) -> &'static str {
     match status {
         StatusFacet::Enabled => "enabled",
         StatusFacet::Disabled => "disabled",

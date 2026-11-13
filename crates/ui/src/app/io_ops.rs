@@ -4,7 +4,7 @@ impl AppView {
     /// T-03: the one SOCKS copy. It reads the row by id and uses the STORED
     /// bind host, so the row's own `Copy SOCKS` and the inspector's SOCKS
     /// control always copy the row they belong to — never the selection.
-    pub(crate) fn copy_row_socks(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy_row_socks(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -14,7 +14,7 @@ impl AppView {
         window.push_notification(Notification::success(t!("copied-socks-url")), cx);
     }
 
-    pub(crate) fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -25,7 +25,7 @@ impl AppView {
     }
 
     /// The chip's chevron: the HTTP form of the row's endpoint.
-    pub(crate) fn copy_row_http(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy_row_http(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -36,7 +36,7 @@ impl AppView {
     }
 
     /// The chip's chevron: both forms, SOCKS first, one per line.
-    pub(crate) fn copy_row_both(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy_row_both(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -46,7 +46,7 @@ impl AppView {
         window.push_notification(Notification::success(t!("copied-proxy-urls")), cx);
     }
 
-    pub(crate) fn copy_selected_urls(
+    pub fn copy_selected_urls(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -76,7 +76,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn copy_selected_socks(
+    pub fn copy_selected_socks(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -116,7 +116,7 @@ impl AppView {
     /// `window.bounds()`: the former is the exact inverse of the
     /// `WindowBounds::Windowed` transform startup uses, while the live client
     /// rect skips the frame split and walked the window up 4px per relaunch.
-    pub(crate) fn save_window_geometry(&mut self, window: &Window) {
+    pub fn save_window_geometry(&mut self, window: &Window) {
         let WindowBounds::Windowed(bounds) = window.window_bounds() else {
             return;
         };
@@ -131,7 +131,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn snapshot_running_set(&mut self, running: &[String]) {
+    pub fn snapshot_running_set(&mut self, running: &[String]) {
         if self.last_snapshot.as_slice() == running {
             return;
         }
@@ -141,7 +141,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn copy_config_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy_config_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folder = crate::tray::config_folder();
         cx.write_to_clipboard(ClipboardItem::new_string(folder.clone()));
         window.push_notification(
@@ -150,7 +150,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn write_visible_logs_to(
+    pub fn write_visible_logs_to(
         &self,
         path: &std::path::Path,
         cx: &App,
@@ -164,7 +164,7 @@ impl AppView {
         Ok(())
     }
 
-    pub(crate) fn save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_logs_path();
         if path.exists() {
             let view = cx.entity();
@@ -192,7 +192,7 @@ impl AppView {
         self.commit_save_visible_logs(window, cx);
     }
 
-    pub(crate) fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lines = self.log_lines(cx);
         if lines.is_empty() {
             window.push_notification(Notification::warning(t!("no-log-lines-to-copy")), cx);
@@ -205,7 +205,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn wipe_library_for_restore(&mut self) -> Result<(), StoreError> {
+    pub fn wipe_library_for_restore(&mut self) -> Result<(), StoreError> {
         let subs = self.store.list_subscriptions()?;
         for sub in &subs {
             self.store.remove_subscription(&sub.id)?;
@@ -217,7 +217,7 @@ impl AppView {
         Ok(())
     }
 
-    pub(crate) fn paste_intake_refusal(text: &str) -> Option<String> {
+    pub fn paste_intake_refusal(text: &str) -> Option<String> {
         use crate::preset::{is_remote_route_attempt, is_route_attempt, looks_like_preset_json};
         if text.trim().is_empty() {
             return Some(t!("clipboard-no-text"));
@@ -247,7 +247,7 @@ impl AppView {
     /// parses cleanly. The ambiguous branches of the import grammar keep
     /// their dialog (library exports keep their explicit-confirm restore —
     /// hard rule; the bare-HTTP chooser and preset shells keep asking).
-    pub(crate) fn import_text_direct(
+    pub fn import_text_direct(
         &mut self,
         text: String,
         window: &mut Window,
@@ -263,7 +263,7 @@ impl AppView {
         self.commit_import_dialog(text, group, None, None, None, window, cx);
     }
 
-    pub(crate) fn import_from_clipboard_direct(
+    pub fn import_from_clipboard_direct(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -278,7 +278,7 @@ impl AppView {
     /// F7: every dropped file lands in the Import dialog when it is open —
     /// the same merge the Browse button runs — instead of being refused. Any
     /// other overlay still refuses; only the Import form absorbs drops.
-    pub(crate) fn import_dropped_files(
+    pub fn import_dropped_files(
         &mut self,
         paths: &ExternalPaths,
         window: &mut Window,
@@ -341,7 +341,7 @@ impl AppView {
         }
     }
 
-    fn read_dropped_import_files(paths: &ExternalPaths) -> (Vec<(String, String)>, Vec<String>) {
+    pub fn read_dropped_import_files(paths: &ExternalPaths) -> (Vec<(String, String)>, Vec<String>) {
         let mut files: Vec<(String, String)> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
         for path in paths.0.iter() {
@@ -357,7 +357,7 @@ impl AppView {
         (files, unreadable)
     }
 
-    fn drop_refusal_text(unreadable: &[String]) -> String {
+    pub fn drop_refusal_text(unreadable: &[String]) -> String {
         if unreadable.is_empty() {
             t!("no-readable-files-dropped")
         } else {
@@ -365,7 +365,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn import_parse_cancelled(&mut self, epoch: u64) -> bool {
+    pub fn import_parse_cancelled(&mut self, epoch: u64) -> bool {
         if self.import_cancel_epoch == Some(epoch) {
             self.import_cancel_epoch = None;
             true
@@ -374,7 +374,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn take_batch_name_lists(
+    pub fn take_batch_name_lists(
         &mut self,
     ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         (
@@ -385,7 +385,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn take_batch_counts(
+    pub fn take_batch_counts(
         &mut self,
     ) -> (usize, usize, usize, usize, usize, usize, usize) {
         self.refresh.members.clear();
@@ -403,7 +403,7 @@ impl AppView {
         (total, added, updated, removed, failed, conflicts, in_use)
     }
 
-    pub(crate) fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (added_names, updated_names, removed_names, kept_in_use_names) =
             self.take_batch_name_lists();
         let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
@@ -449,7 +449,7 @@ impl AppView {
 
     /// Post-download staging shared by both finish variants: write the staged
     /// bytes, then record the row (or refresh the identical row on re-download).
-    pub(crate) fn stage_rule_set_bytes(
+    pub fn stage_rule_set_bytes(
         &mut self,
         grant: &RuleSetDownloadGrant,
         bytes: Vec<u8>,
@@ -492,7 +492,7 @@ impl AppView {
 
     /// Writes the cell value to the clipboard (bind:port-safe display strings
     /// only). Returns `false` without touching the clipboard for an empty value.
-    pub(crate) fn copy_connection_dest(
+    pub fn copy_connection_dest(
         &mut self,
         dest: &str,
         window: &mut Window,
@@ -509,7 +509,7 @@ impl AppView {
     /// Click-to-copy for a Connections cell: clipboard write plus a transient
     /// inline `Copied!` marker anchored at the clicked cell. Repeat clicks reuse
     /// the generation guard so the newest marker survives its full window.
-    pub(crate) fn copy_conn_cell(
+    pub fn copy_conn_cell(
         &mut self,
         target: ConnCopyTarget,
         value: &str,

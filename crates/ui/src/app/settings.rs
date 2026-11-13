@@ -19,7 +19,7 @@ use std::cell::Cell;
 
 /// T-04/B17: the six named sections, in spine order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SettingsSection {
+pub enum SettingsSection {
     General,
     Probing,
     Updates,
@@ -29,7 +29,7 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ORDER: [SettingsSection; 6] = [
+    pub const ORDER: [SettingsSection; 6] = [
         SettingsSection::General,
         SettingsSection::Probing,
         SettingsSection::Updates,
@@ -41,7 +41,7 @@ impl SettingsSection {
     /// The section's name — the column header. Test-only: the live header
     /// reads `settings_section_label`, which can reach the Fluent bundle.
     #[cfg(test)]
-    pub(crate) fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             SettingsSection::General => "General",
             SettingsSection::Probing => "Probing",
@@ -53,7 +53,7 @@ impl SettingsSection {
     }
 
     /// The column header's element id.
-    pub(crate) fn header_id(self) -> &'static str {
+    pub fn header_id(self) -> &'static str {
         match self {
             SettingsSection::General => "settings-section-general",
             SettingsSection::Probing => "settings-section-probing",
@@ -65,7 +65,7 @@ impl SettingsSection {
     }
 
     /// The section body's element id.
-    pub(crate) fn body_id(self) -> &'static str {
+    pub fn body_id(self) -> &'static str {
         match self {
             SettingsSection::General => "settings-body-general",
             SettingsSection::Probing => "settings-body-probing",
@@ -82,27 +82,27 @@ impl SettingsSection {
 /// input adds 10 px of padding per side, so the field needs 540.8 px of room.
 /// 820 px leaves the 168 px rail, a 16 px gap, a 604 px body (584 px of text
 /// room after the padding) and the kit's 16 px padding on each side.
-const SETTINGS_DIALOG_WIDTH: f32 = 820.;
+pub const SETTINGS_DIALOG_WIDTH: f32 = 820.;
 
 /// T-04/B17: the label column's width. Every row's label starts here, so the
 /// labels read as one column and the controls as another — and it is wide
 /// enough for the longest label to stay on one line, because a label that wraps
 /// reads as two columns of label text beside the controls.
-pub(crate) const SETTINGS_LABEL_WIDTH: f32 = 300.;
+pub const SETTINGS_LABEL_WIDTH: f32 = 300.;
 
 /// T-04: the width a text field's control column takes.
-const SETTINGS_CONTROL_WIDTH: f32 = 320.;
+pub const SETTINGS_CONTROL_WIDTH: f32 = 320.;
 
 /// T-04: the chrome the kit's dialog adds around the body — 16 px of padding
 /// top and bottom, the title line, two 16 px gaps and the 24 px footer button.
-const SETTINGS_CHROME_HEIGHT: f32 = 100.;
+pub const SETTINGS_CHROME_HEIGHT: f32 = 100.;
 
 /// T-04/K9: the tallest the section body may grow before it scrolls. The kit
 /// clamps a dialog to `viewport - viewport/10 - 16` px (its own top margin plus
 /// the theme's large spacing), so the body takes what is left after the chrome.
 /// Short sections stay shorter than this — the body hugs its content, so a
 /// three-control section never paints a 500 px black void under itself.
-fn settings_body_max_height(window: &Window) -> f32 {
+pub fn settings_body_max_height(window: &Window) -> f32 {
     let viewport = window.viewport_size().height.as_f32();
     let max_height = viewport - viewport / 10.0 - 16.0;
     (max_height - SETTINGS_CHROME_HEIGHT).max(0.0)
@@ -111,7 +111,7 @@ fn settings_body_max_height(window: &Window) -> f32 {
 /// T-04/B17: one setting row — the label on the left, the control on the
 /// right, and at most one muted help line beneath. A row the filter misses is
 /// hidden but still counted, so the badge can say how many of how many showed.
-fn settings_row(
+pub fn settings_row(
     state: &SettingsState,
     id: &'static str,
     label: impl Into<String>,
@@ -159,7 +159,7 @@ fn settings_row(
 /// T-04: the one deliberate full-width field. The label sits above the
 /// control and the control takes the whole column, because the update-feed URL
 /// is longer than the label column plus a right-hand control column can hold.
-fn settings_field_row(
+pub fn settings_field_row(
     state: &SettingsState,
     id: &'static str,
     label: impl Into<String>,
@@ -200,49 +200,49 @@ fn settings_field_row(
 /// T-04: the state the dialog body reads on every frame. The body is rebuilt
 /// each frame and cannot read the view it belongs to, so every value it shows
 /// travels through one of these cells.
-struct SettingsState {
-    view: Entity<AppView>,
-    appearance: Rc<RefCell<String>>,
-    accent: Rc<RefCell<Accent>>,
-    text_size: Rc<RefCell<TextSize>>,
+pub struct SettingsState {
+    pub view: Entity<AppView>,
+    pub appearance: Rc<RefCell<String>>,
+    pub accent: Rc<RefCell<Accent>>,
+    pub text_size: Rc<RefCell<TextSize>>,
     /// R22/R30: the row density. It owns the row pitch and every chrome
     /// height, and it is persisted under `row_density`.
-    density: Rc<RefCell<Density>>,
-    text_size_slider: Entity<SliderState>,
-    autostart: Rc<RefCell<bool>>,
-    link_handler: Rc<RefCell<bool>>,
-    restore: Rc<RefCell<bool>>,
-    auto_restart: Rc<RefCell<bool>>,
-    notify_from_tray: Rc<RefCell<bool>>,
-    passive_update_check: Rc<RefCell<bool>>,
-    close_action: Rc<RefCell<CloseAction>>,
-    show_tray: Rc<RefCell<bool>>,
-    window_corners: Rc<RefCell<WindowCorners>>,
-    test_all_scope: Rc<RefCell<TestAllScope>>,
-    bind_hosts: Rc<RefCell<Vec<String>>>,
-    bind_host_error: Rc<RefCell<Option<String>>>,
-    last_check: Rc<RefCell<Option<i64>>>,
-    test_url: Entity<InputState>,
-    feed_url: Entity<InputState>,
-    timeout_input: Entity<InputState>,
-    bind_host_input: Entity<InputState>,
-    log_cap_input: Entity<InputState>,
-    filter: Entity<InputState>,
+    pub density: Rc<RefCell<Density>>,
+    pub text_size_slider: Entity<SliderState>,
+    pub autostart: Rc<RefCell<bool>>,
+    pub link_handler: Rc<RefCell<bool>>,
+    pub restore: Rc<RefCell<bool>>,
+    pub auto_restart: Rc<RefCell<bool>>,
+    pub notify_from_tray: Rc<RefCell<bool>>,
+    pub passive_update_check: Rc<RefCell<bool>>,
+    pub close_action: Rc<RefCell<CloseAction>>,
+    pub show_tray: Rc<RefCell<bool>>,
+    pub window_corners: Rc<RefCell<WindowCorners>>,
+    pub test_all_scope: Rc<RefCell<TestAllScope>>,
+    pub bind_hosts: Rc<RefCell<Vec<String>>>,
+    pub bind_host_error: Rc<RefCell<Option<String>>>,
+    pub last_check: Rc<RefCell<Option<i64>>>,
+    pub test_url: Entity<InputState>,
+    pub feed_url: Entity<InputState>,
+    pub timeout_input: Entity<InputState>,
+    pub bind_host_input: Entity<InputState>,
+    pub log_cap_input: Entity<InputState>,
+    pub filter: Entity<InputState>,
     /// `(shown, total)` — written while the column is built, read by the
     /// filter badge. The column is rebuilt every frame, so it resets there.
-    counted: Rc<Cell<(usize, usize)>>,
+    pub counted: Rc<Cell<(usize, usize)>>,
     /// B17: this frame's filter query, trimmed and lowercased. Written once at
     /// the top of `render_body`; every row reads it instead of re-reading the
     /// field, because the column is rebuilt every frame.
-    query: Rc<RefCell<String>>,
+    pub query: Rc<RefCell<String>>,
     /// K9/A7-5: the three cores as `(row id, name, exe)`, resolved once when the
     /// dialog opens. The dialog is rebuilt every frame and the binaries cannot
     /// change under it, so resolving them per frame was pure I/O in a paint.
-    engines: Vec<(&'static str, &'static str, Option<std::path::PathBuf>)>,
+    pub engines: Vec<(&'static str, &'static str, Option<std::path::PathBuf>)>,
     /// T-04: the two folder paths Maintenance shows, resolved at open for the
     /// same reason: `app_data_dir` asks the OS for the exe path.
-    data_folder: String,
-    logs_path: String,
+    pub data_folder: String,
+    pub logs_path: String,
 }
 
 impl SettingsState {
@@ -250,7 +250,7 @@ impl SettingsState {
     /// in the row's label or its id, so two tokens narrow instead of widen, and
     /// a row's id (`settings-row-autostart`) is searchable when the label is not
     /// the word the user reached for.
-    fn row_matches(query: &str, id: &str, label: &str) -> bool {
+    pub fn row_matches(query: &str, id: &str, label: &str) -> bool {
         if query.is_empty() {
             return true;
         }
@@ -261,7 +261,7 @@ impl SettingsState {
     }
 
     /// B17: count one row and report whether it shows.
-    fn note_row(&self, id: &str, label: &str) -> bool {
+    pub fn note_row(&self, id: &str, label: &str) -> bool {
         let shown = Self::row_matches(&self.query.borrow(), id, label);
         let (mut shown_count, mut total) = self.counted.get();
         total += 1;
@@ -274,7 +274,7 @@ impl SettingsState {
 
     /// B17: a row that is not built by `settings_row` still has to be counted
     /// and hidden, or its section would vanish under a filter that matches it.
-    fn filtered(&self, id: &str, label: &str, element: impl Styled + IntoElement) -> AnyElement {
+    pub fn filtered(&self, id: &str, label: &str, element: impl Styled + IntoElement) -> AnyElement {
         let shown = self.note_row(id, label);
         // Hiding the row itself, not a wrapper around it: the wrapper was one
         // more element in a column GPUI lays out again on every frame.
@@ -284,7 +284,7 @@ impl SettingsState {
     }
 
     /// B17: one caps section header over a hairline.
-    fn section_header(&self, section: SettingsSection, cx: &App) -> AnyElement {
+    pub fn section_header(&self, section: SettingsSection, cx: &App) -> AnyElement {
         div()
             .id(section.header_id())
             .test_support()
@@ -305,7 +305,7 @@ impl SettingsState {
     /// B17: the filter field. The kit's own cleanable affordance clears it — no
     /// hand-rolled Clear button — and the count reads `N of M` exactly like the
     /// library's search count.
-    fn render_filter_band(&self, cx: &mut App) -> AnyElement {
+    pub fn render_filter_band(&self, cx: &mut App) -> AnyElement {
         let (shown, total) = self.counted.get();
         div()
             .id("settings-filter-band")
@@ -338,7 +338,7 @@ impl SettingsState {
     /// T-04/B17: every section in one column, in fixed order. A section whose
     /// rows all miss the filter takes its header with it, so the column reads as
     /// the filter's result and not as a mostly empty spine.
-    fn render_body(&self, _window: &mut Window, cx: &mut App) -> AnyElement {
+    pub fn render_body(&self, _window: &mut Window, cx: &mut App) -> AnyElement {
         self.counted.set((0, 0));
         *self.query.borrow_mut() = self.filter.read(cx).value().trim().to_lowercase();
         let mut column = div()
@@ -380,7 +380,7 @@ impl SettingsState {
     }
 
     /// T-04: General — appearance, startup, window behaviour.
-    fn render_general(&self, cx: &mut App) -> AnyElement {
+    pub fn render_general(&self, cx: &mut App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut body = div()
             .id(SettingsSection::General.body_id())
@@ -820,7 +820,7 @@ impl SettingsState {
 
     /// T-04: Probing — the URL a probe fetches, how long it may take, and the
     /// rows a "Test all" run covers.
-    fn render_probing(&self, cx: &mut App) -> AnyElement {
+    pub fn render_probing(&self, cx: &mut App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut body = div()
             .id(SettingsSection::Probing.body_id())
@@ -901,7 +901,7 @@ impl SettingsState {
     }
 
     /// T-04: Updates — the feed the release check reads, and when it last ran.
-    fn render_updates(&self, cx: &mut App) -> AnyElement {
+    pub fn render_updates(&self, cx: &mut App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut body = div()
             .id(SettingsSection::Updates.body_id())
@@ -989,7 +989,7 @@ impl SettingsState {
 
     /// T-04: Engine — the cores beside the app, the crash restart, and the
     /// address list every row's picker reads.
-    fn render_engine(&self, cx: &mut App) -> AnyElement {
+    pub fn render_engine(&self, cx: &mut App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut body = div()
             .id(SettingsSection::Engine.body_id())
@@ -1144,7 +1144,7 @@ impl SettingsState {
     }
 
     /// T-04: the bind-address list, one row per address.
-    fn render_bind_hosts(&self, cx: &mut App) -> AnyElement {
+    pub fn render_bind_hosts(&self, cx: &mut App) -> AnyElement {
         let mut list = div()
             .id("settings-bind-host-list")
             .test_support()
@@ -1215,7 +1215,7 @@ impl SettingsState {
     }
 
     /// T-04: the "Add address" button, right-aligned against the field.
-    fn render_add_bind_host(&self) -> AnyElement {
+    pub fn render_add_bind_host(&self) -> AnyElement {
         let view = self.view.clone();
         let input = self.bind_host_input.clone();
         let cell = self.bind_hosts.clone();
@@ -1247,7 +1247,7 @@ impl SettingsState {
     }
 
     /// T-04: Maintenance — the upkeep actions, and the destructive ones.
-    fn render_maintenance(&self, cx: &mut App) -> AnyElement {
+    pub fn render_maintenance(&self, cx: &mut App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut body = div()
             .id(SettingsSection::Maintenance.body_id())
@@ -1370,7 +1370,7 @@ impl SettingsState {
 
     /// T-04: Shortcuts — every binding, read from the one list the reference
     /// below the app uses, so the two can never drift apart.
-    fn render_shortcuts(&self, cx: &mut App) -> AnyElement {
+    pub fn render_shortcuts(&self, cx: &mut App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut body = div()
             .id(SettingsSection::Shortcuts.body_id())
@@ -1413,7 +1413,7 @@ impl SettingsState {
 /// T-04: what the close button does, given the stored choice and whether a
 /// tray exists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum CloseRoute {
+pub enum CloseRoute {
     /// Hide the window to the tray; the proxies keep running.
     HideToTray,
     /// Take the quit path: stop every profile and exit.
@@ -1423,21 +1423,21 @@ pub(crate) enum CloseRoute {
 /// T-04: the destructive Maintenance actions, named so the row builder can
 /// pick one without a closure per row.
 #[derive(Clone, Copy)]
-enum MaintenanceAction {
+pub enum MaintenanceAction {
     Traffic,
     Health,
     Snapshot,
 }
 
 /// T-04: the data folder the app writes into, as shown in Maintenance.
-fn data_folder_text() -> String {
+pub fn data_folder_text() -> String {
     crate::store::app_data_dir().display().to_string()
 }
 
 /// K9/A7-5: the Engine section's whole resting summary — name and resolved
 /// state, no path. The path rides behind `Details` so a long install path is
 /// never truncated mid-directory in the row.
-pub(crate) fn engine_summary(name: &str, ready: bool) -> String {
+pub fn engine_summary(name: &str, ready: bool) -> String {
     if ready {
         t!("settings-engine-ready", name = name)
     } else {
@@ -1447,7 +1447,7 @@ pub(crate) fn engine_summary(name: &str, ready: bool) -> String {
 
 /// K9/A7-5: the one `Details` tooltip. A resolved engine names its exe; a
 /// missing one states the lookup rule instead of inventing a path.
-pub(crate) fn engine_details_tooltip(name: &str, path: Option<&std::path::Path>) -> String {
+pub fn engine_details_tooltip(name: &str, path: Option<&std::path::Path>) -> String {
     match path {
         Some(path) => t!(
             "settings-engine-details-path",
@@ -1460,16 +1460,16 @@ pub(crate) fn engine_details_tooltip(name: &str, path: Option<&std::path::Path>)
 
 /// K9: the text fields the one footer `Save` owns. Toggles and radios keep
 /// their save-on-change contract; these four commit on Enter or on `Save`.
-pub(crate) struct SettingsTextDraft {
-    pub(crate) test_url: String,
-    pub(crate) probe_timeout: String,
-    pub(crate) feed_url: String,
-    pub(crate) log_cap: String,
+pub struct SettingsTextDraft {
+    pub test_url: String,
+    pub probe_timeout: String,
+    pub feed_url: String,
+    pub log_cap: String,
 }
 
 /// T-04: a check timestamp, rendered as plain local text. The app never
 /// claims a timezone it does not know.
-fn format_check_time(at: i64) -> String {
+pub fn format_check_time(at: i64) -> String {
     let seconds = at.rem_euclid(86_400);
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
@@ -1483,7 +1483,7 @@ impl AppView {
     /// K9: the footer `Save` commits every text field whose value differs from
     /// the stored one and skips the rest, so one Save never fires a toast per
     /// untouched field. A refused value keeps the dialog open.
-    pub(crate) fn commit_settings_text_draft(
+    pub fn commit_settings_text_draft(
         &mut self,
         draft: &SettingsTextDraft,
         window: &mut Window,
@@ -1524,7 +1524,7 @@ impl AppView {
         saved
     }
 
-    pub(crate) fn commit_autostart(
+    pub fn commit_autostart(
         &mut self,
         enabled: bool,
         window: &mut Window,
@@ -1552,7 +1552,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_link_handler(
+    pub fn commit_link_handler(
         &mut self,
         enabled: bool,
         window: &mut Window,
@@ -1585,7 +1585,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_restore_opt_in(
+    pub fn commit_restore_opt_in(
         &mut self,
         enabled: bool,
         window: &mut Window,
@@ -1615,7 +1615,7 @@ impl AppView {
 
     /// "Automatically restart crashed cores" setting; a missing or corrupt value
     /// reads as enabled, matching `AutoRestartConfig::default()`.
-    pub(crate) fn auto_restart_enabled(&self) -> bool {
+    pub fn auto_restart_enabled(&self) -> bool {
         self.store
             .get_meta(META_AUTO_RESTART)
             .map(|value| value.as_deref() != Some("0"))
@@ -1624,7 +1624,7 @@ impl AppView {
 
     /// Pushes the persisted auto-restart choice into the live engine. Called once
     /// at startup so a saved opt-out takes effect before the first crash tick.
-    pub(crate) fn apply_engine_auto_restart(&mut self) {
+    pub fn apply_engine_auto_restart(&mut self) {
         self.engine.set_auto_restart(AutoRestartConfig {
             enabled: self.auto_restart_enabled(),
             ..AutoRestartConfig::default()
@@ -1632,14 +1632,14 @@ impl AppView {
     }
 
     /// "Notify from the tray"; missing or corrupt reads as on.
-    pub(crate) fn notify_from_tray_enabled(&self) -> bool {
+    pub fn notify_from_tray_enabled(&self) -> bool {
         self.store
             .get_meta(META_NOTIFY_FROM_TRAY)
             .map(|value| value.as_deref() != Some("0"))
             .unwrap_or(true)
     }
 
-    pub(crate) fn commit_notify_from_tray(
+    pub fn commit_notify_from_tray(
         &mut self,
         enabled: bool,
         window: &mut Window,
@@ -1674,14 +1674,14 @@ impl AppView {
     }
 
     /// "Check for updates weekly"; missing or corrupt reads as on.
-    pub(crate) fn passive_update_check_enabled(&self) -> bool {
+    pub fn passive_update_check_enabled(&self) -> bool {
         self.store
             .get_meta(META_PASSIVE_UPDATE_CHECK)
             .map(|value| value.as_deref() != Some("0"))
             .unwrap_or(true)
     }
 
-    pub(crate) fn commit_passive_update_check(
+    pub fn commit_passive_update_check(
         &mut self,
         enabled: bool,
         window: &mut Window,
@@ -1721,7 +1721,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_auto_restart(
+    pub fn commit_auto_restart(
         &mut self,
         enabled: bool,
         window: &mut Window,
@@ -1756,7 +1756,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_appearance(
+    pub fn commit_appearance(
         &mut self,
         value: &str,
         window: &mut Window,
@@ -1787,7 +1787,7 @@ impl AppView {
     /// Task 11: an accent pick saves and repaints at once. The full appearance
     /// pass re-stamps the accent after `Theme::change` rebuilt the theme, then
     /// restores the reading scale that same rebuild reset.
-    pub(crate) fn commit_accent(
+    pub fn commit_accent(
         &mut self,
         accent: Accent,
         window: &mut Window,
@@ -1815,7 +1815,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_text_size(
+    pub fn commit_text_size(
         &mut self,
         size: TextSize,
         window: &mut Window,
@@ -1844,7 +1844,7 @@ impl AppView {
 
     /// T-04: the close button's behaviour. `Tray` keeps the proxies running;
     /// `Quit` stops them and exits.
-    pub(crate) fn commit_close_action(
+    pub fn commit_close_action(
         &mut self,
         action: CloseAction,
         window: &mut Window,
@@ -1874,7 +1874,7 @@ impl AppView {
     /// Task 12: save the frame style and hand it to DWM at once. The attribute
     /// is unknown below Windows 11, so a failure there leaves stock corners and
     /// is not a user error.
-    pub(crate) fn commit_window_corners(
+    pub fn commit_window_corners(
         &mut self,
         corners: WindowCorners,
         window: &mut Window,
@@ -1908,7 +1908,7 @@ impl AppView {
     /// removing the only way back from a hidden window, makes close mean Quit;
     /// on rebuilds the icon. The stored close choice is untouched, so it
     /// returns with the icon.
-    pub(crate) fn commit_show_tray_icon(
+    pub fn commit_show_tray_icon(
         &mut self,
         show: bool,
         window: &mut Window,
@@ -1950,7 +1950,7 @@ impl AppView {
     }
 
     /// T-04: how long one URL probe may take.
-    pub(crate) fn commit_probe_timeout(
+    pub fn commit_probe_timeout(
         &mut self,
         raw: &str,
         window: &mut Window,
@@ -1991,7 +1991,7 @@ impl AppView {
     }
 
     /// T-04: which rows a "Test all" run covers.
-    pub(crate) fn commit_test_all_scope(
+    pub fn commit_test_all_scope(
         &mut self,
         scope: TestAllScope,
         window: &mut Window,
@@ -2021,7 +2021,7 @@ impl AppView {
     /// T-04: adds one address to the list the Settings editor draws from.
     /// The store owns validation (IP literals only, no duplicates); the message
     /// it returns is exactly what the Settings field shows inline.
-    pub(crate) fn commit_add_bind_host(
+    pub fn commit_add_bind_host(
         &mut self,
         raw: &str,
         window: &mut Window,
@@ -2046,7 +2046,7 @@ impl AppView {
 
     /// T-33: removes one extra. The store refuses constants and any bind a row
     /// still uses; that refusal names the blocking row(s) and lands inline.
-    pub(crate) fn commit_remove_bind_host(
+    pub fn commit_remove_bind_host(
         &mut self,
         host: &str,
         window: &mut Window,
@@ -2071,7 +2071,7 @@ impl AppView {
 
     /// T-04: opens the app's data folder in the shell. The path is the app's
     /// own folder — nothing outside it is ever opened.
-    pub(crate) fn open_data_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_data_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folder = crate::store::app_data_dir();
         match open_folder_in_shell(&folder) {
             Ok(()) => {
@@ -2095,7 +2095,7 @@ impl AppView {
 
     /// T-04: the naming confirm for the library reset. The dialog names the
     /// library and the number of configurations it would delete.
-    pub(crate) fn open_reset_library_confirm(
+    pub fn open_reset_library_confirm(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2127,7 +2127,7 @@ impl AppView {
 
     /// T-04: empties the library. Running profiles are stopped first, so no
     /// sidecar is left behind.
-    pub(crate) fn commit_reset_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_reset_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.store.list().unwrap_or_default();
         let mut removed = 0usize;
         for row in &rows {
@@ -2166,7 +2166,7 @@ impl AppView {
     /// T-04/Task 14: the close button's route. `Tray` hides the window only
     /// when the icon setting is on and a tray actually exists to hide to;
     /// otherwise there is nothing to hide to, so the close takes the quit path.
-    pub(crate) fn close_route(&self, has_tray: bool) -> CloseRoute {
+    pub fn close_route(&self, has_tray: bool) -> CloseRoute {
         match self.store.close_action() {
             CloseAction::Tray if has_tray && self.store.show_tray_icon() => CloseRoute::HideToTray,
             _ => CloseRoute::Quit,
@@ -2175,7 +2175,7 @@ impl AppView {
 
     /// T-04: the one-time "still running in the tray" hint. It shows exactly
     /// once per library: the flag is written before the toast goes out.
-    pub(crate) fn show_tray_hint_once(
+    pub fn show_tray_hint_once(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2193,7 +2193,7 @@ impl AppView {
 
     /// R22: the density owns every chrome height and the row pitch. The
     /// choice is written on every change, so the next launch reads it back.
-    pub(crate) fn set_density(
+    pub fn set_density(
         &mut self,
         density: Density,
         window: &mut Window,
@@ -2214,16 +2214,16 @@ impl AppView {
     }
 
     /// The palette's `Density: Comfortable`.
-    pub(crate) fn set_comfortable_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_comfortable_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_density(Density::Comfortable, window, cx);
     }
 
     /// The palette's `Density: Compact`.
-    pub(crate) fn set_compact_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_compact_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_density(Density::Compact, window, cx);
     }
 
-    pub(crate) fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
 
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
@@ -2555,7 +2555,7 @@ impl AppView {
 /// app's own data folder is ever opened; the app never navigates anywhere on
 /// its own.
 #[cfg(windows)]
-fn open_folder_in_shell(folder: &std::path::Path) -> Result<(), String> {
+pub fn open_folder_in_shell(folder: &std::path::Path) -> Result<(), String> {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt as _;
     fn wide(text: &str) -> Vec<u16> {
@@ -2584,6 +2584,6 @@ fn open_folder_in_shell(folder: &std::path::Path) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn open_folder_in_shell(_folder: &std::path::Path) -> Result<(), String> {
+pub fn open_folder_in_shell(_folder: &std::path::Path) -> Result<(), String> {
     Err(t!("folder-open-unsupported"))
 }

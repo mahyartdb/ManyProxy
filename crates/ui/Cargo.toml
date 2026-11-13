@@ -35,5 +35,16 @@ manyproxy-core = { path = "../core", features = ["test-support"] }
 gpui-kit = { version = "0.6", features = ["test-support"] }
 base64 = "0.22"
 
+# The split integration-test binaries under tests/ drive the app's own
+# internals (AppView fields, the delegate, engine fakes). A self
+# dev-dependency with this feature compiles the lib once more with those
+# internals exposed; production builds never enable it.
+[features]
+test-support = []
+
+[dev-dependencies.manyproxy-ui]
+path = "."
+features = ["test-support"]
+
 [build-dependencies]
 png = "0.18"

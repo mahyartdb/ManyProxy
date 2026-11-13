@@ -1,19 +1,19 @@
 #![recursion_limit = "512"]
 
-mod app;
-mod appearance;
-mod chain;
-mod dialog;
-mod forms;
+pub mod app;
+pub mod appearance;
+pub mod chain;
+pub mod dialog;
+pub mod forms;
 mod i18n;
-mod keys;
-mod library;
-mod os;
-mod pickers;
-mod preset;
-mod text;
-mod tray;
-mod update;
+pub mod keys;
+pub mod library;
+pub mod os;
+pub mod pickers;
+pub mod preset;
+pub mod text;
+pub mod tray;
+pub mod update;
 
 use manyproxy_core::*;
 
@@ -115,13 +115,13 @@ use manyproxy_core::store::{
 /// T-03: the inspector docks to the RIGHT of the library. Below this window
 /// width it collapses to a slide-over drawer, so the table never loses the
 /// width it needs.
-pub(crate) const INSPECTOR_DRAWER_BREAKPOINT: f32 = 1080.;
+pub const INSPECTOR_DRAWER_BREAKPOINT: f32 = 1080.;
 /// R12: the inspector's width range. The default and the clamped range live
 /// in the store, which owns the `inspector_width` key.
-pub(crate) const INSPECTOR_WIDTH_MIN: f32 = store::Store::INSPECTOR_WIDTH_MIN;
-pub(crate) const INSPECTOR_WIDTH_MAX: f32 = store::Store::INSPECTOR_WIDTH_MAX;
+pub const INSPECTOR_WIDTH_MIN: f32 = store::Store::INSPECTOR_WIDTH_MIN;
+pub const INSPECTOR_WIDTH_MAX: f32 = store::Store::INSPECTOR_WIDTH_MAX;
 
-pub(crate) use i18n::t;
+pub use i18n::translate;
 
 use app::actions::*;
 use app::bits::*;
@@ -152,8 +152,8 @@ use text::*;
 // name. An explicit import wins over both globs, so every call site below
 // resolves to the copy that can reach the Fluent bundle.
 #[allow(unused_imports)]
-pub(crate) use text::bulk_delete_result_message;
-pub(crate) use text::{
+pub use text::bulk_delete_result_message;
+pub use text::{
     about_body, addsub_error_message, already_running_message, already_stopped_message,
     already_subscribed_message, auto_clear_opt_in_note, auto_clear_summary_toast,
     bind_port_collision_warning, bulk_start_enable_flag_failed_message, bulk_start_failed_message,
@@ -212,282 +212,282 @@ actions!(
     ]
 );
 
-struct AppView {
-    focus: FocusHandle,
-    libraries: Entity<ListState<LibraryDelegate>>,
+pub struct AppView {
+    pub focus: FocusHandle,
+    pub libraries: Entity<ListState<LibraryDelegate>>,
 
-    detail_scroll: ScrollHandle,
-    store: Store,
+    pub detail_scroll: ScrollHandle,
+    pub store: Store,
 
     /// T-08: the last failed write probe, as the standing banner's trigger.
     /// `Some(reason)` means the data folder refused a real write; `None` means
     /// the folder is writable (or the store is in-memory, which has no folder).
     /// Set after a probe, cleared only by a probe that succeeds.
-    write_blocked: Option<String>,
+    pub write_blocked: Option<String>,
 
     /// T-08: the folder the banner names when no store can supply one. Only a
     /// session that fell back to memory after a failed open sets it; a
     /// deliberate in-memory store leaves it `None`.
-    write_blocked_folder: Option<PathBuf>,
+    pub write_blocked_folder: Option<PathBuf>,
 
     /// T-08: the banner is pinned by a failed open. A probe may prove the
     /// folder writable again, but this session still cannot save, so the
     /// banner must not be cleared into a lie.
-    write_blocked_pinned: bool,
+    pub write_blocked_pinned: bool,
 
-    engine: EngineController,
+    pub engine: EngineController,
 
-    health_store: HealthStore,
+    pub health_store: HealthStore,
 
-    logs: LogsState,
+    pub logs: LogsState,
 
     /// T-04: the Settings dialog's Enter-commit subscriptions. The dialog owns
     /// its text fields, so the subscriptions live as long as it does.
-    settings_subscriptions: Vec<Subscription>,
+    pub settings_subscriptions: Vec<Subscription>,
 
     /// T-04: the timestamp of the last update check, mirrored into the open
     /// Settings dialog so the Updates section can show it.
-    settings_last_check: Option<Rc<RefCell<Option<i64>>>>,
+    pub settings_last_check: Option<Rc<RefCell<Option<i64>>>>,
 
-    expanded_subs: HashSet<String>,
+    pub expanded_subs: HashSet<String>,
 
     /// The one selection model: the set, the anchor a range grows from, and
     /// the focus the keyboard is on. Session-only — nothing about it is
     /// persisted, and it never survives a launch.
-    selection: HashSet<String>,
+    pub selection: HashSet<String>,
 
-    selection_anchor: Option<String>,
+    pub selection_anchor: Option<String>,
 
-    selection_focus: Option<String>,
+    pub selection_focus: Option<String>,
 
     /// The last batch: the ids it snapshotted, how far it got and what it
     /// found. Transient — the bar shows it until the selection changes or
     /// the user clears the result.
-    batch: Option<BatchRun>,
+    pub batch: Option<BatchRun>,
 
     /// The row density. It owns every chrome height and the row pitch, and
     /// it is persisted under `row_density`.
-    density: Density,
+    pub density: Density,
 
     /// T-27: resolved out-IP text per row id, session-only. The resolution
     /// action already computes it; keeping it per row is what `out_ip` sorts by.
-    out_ip_by_row: HashMap<String, String>,
+    pub out_ip_by_row: HashMap<String, String>,
 
-    traffic_last_seen: TrafficSeenMap,
+    pub traffic_last_seen: TrafficSeenMap,
 
-    traffic_tick_in_flight: bool,
+    pub traffic_tick_in_flight: bool,
 
-    traffic_mirror_hydrated: bool,
+    pub traffic_mirror_hydrated: bool,
 
-    prober: Box<dyn HealthProber + Send + Sync>,
-    ticks_enabled: bool,
+    pub prober: Box<dyn HealthProber + Send + Sync>,
+    pub ticks_enabled: bool,
 
-    refresh: RefreshBatch,
+    pub refresh: RefreshBatch,
 
-    probe_url_in_flight: bool,
-    probe_ping_in_flight: bool,
+    pub probe_url_in_flight: bool,
+    pub probe_ping_in_flight: bool,
 
-    update_check_in_flight: bool,
+    pub update_check_in_flight: bool,
 
     /// The newer release a passive check found. It is the status-bar hint's
     /// whole state: set on `Newer`, cleared on a check, an up-to-date result,
     /// or the opt-out.
-    update_available: Option<FetchedRelease>,
+    pub update_available: Option<FetchedRelease>,
 
     /// Bumped whenever a manual check or the opt-out supersedes a passive
     /// fetch, so the stale result cannot land after the user moved on.
-    passive_update_epoch: u64,
+    pub passive_update_epoch: u64,
 
-    probe_stop: Arc<AtomicBool>,
+    pub probe_stop: Arc<AtomicBool>,
 
-    group_test_in_flight: bool,
+    pub group_test_in_flight: bool,
 
     /// K5: this view's fixed key for the one `Testing N…` toast, so a sweep's
     /// progress repaints that toast instead of pushing another.
-    probe_toast_key: u64,
+    pub probe_toast_key: u64,
 
-    subs_form: Option<SubForm>,
+    pub subs_form: Option<SubForm>,
 
-    preset_form: Option<PresetForm>,
+    pub preset_form: Option<PresetForm>,
 
     /// F7: the open Import form, so a window drop lands in its textarea the
     /// way Browse does. `Some` only while the Import dialog is up; every
     /// close path clears it, and a stale marker self-heals on the next drop.
-    import_form: Option<ImportForm>,
+    pub import_form: Option<ImportForm>,
 
     /// T-19: the row whose ConfigForm edit dialog is open, while it is open —
     /// auto-clear never removes the row under edit.
-    edit_form_open: Option<String>,
+    pub edit_form_open: Option<String>,
 
     /// Slice 5: one endpoint draft at a time. The row popover and the
     /// inspector inline form both render this; no per-row editor map exists.
-    pub(crate) endpoint_draft: Option<EndpointDraft>,
+    pub endpoint_draft: Option<EndpointDraft>,
 
     /// T-12: one confirmed rule-set download at a time; the explicit per-file
     /// confirm never batches.
-    rule_set_download_in_flight: bool,
+    pub rule_set_download_in_flight: bool,
 
-    import_parse_in_flight: bool,
+    pub import_parse_in_flight: bool,
 
-    import_parse_epoch: u64,
+    pub import_parse_epoch: u64,
 
-    import_cancel_epoch: Option<u64>,
+    pub import_cancel_epoch: Option<u64>,
 
-    close_confirmed: bool,
+    pub close_confirmed: bool,
 
-    tray: Option<crate::tray::TrayHandle>,
+    pub tray: Option<crate::tray::TrayHandle>,
 
     /// Task 12: DWM can drop the corner preference when the window leaves the
     /// maximized state, so render re-applies the stored style on that edge
     /// only — never once per frame.
-    window_was_maximized: bool,
+    pub window_was_maximized: bool,
 
     /// Taskbar progress + thumbnail toolbar. `None` until the main window's
     /// handle exists; the install is a no-op under the test harness.
-    os_taskbar: Option<crate::os::taskbar::Taskbar>,
+    pub os_taskbar: Option<crate::os::taskbar::Taskbar>,
 
     /// Hidden-window balloons for failures that happen while the window is
     /// gone. Same lifecycle as `os_taskbar`.
-    os_notifier: Option<crate::os::notify::Notifier>,
+    pub os_notifier: Option<crate::os::notify::Notifier>,
 
     /// Dedup and flood rules for [`Self::os_notifier`], kept in the view so the
     /// policy outlives any single balloon.
-    os_notice_policy: crate::os::notify::NoticePolicy,
+    pub os_notice_policy: crate::os::notify::NoticePolicy,
 
-    last_snapshot: Vec<String>,
+    pub last_snapshot: Vec<String>,
 
-    start_in_flight: bool,
+    pub start_in_flight: bool,
 
-    ticks_started: bool,
+    pub ticks_started: bool,
 
-    sidecar_presence: Vec<String>,
+    pub sidecar_presence: Vec<String>,
 
-    _libraries_subscription: Subscription,
+    pub _libraries_subscription: Subscription,
 
     /// Slice 3: the one query. Session-only, never written to the store.
-    pub(crate) query: FilterQuery,
+    pub query: FilterQuery,
     /// Slice 7: the nav-owned scope. `All` until the user picks a group or a
     /// source; the delegate reads it and never owns one.
-    pub(crate) scope: LibraryScope,
+    pub scope: LibraryScope,
     /// Slice 7: every scope's total, recomputed on the row-load path. The nav
     /// reads this instead of walking the library per frame.
-    pub(crate) scope_counts: Vec<(LibraryScope, usize)>,
+    pub scope_counts: Vec<(LibraryScope, usize)>,
     /// Slice 7: enabled rows in the current scope, for the action-bar count.
-    pub(crate) scope_enabled: usize,
+    pub scope_enabled: usize,
     /// Slice 7: groups created in this session before any row used them.
     /// Session-only; the store has no group registry.
-    pub(crate) created_groups: Vec<String>,
-    pub(crate) group_list: Vec<GroupEntry>,
-    pub(crate) source_list: Vec<SourceEntry>,
+    pub created_groups: Vec<String>,
+    pub group_list: Vec<GroupEntry>,
+    pub source_list: Vec<SourceEntry>,
     /// Slice 7: the group entry the row drag is hovering, for the drop rim.
-    pub(crate) row_drop_target: Option<String>,
+    pub row_drop_target: Option<String>,
     /// Slice 7: the scope list's scroll offset. Session-only, never persisted.
-    pub(crate) nav_scroll: ScrollHandle,
+    pub nav_scroll: ScrollHandle,
     /// Slice 3: the rows the query keeps, in paint order. Owned here so the
     /// filter row, the batch bar and the empty state read one list.
-    pub(crate) visible: Vec<usize>,
+    pub visible: Vec<usize>,
     /// R29: the last batch's failures, narrowed to themselves until an
     /// ordinary filter control takes the filter away.
-    pub(crate) failure_filter: Option<HashSet<String>>,
+    pub failure_filter: Option<HashSet<String>>,
 
-    search_input: Entity<InputState>,
-    _search_subscription: Subscription,
+    pub search_input: Entity<InputState>,
+    pub _search_subscription: Subscription,
     /// Slice 3: one cancellable 80ms task and the epoch that retires it.
-    search_debounce: Option<Task<()>>,
-    search_epoch: u64,
+    pub search_debounce: Option<Task<()>>,
+    pub search_epoch: u64,
 
     /// The Filter popover's port fields. They are two views of `query.port`;
     /// editing either updates the query without rewriting the search bytes.
-    port_from: Entity<InputState>,
-    port_to: Entity<InputState>,
-    _port_from_subscription: Subscription,
-    _port_to_subscription: Subscription,
-    port_error: Option<String>,
+    pub port_from: Entity<InputState>,
+    pub port_to: Entity<InputState>,
+    pub _port_from_subscription: Subscription,
+    pub _port_to_subscription: Subscription,
+    pub port_error: Option<String>,
     /// A `port=` token in the search changed the predicate; the next frame
     /// writes it into the popover's From/To fields.
-    port_fields_stale: bool,
+    pub port_fields_stale: bool,
 
     /// The protocol popover's local filter field, shown above eight options.
-    protocol_filter: Entity<InputState>,
-    _protocol_filter_subscription: Subscription,
+    pub protocol_filter: Entity<InputState>,
+    pub _protocol_filter_subscription: Subscription,
 
     /// T-03/R11: the one column layout — order, visibility and widths. The
     /// header and the delegate both read this copy; nothing else owns one.
-    column_layout: ColumnLayout,
+    pub column_layout: ColumnLayout,
 
     /// T-03: the width drag in flight. `None` means no pointer is resizing a
     /// column; the layout updates every move and only mouse-up writes the
     /// store.
-    column_resize: Option<ColumnResize>,
+    pub column_resize: Option<ColumnResize>,
 
     /// T-04: the header drag's live landing slot. `None` while not dragging (or
     /// between cells), so the strip paints one indicator at most.
-    column_drop: Option<(ColumnId, DropSide)>,
+    pub column_drop: Option<(ColumnId, DropSide)>,
 
     /// The horizontal offset shared by the header strip and the rows. One
     /// scroll container owns it, so the two can never drift apart.
-    table_scroll: ScrollHandle,
+    pub table_scroll: ScrollHandle,
 
     /// T-03: the split's own state. The width is persisted under
     /// `inspector_width` on mouse-up; between drags the split reads live.
-    split_state: Entity<ResizableState>,
+    pub split_state: Entity<ResizableState>,
 
     /// R6: ONE flag owns the inspector's presence in both presentations —
     /// docked (≥1080) and the slide-over drawer below it. It starts closed;
     /// `Ctrl+I` or picking a row opens it, Esc or the close button shuts it.
     /// Esc hands focus back to the list. The target is the selection.
-    inspector_visible: bool,
+    pub inspector_visible: bool,
 
     /// Slice 6: the console dock — open state, tab, scope, quick filter and
     /// the pause snapshot. Session-only; a launch starts collapsed on Logs/All.
-    pub(crate) console: ConsoleState,
+    pub console: ConsoleState,
 
     /// The console quick filter's input entity. One dock, one filter, rebuilt
     /// with the view like the search field.
-    pub(crate) console_filter_input: Entity<InputState>,
-    _console_filter_subscription: Subscription,
+    pub console_filter_input: Entity<InputState>,
+    pub _console_filter_subscription: Subscription,
 
     /// B3: one scroll window per row-listing console pane, so an open console
     /// builds only the rows it can show and a return to a pane keeps its
     /// position. The old inspector `pane_*` handles renamed to their new home.
-    console_logs: PaneWindow,
-    console_connections: PaneWindow,
-    console_traffic: PaneWindow,
+    pub console_logs: PaneWindow,
+    pub console_connections: PaneWindow,
+    pub console_traffic: PaneWindow,
 
-    conn: ConnectionState,
+    pub conn: ConnectionState,
 
-    palette: Option<Entity<CommandState>>,
+    pub palette: Option<Entity<CommandState>>,
 
     /// T-30: per-shard CPU (% of one core) / RAM (MB) rings, keyed by the
     /// shard label `poll_shards` uses. One entry per live shard, 60 samples.
-    shard_rings: BTreeMap<String, ShardRing>,
+    pub shard_rings: BTreeMap<String, ShardRing>,
 
     /// T-30: previous raw counters per label — the delta baseline for the next
     /// engine tick. Dropped with the shard, re-primed on respawn.
-    shard_baselines: BTreeMap<String, (u32, ProcessSample, Instant)>,
+    pub shard_baselines: BTreeMap<String, (u32, ProcessSample, Instant)>,
 
     /// T-30: shards whose handle the OS refused on the last tick.
-    shard_denied: HashSet<String>,
+    pub shard_denied: HashSet<String>,
 
     /// T-30: the read-only sampler seam; production reads Win32, tests inject.
-    process_sampler: ProcessSampler,
+    pub process_sampler: ProcessSampler,
 
-    started_at: std::time::Instant,
+    pub started_at: std::time::Instant,
 }
 
 /// T-03: the start of one header-edge drag. The delta is measured from the
 /// pointer's start x, so a move that returns to the origin restores the width
 /// without accumulating rounding drift.
 #[derive(Clone, Copy)]
-struct ColumnResize {
-    column: ColumnId,
-    start_x: f32,
-    start_width: f32,
+pub struct ColumnResize {
+    pub column: ColumnId,
+    pub start_x: f32,
+    pub start_width: f32,
 }
 
 /// T-04: where a dragged header would land relative to the hovered column.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DropSide {
+pub enum DropSide {
     Before,
     After,
 }
@@ -495,26 +495,26 @@ pub(crate) enum DropSide {
 /// T-04: the payload carried by a header drag. The movable set is the payload
 /// type, so a drag can never target the pinned lamp/check/name/copy cells.
 #[derive(Clone, Copy)]
-pub(crate) struct ColumnDrag {
-    pub(crate) column: ColumnId,
+pub struct ColumnDrag {
+    pub column: ColumnId,
 }
 
 /// T-08: why this session is running in memory instead of on disk. The banner
 /// names `folder` and carries `reason` in its tooltip; the pair comes from the
 /// open failure itself, because an in-memory store has no folder to probe.
-struct WriteFallback {
-    folder: Option<PathBuf>,
-    reason: String,
+pub struct WriteFallback {
+    pub folder: Option<PathBuf>,
+    pub reason: String,
 }
 
 /// T-08: the folder a failed open was trying to use, when the path has one.
-fn store_folder(path: &Path) -> Option<PathBuf> {
+pub fn store_folder(path: &Path) -> Option<PathBuf> {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
 }
 
-fn install_crash_hook() {
+pub fn install_crash_hook() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut report = format!("panic: {info}\n");
@@ -540,7 +540,7 @@ fn install_crash_hook() {
     }));
 }
 
-fn append_crash_report(path: &std::path::Path, report: &str) -> std::io::Result<()> {
+pub fn append_crash_report(path: &std::path::Path, report: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -728,5 +728,3 @@ pub fn run() {
     });
 }
 
-#[cfg(test)]
-mod tests;

@@ -3,23 +3,23 @@ use crate::*;
 /// K12: the visible `Field` label is not an accessible name, so a labelled
 /// input carries the same words through `aria_label`. Required-field stars are
 /// visual, not spoken.
-fn accessible_label(label: &str) -> String {
+pub fn accessible_label(label: &str) -> String {
     label.trim_end_matches('*').trim_end().to_string()
 }
 
-pub(crate) fn labelled_input(label: impl Into<String>, state: &Entity<InputState>) -> Input {
+pub fn labelled_input(label: impl Into<String>, state: &Entity<InputState>) -> Input {
     let label = label.into();
     Input::new(state).aria_label(accessible_label(&label))
 }
 
-pub(crate) fn labelled_masked_input(label: impl Into<String>, state: &Entity<InputState>) -> Input {
+pub fn labelled_masked_input(label: impl Into<String>, state: &Entity<InputState>) -> Input {
     let label = label.into();
     Input::new(state)
         .mask_toggle()
         .aria_label(accessible_label(&label))
 }
 
-pub(crate) fn labelled_textarea(
+pub fn labelled_textarea(
     label: impl Into<String>,
     state: &Entity<TextareaState>,
 ) -> Textarea {
@@ -27,7 +27,7 @@ pub(crate) fn labelled_textarea(
     Textarea::new(state).aria_label(accessible_label(&label))
 }
 
-pub(crate) fn dialog_field(
+pub fn dialog_field(
     id: &'static str,
     label: impl Into<String>,
     state: Entity<InputState>,
@@ -38,11 +38,11 @@ pub(crate) fn dialog_field(
         .child(labelled_input(label, &state).id(id))
 }
 
-pub(crate) type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
+pub type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
-pub(crate) type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
 
-pub(crate) fn dialog_footer(
+pub fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
     ok_label: &str,
@@ -96,7 +96,7 @@ pub(crate) fn dialog_footer(
 
 /// F13: `cancel_id` is None where the sheet's primary button already is the
 /// only exit — Groups had Cancel and Close beside the header close.
-pub(crate) fn sheet_footer(
+pub fn sheet_footer(
     ok_id: &'static str,
     cancel_id: Option<&'static str>,
     ok_label: &str,
@@ -133,7 +133,7 @@ pub(crate) fn sheet_footer(
     )
 }
 
-pub(crate) fn footer_commit_label(dialog: &str) -> String {
+pub fn footer_commit_label(dialog: &str) -> String {
     match dialog {
         // K9 handed the dead Settings mapping over to K5: the settings modal
         // owns its own Cancel/Save footer, so "settings" falls through.
@@ -153,7 +153,7 @@ pub(crate) fn footer_commit_label(dialog: &str) -> String {
     }
 }
 
-pub(crate) fn secret_state_caption(value: &str) -> String {
+pub fn secret_state_caption(value: &str) -> String {
     if value.trim().is_empty() {
         t!("secret-not-set")
     } else {
@@ -161,7 +161,7 @@ pub(crate) fn secret_state_caption(value: &str) -> String {
     }
 }
 
-pub(crate) fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
+pub fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
     match error {
         StoreError::Invalid(errors) => errors
             .first()

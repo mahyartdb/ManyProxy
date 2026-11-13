@@ -1,7 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.focus_handle(cx).focus(window, cx);
     }
 
@@ -11,7 +11,7 @@ impl AppView {
     ///
     /// T-03: the strip reads the same `RowMetrics` the row reads, so every
     /// label sits at its column's first character.
-    pub(crate) fn render_library_column_headers(
+    pub fn render_library_column_headers(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -113,7 +113,7 @@ impl AppView {
 
     /// R11: the one Explorer-style menu every header opens. The same items and
     /// the same ids on every column; only the fit target differs.
-    pub(crate) fn column_header_menu(
+    pub fn column_header_menu(
         mut menu: PopupMenu,
         column: ColumnId,
         layout: ColumnLayout,
@@ -146,7 +146,7 @@ impl AppView {
         ))
     }
 
-    fn column_menu_action(
+    pub fn column_menu_action(
         id: &'static str,
         label: String,
         view: Entity<AppView>,
@@ -165,7 +165,7 @@ impl AppView {
         })
     }
 
-    fn column_visibility_item(
+    pub fn column_visibility_item(
         column: ColumnId,
         layout: ColumnLayout,
         view: &Entity<AppView>,
@@ -214,7 +214,7 @@ impl AppView {
 /// `on_mouse_move` stops at the cell edge, but the user may drag higher or
 /// lower than the 30px strip; the window listener follows until mouse-up. It
 /// has to be registered during paint, hence the zero-visual canvas.
-fn column_drag_canvas(view: Entity<AppView>) -> AnyElement {
+pub fn column_drag_canvas(view: Entity<AppView>) -> AnyElement {
     canvas(
         |_, _, _| (),
         move |_, _, window, _| {

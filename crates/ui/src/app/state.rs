@@ -11,26 +11,26 @@ use gpui_kit::component::list::ListState;
 /// copies the snapshot into the ring at 10fps — no thread ever touches an
 /// entity.
 #[derive(Clone, Copy)]
-struct ProbeProgress {
-    done: usize,
-    total: usize,
-    failed: usize,
+pub struct ProbeProgress {
+    pub done: usize,
+    pub total: usize,
+    pub failed: usize,
 }
 
-struct CountingProber<'a> {
-    inner: &'a (dyn HealthProber + Sync),
-    progress: Arc<std::sync::Mutex<ProbeProgress>>,
+pub struct CountingProber<'a> {
+    pub inner: &'a (dyn HealthProber + Sync),
+    pub progress: Arc<std::sync::Mutex<ProbeProgress>>,
 }
 
 /// The group sweep reports done/total through its own callback; this wrapper
 /// only adds the failure counter, so the taskbar can turn red for a partial
 /// sweep without changing `test_group`'s progress shape.
-struct FailureCountingProber<'a> {
-    inner: &'a (dyn HealthProber + Sync),
-    progress: Arc<std::sync::Mutex<ProbeProgress>>,
+pub struct FailureCountingProber<'a> {
+    pub inner: &'a (dyn HealthProber + Sync),
+    pub progress: Arc<std::sync::Mutex<ProbeProgress>>,
 }
 
-fn note_probe_complete(progress: &std::sync::Mutex<ProbeProgress>, failed: bool) {
+pub fn note_probe_complete(progress: &std::sync::Mutex<ProbeProgress>, failed: bool) {
     let mut state = progress.lock().unwrap_or_else(|poison| poison.into_inner());
     state.done = (state.done + 1).min(state.total);
     if failed {
@@ -40,7 +40,7 @@ fn note_probe_complete(progress: &std::sync::Mutex<ProbeProgress>, failed: bool)
 
 /// Group sweeps already count completion in their own callback, so this only
 /// raises the failure flag.
-fn note_probe_failure(progress: &std::sync::Mutex<ProbeProgress>) {
+pub fn note_probe_failure(progress: &std::sync::Mutex<ProbeProgress>) {
     let mut state = progress.lock().unwrap_or_else(|poison| poison.into_inner());
     state.failed = (state.failed + 1).min(state.total);
 }
@@ -111,7 +111,7 @@ impl HealthProber for FailureCountingProber<'_> {
     }
 }
 
-fn spawn_probe_progress_poller(
+pub fn spawn_probe_progress_poller(
     toast: Option<ToastHandle>,
     progress: Arc<std::sync::Mutex<ProbeProgress>>,
     active: Arc<AtomicBool>,
@@ -144,27 +144,27 @@ fn spawn_probe_progress_poller(
 /// `stored` is the store's group name, which `Ungrouped` maps to the default
 /// bucket. `sub_count` is what the manage sheet's refresh button reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GroupEntry {
-    pub(crate) name: String,
-    pub(crate) scope: LibraryScope,
-    pub(crate) count: usize,
-    pub(crate) sub_count: usize,
-    pub(crate) ungrouped: bool,
+pub struct GroupEntry {
+    pub name: String,
+    pub scope: LibraryScope,
+    pub count: usize,
+    pub sub_count: usize,
+    pub ungrouped: bool,
 }
 
 /// One source entry the nav paints. Health, quota and traffic are snapshotted
 /// on the row-load path so the nav and the strip never read the store per
 /// frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceEntry {
-    pub(crate) id: String,
-    pub(crate) label: String,
-    pub(crate) group: String,
-    pub(crate) count: usize,
-    pub(crate) running: usize,
-    pub(crate) health: SourceHealth,
-    pub(crate) quota: Option<SourceQuotaLine>,
-    pub(crate) traffic: Option<(u64, u64)>,
+pub struct SourceEntry {
+    pub id: String,
+    pub label: String,
+    pub group: String,
+    pub count: usize,
+    pub running: usize,
+    pub health: SourceHealth,
+    pub quota: Option<SourceQuotaLine>,
+    pub traffic: Option<(u64, u64)>,
 }
 
 /// F16: the refresh batch's progress counters and the in-flight set, together
@@ -172,62 +172,62 @@ pub(crate) struct SourceEntry {
 /// `refresh_batch_progress` through it; nothing else may be added here without
 /// belonging to that lifecycle.
 #[derive(Default)]
-pub(crate) struct RefreshBatch {
-    pub(crate) total: usize,
-    pub(crate) members: HashSet<String>,
-    pub(crate) added: usize,
-    pub(crate) updated: usize,
-    pub(crate) removed: usize,
-    pub(crate) failed: usize,
-    pub(crate) conflicts: usize,
-    pub(crate) in_use: usize,
-    pub(crate) added_names: Vec<String>,
-    pub(crate) updated_names: Vec<String>,
-    pub(crate) removed_names: Vec<String>,
-    pub(crate) in_use_names: Vec<String>,
-    pub(crate) generation: u64,
-    pub(crate) inflight: HashSet<String>,
+pub struct RefreshBatch {
+    pub total: usize,
+    pub members: HashSet<String>,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub failed: usize,
+    pub conflicts: usize,
+    pub in_use: usize,
+    pub added_names: Vec<String>,
+    pub updated_names: Vec<String>,
+    pub removed_names: Vec<String>,
+    pub in_use_names: Vec<String>,
+    pub generation: u64,
+    pub inflight: HashSet<String>,
     /// T-20: refreshes whose completion carries the named `[+]/[~]/[-]/[=]`
     /// report — set for manual origins only, so due-tick refreshes finish
     /// count-only.
-    pub(crate) inflight_named: HashSet<String>,
+    pub inflight_named: HashSet<String>,
     /// B16: the last fetch/store failure, held until the in-flight set drains
     /// so the list can report it when it has no rows to fall back on.
-    pub(crate) last_error: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// F16: everything the Logs sheet owns — the record store plus the filters,
 /// tail/seen marks and the list/input entities the sheet rebuilds.
 #[derive(Default)]
-pub(crate) struct LogsState {
-    pub(crate) store: LogStore,
-    pub(crate) filter: String,
-    pub(crate) exclude: String,
-    pub(crate) regex: String,
-    pub(crate) level: Option<LogLevel>,
-    pub(crate) tail: bool,
-    pub(crate) open: bool,
-    pub(crate) seen: u64,
-    pub(crate) inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
-    pub(crate) cap_input: Option<Entity<InputState>>,
+pub struct LogsState {
+    pub store: LogStore,
+    pub filter: String,
+    pub exclude: String,
+    pub regex: String,
+    pub level: Option<LogLevel>,
+    pub tail: bool,
+    pub open: bool,
+    pub seen: u64,
+    pub inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
+    pub cap_input: Option<Entity<InputState>>,
     /// Captured just before a control-driven sheet swap. The live input text
     /// wins over the committed filter fields so typed-but-unapplied text
     /// survives the swap, then is consumed once on the next open.
-    pub(crate) reopen_draft: Option<(String, String, String)>,
-    pub(crate) list: Option<Entity<ListState<LogLinesDelegate>>>,
+    pub reopen_draft: Option<(String, String, String)>,
+    pub list: Option<Entity<ListState<LogLinesDelegate>>>,
 }
 
 /// Slice 6: the console dock's session state. It never persists: a launch is
 /// collapsed, on Logs, scoped to All, with an empty filter and live rows.
 /// Closing keeps every field so reopening restores the session's view.
-pub(crate) struct ConsoleState {
-    pub(crate) open: bool,
-    pub(crate) tab: ConsoleTab,
-    pub(crate) scope: ConsoleScope,
+pub struct ConsoleState {
+    pub open: bool,
+    pub tab: ConsoleTab,
+    pub scope: ConsoleScope,
     /// The one quick filter the three tabs share, case-insensitive substring.
-    pub(crate) filter: String,
+    pub filter: String,
     /// Some(rows) while paused: the frozen paint. `None` recomputes live.
-    pub(crate) paused: Option<Vec<crate::ConsoleLogRow>>,
+    pub paused: Option<Vec<crate::ConsoleLogRow>>,
 }
 
 impl Default for ConsoleState {
@@ -247,15 +247,15 @@ impl Default for ConsoleState {
 /// count does, and the list never needs a measure-then-correct pass beyond the
 /// frame that infers its width. `scroll` is the memory that makes coming back
 /// to a pane land where the user left it instead of at the top.
-pub(crate) struct PaneWindow {
-    sizes: Rc<Vec<Size<Pixels>>>,
-    rows: usize,
-    row_h: f32,
-    pub(crate) scroll: VirtualListScrollHandle,
+pub struct PaneWindow {
+    pub sizes: Rc<Vec<Size<Pixels>>>,
+    pub rows: usize,
+    pub row_h: f32,
+    pub scroll: VirtualListScrollHandle,
 }
 
 impl PaneWindow {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             sizes: Rc::new(Vec::new()),
             rows: 0,
@@ -264,7 +264,7 @@ impl PaneWindow {
         }
     }
 
-    pub(crate) fn sizes_for(&mut self, rows: usize, row_h: f32) -> Rc<Vec<Size<Pixels>>> {
+    pub fn sizes_for(&mut self, rows: usize, row_h: f32) -> Rc<Vec<Size<Pixels>>> {
         if self.rows != rows || self.row_h != row_h {
             self.rows = rows;
             self.row_h = row_h;
@@ -285,16 +285,16 @@ impl PaneWindow {
 /// F16: the Traffic sheet's snapshot and its view state, replaced in place on
 /// every poll.
 #[derive(Default)]
-pub(crate) struct ConnectionState {
-    pub(crate) snapshot: Vec<(String, crate::health::ClashConn)>,
+pub struct ConnectionState {
+    pub snapshot: Vec<(String, crate::health::ClashConn)>,
     /// T-25: counts derived from `snapshot` on the traffic tick, so the status
     /// bar never walks the snapshot per frame.
-    pub(crate) counts: crate::health::ConnCounts,
-    pub(crate) delta: HashMap<String, (u64, u64)>,
-    pub(crate) sort_desc: bool,
-    pub(crate) copied: Option<ConnCopyTarget>,
-    pub(crate) copied_generation: u64,
-    pub(crate) last_poll_at: i64,
+    pub counts: crate::health::ConnCounts,
+    pub delta: HashMap<String, (u64, u64)>,
+    pub sort_desc: bool,
+    pub copied: Option<ConnCopyTarget>,
+    pub copied_generation: u64,
+    pub last_poll_at: i64,
 }
 
 impl AppView {
@@ -305,7 +305,7 @@ impl AppView {
     /// should be a gpui_component::Root"). Boot paths hand their overlay to
     /// these helpers, which land it on the first frame, after Root exists. The
     /// decision (message, severity, dialog content) is still taken at boot.
-    pub(crate) fn after_root(
+    pub fn after_root(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -314,7 +314,7 @@ impl AppView {
         cx.on_next_frame(window, move |view, window, cx| open(view, window, cx));
     }
 
-    pub(crate) fn notify_after_root(
+    pub fn notify_after_root(
         &mut self,
         notification: Notification,
         window: &mut Window,
@@ -331,14 +331,14 @@ impl AppView {
     /// exactly the panic condition: it is false while `cx.open_window`'s
     /// closure is still running, and also for a window whose root view is not
     /// a `Root` at all (the test harness shape).
-    pub(crate) fn root_installed(window: &Window) -> bool {
+    pub fn root_installed(window: &Window) -> bool {
         window.root::<Root>().flatten().is_some()
     }
 
     /// A path that boots *and* runs later (`reload`): deliver now when the
     /// window already has its Root, so ordinary use keeps its exact timing,
     /// and hand the notification to the first frame during boot.
-    pub(crate) fn notify_now_or_after_root(
+    pub fn notify_now_or_after_root(
         &mut self,
         notification: Notification,
         window: &mut Window,
@@ -351,7 +351,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn with_store_inner(
+    pub fn with_store_inner(
         window: &mut Window,
         cx: &mut Context<Self>,
         store: Store,
@@ -658,14 +658,14 @@ impl AppView {
         view
     }
 
-    pub(crate) fn config_count(&self, cx: &App) -> usize {
+    pub fn config_count(&self, cx: &App) -> usize {
         self.libraries.read(cx).delegate().counts().0
     }
 
     /// R6: the one row the inspector's sections act on. Exactly one selected
     /// row targets the inspector; a focused-but-unselected row never does —
     /// focus and selection are independent, and the inspector reads the set.
-    pub(crate) fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
+    pub fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
         if self.selection.len() != 1 {
             return None;
         }
@@ -676,11 +676,11 @@ impl AppView {
 
     /// R6: the selection set, ordered as the table paints it. Every console
     /// scope and the inspector aggregate read this one list.
-    pub(crate) fn selected_id_set(&self, cx: &App) -> HashSet<String> {
+    pub fn selected_id_set(&self, cx: &App) -> HashSet<String> {
         self.selected_ids_in_visible_order(cx).into_iter().collect()
     }
 
-    pub(crate) fn cached_upstream(&self, cx: &App, config: &ProxyConfig) -> String {
+    pub fn cached_upstream(&self, cx: &App, config: &ProxyConfig) -> String {
         self.libraries
             .read(cx)
             .delegate()
@@ -692,7 +692,7 @@ impl AppView {
     /// T-08: one probe, one state write. Returns true when the standing
     /// condition changed, so the tick only asks for a repaint when there is
     /// something new to paint.
-    pub(crate) fn refresh_write_blocked(&mut self, cx: &mut Context<Self>) -> bool {
+    pub fn refresh_write_blocked(&mut self, cx: &mut Context<Self>) -> bool {
         // T-08: a failed open pins the banner. A probe can prove the folder
         // writable again, but this session is still in memory: clearing the
         // banner would promise saves that still cannot happen. Only a restart
@@ -712,7 +712,7 @@ impl AppView {
     /// T-08: a failed save may be the folder, not the row. The probe is the
     /// honest arbiter: a folder that refuses a write gets the standing banner
     /// (a toast would vanish); any other failure keeps its own honest toast.
-    pub(crate) fn report_save_error(
+    pub fn report_save_error(
         &mut self,
         error: StoreError,
         window: &mut Window,
@@ -729,7 +729,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn list_or_notify(
+    pub fn list_or_notify(
         &self,
         window: &mut Window,
         cx: &mut App,
@@ -743,7 +743,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn running_rows_or_notify(
+    pub fn running_rows_or_notify(
         &self,
         window: &mut Window,
         cx: &mut App,
@@ -756,7 +756,7 @@ impl AppView {
         })
     }
 
-    pub(crate) fn format_dialog_params(
+    pub fn format_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
         window: &mut Window,
@@ -779,7 +779,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn template_dialog_params(
+    pub fn template_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
         form: &ConfigForm,
@@ -803,7 +803,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn validate_dialog_params(
+    pub fn validate_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
         protocol: &str,
@@ -836,14 +836,14 @@ impl AppView {
         true
     }
 
-    pub(crate) fn row_config(&self, id: &str) -> Option<ProxyConfig> {
+    pub fn row_config(&self, id: &str) -> Option<ProxyConfig> {
         self.store.get(id).ok().flatten()
     }
 
     /// Surfaces at most one engine-crash notification and drives the auto-restart
     /// policy. The pending cause lives in the controller, so this still sees a
     /// crash the 5 s tick already drained from the backend.
-    pub(crate) fn service_engine_crash(&mut self) -> Option<Notification> {
+    pub fn service_engine_crash(&mut self) -> Option<Notification> {
         let now = std::time::Instant::now();
         let detail = self.engine.pending_crash();
         self.engine.settle_restart_budget(now);
@@ -873,7 +873,7 @@ impl AppView {
         Some(Notification::error(text))
     }
 
-    pub(crate) fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(notification) = self.service_engine_crash() {
             // Reachable from `reload`, which the boot path calls before the
             // window adopts its Root layer — deliver it the same safe way.
@@ -881,7 +881,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn push_engine_notification(
+    pub fn push_engine_notification(
         &self,
         notification: Notification,
         cx: &mut Context<Self>,
@@ -893,13 +893,13 @@ impl AppView {
         }
     }
 
-    pub(crate) fn warn_for_lan_binds(&self, window: &mut Window, cx: &mut App) {
+    pub fn warn_for_lan_binds(&self, window: &mut Window, cx: &mut App) {
         for warning in self.engine.lan_warnings() {
             window.push_notification(Notification::warning(warning), cx);
         }
     }
 
-    pub(crate) fn running_names_for_close(&self) -> Vec<String> {
+    pub fn running_names_for_close(&self) -> Vec<String> {
         let running = self.engine.running_ids();
         if running.is_empty() {
             return Vec::new();
@@ -914,14 +914,14 @@ impl AppView {
         }
     }
 
-    pub(crate) fn close_veto_text(&self) -> Option<String> {
+    pub fn close_veto_text(&self) -> Option<String> {
         if self.close_confirmed {
             return None;
         }
         close_confirm_description(&self.running_names_for_close())
     }
 
-    pub(crate) fn confirm_close_stop(&mut self, window: &Window) {
+    pub fn confirm_close_stop(&mut self, window: &Window) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
@@ -938,7 +938,7 @@ impl AppView {
 
     /// T-34: every orderly exit writes the marker right after its snapshot
     /// clear. A kill/crash never reaches here, so boot's "0" stands.
-    pub(crate) fn mark_clean_exit(&mut self) {
+    pub fn mark_clean_exit(&mut self) {
         if let Err(error) = self.store.set_last_clean_exit(true) {
             eprintln!("clean-exit marker failed: {error}");
         }
@@ -947,14 +947,14 @@ impl AppView {
     /// T-26: mirrors the running count into the OS window title on the exact
     /// cadence the tray tooltip is fed from — no extra poll or timer. The
     /// custom titlebar label composes the same `window_title_text` at render.
-    pub(crate) fn sync_running_title(&self, running: usize, cx: &mut Context<Self>) {
+    pub fn sync_running_title(&self, running: usize, cx: &mut Context<Self>) {
         let title = window_title_text(running);
         if let Some(handle) = cx.active_window() {
             let _ = handle.update(cx, move |_, window, _| window.set_window_title(&title));
         }
     }
 
-    pub(crate) fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(windows)]
         match crate::tray::hwnd_from_window(window) {
             Some(hwnd) => {
@@ -971,7 +971,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn show_window_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_window_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(windows)]
         if let Some(hwnd) = crate::tray::hwnd_from_window(window) {
             crate::tray::show_window_handle(hwnd);
@@ -980,7 +980,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn quit_from_tray(&mut self, window: &Window) {
+    pub fn quit_from_tray(&mut self, window: &Window) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
@@ -1002,7 +1002,7 @@ impl AppView {
     /// feed at most once every seven days, and only posts the status-bar hint.
     /// Neither path downloads or runs a release; the feed read is the whole
     /// check.
-    pub(crate) fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A manual check replaces whatever the passive path was about to say.
         self.passive_update_epoch = self.passive_update_epoch.wrapping_add(1);
         self.update_available = None;
@@ -1041,7 +1041,7 @@ impl AppView {
     /// at launch. The timestamp lands before the request so a failed attempt
     /// still waits out the week; a background failure is silent because the
     /// manual check owns error reporting.
-    pub(crate) fn start_passive_update_check(&mut self, cx: &mut Context<Self>) {
+    pub fn start_passive_update_check(&mut self, cx: &mut Context<Self>) {
         let enabled = self.passive_update_check_enabled();
         let last = self.store.last_update_check();
         let due = passive_update_check_due(last, crate::store::now_unix(), enabled);
@@ -1075,7 +1075,7 @@ impl AppView {
 
     /// T-04: writes the check's timestamp into the store and mirrors it into
     /// the open Settings dialog.
-    pub(crate) fn record_update_check(&mut self) {
+    pub fn record_update_check(&mut self) {
         let now = crate::store::now_unix();
         if let Err(error) = self.store.set_last_update_check(now) {
             eprintln!("update-check timestamp failed: {error}");
@@ -1085,11 +1085,11 @@ impl AppView {
         }
     }
 
-    pub(crate) fn palette_op_at(index: IndexPath) -> Option<&'static str> {
+    pub fn palette_op_at(index: IndexPath) -> Option<&'static str> {
         palette_action_at(index)
     }
 
-    pub(crate) fn run_palette_op(
+    pub fn run_palette_op(
         &mut self,
         index: IndexPath,
         window: &mut Window,
@@ -1108,7 +1108,7 @@ impl AppView {
     /// T-27: the latest URL-test sample per row, in ms. Dead samples (an error
     /// with no latency), ping-only evidence and never-tested rows are absent —
     /// which is what pins them last when `latency` sorts.
-    pub(crate) fn latency_map(&self, rows: &[ProxyConfig]) -> HashMap<String, u64> {
+    pub fn latency_map(&self, rows: &[ProxyConfig]) -> HashMap<String, u64> {
         let mut map = HashMap::new();
         for row in rows {
             let Some(sample) = self.health_store.latest_of(&row.id, HealthKind::UrlTest) else {
@@ -1126,7 +1126,7 @@ impl AppView {
 
     /// T-27: the per-row session traffic mirror the traffic tick already keeps
     /// (`download`/`upload` sort keys).
-    pub(crate) fn data_traffic_map(&self, rows: &[ProxyConfig]) -> HashMap<String, (u64, u64)> {
+    pub fn data_traffic_map(&self, rows: &[ProxyConfig]) -> HashMap<String, (u64, u64)> {
         rows.iter()
             .filter_map(|row| {
                 self.health_store
@@ -1142,14 +1142,14 @@ impl AppView {
     /// K12/A5-1: the strip no longer renders this count; the Links
     /// inspector tab carries it. Retained for the counter merge tests only.
     #[cfg(test)]
-    pub(crate) fn conn_counter_text(&self) -> Option<String> {
+    pub fn conn_counter_text(&self) -> Option<String> {
         if self.engine.running_count() == 0 {
             return None;
         }
         Some(self.conn.counts.status_text())
     }
 
-    pub(crate) fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
+    pub fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
         let mut snapshots = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
             self.health_store.record_outcome(outcome);
@@ -1174,7 +1174,7 @@ impl AppView {
         self.settle_batch_test(outcomes);
     }
 
-    pub(crate) fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
+    pub fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
         let running = self.engine.running_ids();
         self.store
             .list()
@@ -1184,7 +1184,7 @@ impl AppView {
             .collect()
     }
 
-    pub(crate) fn spawn_group_probe(
+    pub fn spawn_group_probe(
         &mut self,
         rows: Vec<ProxyConfig>,
         group: String,
@@ -1336,7 +1336,7 @@ impl AppView {
     /// The retired Library menu's prune family. Slice 7 re-homes it in the
     /// group and source manage sheet.
     #[allow(dead_code)]
-    pub(crate) fn group_test_sample_count(&self, group: &str) -> usize {
+    pub fn group_test_sample_count(&self, group: &str) -> usize {
         let ids: HashSet<String> = self
             .store
             .list()
@@ -1360,7 +1360,7 @@ impl AppView {
     /// batch) are excluded at the candidate-filter level; removal goes through
     /// the shared removal pipeline. Returns one (removed, kept-reasons) pair
     /// when a summary is warranted.
-    pub(crate) fn auto_clear_after_sweep(&mut self, group: &str) -> Option<(usize, Vec<String>)> {
+    pub fn auto_clear_after_sweep(&mut self, group: &str) -> Option<(usize, Vec<String>)> {
         if !self.store.auto_clear_enabled(group) {
             return None;
         }
@@ -1423,7 +1423,7 @@ impl AppView {
     /// T-27: one writer for the sort model — persists the meta row beside
     /// `library_columns`, mirrors the choice to the list, and says which order
     /// is live (the retired toggle's notification, now covering every key).
-    pub(crate) fn set_library_sort(
+    pub fn set_library_sort(
         &mut self,
         key: LibrarySortKey,
         window: &mut Window,
@@ -1433,7 +1433,7 @@ impl AppView {
         self.commit_library_sort(LibrarySort::new(key, direction), window, cx);
     }
 
-    pub(crate) fn ping_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn ping_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -1452,7 +1452,7 @@ impl AppView {
         self.spawn_probe(vec![config], true, false, None, cx);
     }
 
-    pub(crate) fn effective_test_url(&self, rows: &[ProxyConfig]) -> String {
+    pub fn effective_test_url(&self, rows: &[ProxyConfig]) -> String {
         let global = self.store.test_url();
         if rows.len() == 1 {
             let row_override = self.store.row_test_url(&rows[0].id);
@@ -1464,7 +1464,7 @@ impl AppView {
     /// K5: Retry from a test-result toast. Rows are re-resolved because the
     /// library may have changed while the toast sat there; stopped or removed
     /// rows simply drop out of the retry.
-    pub(crate) fn retry_probe(
+    pub fn retry_probe(
         &mut self,
         ids: Vec<String>,
         ping: bool,
@@ -1486,7 +1486,7 @@ impl AppView {
 
     /// K5: Retry from a group sweep summary. The group's running set is read
     /// again so a row started or stopped since the first pass is respected.
-    pub(crate) fn retry_group_probe(
+    pub fn retry_group_probe(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -1507,7 +1507,7 @@ impl AppView {
         self.spawn_group_probe(rows, group.to_string(), Some(window.window_handle()), cx);
     }
 
-    pub(crate) fn spawn_probe(
+    pub fn spawn_probe(
         &mut self,
         rows: Vec<ProxyConfig>,
         ping: bool,
@@ -1674,7 +1674,7 @@ impl AppView {
         count
     }
 
-    pub(crate) fn log_lines(&self, cx: &App) -> Vec<String> {
+    pub fn log_lines(&self, cx: &App) -> Vec<String> {
         self.console_log_rows(cx)
             .iter()
             .map(crate::ConsoleLogRow::line)
@@ -1685,7 +1685,7 @@ impl AppView {
     /// The pure `console::log_rows` does the work; this adapter owns the
     /// committed log-sheet filters and the pause snapshot. A paused console
     /// paints its frozen rows and ignores new records until resume.
-    pub(crate) fn console_log_rows(&self, cx: &App) -> Vec<crate::ConsoleLogRow> {
+    pub fn console_log_rows(&self, cx: &App) -> Vec<crate::ConsoleLogRow> {
         if let Some(frozen) = &self.console.paused {
             return frozen.clone();
         }
@@ -1712,7 +1712,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn set_log_level(
+    pub fn set_log_level(
         &mut self,
         level: Option<LogLevel>,
         window: &mut Window,
@@ -1730,7 +1730,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.logs.filter.clear();
 
         self.logs.exclude.clear();
@@ -1751,7 +1751,7 @@ impl AppView {
     }
 
     /// Live text of the open sheet's three inputs (typed but not yet applied).
-    pub(crate) fn log_input_draft(&self, cx: &App) -> Option<(String, String, String)> {
+    pub fn log_input_draft(&self, cx: &App) -> Option<(String, String, String)> {
         self.logs.inputs.as_ref().map(|(filter, exclude, pattern)| {
             (
                 filter.read(cx).value().to_string(),
@@ -1764,7 +1764,7 @@ impl AppView {
     /// Toggle one column's visibility from the header menu or the columns
     /// sheet. Locked columns refuse the change in the layout, so the UI's
     /// disabled controls are a convenience, not the guard.
-    pub(crate) fn set_column_visible(
+    pub fn set_column_visible(
         &mut self,
         column: ColumnId,
         visible: bool,
@@ -1777,7 +1777,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn browse_for_import_files(
+    pub fn browse_for_import_files(
         &mut self,
         current_text: String,
         current_group: String,
@@ -1833,7 +1833,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn browse_for_ssh_key(
+    pub fn browse_for_ssh_key(
         &mut self,
         path_entity: Entity<InputState>,
         key_entity: Entity<TextareaState>,
@@ -1865,7 +1865,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn chain_add_hop(
+    pub fn chain_add_hop(
         &mut self,
         hops: &Rc<RefCell<Vec<serde_json::Value>>>,
         library: &Rc<RefCell<Vec<ChainLibraryEntry>>>,
@@ -1904,7 +1904,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn chain_replace_hop(
+    pub fn chain_replace_hop(
         &mut self,
         hops: &Rc<RefCell<Vec<serde_json::Value>>>,
         library: &Rc<RefCell<Vec<ChainLibraryEntry>>>,
@@ -1946,7 +1946,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn browse_for_extra_exe(
+    pub fn browse_for_extra_exe(
         &mut self,
         path_entity: Entity<InputState>,
         window: &mut Window,
@@ -1977,7 +1977,7 @@ impl AppView {
     }
 
     /// Keeps the dialog footer's mirror in step with the parse state.
-    pub(crate) fn set_import_parse_in_flight(&mut self, in_flight: bool) {
+    pub fn set_import_parse_in_flight(&mut self, in_flight: bool) {
         self.import_parse_in_flight = in_flight;
         if let Some(form) = &self.import_form {
             form.in_flight.set(in_flight);
@@ -1986,12 +1986,12 @@ impl AppView {
 
     /// Marks the running (or just-finished) import parse as cancelled so its
     /// batch is dropped instead of landing after the dialog was dismissed.
-    pub(crate) fn cancel_import_parse(&mut self, cx: &mut Context<Self>) {
+    pub fn cancel_import_parse(&mut self, cx: &mut Context<Self>) {
         self.import_cancel_epoch = Some(self.import_parse_epoch);
         cx.notify();
     }
 
-    pub(crate) fn try_addsub_commit(
+    pub fn try_addsub_commit(
         &mut self,
         resolved: &ResolvedImport,
         window: &mut Window,
@@ -2017,7 +2017,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn accumulate_batch_member(
+    pub fn accumulate_batch_member(
         &mut self,
         sub_id: &str,
         added: usize,
@@ -2053,11 +2053,11 @@ impl AppView {
         self.refresh.members.is_empty()
     }
 
-    pub(crate) fn is_batch_member(&self, sub_id: &str) -> bool {
+    pub fn is_batch_member(&self, sub_id: &str) -> bool {
         self.refresh.members.contains(sub_id)
     }
 
-    pub(crate) fn refresh_batch_progress(&self) -> Option<(usize, usize)> {
+    pub fn refresh_batch_progress(&self) -> Option<(usize, usize)> {
         if self.refresh.members.is_empty() {
             return None;
         }
@@ -2065,7 +2065,7 @@ impl AppView {
         Some((total.saturating_sub(self.refresh.members.len()), total))
     }
 
-    pub(crate) fn close_batch_slot(
+    pub fn close_batch_slot(
         &mut self,
         sub_id: &str,
         window: &mut Window,
@@ -2078,12 +2078,12 @@ impl AppView {
         }
     }
 
-    pub(crate) fn push_refresh_log(&mut self, line: &str) {
+    pub fn push_refresh_log(&mut self, line: &str) {
         self.logs.store.push_raw(line, &LogTagIndex::default());
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn route_refresh_completion(
+    pub fn route_refresh_completion(
         &mut self,
         sub_id: &str,
         notice: ToastSpec,
@@ -2143,7 +2143,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn refresh_subscription_by_id(
+    pub fn refresh_subscription_by_id(
         &mut self,
         sub_id: &str,
         window: &mut Window,
@@ -2184,14 +2184,14 @@ impl AppView {
         started
     }
 
-    pub(crate) fn note_refresh_started(&mut self, sub_id: &str) -> bool {
+    pub fn note_refresh_started(&mut self, sub_id: &str) -> bool {
         self.refresh.inflight.insert(sub_id.to_string())
     }
 
     /// B16: every refresh origin funnels through `start_subscription_refresh`,
     /// so the list learns it is waiting from one place and never has to read
     /// the app's in-flight set while a frame is borrowing it.
-    pub(crate) fn mark_library_loading(&mut self, cx: &mut App) {
+    pub fn mark_library_loading(&mut self, cx: &mut App) {
         let load = LibraryLoad::Loading(t!("library-loading-subscriptions"));
         self.libraries.update(cx, |state, cx| {
             if state.delegate_mut().set_load(load) {
@@ -2203,7 +2203,7 @@ impl AppView {
     /// B16: settle once nothing is in flight. A failure with no rows left is
     /// the list's state to report; with rows on screen the toast already said
     /// it and the list stays out of the way.
-    pub(crate) fn settle_library_load(&mut self, cx: &mut App) {
+    pub fn settle_library_load(&mut self, cx: &mut App) {
         if !self.refresh.inflight.is_empty() {
             return;
         }
@@ -2221,7 +2221,7 @@ impl AppView {
 
     /// B16: the failed state's way back. Retry means "fetch my subscriptions
     /// again", which is the only thing that can fill an empty list.
-    pub(crate) fn retry_library_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn retry_library_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let subs = self.store.list_subscriptions().unwrap_or_default();
         if subs.is_empty() {
             self.settle_library_load(cx);
@@ -2231,7 +2231,7 @@ impl AppView {
         self.start_explicit_refresh(subs, window, cx);
     }
 
-    pub(crate) fn sync_presets_to_engine(&mut self) -> Result<(), String> {
+    pub fn sync_presets_to_engine(&mut self) -> Result<(), String> {
         match self.store.preset_rules_map() {
             Ok(map) => {
                 self.engine.set_preset_rules(map);
@@ -2246,7 +2246,7 @@ impl AppView {
         self.sync_rule_sets_to_engine()
     }
 
-    pub(crate) fn try_preset_commit(
+    pub fn try_preset_commit(
         &mut self,
         resolved: &ResolvedImport,
         window: &mut Window,
@@ -2346,7 +2346,7 @@ impl AppView {
     /// text for the editor's "Invalid lines" fold. The expanded rules flow
     /// through the store's own `validate_preset_rules` gate unchanged — no
     /// new intake errors here.
-    pub(crate) fn expand_simple_rule_boxes(
+    pub fn expand_simple_rule_boxes(
         boxes: &SimpleRuleBoxes,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2381,7 +2381,7 @@ impl AppView {
         Err(())
     }
 
-    pub(crate) fn rewrite_preset_rules_box(
+    pub fn rewrite_preset_rules_box(
         form: &PresetForm,
         op: &PresetRulesOp,
         window: &mut Window,
@@ -2438,7 +2438,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn preset_name_for(&self, preset_id: Option<&str>) -> Option<String> {
+    pub fn preset_name_for(&self, preset_id: Option<&str>) -> Option<String> {
         let id = preset_id?;
         self.store
             .get_preset(id)
@@ -2447,7 +2447,7 @@ impl AppView {
             .map(|preset| preset.name)
     }
 
-    pub(crate) fn refresh_preset_by_id(
+    pub fn refresh_preset_by_id(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -2484,7 +2484,7 @@ impl AppView {
 
     // ——— T-12: .srs rule-set staging (explicit confirm-per-download only) ——
 
-    pub(crate) fn sync_rule_sets_to_engine(&mut self) -> Result<(), String> {
+    pub fn sync_rule_sets_to_engine(&mut self) -> Result<(), String> {
         let dir = crate::store::rule_sets_dir();
         let files: HashMap<String, PathBuf> = self
             .store
@@ -2497,13 +2497,13 @@ impl AppView {
         Ok(())
     }
 
-    pub(crate) fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
         for sub in self.due_subscriptions() {
             self.start_subscription_refresh(sub, false, cx);
         }
     }
 
-    pub(crate) fn refresh_due_on_startup_deferred(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_due_on_startup_deferred(&mut self, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_entity, cx| {
             cx.background_executor()
@@ -2522,7 +2522,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn due_subscriptions(&self) -> Vec<ProxySubscription> {
+    pub fn due_subscriptions(&self) -> Vec<ProxySubscription> {
         if !self.store.subs_auto_refresh_enabled() {
             return Vec::new();
         }
@@ -2533,7 +2533,7 @@ impl AppView {
             .collect()
     }
 
-    pub(crate) fn due_for_manual_refresh(&self) -> Vec<ProxySubscription> {
+    pub fn due_for_manual_refresh(&self) -> Vec<ProxySubscription> {
         let now = now_unix();
         self.store
             .list_subscriptions()
@@ -2543,7 +2543,7 @@ impl AppView {
             .collect()
     }
 
-    pub(crate) fn refresh_all_due(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+    pub fn refresh_all_due(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let due = self.due_for_manual_refresh();
         if due.is_empty() {
             window.push_notification(Notification::success(t!("no-subs-due")), cx);
@@ -2561,14 +2561,14 @@ impl AppView {
         started
     }
 
-    pub(crate) fn current_group(&self, cx: &App) -> Option<String> {
+    pub fn current_group(&self, cx: &App) -> Option<String> {
         self.selected_config(cx).map(|config| config.group)
     }
 
     /// `Ctrl+R` acts on the scope, never on the selected row. Under
     /// `All configs` there is no scope to update; the action's enabled state
     /// refuses it before this point, and this guard keeps a direct call honest.
-    pub(crate) fn update_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn update_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.scope.clone() {
             LibraryScope::All => {
                 window.push_notification(Notification::info(t!("scope-update-disabled")), cx);
@@ -2581,7 +2581,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn update_group_subs(
+    pub fn update_group_subs(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -2601,7 +2601,7 @@ impl AppView {
 
     /// Probe endpoints whose own bytes must stay out of row usage: the default
     /// test URL, the global custom test URL, and every running row's override.
-    pub(crate) fn traffic_probe_exclusions(&self) -> ProbeExclusions {
+    pub fn traffic_probe_exclusions(&self) -> ProbeExclusions {
         let mut exclusions = ProbeExclusions::new();
         exclusions.push_url(DEFAULT_TEST_URL);
         if let Some(global) = self.store.test_url() {
@@ -2615,7 +2615,7 @@ impl AppView {
         exclusions
     }
 
-    pub(crate) fn spawn_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
+    pub fn spawn_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled || self.traffic_tick_in_flight {
             return 0;
         }
@@ -2664,7 +2664,7 @@ impl AppView {
         1
     }
 
-    pub(crate) fn usage_line(&self, config_id: &str) -> String {
+    pub fn usage_line(&self, config_id: &str) -> String {
         match self.store.traffic_totals() {
             Ok(totals) => match totals.get(config_id) {
                 Some((rx, tx)) => t!(
@@ -2678,7 +2678,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn usage_parts(&self, config_id: &str) -> Option<(String, String)> {
+    pub fn usage_parts(&self, config_id: &str) -> Option<(String, String)> {
         match self.store.traffic_totals() {
             Ok(totals) => totals
                 .get(config_id)
@@ -2687,7 +2687,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn history_line(&self, config_id: &str, cx: &App) -> AnyElement {
+    pub fn history_line(&self, config_id: &str, cx: &App) -> AnyElement {
         let since = now_unix().saturating_sub(90 * 86_400);
         let entries = match self.store.load_health_history(config_id, Some(since)) {
             Ok(entries) => entries,
@@ -2739,12 +2739,12 @@ impl AppView {
     // one easing, two primitives. Nothing loops, nothing exceeds the budget,
     // and reduced motion turns all of it off.
 
-    pub(crate) const MOTION_FAST_MS: u64 = 150;
+    pub const MOTION_FAST_MS: u64 = 150;
 
     /// How long a `Copied!` transient marker stays painted after a cell click.
-    pub(crate) const CONN_COPIED_TOOLTIP_MS: u64 = 1500;
+    pub const CONN_COPIED_TOOLTIP_MS: u64 = 1500;
 
-    pub(crate) fn motion_fast_duration(cx: &App) -> Duration {
+    pub fn motion_fast_duration(cx: &App) -> Duration {
         if cx.reduce_motion() {
             Duration::ZERO
         } else {
@@ -2753,7 +2753,7 @@ impl AppView {
     }
 
     /// Quick off the mark, soft landing. No overshoot: nothing here bounces.
-    pub(crate) fn motion_ease_out() -> impl Fn(f32) -> f32 + 'static {
+    pub fn motion_ease_out() -> impl Fn(f32) -> f32 + 'static {
         ease_out_quint()
     }
 
@@ -2761,7 +2761,7 @@ impl AppView {
     /// its own layout, so an absolutely positioned surface (the inspector
     /// drawer) does not reflow the list behind it and a padded bar keeps its
     /// padding.
-    pub(crate) fn motion_fade<E>(element: E, id: impl Into<ElementId>, cx: &App) -> impl IntoElement
+    pub fn motion_fade<E>(element: E, id: impl Into<ElementId>, cx: &App) -> impl IntoElement
     where
         E: Styled + IntoElement + 'static,
     {
@@ -2774,14 +2774,14 @@ impl AppView {
 
     /// The accent spends half the budget going up and half coming back down —
     /// one blink, never a loop, and never longer than the entry fade.
-    pub(crate) const fn motion_accent_halves_ms() -> u64 {
+    pub const fn motion_accent_halves_ms() -> u64 {
         Self::MOTION_FAST_MS / 2
     }
 
     /// The accent that marks the one row whose engine state just settled.
     /// Reduced motion returns `None`, so the caller paints neither the strip
     /// nor its animation state.
-    pub(crate) fn motion_accent<E>(
+    pub fn motion_accent<E>(
         accent: E,
         id: impl Into<ElementId>,
         cx: &App,
@@ -2807,7 +2807,7 @@ impl AppView {
     /// F19/Slice 6: `Ctrl+I` owns the inspector's presence on its own: it
     /// opens the panel and closes the one that is already open. Focus stays
     /// on the table, so the arrows keep moving the inspector's target.
-    pub(crate) fn toggle_inspector(&mut self) {
+    pub fn toggle_inspector(&mut self) {
         self.inspector_visible = !self.inspector_visible;
         if self.inspector_visible {
             self.detail_scroll.set_offset(point(px(0.), px(0.)));
@@ -2818,7 +2818,7 @@ impl AppView {
     /// never steals focus; closing hands focus to the table only when the
     /// keyboard was inside the console (the quick filter is its one focusable
     /// field), so a dialog or sheet keeps its own focus.
-    pub(crate) fn toggle_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let filter_focused = self
             .console_filter_input
             .read(cx)
@@ -2834,7 +2834,7 @@ impl AppView {
     /// R9: the row menu's `Open logs`, and the inspector's console link. Opens
     /// the dock on Logs with scope `Selected`; the console filter stays as the
     /// session left it — only the inspector link lands with it empty.
-    pub(crate) fn open_console_scoped_to_selection(
+    pub fn open_console_scoped_to_selection(
         &mut self,
         clear_filter: bool,
         cx: &mut Context<Self>,
@@ -2849,12 +2849,12 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn clear_console_filter(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_console_filter(&mut self, cx: &mut Context<Self>) {
         self.console.filter.clear();
         cx.notify();
     }
 
-    pub(crate) fn pause_console(&mut self, cx: &mut Context<Self>) {
+    pub fn pause_console(&mut self, cx: &mut Context<Self>) {
         if self.console.paused.is_some() {
             return;
         }
@@ -2863,14 +2863,14 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn resume_console(&mut self, cx: &mut Context<Self>) {
+    pub fn resume_console(&mut self, cx: &mut Context<Self>) {
         self.console.paused = None;
         cx.notify();
     }
 
     /// The console's Clear: empty the log ring, reset the sheet's seen mark,
     /// and drop the pause snapshot. No confirm — logs are session evidence.
-    pub(crate) fn clear_console_logs(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_console_logs(&mut self, cx: &mut Context<Self>) {
         self.logs.store.clear();
         self.logs.seen = self.logs.store.push_seq();
         self.console.paused = None;
@@ -2879,7 +2879,7 @@ impl AppView {
 
     /// R12: persist the dragged width. A failed write keeps the session width
     /// and surfaces one toast; the drag itself is never undone.
-    pub(crate) fn persist_inspector_width(
+    pub fn persist_inspector_width(
         &mut self,
         width: f32,
         window: &mut Window,
@@ -2896,7 +2896,7 @@ impl AppView {
 
     /// Focus the table. Closing a dock (console or inspector) lands here —
     /// never the root handle, so arrows keep driving rows.
-    pub(crate) fn close_console_focus_table(
+    pub fn close_console_focus_table(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2905,7 +2905,7 @@ impl AppView {
         window.focus(&list, cx);
     }
 
-    pub(crate) fn detail_failed(&self, config: &ProxyConfig) -> bool {
+    pub fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
             || self.health_store.row_summary(&config.id).trim() == "dead"
     }

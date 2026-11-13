@@ -6,16 +6,16 @@ use super::console::render_console_slot;
 /// rows, the facet bar and the drawer all read these two numbers, so the
 /// table can never lay itself out under the drawer.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct InspectorLayout {
-    pub(crate) drawer_w: f32,
-    pub(crate) table_w: f32,
+pub struct InspectorLayout {
+    pub drawer_w: f32,
+    pub table_w: f32,
 }
 
 impl InspectorLayout {
     /// F19: a hidden inspector costs the table nothing in either presentation,
     /// so the list takes the whole viewport. A visible drawer is clamped so the
     /// table never drops under its floor.
-    pub(crate) fn compute(viewport: f32, inspector_w: f32, docked: bool, visible: bool) -> Self {
+    pub fn compute(viewport: f32, inspector_w: f32, docked: bool, visible: bool) -> Self {
         if !visible {
             return Self {
                 drawer_w: 0.,
@@ -39,7 +39,7 @@ impl InspectorLayout {
 impl AppView {
     /// F18: the empty canvas names the two intake actions and calls the same
     /// AppView methods the toolbar buttons use.
-    pub(crate) fn render_empty_ctas(app: Entity<Self>) -> impl IntoElement {
+    pub fn render_empty_ctas(app: Entity<Self>) -> impl IntoElement {
         let add_view = app.clone();
         let import_view = app;
         div()
@@ -76,7 +76,7 @@ impl AppView {
     /// T-03: the window width decides the inspector's shape. At or above the
     /// breakpoint the inspector docks to the right and takes its share; below
     /// it the inspector becomes a slide-over drawer beside the table.
-    pub(crate) fn inspector_docked(&self, window: &Window) -> bool {
+    pub fn inspector_docked(&self, window: &Window) -> bool {
         window.viewport_size().width.as_f32() >= INSPECTOR_DRAWER_BREAKPOINT
     }
 
@@ -84,7 +84,7 @@ impl AppView {
     /// after a drag, so the table's column budget follows; before the first
     /// drag (and on the first frame, when `sizes()` is empty) the persisted
     /// store width is authoritative.
-    pub(crate) fn inspector_width(&self, cx: &App) -> f32 {
+    pub fn inspector_width(&self, cx: &App) -> f32 {
         let sizes = self.split_state.read(cx).sizes();
         sizes
             .get(1)

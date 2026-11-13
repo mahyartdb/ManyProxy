@@ -4,9 +4,9 @@ use gpui_kit::*;
 
 use crate::store::{Accent, TextSize};
 
-pub(crate) const APPEARANCE_CHOICES: &[(&str, &str)] =
+pub const APPEARANCE_CHOICES: &[(&str, &str)] =
     &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
-pub(crate) fn windows_apps_light_theme() -> Option<bool> {
+pub fn windows_apps_light_theme() -> Option<bool> {
     #[cfg(windows)]
     {
         use winreg::enums::HKEY_CURRENT_USER;
@@ -23,7 +23,7 @@ pub(crate) fn windows_apps_light_theme() -> Option<bool> {
         None
     }
 }
-pub(crate) fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
+pub fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
     match appearance {
         "light" => ThemeMode::Light,
         "dark" => ThemeMode::Dark,
@@ -32,13 +32,13 @@ pub(crate) fn appearance_theme_mode(appearance: &str, system_light: bool) -> The
         _ => ThemeMode::Dark,
     }
 }
-pub(crate) fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
+pub fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
     appearance_theme_mode(appearance, windows_apps_light_theme().unwrap_or(false))
 }
 /// F17: the kit's light scrim is `#0000000d` (~5%), which a modal over a
 /// near-white page barely reads as a backdrop. Dark keeps the kit's 20%. The
 /// dialog backdrop paints this exact token (`Theme::overlay`).
-pub(crate) const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
+pub const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
 
 /// The kit's light muted ink is `neutral-500` (#737373): 4.35:1 on the quiet
 /// surface (#f5f5f5), under WCAG AA for text. Row cards, the tab bar, and the
@@ -46,18 +46,18 @@ pub(crate) const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
 /// backs this one token off toward black (4.98:1 there). Dark keeps the kit's
 /// `neutral-400`, which reads at 7.8:1. Overriding the token also fixes the
 /// kit's own muted text (group-box titles, table heads).
-pub(crate) const LIGHT_MUTED_INK_DARKEN: f32 = 0.08;
+pub const LIGHT_MUTED_INK_DARKEN: f32 = 0.08;
 
 /// K12: the kit's stock sizes (`Theme::default`). `Theme::change` rebuilds the
 /// theme from its config, so every appearance swap resets these before the
 /// reading scale is applied again.
-pub(crate) const BASE_FONT_SIZE: f32 = 16.;
-pub(crate) const BASE_MONO_FONT_SIZE: f32 = 13.;
+pub const BASE_FONT_SIZE: f32 = 16.;
+pub const BASE_MONO_FONT_SIZE: f32 = 13.;
 
 /// K12: scale the rem the whole window resolves against. Text roles keep
 /// their two steps; only the base moves. `Root` re-reads `theme.font_size` for
 /// `window.set_rem_size` every frame, so refreshing windows is enough.
-pub(crate) fn apply_text_size(size: TextSize, cx: &mut App) {
+pub fn apply_text_size(size: TextSize, cx: &mut App) {
     let scale = size.scale();
     let theme = Theme::global_mut(cx);
     theme.font_size = px(BASE_FONT_SIZE * scale);
@@ -68,19 +68,19 @@ pub(crate) fn apply_text_size(size: TextSize, cx: &mut App) {
 /// Task 11: the accent-bearing tokens a preset stamps over the kit theme. Blue
 /// has no entry: it is the kit's stock selection and re-stamping it would make
 /// the defaults differ from the palette the suite already pins.
-struct AccentPalette {
-    primary: Hsla,
-    primary_hover: Hsla,
-    primary_active: Hsla,
-    primary_foreground: Hsla,
-    ring: Hsla,
-    selection: Hsla,
-    wash: Hsla,
-    rim: Hsla,
-    solid: Hsla,
+pub struct AccentPalette {
+    pub primary: Hsla,
+    pub primary_hover: Hsla,
+    pub primary_active: Hsla,
+    pub primary_foreground: Hsla,
+    pub ring: Hsla,
+    pub selection: Hsla,
+    pub wash: Hsla,
+    pub rim: Hsla,
+    pub solid: Hsla,
 }
 
-fn accent_hue(accent: Accent) -> Option<f32> {
+pub fn accent_hue(accent: Accent) -> Option<f32> {
     match accent {
         Accent::Blue => None,
         Accent::Indigo => Some(0.66),
@@ -92,7 +92,7 @@ fn accent_hue(accent: Accent) -> Option<f32> {
     }
 }
 
-fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
+pub fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
     let hue = accent_hue(accent)?;
     Some(if mode.is_dark() {
         AccentPalette {
@@ -123,7 +123,7 @@ fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
 
 /// Task 11: the color a Settings swatch paints. Blue borrows the kit's stock
 /// selection rim so the default swatch matches what the window actually shows.
-pub(crate) fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
+pub fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
     match accent_palette(accent, mode) {
         Some(palette) => palette.solid,
         None => {
@@ -139,7 +139,7 @@ pub(crate) fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
 /// Task 11: re-stamp every accent-bearing token after `Theme::change` rebuilt
 /// the theme from its config. Health, danger, and warning tokens are never
 /// touched: those hues carry meaning, not preference.
-pub(crate) fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
+pub fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
     let Some(palette) = accent_palette(accent, mode) else {
         return;
     };
@@ -190,7 +190,7 @@ pub(crate) fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
     cx.refresh_windows();
 }
 
-pub(crate) fn apply_appearance(
+pub fn apply_appearance(
     appearance: &str,
     accent: Accent,
     window: Option<&mut Window>,

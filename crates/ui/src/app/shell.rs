@@ -1,7 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn render_shell(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub fn render_shell(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let drop_view = cx.entity();
         div()
             .id("manyproxy-shell")
@@ -98,7 +98,7 @@ impl AppView {
     /// its own folder; a session that fell back to memory carries the folder
     /// the failed open was using; a deliberate in-memory store has none, and
     /// never raises the banner anyway.
-    pub(crate) fn writable_folder(&self) -> String {
+    pub fn writable_folder(&self) -> String {
         self.write_blocked_folder
             .clone()
             .or_else(|| self.store.data_dir())
@@ -111,7 +111,7 @@ impl AppView {
     /// A failed OPEN names its own cause; the probe path keeps the write
     /// refusal. Both name the folder and both promise the same outcome: this
     /// session does not save.
-    pub(crate) fn write_banner_text(&self) -> Option<String> {
+    pub fn write_banner_text(&self) -> Option<String> {
         let reason = self.write_blocked.as_ref()?;
         Some(write_banner_sentence(
             &self.writable_folder(),
@@ -123,7 +123,7 @@ impl AppView {
     /// column — under the toolbar, above the table — so it takes its own height
     /// and the table shrinks. It carries no focus handle and no click-absorbing
     /// layer: the app keeps working, only saving is affected.
-    pub(crate) fn render_writable_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_writable_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let reason = self.write_blocked.as_ref()?;
         let text = self.write_banner_text()?;
         let tip = reason.clone();
@@ -175,7 +175,7 @@ impl AppView {
 /// `open_failure` carries the real reason a store could not open — a corrupt or
 /// locked database is not a write refusal — while the probe path keeps the
 /// write sentence.
-fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
+pub fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
     // The consequence leads. The strip is one truncated line, and a folder
     // path can be longer than the window: with the promise last, a long path
     // silently cut off the only part that matters. The OS reason rides the

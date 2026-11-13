@@ -1,20 +1,20 @@
 use crate::*;
 
 #[derive(Clone)]
-pub(crate) struct ImportForm {
-    pub(crate) text: Entity<TextareaState>,
-    pub(crate) group: Entity<InputState>,
-    pub(crate) file_hint: Option<String>,
-    pub(crate) original_text: String,
-    pub(crate) multi_files: Option<Vec<(String, String)>>,
+pub struct ImportForm {
+    pub text: Entity<TextareaState>,
+    pub group: Entity<InputState>,
+    pub file_hint: Option<String>,
+    pub original_text: String,
+    pub multi_files: Option<Vec<(String, String)>>,
     /// Mirrors `AppView::import_parse_in_flight` for the dialog footer: the
     /// builder cannot read `AppView` mid-update, but a cell it owns lets the
     /// footer repaint when the parse starts or finishes.
-    pub(crate) in_flight: Rc<Cell<bool>>,
+    pub in_flight: Rc<Cell<bool>>,
 }
 
 impl ImportForm {
-    pub(crate) fn new(
+    pub fn new(
         window: &mut Window,
         cx: &mut Context<AppView>,
         prefill_text: &str,
@@ -37,7 +37,7 @@ impl ImportForm {
         }
     }
 
-    pub(crate) fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
+    pub fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
         let text = self.text.read(cx).value().to_string();
 
         let preview = preview_batch_for_form(

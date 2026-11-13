@@ -12,27 +12,27 @@ use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::{FluentArgs, FluentResource};
 use unic_langid::LanguageIdentifier;
 
-pub(crate) use fluent_bundle::FluentArgs as Args;
+pub use fluent_bundle::FluentArgs as Args;
 
 /// Reserved store key for a future language picker. Nothing writes it yet;
 /// reading it here means the resolution order is already in place.
-pub(crate) const LOCALE_META_KEY: &str = "locale";
+pub const LOCALE_META_KEY: &str = "locale";
 
 /// The only locale with an embedded resource. Also the final fallback.
-pub(crate) const DEFAULT_LOCALE: &str = "en";
+pub const DEFAULT_LOCALE: &str = "en";
 
-const EN_FTL: &str = include_str!("../../locales/en/main.ftl");
+pub const EN_FTL: &str = include_str!("../../locales/en/main.ftl");
 
-type Bundle = FluentBundle<FluentResource>;
+pub type Bundle = FluentBundle<FluentResource>;
 
-struct Cache {
-    bundles: HashMap<String, Bundle>,
-    current: String,
+pub struct Cache {
+    pub bundles: HashMap<String, Bundle>,
+    pub current: String,
 }
 
-static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+pub static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
-fn cache() -> &'static Mutex<Cache> {
+pub fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| {
         Mutex::new(Cache {
             bundles: HashMap::new(),
@@ -43,14 +43,14 @@ fn cache() -> &'static Mutex<Cache> {
 
 /// A poisoned cache would only mean one panicking render; recovering the guard
 /// keeps copy rendering instead of cascading the panic into every later frame.
-fn lock_cache() -> MutexGuard<'static, Cache> {
+pub fn lock_cache() -> MutexGuard<'static, Cache> {
     match cache().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
 
-fn source_for(locale: &str) -> Option<&'static str> {
+pub fn source_for(locale: &str) -> Option<&'static str> {
     match locale {
         "en" => Some(EN_FTL),
         _ => None,
@@ -59,7 +59,7 @@ fn source_for(locale: &str) -> Option<&'static str> {
 
 /// Reduce a system tag to one we can serve. `en-US` lands on `en`; a locale
 /// with no resource falls all the way back to English.
-fn negotiate(tag: &str) -> String {
+pub fn negotiate(tag: &str) -> String {
     let normalized = normalize(tag);
     if source_for(&normalized).is_some() {
         return normalized;
@@ -75,7 +75,7 @@ fn negotiate(tag: &str) -> String {
     DEFAULT_LOCALE.to_string()
 }
 
-fn normalize(tag: &str) -> String {
+pub fn normalize(tag: &str) -> String {
     let tag = tag.trim().replace('_', "-");
     match tag.parse::<LanguageIdentifier>() {
         Ok(id) => id.to_string(),
@@ -85,7 +85,7 @@ fn normalize(tag: &str) -> String {
 
 /// Store override first, then the OS locale, then English. Kept pure so the
 /// precedence is testable without touching the process-wide current locale.
-fn resolve_locale_with(stored: Option<&str>, system: Option<&str>) -> String {
+pub fn resolve_locale_with(stored: Option<&str>, system: Option<&str>) -> String {
     let candidate = stored
         .map(str::trim)
         .filter(|tag| !tag.is_empty())
@@ -96,7 +96,7 @@ fn resolve_locale_with(stored: Option<&str>, system: Option<&str>) -> String {
 
 /// Tests force English: the suite asserts literal English copy, and a machine
 /// whose OS locale is not English must not change those assertions.
-pub(crate) fn resolve_locale(stored: Option<&str>) -> String {
+pub fn resolve_locale(stored: Option<&str>) -> String {
     #[cfg(test)]
     {
         let _ = stored;
@@ -108,18 +108,18 @@ pub(crate) fn resolve_locale(stored: Option<&str>) -> String {
     }
 }
 
-pub(crate) fn set_locale(tag: &str) {
+pub fn set_locale(tag: &str) {
     let negotiated = negotiate(tag);
     lock_cache().current = negotiated;
 }
 
-#[cfg(test)]
-pub(crate) fn current_locale() -> String {
+#[cfg(any(test, feature = "test-support"))]
+pub fn current_locale() -> String {
     lock_cache().current.clone()
 }
 
 impl Cache {
-    fn bundle(&mut self, locale: &str) -> Option<&Bundle> {
+    pub fn bundle(&mut self, locale: &str) -> Option<&Bundle> {
         if !self.bundles.contains_key(locale) {
             let source = source_for(locale)?;
             let langid: LanguageIdentifier = locale.parse().ok()?;
@@ -142,7 +142,7 @@ impl Cache {
         self.bundles.get(locale)
     }
 
-    fn format(&mut self, locale: &str, key: &str, args: Option<&FluentArgs<'_>>) -> Option<String> {
+    pub fn format(&mut self, locale: &str, key: &str, args: Option<&FluentArgs<'_>>) -> Option<String> {
         let bundle = self.bundle(locale)?;
         let message = bundle.get_message(key)?;
         let pattern = message.value()?;
@@ -159,7 +159,7 @@ impl Cache {
 
 /// Log a missing key once. A missing translation should be visible in dev but
 /// must not flood a repainting window.
-fn log_once(tag: &str) -> bool {
+pub fn log_once(tag: &str) -> bool {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     match seen.lock() {
@@ -168,7 +168,7 @@ fn log_once(tag: &str) -> bool {
     }
 }
 
-pub(crate) fn translate(key: &str, args: Option<&FluentArgs<'_>>) -> String {
+pub fn translate(key: &str, args: Option<&FluentArgs<'_>>) -> String {
     let mut cache = lock_cache();
     let current = cache.current.clone();
     if let Some(text) = cache.format(&current, key, args) {
@@ -192,6 +192,11 @@ pub(crate) fn translate(key: &str, args: Option<&FluentArgs<'_>>) -> String {
 ///
 /// Values become Fluent arguments, so a sentence with a row name is one
 /// message rather than concatenated fragments.
+///
+/// `#[macro_export]` hoists the macro to the crate root, which is how the
+/// 2018-edition paths (`crate::t!` from any module, `manyproxy_ui::t!` from
+/// the split test binaries) resolve it. There is no mod-local copy.
+#[macro_export]
 macro_rules! t {
     ($key:literal $(,)?) => {
         $crate::i18n::translate($key, None)
@@ -202,8 +207,6 @@ macro_rules! t {
         $crate::i18n::translate($key, Some(&args))
     }};
 }
-
-pub(crate) use t;
 
 #[cfg(test)]
 mod tests {

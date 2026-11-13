@@ -1,7 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn finish_update_check(
+    pub fn finish_update_check(
         &mut self,
         fetched: Result<Option<FetchedRelease>, String>,
         window: &mut Window,
@@ -22,7 +22,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn finish_update_check_no_window(
+    pub fn finish_update_check_no_window(
         &mut self,
         _fetched: Result<Option<FetchedRelease>, String>,
         cx: &mut Context<Self>,
@@ -31,7 +31,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn finish_passive_update_check(
+    pub fn finish_passive_update_check(
         &mut self,
         fetched: Result<Option<FetchedRelease>, String>,
         epoch: u64,
@@ -58,7 +58,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn finish_ssh_key_pick(
+    pub fn finish_ssh_key_pick(
         &mut self,
         path_entity: Entity<InputState>,
         key_entity: Entity<TextareaState>,
@@ -80,7 +80,7 @@ impl AppView {
         window.push_notification(Notification::success(t!("loaded-ssh-key", path = path)), cx);
     }
 
-    pub(crate) fn finish_extra_exe_pick(
+    pub fn finish_extra_exe_pick(
         &mut self,
         path_entity: Entity<InputState>,
         display: String,
@@ -101,7 +101,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn finish_browse_pick(
+    pub fn finish_browse_pick(
         &mut self,
         current_text: String,
         current_group: String,
@@ -129,7 +129,7 @@ impl AppView {
         // cannot be named by a row that lists only readable ones).
     }
 
-    pub(crate) fn finish_import_parse(
+    pub fn finish_import_parse(
         &mut self,
         epoch: u64,
         batch: crate::import::BatchResult,
@@ -147,7 +147,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn finish_import_parse_no_window(
+    pub fn finish_import_parse_no_window(
         &mut self,
         epoch: u64,
         batch: crate::import::BatchResult,
@@ -163,7 +163,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn finish_import_batch(
+    pub fn finish_import_batch(
         &mut self,
         batch: crate::import::BatchResult,
         group: &str,
@@ -262,7 +262,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn finish_subscription_refresh(
+    pub fn finish_subscription_refresh(
         &mut self,
         sub_id: &str,
         label: &str,
@@ -506,7 +506,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    pub(crate) fn finish_subscription_refresh_no_window(
+    pub fn finish_subscription_refresh_no_window(
         &mut self,
         sub_id: &str,
         fetched: Result<FetchedSubscription, String>,
@@ -626,7 +626,7 @@ impl AppView {
         self.reload_quiet(cx);
     }
 
-    pub(crate) fn finish_preset_refresh(
+    pub fn finish_preset_refresh(
         &mut self,
         id: &str,
         name: &str,
@@ -680,7 +680,7 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn finish_preset_refresh_no_window(
+    pub fn finish_preset_refresh_no_window(
         &mut self,
         id: &str,
         fetched: Result<FetchedSubscription, String>,
@@ -705,7 +705,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn finish_rule_set_download(
+    pub fn finish_rule_set_download(
         &mut self,
         grant: &RuleSetDownloadGrant,
         fetched: Result<Vec<u8>, String>,
@@ -759,7 +759,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn finish_rule_set_download_no_window(
+    pub fn finish_rule_set_download_no_window(
         &mut self,
         grant: &RuleSetDownloadGrant,
         fetched: Result<Vec<u8>, String>,

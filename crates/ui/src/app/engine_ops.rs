@@ -1,28 +1,28 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn reload_quiet(&mut self, cx: &mut Context<Self>) {
+    pub fn reload_quiet(&mut self, cx: &mut Context<Self>) {
         let _ = self.reload_inner(cx);
         cx.notify();
     }
 
-    pub(crate) fn reload_quiet_no_poll(&mut self, cx: &mut Context<Self>) {
+    pub fn reload_quiet_no_poll(&mut self, cx: &mut Context<Self>) {
         let _ = self.reload_inner_no_poll(cx);
         cx.notify();
     }
 
-    pub(crate) fn reload_inner(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
+    pub fn reload_inner(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
         self.reload_inner_impl(cx, true)
     }
 
-    pub(crate) fn reload_inner_no_poll(
+    pub fn reload_inner_no_poll(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<(), StoreError> {
         self.reload_inner_impl(cx, false)
     }
 
-    pub(crate) fn reload_inner_impl(
+    pub fn reload_inner_impl(
         &mut self,
         cx: &mut Context<Self>,
         poll: bool,
@@ -92,7 +92,7 @@ impl AppView {
     }
 
     #[cfg(test)]
-    pub(crate) fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -102,12 +102,12 @@ impl AppView {
         self.commit_enabled_flag(&id, enabled, window, cx);
     }
 
-    pub(crate) fn poll_engine(&mut self) -> Option<String> {
+    pub fn poll_engine(&mut self) -> Option<String> {
         self.engine.poll()
     }
 
     #[cfg(test)]
-    pub(crate) fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let crashed = self.engine.crashed_shards();
         if crashed.is_empty() {
             window.push_notification(Notification::info(t!("no-crashed-to-restart")), cx);
@@ -134,7 +134,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn start_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -142,7 +142,7 @@ impl AppView {
         self.start_row(&config.id, window, cx);
     }
 
-    pub(crate) fn start_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             self.settle_batch_start(&[]);
@@ -165,7 +165,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn stop_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -173,7 +173,7 @@ impl AppView {
         self.stop_row(&config.id, window, cx);
     }
 
-    pub(crate) fn stop_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -223,7 +223,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
@@ -266,7 +266,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.engine.running_count() == 0 {
             let message = stop_all_message(0);
             window.push_notification(Notification::warning(message), cx);
@@ -294,7 +294,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn health_map(&self) -> HashMap<String, String> {
+    pub fn health_map(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for id in self.engine.running_ids() {
             let summary = self.health_store.row_summary(&id);
@@ -305,7 +305,7 @@ impl AppView {
         map
     }
 
-    pub(crate) fn health_tones(&self) -> HashMap<String, LatencyTone> {
+    pub fn health_tones(&self) -> HashMap<String, LatencyTone> {
         self.engine
             .running_ids()
             .iter()
@@ -314,11 +314,11 @@ impl AppView {
             .collect()
     }
 
-    pub(crate) fn health_counts(&self) -> (usize, usize) {
+    pub fn health_counts(&self) -> (usize, usize) {
         self.health_store.counts(&self.engine.running_ids())
     }
 
-    pub(crate) fn probe_kind_in_flight(&self, ping: bool) -> bool {
+    pub fn probe_kind_in_flight(&self, ping: bool) -> bool {
         if ping {
             self.probe_ping_in_flight
         } else {
@@ -326,7 +326,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+    pub fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let Some(rows) = self.running_rows_or_notify(window, cx) else {
             return 0;
         };
@@ -350,7 +350,7 @@ impl AppView {
         self.spawn_probe(rows, false, true, Some(window.window_handle()), cx)
     }
 
-    pub(crate) fn test_selected_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn test_selected_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -358,7 +358,7 @@ impl AppView {
         self.test_row(&config.id, window, cx);
     }
 
-    pub(crate) fn test_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn test_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             self.settle_batch_test(&[]);
@@ -382,7 +382,7 @@ impl AppView {
 
     /// URL-test the row menu's subject or the whole selection. One row keeps
     /// its own not-running copy; several rows test the running subset.
-    pub(crate) fn test_selected_rows(
+    pub fn test_selected_rows(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -415,7 +415,7 @@ impl AppView {
     /// the T-19 auto-clear path and its tests, so the entry point is retained
     /// until a group-test entry gets a new UI home.
     #[allow(dead_code)]
-    pub(crate) fn test_group_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn test_group_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(Notification::info(t!("no-group-focus")), cx);
             return;
@@ -438,7 +438,7 @@ impl AppView {
     /// Stop the probe batch that is running — the group sweep or the URL
     /// test the engine bar's `Test all` started. Both read the same stop
     /// flag, so one button covers both.
-    pub(crate) fn stop_group_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_group_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use std::sync::atomic::Ordering;
         if !self.group_test_in_flight && !self.probe_url_in_flight {
             window.push_notification(Notification::info(t!("no-group-test-running")), cx);
@@ -454,7 +454,7 @@ impl AppView {
     /// The retired Library menu's prune family. Slice 7 re-homes it in the
     /// group and source manage sheet.
     #[allow(dead_code)]
-    pub(crate) fn health_store_prune_group(&mut self, group: &str) {
+    pub fn health_store_prune_group(&mut self, group: &str) {
         let ids: HashSet<String> = self
             .store
             .list()
@@ -470,7 +470,7 @@ impl AppView {
     /// the toolbar; the protocol column carries the security suffix instead,
     /// so the row's own flag stays until the column work lands.
     #[allow(dead_code)]
-    pub(crate) fn toggle_show_security(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_show_security(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // A6-4/K8: the toggle renders in place (rows re-render with the
         // security marks) — no toast while the menu is open.
         let show = !self.libraries.read(cx).delegate().show_security;
@@ -483,7 +483,7 @@ impl AppView {
     /// R7: every visible header sorts on click. The first click on a column
     /// sorts ascending by that column's natural key; clicking the active
     /// column again reverses it.
-    pub(crate) fn sort_by_header(
+    pub fn sort_by_header(
         &mut self,
         column: ColumnId,
         window: &mut Window,
@@ -499,7 +499,7 @@ impl AppView {
         self.commit_library_sort(LibrarySort::new(key, direction), window, cx);
     }
 
-    pub(crate) fn drain_engine_logs(&mut self, active: &[ProxyConfig]) {
+    pub fn drain_engine_logs(&mut self, active: &[ProxyConfig]) {
         let lines = self.engine.drain_log_lines();
         if lines.is_empty() {
             return;
@@ -511,7 +511,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn toggle_log_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_log_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.logs.tail = !self.logs.tail;
         window.push_notification(
             Notification::info(if self.logs.tail {
@@ -533,12 +533,12 @@ impl AppView {
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
+    pub fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
         self.logs.filter = filter;
         cx.notify();
     }
 
-    pub(crate) fn apply_log_filters(
+    pub fn apply_log_filters(
         &mut self,
         include: String,
         exclude: String,
@@ -551,7 +551,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn start_subscription_refresh(
+    pub fn start_subscription_refresh(
         &mut self,
         sub: ProxySubscription,
         named: bool,
@@ -592,7 +592,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn toggle_sub_expanded(
+    pub fn toggle_sub_expanded(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -604,7 +604,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    pub(crate) fn start_preset_refresh(
+    pub fn start_preset_refresh(
         &mut self,
         preset: store::RoutePreset,
         cx: &mut Context<Self>,
@@ -644,7 +644,7 @@ impl AppView {
 
     /// Reached only from the confirm dialog's Download click. Fetches through
     /// the shared subscription pipeline, then stages bytes + row.
-    pub(crate) fn start_rule_set_download(
+    pub fn start_rule_set_download(
         &mut self,
         grant: RuleSetDownloadGrant,
         window: &mut Window,
@@ -676,7 +676,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn start_explicit_refresh(
+    pub fn start_explicit_refresh(
         &mut self,
         subs: Vec<ProxySubscription>,
         window: &mut Window,
@@ -702,11 +702,11 @@ impl AppView {
     }
 
     #[cfg(test)]
-    pub(crate) fn stop_background_ticks(&mut self) {
+    pub fn stop_background_ticks(&mut self) {
         self.ticks_enabled = false;
     }
 
-    pub(crate) fn tick_engine_poll(&mut self, cx: &mut Context<Self>) -> Option<String> {
+    pub fn tick_engine_poll(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if !self.ticks_enabled {
             return None;
         }
@@ -724,7 +724,7 @@ impl AppView {
     }
 
     #[cfg(test)]
-    pub(crate) fn tick_engine_poll_notify(
+    pub fn tick_engine_poll_notify(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -745,7 +745,7 @@ impl AppView {
     /// T-30: one sampling pass, riding the existing engine tick (no new timer).
     /// The pid cohort comes from the controller, so only this app's own
     /// sidecars can ever be opened.
-    pub(crate) fn tick_shard_samples(&mut self) {
+    pub fn tick_shard_samples(&mut self) {
         let live: Vec<(String, u32)> = self
             .engine
             .shard_processes()
@@ -761,7 +761,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
+    pub fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
@@ -777,7 +777,7 @@ impl AppView {
         started
     }
 
-    pub(crate) fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
+    pub fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
@@ -800,7 +800,7 @@ impl AppView {
         self.spawn_probe(rows, false, false, None, cx)
     }
 
-    pub(crate) fn ensure_traffic_mirror(&mut self, cx: &mut Context<Self>) {
+    pub fn ensure_traffic_mirror(&mut self, cx: &mut Context<Self>) {
         if self.traffic_mirror_hydrated {
             return;
         }
@@ -824,7 +824,7 @@ impl AppView {
     }
 
     #[cfg(test)]
-    pub(crate) fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
+    pub fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
@@ -843,7 +843,7 @@ impl AppView {
         self.apply_traffic_results(results, &exclusions, cx)
     }
 
-    pub(crate) fn apply_traffic_results(
+    pub fn apply_traffic_results(
         &mut self,
         results: Vec<(
             crate::engine::ClashTarget,
@@ -944,7 +944,7 @@ impl AppView {
         updated
     }
 
-    pub(crate) fn start_background_ticks(&mut self, cx: &mut Context<Self>) {
+    pub fn start_background_ticks(&mut self, cx: &mut Context<Self>) {
         if self.ticks_started {
             return;
         }

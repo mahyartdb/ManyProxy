@@ -1,6 +1,6 @@
 use crate::*;
 
-pub(crate) fn redact_subscription_url(url: &str) -> String {
+pub fn redact_subscription_url(url: &str) -> String {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let without_query = without_fragment
         .split('?')
@@ -25,7 +25,7 @@ pub(crate) fn redact_subscription_url(url: &str) -> String {
     truncate(&stripped, 96)
 }
 
-pub(crate) fn subscription_label_from_url(url: &str) -> String {
+pub fn subscription_label_from_url(url: &str) -> String {
     let after = url.split("://").nth(1).unwrap_or(url);
     let host = after.split('/').next().unwrap_or(after);
     let host = host.rsplit('@').next().unwrap_or(host);
@@ -36,14 +36,14 @@ pub(crate) fn subscription_label_from_url(url: &str) -> String {
     }
 }
 
-pub(crate) fn subscription_member_names(rows: &[ProxyConfig], sub_id: &str) -> Vec<String> {
+pub fn subscription_member_names(rows: &[ProxyConfig], sub_id: &str) -> Vec<String> {
     rows.iter()
         .filter(|row| row.subscription_id.as_deref() == Some(sub_id))
         .map(|row| row.name.clone())
         .collect()
 }
 
-pub(crate) fn subscription_row(
+pub fn subscription_row(
     view: Entity<AppView>,
     sub: ProxySubscription,
     count: usize,
@@ -236,7 +236,7 @@ pub(crate) fn subscription_row(
     )
 }
 
-pub(crate) fn update_target_subs(
+pub fn update_target_subs(
     subs: &[ProxySubscription],
     group: &str,
 ) -> Vec<ProxySubscription> {
@@ -249,7 +249,7 @@ pub(crate) fn update_target_subs(
     out
 }
 
-pub(crate) fn update_all_targets(
+pub fn update_all_targets(
     subs: Vec<ProxySubscription>,
     flagged: &HashSet<String>,
 ) -> (Vec<ProxySubscription>, Vec<ProxySubscription>) {
@@ -265,7 +265,7 @@ pub(crate) fn update_all_targets(
     (included, skipped)
 }
 
-pub(crate) fn rule_set_row(
+pub fn rule_set_row(
     view: Entity<AppView>,
     row: store::RuleSetRow,
     used_by: Vec<String>,

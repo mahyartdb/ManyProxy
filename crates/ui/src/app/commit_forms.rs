@@ -5,7 +5,7 @@ use crate::*;
 
 impl AppView {
     #[cfg(test)]
-    pub(crate) fn commit_add(
+    pub fn commit_add(
         &mut self,
         input: NewConfig,
         window: &mut Window,
@@ -29,7 +29,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_add_with_focus(
+    pub fn commit_add_with_focus(
         &mut self,
         form: &ConfigForm,
         form_error: &Rc<RefCell<Option<(String, String)>>>,
@@ -100,7 +100,7 @@ impl AppView {
     /// The tests' direct store-edit path. Production edit actions go through
     /// `commit_edit_with_focus`, which owns the form error and focus.
     #[cfg(test)]
-    pub(crate) fn commit_edit(
+    pub fn commit_edit(
         &mut self,
         id: &str,
         patch: ConfigPatch,
@@ -150,7 +150,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_edit_with_focus(
+    pub fn commit_edit_with_focus(
         &mut self,
         id: &str,
         patch: ConfigPatch,
@@ -241,7 +241,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // K5: the whole row is captured BEFORE removal — the undo toast keeps
         // it in memory for its lifetime, so expiry means the row is simply
         // gone, and Undo re-adds it with its group assignment.
@@ -293,7 +293,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_duplicate(
+    pub fn commit_duplicate(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -343,7 +343,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_test_url(
+    pub fn commit_test_url(
         &mut self,
         raw: &str,
         window: &mut Window,
@@ -390,7 +390,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_update_feed_url(
+    pub fn commit_update_feed_url(
         &mut self,
         raw: &str,
         window: &mut Window,
@@ -453,7 +453,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_row_test_url(
+    pub fn commit_row_test_url(
         &mut self,
         id: &str,
         raw: &str,
@@ -517,7 +517,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_edit_with_test_url(
+    pub fn commit_edit_with_test_url(
         &mut self,
         id: &str,
         patch: ConfigPatch,
@@ -543,7 +543,7 @@ impl AppView {
 
     /// The row's auto-start flag flipped to its current opposite. Read now, at
     /// invocation, so the menu never acts on a stale render.
-    pub(crate) fn toggle_row_enabled(
+    pub fn toggle_row_enabled(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -556,7 +556,7 @@ impl AppView {
         self.commit_enabled_flag(&config.id, !config.enabled, window, cx);
     }
 
-    pub(crate) fn commit_enabled_flag(
+    pub fn commit_enabled_flag(
         &mut self,
         id: &str,
         enabled: bool,
@@ -590,7 +590,7 @@ impl AppView {
 
     /// The group manage sheet's prune family. The sheet names its group; no
     /// selected row is required.
-    pub(crate) fn commit_prune(
+    pub fn commit_prune(
         &mut self,
         kind: GroupPruneKind,
         group: &str,
@@ -713,7 +713,7 @@ impl AppView {
 
     /// T-19: only this confirm's ACK enables the flag — the note is
     /// auto-clear's own, and the store rejects any enable without note_seen.
-    pub(crate) fn commit_auto_clear_opt_in(
+    pub fn commit_auto_clear_opt_in(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -741,7 +741,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_auto_clear_off(
+    pub fn commit_auto_clear_off(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -773,7 +773,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_library_sort(
+    pub fn commit_library_sort(
         &mut self,
         sort: LibrarySort,
         window: &mut Window,
@@ -805,7 +805,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn commit_save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_logs_path();
         match self.write_visible_logs_to(&path, cx) {
             Ok(()) => window.push_notification(
@@ -820,7 +820,7 @@ impl AppView {
     /// The rebuild preserves nothing: changing the cap mid-session truncates
     /// every present record for the fresh ring (no partial-growth state), which
     /// the Settings note beside the field states.
-    pub(crate) fn commit_log_cap(
+    pub fn commit_log_cap(
         &mut self,
         window: &mut Window,
         raw: &str,
@@ -858,7 +858,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn commit_export_dialog(
+    pub fn commit_export_dialog(
         &mut self,
         path: String,
         window: &mut Window,
@@ -900,7 +900,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn commit_export_write_to(
+    pub fn commit_export_write_to(
         &mut self,
         path: &str,
         window: &mut Window,
@@ -936,7 +936,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_library_restore(
+    pub fn commit_library_restore(
         &mut self,
         payload: &str,
         window: &mut Window,
@@ -1022,7 +1022,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_usage_reset(
+    pub fn commit_usage_reset(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1045,7 +1045,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_bare_url_subscription(
+    pub fn commit_bare_url_subscription(
         &mut self,
         url: String,
         window: &mut Window,
@@ -1066,7 +1066,7 @@ impl AppView {
     }
 
     #[cfg(test)]
-    pub(crate) fn commit_import(
+    pub fn commit_import(
         &mut self,
         text: String,
         group: String,
@@ -1079,7 +1079,7 @@ impl AppView {
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_import_with_context(
+    pub fn commit_import_with_context(
         &mut self,
         text: String,
         group: String,
@@ -1105,7 +1105,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_import_dialog(
+    pub fn commit_import_dialog(
         &mut self,
         text: String,
         group: String,
@@ -1167,7 +1167,7 @@ impl AppView {
         false
     }
 
-    pub(crate) fn commit_addsub_request_with_group(
+    pub fn commit_addsub_request_with_group(
         &mut self,
         request: AddSubRequest,
         dialog_group: &str,
@@ -1187,7 +1187,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_subscription_add(
+    pub fn commit_subscription_add(
         &mut self,
         label: String,
         url: String,
@@ -1239,7 +1239,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_subscription_edit(
+    pub fn commit_subscription_edit(
         &mut self,
         id: &str,
         label: String,
@@ -1288,7 +1288,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_subscription_auto(
+    pub fn commit_subscription_auto(
         &mut self,
         sub_id: &str,
         window: &mut Window,
@@ -1328,7 +1328,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_create_with_boxes(
+    pub fn commit_preset_create_with_boxes(
         &mut self,
         name: String,
         rules_text: String,
@@ -1408,7 +1408,7 @@ impl AppView {
     /// Compat entry for contract tests that only exercise the rules JSON
     /// layer (empty boxes expand to nothing).
     #[cfg(test)]
-    pub(crate) fn commit_preset_edit(
+    pub fn commit_preset_edit(
         &mut self,
         id: &str,
         name: String,
@@ -1426,7 +1426,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn commit_preset_edit_with_boxes(
+    pub fn commit_preset_edit_with_boxes(
         &mut self,
         id: &str,
         name: String,
@@ -1482,7 +1482,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_preset_export_link(
+    pub fn commit_preset_export_link(
         &mut self,
         preset: &store::RoutePreset,
         window: &mut Window,
@@ -1517,7 +1517,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_preset_duplicate(
+    pub fn commit_preset_duplicate(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1565,7 +1565,7 @@ impl AppView {
     /// T-10 prevent-modifications lock. The toggle is the owner's positive
     /// action (no confirm dialog); it protects the rules, never the attach
     /// relationship.
-    pub(crate) fn commit_preset_lock(
+    pub fn commit_preset_lock(
         &mut self,
         id: &str,
         locked: bool,
@@ -1592,7 +1592,7 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_remove(
+    pub fn commit_preset_remove(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1634,7 +1634,7 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_detach_delete(
+    pub fn commit_preset_detach_delete(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1663,7 +1663,7 @@ impl AppView {
 
     /// The selection's attach: the same preset, applied to every selected
     /// config. One message names the count.
-    pub(crate) fn commit_preset_attach_ids(
+    pub fn commit_preset_attach_ids(
         &mut self,
         config_ids: &[String],
         preset_id: Option<String>,
@@ -1706,7 +1706,7 @@ impl AppView {
 
     /// Remove: blocked while any preset references the set (loud inline), the
     /// file delete lands right after the row so no orphan cache bytes survive.
-    pub(crate) fn commit_rule_set_remove(
+    pub fn commit_rule_set_remove(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1752,7 +1752,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_subscription_remove(
+    pub fn commit_subscription_remove(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1778,7 +1778,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    pub(crate) fn commit_subs_global_auto(
+    pub fn commit_subs_global_auto(
         &mut self,
         on: bool,
         window: &mut Window,
@@ -1797,7 +1797,7 @@ impl AppView {
 /// K3: the `Add remote ruleset…` row only carries a URL, so the staging name
 /// falls back to the URL's last path segment with the extension stripped. The
 /// store still validates the final name and reports why it refused.
-fn rule_set_name_from_url(url: &str) -> String {
+pub fn rule_set_name_from_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches(['/', '\\']);
     let segment = trimmed
         .split(['/', '?', '#'])

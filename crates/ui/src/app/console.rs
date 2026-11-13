@@ -12,7 +12,7 @@ use super::detail::{note_console_row, pane_rows, ConsoleRows, PANE_LINK_ROW_H, P
 
 /// R4/fork 2: the dock is fixed-height. Comfortable is the default; compact
 /// is what the density row asks for. It never resizes and never persists.
-pub(crate) fn console_height(density: Density) -> f32 {
+pub fn console_height(density: Density) -> f32 {
     match density {
         Density::Compact => 220.,
         Density::Comfortable => 240.,
@@ -23,12 +23,12 @@ pub(crate) fn console_height(density: Density) -> f32 {
 /// just truncates. At 1100px the filter shrinks first; tabs and buttons wrap
 /// never (one flex row, `flex_nowrap`, each control `flex_shrink_0` except
 /// the filter).
-const CONSOLE_FILTER_MIN_PX: f32 = 80.;
-const CONSOLE_FILTER_MAX_PX: f32 = 180.;
+pub const CONSOLE_FILTER_MIN_PX: f32 = 80.;
+pub const CONSOLE_FILTER_MAX_PX: f32 = 180.;
 
 /// The one entry point render.rs calls. A collapsed dock is no element at
 /// all: the engine bar never moves because nothing above it changed height.
-pub(crate) fn render_console_slot(
+pub fn render_console_slot(
     view: &mut AppView,
     window: &mut Window,
     cx: &mut Context<AppView>,
@@ -39,7 +39,7 @@ pub(crate) fn render_console_slot(
     Some(render_console(view, window, cx))
 }
 
-fn render_console(
+pub fn render_console(
     view: &mut AppView,
     _window: &mut Window,
     cx: &mut Context<AppView>,
@@ -68,7 +68,7 @@ fn render_console(
 /// Header, left to right: title, tabs, scope, quick filter, pause/clear
 /// (Logs only), close. One non-wrapping row — the filter is the only
 /// shrinkable item.
-fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     let view_entity = cx.entity();
 
     let mut tabs = div().flex().flex_row().items_center().gap_1();
@@ -300,7 +300,7 @@ fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> AnyEl
 
 /// The scope row every tab shows when `Selected` is empty: one honest line,
 /// no bounce back to `All`.
-fn render_scope_empty(cx: &App) -> AnyElement {
+pub fn render_scope_empty(cx: &App) -> AnyElement {
     div()
         .id("console-empty-selected")
         .test_support()
@@ -310,7 +310,7 @@ fn render_scope_empty(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     if view.console.scope == ConsoleScope::Selected && view.selection_count() == 0 {
         return render_scope_empty(cx);
     }
@@ -387,7 +387,7 @@ fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElem
         .into_any_element()
 }
 
-fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     if view.console.scope == ConsoleScope::Selected && view.selection_count() == 0 {
         return render_scope_empty(cx);
     }
@@ -620,7 +620,7 @@ fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>) -> 
         .into_any_element()
 }
 
-fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     if view.console.scope == ConsoleScope::Selected && view.selection_count() == 0 {
         return render_scope_empty(cx);
     }
@@ -780,7 +780,7 @@ fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyE
 
 /// The old `Runtime stats` dialog's lines: uptime, endpoints, running binds,
 /// session delta, subscriptions, database, selected row, and the shard rows.
-fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     let uptime = format_uptime(view.started_at.elapsed().as_secs());
     let running = view.engine.running_count();
     let rows = view.store.list().unwrap_or_default();

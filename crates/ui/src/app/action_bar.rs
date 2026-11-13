@@ -8,11 +8,11 @@ use crate::*;
 
 impl AppView {
     /// The empty canvas and the action bar share these two handlers.
-    pub(crate) fn open_add_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_add_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_add_dialog(window, cx);
     }
 
-    pub(crate) fn open_import_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_import_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
     }
 
@@ -21,7 +21,7 @@ impl AppView {
     ///
     /// The count truncates before the buttons do: at the minimum width the
     /// numbers give up their room first, never a control.
-    pub(crate) fn render_action_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_action_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let total = self.scope_count(&self.scope);
         let enabled = self.scope_enabled;
         let count_text = status_count_text(total, enabled);
@@ -100,7 +100,7 @@ impl AppView {
 
     /// The overflow behind the action bar's `⋯`: the verbs that are neither
     /// intake nor transport.
-    pub(crate) fn render_action_overflow(&self, view: Entity<AppView>) -> AnyElement {
+    pub fn render_action_overflow(&self, view: Entity<AppView>) -> AnyElement {
         Button::new("action-bar-overflow")
             .small()
             .ghost()
@@ -171,7 +171,7 @@ impl AppView {
 
 /// The passive check's marker on the overflow. The retired status strip
 /// carried this as a text hint; a dot says the same thing in one pixel.
-fn action_overflow_dot(update_available: bool, cx: &mut Context<AppView>) -> AnyElement {
+pub fn action_overflow_dot(update_available: bool, cx: &mut Context<AppView>) -> AnyElement {
     if !update_available {
         return div().into_any_element();
     }
