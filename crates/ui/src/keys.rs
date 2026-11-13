@@ -101,11 +101,7 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
         Some(ENDPOINT_EDITOR_CONTEXT),
     ));
     bind(&mut keys, "focus-search", FocusSearch);
-    bind(&mut keys, "inspector-details", InspectorDetails);
-    bind(&mut keys, "inspector-health", InspectorHealth);
-    bind(&mut keys, "inspector-logs", InspectorLogs);
-    bind(&mut keys, "inspector-links", InspectorLinks);
-    bind(&mut keys, "inspector-traffic", InspectorTraffic);
-    bind(&mut keys, "inspector-toggle", InspectorToggle);
+    bind(&mut keys, "inspector-toggle", ToggleInspector);
+    bind(&mut keys, "toggle-console", ToggleConsole);
     cx.bind_keys(keys);
 }

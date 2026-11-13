@@ -81,25 +81,11 @@ impl AppView {
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
                 shortcut_action(view, "focus-search", window, cx);
             }))
-            .on_action(cx.listener(|view, _: &InspectorDetails, window, cx| {
-                // F19: Ctrl-1 is the one key that owns presence — it toggles
-                // the panel shut when it is already showing Details.
-                shortcut_action(view, "inspector-details", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {
-                shortcut_action(view, "inspector-health", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorLogs, window, cx| {
-                shortcut_action(view, "inspector-logs", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorLinks, window, cx| {
-                shortcut_action(view, "inspector-links", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorTraffic, window, cx| {
-                shortcut_action(view, "inspector-traffic", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorToggle, window, cx| {
+            .on_action(cx.listener(|view, _: &ToggleInspector, window, cx| {
                 shortcut_action(view, "inspector-toggle", window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ToggleConsole, window, cx| {
+                shortcut_action(view, "toggle-console", window, cx);
             }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {

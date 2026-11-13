@@ -1,5 +1,7 @@
 use crate::*;
 
+use super::console::render_console_slot;
+
 /// F2: the one owner of the inspector's geometry. The column headers, the
 /// rows, the facet bar and the drawer all read these two numbers, so the
 /// table can never lay itself out under the drawer.
@@ -78,15 +80,17 @@ impl AppView {
         window.viewport_size().width.as_f32() >= INSPECTOR_DRAWER_BREAKPOINT
     }
 
-    /// T-03: the inspector's live width. The split's own state carries it, so
-    /// the table's column budget follows a drag. The width is session-only.
+    /// T-03/R12: the inspector's live width. The split's own state carries it
+    /// after a drag, so the table's column budget follows; before the first
+    /// drag (and on the first frame, when `sizes()` is empty) the persisted
+    /// store width is authoritative.
     pub(crate) fn inspector_width(&self, cx: &App) -> f32 {
         let sizes = self.split_state.read(cx).sizes();
         sizes
             .get(1)
             .map(|size| size.as_f32())
             .filter(|width| *width >= INSPECTOR_WIDTH_MIN && *width <= INSPECTOR_WIDTH_MAX)
-            .unwrap_or(INSPECTOR_WIDTH)
+            .unwrap_or_else(|| self.store.inspector_width())
     }
 }
 
@@ -144,6 +148,7 @@ impl Render for AppView {
         let action_bar = self.render_action_bar(cx);
         let filter_slot = self.render_filter_slot(window, cx);
         let engine_bar = self.render_engine_bar(cx);
+        let console_slot = render_console_slot(self, window, cx);
         let column_headers = self.render_library_column_headers(window, cx);
         // R11: the header and the rows live in one horizontally scrolled
         // column, so they can never drift apart and a narrow pane scrolls
@@ -209,8 +214,25 @@ impl Render for AppView {
             // the whole viewport instead of an empty split half.
             list_pane.into_any_element()
         } else if docked {
+            // R12: `on_resize` fires after the mouse-up, so this is one store
+            // write per drag — never one per frame.
+            let weak_view = cx.entity().downgrade();
             h_resizable("main-split")
                 .with_state(&self.split_state)
+                .on_resize(move |state, window, cx| {
+                    let Some(view) = weak_view.upgrade() else {
+                        return;
+                    };
+                    let width = state
+                        .read(cx)
+                        .sizes()
+                        .get(1)
+                        .map(|size| size.as_f32())
+                        .unwrap_or(store::Store::INSPECTOR_WIDTH_DEFAULT);
+                    view.update(cx, |view, cx| {
+                        view.persist_inspector_width(width, window, cx);
+                    });
+                })
                 .child(
                     resizable_panel()
                         .size_range(px(RowMetrics::TABLE_MIN)..px(10000.))
@@ -271,6 +293,11 @@ impl Render for AppView {
                                     .min_h_0()
                                     .child(split),
                             )
+                            // Slice 6: the console dock is a child of main,
+                            // under the rows and above the engine bar. It
+                            // spans the table and the inspector; the nav is
+                            // never under it.
+                            .children(console_slot)
                             // The engine bar is a sibling of the content row,
                             // not a child of the split: it spans the table and
                             // the inspector, and the nav is never under it.

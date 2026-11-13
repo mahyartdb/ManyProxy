@@ -155,7 +155,7 @@ impl AppView {
         path: &std::path::Path,
         cx: &App,
     ) -> Result<(), String> {
-        let body = self.visible_log_lines(cx).join("\n");
+        let body = self.log_lines(cx).join("\n");
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, body)
             .map_err(|error| t!("cannot-save-logs", error = error.to_string()))?;
@@ -193,7 +193,7 @@ impl AppView {
     }
 
     pub(crate) fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let lines = self.visible_log_lines(cx);
+        let lines = self.log_lines(cx);
         if lines.is_empty() {
             window.push_notification(Notification::warning(t!("no-log-lines-to-copy")), cx);
             return;

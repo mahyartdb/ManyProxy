@@ -57,6 +57,10 @@ impl AppView {
     pub(crate) fn commit_clear_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_health_snapshots() {
             Ok(count) => {
+                // The store is authoritative on disk, but `health_store` was
+                // hydrated once at boot. Reset it here or the inspector and the
+                // engine-bar enablement keep reporting the cleared samples.
+                self.health_store = HealthStore::default();
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(t!("cleared-health-toast", count = count)),

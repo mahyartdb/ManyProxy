@@ -478,6 +478,15 @@ impl AppView {
             return false;
         }
         // Slice 3: field first, then the selection, then the facets.
+        let console_filter_focused = self
+            .console_filter_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        if console_filter_focused && !self.console.filter.is_empty() {
+            self.clear_console_filter(cx);
+            return true;
+        }
         if !self.query.search.is_empty() {
             self.clear_search(window, cx);
             return true;
