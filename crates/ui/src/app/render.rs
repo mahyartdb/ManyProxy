@@ -92,6 +92,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.consume_endpoint_intent(window, cx);
         // Task 12: restore-from-maximize is the one frame where DWM may have
         // forgotten the corner style. Re-apply only on that transition.
         let maximized = window.is_maximized();

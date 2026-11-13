@@ -36,6 +36,7 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     bind(&mut keys, "open-palette", OpenPalette);
     bind(&mut keys, "copy-urls", CopyUrls);
     bind(&mut keys, "update-current-group", UpdateCurrentGroup);
+    bind(&mut keys, "edit-endpoint", EditEndpoint);
     bind(&mut keys, "edit", EditSelected);
     bind(&mut keys, "delete", DeleteSelected);
     // Multi-select growth is app-level: the kit's List owns plain Up/Down, and

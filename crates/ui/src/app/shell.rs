@@ -45,6 +45,9 @@ impl AppView {
             .on_action(cx.listener(|view, _: &UpdateCurrentGroup, window, cx| {
                 shortcut_action(view, "update-current-group", window, cx);
             }))
+            .on_action(cx.listener(|view, _: &EditEndpoint, window, cx| {
+                shortcut_action(view, "edit-endpoint", window, cx);
+            }))
             .on_action(cx.listener(|view, _: &EditSelected, window, cx| {
                 shortcut_action(view, "edit", window, cx);
             }))

@@ -347,7 +347,7 @@ impl AppView {
     }
 
     /// Scroll the focused row into view through the list's own API.
-    fn scroll_to_row(&self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn scroll_to_row(&self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.visible_row_ids(cx).iter().position(|row| row == id);
         let Some(index) = index else {
             return;

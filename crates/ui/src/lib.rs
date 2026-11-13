@@ -126,6 +126,7 @@ pub(crate) use i18n::t;
 
 use app::actions::*;
 use app::bits::*;
+use app::endpoint_editor::EndpointDraft;
 use app::focus::*;
 use app::kit_bits::*;
 use app::open::*;
@@ -185,6 +186,7 @@ actions!(
         StopTesting,
         ClearSelection,
         EditSelected,
+        EditEndpoint,
         DeleteSelected,
         SelectPreviousRow,
         SelectNextRow,
@@ -313,6 +315,10 @@ struct AppView {
     /// T-19: the row whose ConfigForm edit dialog is open, while it is open —
     /// auto-clear never removes the row under edit.
     edit_form_open: Option<String>,
+
+    /// Slice 5: one endpoint draft at a time. The row popover and the
+    /// inspector inline form both render this; no per-row editor map exists.
+    pub(crate) endpoint_draft: Option<EndpointDraft>,
 
     /// T-12: one confirmed rule-set download at a time; the explicit per-file
     /// confirm never batches.

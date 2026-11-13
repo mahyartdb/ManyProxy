@@ -467,6 +467,7 @@ impl AppView {
             preset_form: None,
             import_form: None,
             edit_form_open: None,
+            endpoint_draft: None,
             rule_set_download_in_flight: false,
             import_parse_in_flight: false,
             import_parse_epoch: 0,
