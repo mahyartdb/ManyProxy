@@ -92,6 +92,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.consume_endpoint_intent(window, cx);
         // Task 12: restore-from-maximize is the one frame where DWM may have
         // forgotten the corner style. Re-apply only on that transition.
         let maximized = window.is_maximized();
@@ -117,6 +118,10 @@ impl Render for AppView {
         // its width; the table scrolls when the sum is wider than the pane.
         let metrics = RowMetrics::for_table_width(layout.table_w, self.column_layout);
         let content_width = self.column_layout.content_width(layout.table_w);
+        // The one draft beams down to the table as a plain frame; the row that
+        // owns it paints the popover, every other row ignores it.
+        self.prune_endpoint_draft(cx);
+        let endpoint_frame = self.endpoint_frame(cx);
         self.libraries.update(cx, |state, cx| {
             let list_focus = state.focus_handle(cx);
             let delegate = state.delegate_mut();
@@ -125,6 +130,7 @@ impl Render for AppView {
                 cx.notify();
             }
             delegate.set_row_metrics(metrics);
+            delegate.set_endpoint_frame(endpoint_frame);
             // T-06: the row cards paint the kit focus ring while the list holds
             // the keyboard; the handle lives on the ListState, the app owns the
             // cards, so the frame hands it across once.

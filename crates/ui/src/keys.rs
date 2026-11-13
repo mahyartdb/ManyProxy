@@ -36,6 +36,7 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     bind(&mut keys, "open-palette", OpenPalette);
     bind(&mut keys, "copy-urls", CopyUrls);
     bind(&mut keys, "update-current-group", UpdateCurrentGroup);
+    bind(&mut keys, "edit-endpoint", EditEndpoint);
     bind(&mut keys, "edit", EditSelected);
     bind(&mut keys, "delete", DeleteSelected);
     // Multi-select growth is app-level: the kit's List owns plain Up/Down, and
@@ -85,6 +86,19 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
         "escape",
         ClearSelection,
         Some(APP_KEY_CONTEXT),
+    ));
+    // The endpoint form is deeper than both the app and the kit popover, so
+    // Escape reverts/closes the draft and Enter applies before either host
+    // consumes the key.
+    keys.push(KeyBinding::new(
+        "escape",
+        EscapeEndpoint,
+        Some(ENDPOINT_EDITOR_CONTEXT),
+    ));
+    keys.push(KeyBinding::new(
+        "enter",
+        ApplyEndpoint,
+        Some(ENDPOINT_EDITOR_CONTEXT),
     ));
     bind(&mut keys, "focus-search", FocusSearch);
     bind(&mut keys, "inspector-details", InspectorDetails);

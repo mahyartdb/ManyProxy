@@ -107,7 +107,8 @@ Start all / Stop all / Show / Quit.
 | Stop selected | `Shift-F5` |
 | Test selected | `Ctrl-T` |
 | Stop Testing | `Ctrl-.` |
-| Edit selected | `Ctrl-E` |
+| Edit endpoint | `Ctrl-E` |
+| Edit config | `Ctrl-Shift-E` |
 | Delete selected | `Delete` |
 | Focus search | `Ctrl-F` |
 | Inspector details | `Ctrl-1` |

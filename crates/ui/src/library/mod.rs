@@ -7,12 +7,10 @@ use gpui_kit::component::list::ListState;
 use gpui_kit::component::ThemeStyled as _;
 
 mod columns;
-mod host;
 mod shard;
 mod tone;
 
 pub(crate) use columns::*;
-pub(crate) use host::*;
 pub(crate) use shard::*;
 pub(crate) use tone::*;
 
@@ -115,14 +113,10 @@ pub(crate) struct LibraryDelegate {
 
     pub(crate) app_view: Option<Entity<AppView>>,
 
-    pub(crate) endpoint_inputs: HashMap<String, RowEndpointInputs>,
-
-    pub(crate) pending_endpoint_commits: Vec<String>,
-
-    /// T-33: the bind-address menu every per-row picker draws from — constants
-    /// first, then the persisted extras. Pushed from the store on reload, so a
-    /// Settings edit reaches every picker on the next paint.
-    pub(crate) bind_hosts: Vec<String>,
+    /// One frame of the open endpoint draft, handed over by `AppView` before
+    /// the list renders. Only the owning row paints it, so no per-row editor
+    /// state survives the frame.
+    pub(crate) endpoint_frame: Option<EndpointFrame>,
 
     /// B18: the one row whose engine state just settled, with a nonce that
     /// makes a second settle run the accent again instead of reusing the
@@ -156,19 +150,10 @@ impl LibraryDelegate {
             row_metrics: RowMetrics::for_table_width(0., ColumnLayout::default()),
             density: Density::default(),
             app_view: None,
-            endpoint_inputs: HashMap::new(),
-            pending_endpoint_commits: Vec::new(),
-            bind_hosts: Store::BIND_HOST_CONSTANTS
-                .iter()
-                .map(|host| host.to_string())
-                .collect(),
+            endpoint_frame: None,
             settled: None,
             settle_seq: 0,
         }
-    }
-
-    pub(crate) fn set_bind_hosts(&mut self, hosts: Vec<String>) {
-        self.bind_hosts = hosts;
     }
 
     /// B16: returns whether the state actually changed, so a caller can skip a
@@ -194,13 +179,11 @@ impl LibraryDelegate {
             .collect();
         self.rows = rows;
 
-        let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
-
-        self.endpoint_inputs
-            .retain(|id, _| live.contains(id.as_str()));
-        self.pending_endpoint_commits
-            .retain(|id| live.contains(id.as_str()));
         self.refresh_search_words();
+    }
+
+    pub(crate) fn set_endpoint_frame(&mut self, frame: Option<EndpointFrame>) {
+        self.endpoint_frame = frame;
     }
 
     /// R22: the density owns the row pitch and every chrome height.
@@ -217,226 +200,9 @@ impl LibraryDelegate {
         self.upstream_cache.get(id).map(String::as_str)
     }
 
-    pub(crate) fn ensure_row_inputs(
-        &mut self,
-        row_id: &str,
-        bind_default: &str,
-        port_default: &str,
-        window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) {
-        if self.endpoint_inputs.contains_key(row_id) {
-            return;
-        }
-        let bind = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("127.0.0.1")
-                .default_value(bind_default.to_string())
-        });
-        let port = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("auto")
-                .default_value(port_default.to_string())
-        });
-        let hosts = self.bind_hosts.clone();
-        let picker = cx.new(|cx| {
-            let choices = BindHostChoiceList::for_row(row_id, &hosts);
-            let selected = choices
-                .0
-                .iter()
-                .position(|choice| choice.value == bind_default)
-                .map(IndexPath::new);
-            SelectState::new(choices, selected, window, cx)
-        });
-
-        let mut subs = Vec::with_capacity(3);
-        for state in [&bind, &port] {
-            let id = row_id.to_string();
-            subs.push(cx.subscribe(
-                state,
-                move |list: &mut ListState<Self>,
-                      _emitter: Entity<InputState>,
-                      event: &InputEvent,
-                      cx: &mut Context<ListState<Self>>| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        let delegate = list.delegate_mut();
-                        if !delegate.pending_endpoint_commits.contains(&id) {
-                            delegate.pending_endpoint_commits.push(id.clone());
-                        }
-                        cx.notify();
-                    }
-                },
-            ));
-        }
-        let pick_id = row_id.to_string();
-        subs.push(cx.subscribe(
-            &picker,
-            move |list: &mut ListState<Self>,
-                  _emitter: Entity<SelectState<BindHostChoiceList>>,
-                  event: &SelectEvent<BindHostChoiceList>,
-                  cx: &mut Context<ListState<Self>>| {
-                let SelectEvent::Confirm(Some(value)) = event else {
-                    return;
-                };
-                list.delegate_mut().queue_bind_pick(&pick_id, value);
-                cx.notify();
-            },
-        ));
-        self.endpoint_inputs.insert(
-            row_id.to_string(),
-            RowEndpointInputs {
-                bind,
-                port,
-                picker,
-                picker_hosts: hosts,
-                picker_selected: Some(bind_default.to_string()),
-                pick_pending: None,
-                _subs: subs,
-                clean_bind: bind_default.to_string(),
-                clean_port: port_default.to_string(),
-            },
-        );
-    }
-
-    /// T-33: one confirmed pick — from the picker's Confirm event, or a test
-    /// driving the same seam. The host lands in the bind draft, and the row is
-    /// queued for the ordinary endpoint commit so `save_listen_gate` runs on it.
-    pub(crate) fn queue_bind_pick(&mut self, row_id: &str, host: &str) {
-        if let Some(inputs) = self.endpoint_inputs.get_mut(row_id) {
-            inputs.pick_pending = Some(host.to_string());
-        }
-        if !self.pending_endpoint_commits.iter().any(|id| id == row_id) {
-            self.pending_endpoint_commits.push(row_id.to_string());
-        }
-    }
-
-    pub(crate) fn sync_row_inputs(
-        &mut self,
-        row_id: &str,
-        bind_stored: &str,
-        port_stored: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let hosts = self.bind_hosts.clone();
-        let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
-            return;
-        };
-        if let Some(pick) = inputs.pick_pending.take() {
-            if inputs.bind.read(cx).value().as_str() != pick {
-                inputs
-                    .bind
-                    .update(cx, |state, cx| state.set_value(pick.clone(), window, cx));
-            }
-        }
-        let bind_current = inputs.bind.read(cx).value().to_string();
-        let port_current = inputs.port.read(cx).value().to_string();
-        if !inputs.bind.focus_handle(cx).is_focused(window)
-            && bind_current != bind_stored
-            && bind_current == inputs.clean_bind
-        {
-            inputs.bind.update(cx, |state, cx| {
-                state.set_value(bind_stored.to_string(), window, cx)
-            });
-            inputs.clean_bind = bind_stored.to_string();
-        }
-        if !inputs.port.focus_handle(cx).is_focused(window)
-            && port_current != port_stored
-            && port_current == inputs.clean_port
-        {
-            inputs.port.update(cx, |state, cx| {
-                state.set_value(port_stored.to_string(), window, cx)
-            });
-            inputs.clean_port = port_stored.to_string();
-        }
-        if inputs.picker_hosts != hosts {
-            inputs.picker_hosts = hosts.clone();
-            inputs.picker_selected = None;
-            let choices = BindHostChoiceList::for_row(row_id, &hosts);
-            inputs
-                .picker
-                .update(cx, |state, cx| state.set_items(choices, window, cx));
-        }
-        // A bind the list no longer holds (a hand-edited row) leaves the picker
-        // empty rather than inventing an entry — the list stays the authority.
-        let current = inputs.bind.read(cx).value().to_string();
-        if inputs.picker_selected.as_deref() != Some(current.as_str())
-            && hosts.iter().any(|host| host == &current)
-        {
-            inputs.picker.update(cx, |state, cx| {
-                state.set_selected_value(&current, window, cx)
-            });
-            inputs.picker_selected = Some(current);
-        } else if !hosts.iter().any(|host| host == &current) && inputs.picker_selected.is_some() {
-            // The selected value left the list: drop the selection so the
-            // picker shows its placeholder instead of a vanished host.
-            inputs
-                .picker
-                .update(cx, |state, cx| state.set_selected_index(None, window, cx));
-            inputs.picker_selected = None;
-        }
-    }
-
-    pub(crate) fn row_inputs_focused(&self, row_id: &str, window: &Window, cx: &App) -> bool {
-        let Some(inputs) = self.endpoint_inputs.get(row_id) else {
-            return false;
-        };
-        inputs.bind.focus_handle(cx).is_focused(window)
-            || inputs.port.focus_handle(cx).is_focused(window)
-    }
-
-    pub(crate) fn endpoint_draft_texts(&self, row_id: &str, cx: &App) -> Option<(String, String)> {
-        let inputs = self.endpoint_inputs.get(row_id)?;
-        Some((
-            inputs.bind.read(cx).value().to_string(),
-            inputs.port.read(cx).value().to_string(),
-        ))
-    }
-
-    pub(crate) fn endpoint_is_dirty(&self, row_id: &str, cx: &App) -> bool {
-        let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
-            return false;
-        };
-        let Some(inputs) = self.endpoint_inputs.get(row_id) else {
-            return false;
-        };
-        inputs.bind.read(cx).value().as_str() != row.bind_ip.as_str()
-            || inputs.port.read(cx).value().as_str() != row.port.to_string().as_str()
-    }
-
     /// T-03/R11: the owner hands both readers the same geometry.
     pub(crate) fn set_row_metrics(&mut self, metrics: RowMetrics) {
         self.row_metrics = metrics;
-    }
-
-    pub(crate) fn revert_row_inputs(
-        &mut self,
-        row_id: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        let Some(row) = self.rows.iter().find(|row| row.id == row_id).cloned() else {
-            return false;
-        };
-        let port_stored = row.port.to_string();
-        let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
-            return false;
-        };
-        let dirty = inputs.bind.read(cx).value().as_str() != row.bind_ip.as_str()
-            || inputs.port.read(cx).value().as_str() != port_stored.as_str();
-        if dirty {
-            inputs.bind.update(cx, |state, cx| {
-                state.set_value(row.bind_ip.clone(), window, cx)
-            });
-            inputs.port.update(cx, |state, cx| {
-                state.set_value(port_stored.clone(), window, cx)
-            });
-            inputs.clean_bind = row.bind_ip;
-            inputs.clean_port = port_stored;
-            inputs.pick_pending = None;
-            self.pending_endpoint_commits.retain(|id| id != row_id);
-        }
-        dirty
     }
 
     pub(crate) fn set_show_security(&mut self, show: bool) {
@@ -703,8 +469,7 @@ impl ListDelegate for LibraryDelegate {
             RowView::of(row, &inputs)
         };
         let row_name = view.name.clone();
-        let bind = view.bind.clone();
-        let port_stored = view.port.to_string();
+        let endpoint_editable = !is_custom_config_protocol(&view.protocol);
         let traffic_text = view
             .traffic
             .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
@@ -712,21 +477,6 @@ impl ListDelegate for LibraryDelegate {
         // Everything below the helpers mutates the delegate, so the row borrow
         // ends here; the copies above are the fields the frame actually paints.
         let full_route = library_row_full_route(row, &upstream);
-
-        self.ensure_row_inputs(&row_id, &bind, &port_stored, window, cx);
-        self.sync_row_inputs(&row_id, &bind, &port_stored, window, cx);
-
-        if self.pending_endpoint_commits.contains(&row_id) {
-            self.pending_endpoint_commits.retain(|id| id != &row_id);
-            if let Some(app_view) = self.app_view.clone() {
-                let commit_id = row_id.clone();
-                window.defer(cx, move |window, cx| {
-                    app_view.update(cx, |view, cx| {
-                        view.commit_row_endpoint(&commit_id, window, cx);
-                    });
-                });
-            }
-        }
 
         let item = ListItem::new(format!("library-row-{}", row_id))
             .selected(selected)
@@ -865,7 +615,16 @@ impl ListDelegate for LibraryDelegate {
                         let chip_id = row_id.clone();
                         let menu_view = self.app_view.clone();
                         let menu_id = row_id.clone();
-                        div()
+                        let editing = self.endpoint_frame.as_ref().is_some_and(|frame| {
+                            frame.row_id == row_id && frame.host == EndpointHost::RowPopover
+                        });
+                        let editor = editing
+                            .then(|| self.endpoint_frame.clone().zip(self.app_view.clone()))
+                            .flatten();
+                        let pencil_view = self.app_view.clone();
+                        let pencil_id = row_id.clone();
+                        let pencil_name = row_name.clone();
+                        let mut cell = div()
                             .id(format!("row-endpoint-{row_id}"))
                             .test_support()
                             .w(px(width))
@@ -931,8 +690,48 @@ impl ListDelegate for LibraryDelegate {
                                             ),
                                         )
                                     }),
-                            )
-                            .into_any_element()
+                            );
+                        if endpoint_editable {
+                            cell = match editor {
+                                Some((frame, app)) => {
+                                    cell.child(render_endpoint_popover(app, frame))
+                                }
+                                None => cell.child(
+                                    div()
+                                        .id(format!("row-endpoint-edit-slot-{row_id}"))
+                                        .test_support()
+                                        .opacity(if focused_row { 1. } else { 0. })
+                                        .group_hover(format!("row-hover-{row_id}"), |style| {
+                                            style.opacity(1.)
+                                        })
+                                        .child(
+                                            Button::new(format!("row-endpoint-edit-{row_id}"))
+                                                .small()
+                                                .compact()
+                                                .label("✎")
+                                                .accessibility_label(t!(
+                                                    "endpoint-edit-aria",
+                                                    name = pencil_name
+                                                ))
+                                                .tooltip(t!("endpoint-edit-tip"))
+                                                .on_click(move |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(app) = pencil_view.clone() {
+                                                        app.update(cx, |view, cx| {
+                                                            view.open_endpoint_draft(
+                                                                &pencil_id,
+                                                                EndpointHost::RowPopover,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                ),
+                            };
+                        }
+                        cell.into_any_element()
                     }
                     ColumnId::Health => {
                         let health_text = view.health_text.clone();

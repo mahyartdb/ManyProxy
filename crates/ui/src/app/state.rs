@@ -320,9 +320,6 @@ impl AppView {
             eprintln!("clean-exit marker reset failed: {error}");
         }
         let unclean_notice = unclean_exit_notice(previous_clean_exit, &last_snapshot);
-        // T-33: the first read seeds the address list once (constants + every
-        // row's current bind); every later read is the stored extras alone.
-        let bind_hosts = store.bind_hosts();
         // T-04: the probe budget is the persisted one, not the built-in default.
         let probe_timeout_secs = store.probe_timeout_secs();
         let libraries = cx.new(|cx| {
@@ -376,7 +373,6 @@ impl AppView {
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_sort(sort);
             state.delegate_mut().set_density(density);
-            state.delegate_mut().set_bind_hosts(bind_hosts);
             list_cx.notify();
         });
 
@@ -467,6 +463,7 @@ impl AppView {
             preset_form: None,
             import_form: None,
             edit_form_open: None,
+            endpoint_draft: None,
             rule_set_download_in_flight: false,
             import_parse_in_flight: false,
             import_parse_epoch: 0,

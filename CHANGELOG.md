@@ -12,9 +12,11 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - `Ctrl+I` opens the inspector and closes it again.
 - The library table has seven columns — Name, Group, Protocol, Upstream, Endpoint, Health and Traffic. Every header opens one menu with Size Column to Fit, Size All Columns to Fit, per-column visibility and `More…`; the Columns sheet adds order buttons and Reset width, order, visibility and all.
 - The table scrolls horizontally when the chosen widths exceed the pane, with the header and rows sharing one offset. Name and Endpoint stay visible, and no column is dropped to fit.
+- One endpoint editor on every surface: the endpoint chip's pencil, `Edit` in the inspector, and `Ctrl+E` on the selected row all open the same form. It validates the bind and port as you type, offers the first free port on that bind when the port is taken, saves in place while the endpoint is stopped, and restarts it with rollback while it is running. `Ctrl+Shift+E` still opens the full config form.
 
 ### Changed
 
+- Endpoint edits are explicit: the unapplied-edit dirty dot and the Start gate that blocked on it are gone, because the editor writes on Apply or not at all.
 - Column order, visibility and widths persist as one `library_column_layout` value. The Row columns dialog and the eight standalone palette sort commands are retired; every visible header sorts on click and reverses on a second click.
 - The five-menu toolbar, the three-segment status strip and the facet band are gone. Export, About and `Check for updates` live in the action bar's `⋯`, Routing presets and Settings at the bottom of the nav, and the transport controls in the engine bar.
 - The window's minimum size is 1100×640 and it opens at 1200×700, so the nav starts expanded.

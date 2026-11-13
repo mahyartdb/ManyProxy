@@ -8,6 +8,7 @@ pub(crate) mod commit_async;
 pub(crate) mod commit_engine;
 pub(crate) mod commit_forms;
 pub(crate) mod detail;
+pub(crate) mod endpoint_editor;
 pub(crate) mod engine_bar;
 pub(crate) mod engine_ops;
 pub(crate) mod filter_row;
