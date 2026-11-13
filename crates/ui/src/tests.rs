@@ -38105,6 +38105,49 @@ fn inspector_stacked_sections_replace_the_five_tabs(cx: &mut TestAppContext) {
     }
 }
 
+/// The inspector's console link is the only inspector control that opens the
+/// dock. It lands on Logs/Selected and clears the console filter.
+#[gpui_kit::test]
+fn inspector_console_link_opens_logs_scoped_to_the_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    select_library_row(&view, cx, &work.id);
+    view.update(cx, |view, _| {
+        view.console.filter = "stale".to_string();
+        view.console.tab = crate::ConsoleTab::Traffic;
+        view.console.scope = crate::ConsoleScope::All;
+    });
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+
+    cx.update(|window, cx| window.click("inspector-open-console", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+
+    let (open, tab, scope, filter) = view.read_with(cx, |view, _| {
+        (
+            view.console.open,
+            view.console.tab,
+            view.console.scope,
+            view.console.filter.clone(),
+        )
+    });
+    assert!(open, "the link opens the console");
+    assert_eq!(tab, crate::ConsoleTab::Logs);
+    assert_eq!(scope, crate::ConsoleScope::Selected);
+    assert!(filter.is_empty(), "the link lands with an empty filter");
+    assert_painted(cx, "console");
+}
+
 /// R6: one selected row shows its sections; three show the aggregate counts
 /// and no action buttons at all.
 #[gpui_kit::test]
