@@ -2018,9 +2018,9 @@ impl AppView {
         }
     }
 
-    /// T-04: adds one address to the list the row pickers draw from. The store
-    /// owns validation (IP literals only, no duplicates); the message it returns
-    /// is exactly what the Settings field shows inline.
+    /// T-04: adds one address to the list the Settings editor draws from.
+    /// The store owns validation (IP literals only, no duplicates); the message
+    /// it returns is exactly what the Settings field shows inline.
     pub(crate) fn commit_add_bind_host(
         &mut self,
         raw: &str,
@@ -2029,7 +2029,7 @@ impl AppView {
     ) -> Result<Vec<String>, String> {
         match self.store.add_bind_host(raw) {
             Ok(hosts) => {
-                self.refresh_bind_hosts(cx);
+                cx.notify();
                 window.push_notification(
                     Notification::success(t!("bind-host-added", host = raw.trim())),
                     cx,
@@ -2054,7 +2054,7 @@ impl AppView {
     ) -> Result<Vec<String>, String> {
         match self.store.remove_bind_host(host) {
             Ok(hosts) => {
-                self.refresh_bind_hosts(cx);
+                cx.notify();
                 window.push_notification(
                     Notification::success(t!("bind-host-removed", host = host)),
                     cx,
@@ -2067,17 +2067,6 @@ impl AppView {
                 Err(message)
             }
         }
-    }
-
-    /// T-33: pushes the current list into every picker at once — a Settings edit
-    /// is visible in all rows on the next paint.
-    pub(crate) fn refresh_bind_hosts(&mut self, cx: &mut Context<Self>) {
-        let hosts = self.store.bind_hosts();
-        self.libraries.update(cx, |list, cx| {
-            list.delegate_mut().set_bind_hosts(hosts);
-            cx.notify();
-        });
-        cx.notify();
     }
 
     /// T-04: opens the app's data folder in the shell. The path is the app's

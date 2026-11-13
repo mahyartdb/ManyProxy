@@ -635,17 +635,10 @@ impl AppView {
             self.settle_batch_start(&[]);
             return;
         }
-        let mut skipped_dirty: Vec<String> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
         let mut configs: Vec<ProxyConfig> = Vec::new();
         let mut names: HashMap<String, String> = HashMap::new();
         for id in ids {
-            if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
-                if let Ok(Some(config)) = self.store.get(id) {
-                    skipped_dirty.push(config.name.clone());
-                }
-                continue;
-            }
             let config = match self.store.get(id) {
                 Ok(Some(config)) => config,
                 Ok(None) => continue,
@@ -678,12 +671,6 @@ impl AppView {
         self.start_in_flight = false;
         self.reload(window, cx);
         self.settle_batch_start(&outcome.applied);
-        if !skipped_dirty.is_empty() {
-            window.push_notification(
-                Notification::info(skipped_dirty_message(&skipped_dirty)),
-                cx,
-            );
-        }
         if !unreadable.is_empty() {
             window.push_notification(
                 Notification::warning(bulk_start_unreadable_message(&unreadable)),

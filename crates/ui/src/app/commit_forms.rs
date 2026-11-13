@@ -97,6 +97,9 @@ impl AppView {
         }
     }
 
+    /// The tests' direct store-edit path. Production edit actions go through
+    /// `commit_edit_with_focus`, which owns the form error and focus.
+    #[cfg(test)]
     pub(crate) fn commit_edit(
         &mut self,
         id: &str,
@@ -145,70 +148,6 @@ impl AppView {
                 }
             }
         }
-    }
-
-    pub(crate) fn commit_row_endpoint(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let (bind_raw, port_raw, stored) = self.libraries.read_with(cx, |list, cx| {
-            let delegate = list.delegate();
-            let drafts = delegate.endpoint_draft_texts(id, cx).unwrap_or_default();
-            let stored = delegate
-                .rows
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| (row.name.clone(), row.bind_ip.clone(), row.port.to_string()));
-            (drafts.0, drafts.1, stored)
-        });
-        let Some((name, bind_stored, port_stored)) = stored else {
-            window.push_notification(Notification::warning(t!("already-removed")), cx);
-            return true;
-        };
-        if bind_raw.trim() == bind_stored && port_raw.trim() == port_stored {
-            self.libraries.update(cx, |list, _| {
-                if let Some(inputs) = list.delegate_mut().endpoint_inputs.get_mut(id) {
-                    inputs.clean_bind = bind_raw.clone();
-                    inputs.clean_port = port_raw.clone();
-                }
-            });
-            return true;
-        }
-        if let Err(reason) = save_listen_gate(&name, &bind_raw, &port_raw) {
-            window.push_notification(Notification::error(reason), cx);
-            return false;
-        }
-        let patch = ConfigPatch {
-            bind_ip: Some(bind_raw),
-            port: Some(port_raw),
-            ..Default::default()
-        };
-        let ok = self.commit_edit(id, patch, window, cx);
-        if ok {
-            if let Ok(Some(fresh)) = self.store.get(id) {
-                let bind_fresh = fresh.bind_ip.clone();
-                let port_fresh = fresh.port.to_string();
-                self.libraries.update(cx, |list, cx| {
-                    let delegate = list.delegate_mut();
-                    delegate
-                        .pending_endpoint_commits
-                        .retain(|pending| pending != id);
-                    if let Some(inputs) = delegate.endpoint_inputs.get_mut(id) {
-                        inputs.bind.update(cx, |state, cx| {
-                            state.set_value(bind_fresh.clone(), window, cx);
-                        });
-                        inputs.port.update(cx, |state, cx| {
-                            state.set_value(port_fresh.clone(), window, cx);
-                        });
-                        inputs.clean_bind = bind_fresh;
-                        inputs.clean_port = port_fresh;
-                    }
-                });
-            }
-        }
-        ok
     }
 
     pub(crate) fn commit_edit_with_focus(

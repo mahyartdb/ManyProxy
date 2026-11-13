@@ -28,7 +28,6 @@ impl AppView {
         poll: bool,
     ) -> Result<(), StoreError> {
         let rows = self.store.list()?;
-        let bind_hosts = self.store.bind_hosts();
         self.drain_engine_logs(&rows);
 
         if poll {
@@ -63,7 +62,6 @@ impl AppView {
         }
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
-            state.delegate_mut().set_bind_hosts(bind_hosts);
             state.delegate_mut().set_health(health);
 
             state.delegate_mut().set_health_tone(health_tones);
@@ -148,11 +146,6 @@ impl AppView {
             return;
         };
 
-        if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
-            window.push_notification(Notification::info(dirty_endpoint_message(&config.name)), cx);
-            self.settle_batch_start(&[]);
-            return;
-        }
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
