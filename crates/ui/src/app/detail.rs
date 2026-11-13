@@ -206,7 +206,7 @@ impl AppView {
                 if self.config_count(cx) == 0 {
                     return div().id("config-detail").test_support().into_any_element();
                 }
-                return self.render_detail_empty(cx).into_any_element();
+                self.render_detail_empty(cx).into_any_element()
             }
             1 => {
                 let Some(config) = self.selected_config(cx) else {
@@ -1198,6 +1198,10 @@ impl AppView {
             counts
         };
         let hidden = self.selection_hidden_count(cx);
+        let selected = t!("inspector-selected-count", count = count);
+        let running = t!("inspector-running-count", count = running);
+        let failed = t!("inspector-failed-count", count = failed);
+        let stopped = t!("inspector-stopped-count", count = stopped);
         let mut section = div()
             .id("inspector-aggregate")
             .test_support()
@@ -1209,29 +1213,33 @@ impl AppView {
                 div()
                     .id("inspector-selected-count")
                     .test_support()
+                    .aria_label(selected.clone())
                     .text_sm()
-                    .child(t!("inspector-selected-count", count = count)),
+                    .child(selected),
             )
             .child(
                 div()
                     .id("inspector-running-count")
                     .test_support()
+                    .aria_label(running.clone())
                     .text_sm()
-                    .child(t!("inspector-running-count", count = running)),
+                    .child(running),
             )
             .child(
                 div()
                     .id("inspector-failed-count")
                     .test_support()
+                    .aria_label(failed.clone())
                     .text_sm()
-                    .child(t!("inspector-failed-count", count = failed)),
+                    .child(failed),
             )
             .child(
                 div()
                     .id("inspector-stopped-count")
                     .test_support()
+                    .aria_label(stopped.clone())
                     .text_sm()
-                    .child(t!("inspector-stopped-count", count = stopped)),
+                    .child(stopped),
             );
         if hidden > 0 {
             let view = cx.entity();
@@ -1239,11 +1247,11 @@ impl AppView {
                 Button::new("inspector-hidden-count")
                     .small()
                     .ghost()
-                    .label(t!("inspector-hidden-count", count = hidden))
-                    .tooltip(t!("batch-clear-filters-tip"))
-                    .on_click(move |_, _window, cx| {
+                    .label(t!("selection-hidden", count = hidden))
+                    .tooltip(t!("selection-hidden-tip"))
+                    .on_click(move |_, window, cx| {
                         view.update(cx, |view, cx| {
-                            view.clear_filters(cx);
+                            view.reveal_hidden_selection(window, cx);
                         });
                     }),
             );
@@ -1252,6 +1260,7 @@ impl AppView {
             div()
                 .id("inspector-use-selection-bar")
                 .test_support()
+                .aria_label(t!("inspector-use-selection-bar"))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(t!("inspector-use-selection-bar")),
