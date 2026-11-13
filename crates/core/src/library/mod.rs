@@ -9,6 +9,7 @@ mod metrics;
 pub mod query;
 mod row;
 mod rows;
+pub mod sources;
 
 pub use columns::*;
 pub use endpoint::*;
@@ -18,3 +19,4 @@ pub use metrics::*;
 pub use query::*;
 pub use row::*;
 pub use rows::*;
+pub use sources::*;
