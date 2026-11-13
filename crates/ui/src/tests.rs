@@ -10306,7 +10306,7 @@ fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
         ("start", "Start"),
         ("stop", "Stop"),
         ("test", "Test"),
-        ("edit", "Edit"),
+        ("edit", "Edit config…"),
         ("copy-urls", "Copy URLs"),
         ("move", "Move to group"),
         ("assign-preset", "Assign preset"),
@@ -12483,106 +12483,6 @@ fn columns_palette_action_opens_the_sheet(cx: &mut TestAppContext) {
     assert!(
         cx.update(|window, cx| window.has_active_sheet(cx)),
         "the palette opens the columns sheet"
-    );
-}
-
-#[gpui_kit::test]
-fn r05_dirty_start_gates_and_clean_launches(cx: &mut TestAppContext) {
-    use crate::engine::EngineController;
-    assert_eq!(
-        crate::dirty_endpoint_message("Work"),
-        "\"Work\" has unapplied endpoint edits — press Enter to apply or Esc to revert",
-        "gate toast pinned"
-    );
-    assert_eq!(
-        crate::skipped_dirty_message(&["Work".to_string()]),
-        "Skipped with unapplied edits (Enter applies, Esc reverts): Work",
-        "bulk skip toast pinned"
-    );
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let dirty = store
-        .add(t30_engine_seed("Dirty", "10801"))
-        .expect("seed works");
-    let clean = store
-        .add(t30_engine_seed("Clean", "10802"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.update(|_, cx| {
-        view.update(cx, |view, _| {
-            let (engine, _) = EngineController::fake();
-            view.engine = engine;
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    // T-03: the dirty marker rides the inspector's row header, so the row is
-    // selected first.
-    select_library_row(&view, cx, &dirty.id);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            let bind = view.libraries.read(cx).delegate().endpoint_inputs[&dirty.id]
-                .bind
-                .clone();
-            bind.update(cx, |input, cx| {
-                input.set_value("127.0.0.2".to_string(), window, cx);
-            });
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    assert!(
-        view.read_with(cx, |view, cx| view
-            .libraries
-            .read(cx)
-            .delegate()
-            .endpoint_is_dirty(&dirty.id, cx)),
-        "draft is dirty"
-    );
-    assert_painted(cx, &format!("row-dirty-{}", dirty.id));
-    assert_absent(cx, format!("row-dirty-{}", clean.id));
-    let before = notification_count(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.start_row(&dirty.id, window, cx));
-    });
-    assert_eq!(
-        view.read_with(cx, |view, _| view.engine.running_count()),
-        0,
-        "dirty Start launches nothing"
-    );
-    assert_eq!(
-        notification_count(cx),
-        before + 1,
-        "dirty Start toasts honestly"
-    );
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.start_row(&clean.id, window, cx));
-    });
-    assert_eq!(
-        view.read_with(cx, |view, _| view.engine.running_count()),
-        1,
-        "clean Start launches"
-    );
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.select_rows(&[dirty.id.clone(), clean.id.clone()], cx);
-        });
-    });
-    let before_bulk = notification_count(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.start_selected_batch(window, cx));
-    });
-    assert_eq!(
-        view.read_with(cx, |view, _| view.engine.running_count()),
-        1,
-        "bulk skips the dirty row"
-    );
-    assert_eq!(
-        notification_count(cx),
-        before_bulk + 2,
-        "bulk reports started plus skipped"
     );
 }
 
@@ -16103,7 +16003,7 @@ fn f08_palette_rows_stop_lying(cx: &mut TestAppContext) {
     );
     // The surviving row is the ClearSelection op, at its renumbered path.
     assert_eq!(
-        crate::AppView::palette_op_at(gpui_kit::component::IndexPath::new(9).section(0)),
+        crate::AppView::palette_op_at(gpui_kit::component::IndexPath::new(10).section(0)),
         Some("clear-selection"),
         "Clear selection stays on the op it names"
     );
@@ -16306,7 +16206,7 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.run_palette_op(IndexPath::new(13).section(0), window, cx)
+            view.run_palette_op(IndexPath::new(14).section(0), window, cx)
         });
     });
     cx.run_until_parked();
@@ -16322,7 +16222,7 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
     let before = notification_count(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.run_palette_op(IndexPath::new(12).section(0), window, cx)
+            view.run_palette_op(IndexPath::new(13).section(0), window, cx)
         });
     });
     cx.run_until_parked();
@@ -16788,10 +16688,11 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
     };
     select_health_tab(&view, cx);
 
-    // K1/A4-2: the pane is ONE scroll. At the 700px default the denser Health
-    // pane now fits; paint the 620px minimum-height frame so the content
-    // genuinely overflows and the scroll range is observable.
-    paint_frame_at(cx, 1000., 620.);
+    // K1/A4-2: the pane is ONE scroll. Slice 5 slimmed the endpoint section to
+    // a summary plus Edit, so the Health pane now fits at the 620px window
+    // minimum; paint a deliberately short frame so the content genuinely
+    // overflows and the scroll range is observable.
+    paint_frame_at(cx, 1000., 540.);
 
     let max_offset = cx.update(|_, cx| view.read(cx).detail_scroll.max_offset());
     assert!(
@@ -19704,9 +19605,20 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| window.focus(&focus, cx));
     press(cx, "ctrl-e");
+    paint_frame(cx);
+    assert_painted(cx, "endpoint-form");
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "Ctrl-E edits the endpoint, not the full config form"
+    );
+    view.update(cx, |view, cx| view.cancel_endpoint_draft(cx));
+    paint_frame(cx);
+
+    cx.update(|window, cx| window.focus(&focus, cx));
+    press(cx, "ctrl-shift-e");
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "Ctrl-E edits the selected row"
+        "Ctrl-Shift-E edits the selected row's config"
     );
     assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
     cx.update(|window, cx| window.close_all_dialogs(cx));
@@ -19742,10 +19654,10 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
             view.select_visible_row(0, cx);
         });
     });
-    press(cx, "ctrl-e");
+    press(cx, "ctrl-shift-e");
     assert!(
         cx.update(|window, cx| window.has_active_dialog(cx)),
-        "Ctrl-E edits the selected row"
+        "Ctrl-Shift-E opens the selected row's config dialog"
     );
     assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
     cx.update(|window, cx| window.focus(&focus, cx));
@@ -20400,80 +20312,6 @@ fn honest_engine_feedback_copies() {
         for canary in ["hunter2", "SECRET-UUID", "token=abc"] {
             assert!(!text.contains(canary), "no secrets in {text}");
         }
-    }
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    let beta = store
-        .add(t30_engine_seed("Beta", "10952"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-
-    // T-03: the row is one line. It keeps the quiet endpoint chip and
-    // nothing else framed — the editors moved to the inspector.
-    for id in [&alpha.id, &beta.id] {
-        assert_painted(cx, &format!("row-endpoint-chip-{id}"));
-        for slot in ["row-bind-", "row-port-input-", "row-serve-", "row-edit-"] {
-            assert_absent(cx, format!("{slot}{id}"));
-        }
-    }
-
-    // The inspector carries the selected row's editors — and only that row's.
-    // K1/A4-8: the per-row Start/Edit buttons are gone; the ONE operate row
-    // (`engine-start`/`engine-stop`/`health-test` + `…`) acts on the selection.
-    select_library_row(&view, cx, &alpha.id);
-    for slot in ["row-bind-", "row-port-input-"] {
-        assert_painted(cx, &format!("{slot}{}", alpha.id));
-    }
-    assert_absent(cx, format!("row-port-input-{}", beta.id));
-    for id in ["engine-start", "engine-stop", "health-test", "row-menu"] {
-        assert_painted(cx, id);
-    }
-
-    let (bind_w, port_w) = cx.update(|window, _| {
-        // T-33: generated-config rows bind through the picker; the port
-        // keeps the free-text input.
-        let bind = window
-            .try_find(format!("row-bind-picker-{}", alpha.id))
-            .expect("bind picker renders")
-            .bounds()
-            .size
-            .width;
-        let port = window
-            .try_find(format!("row-port-input-{}", alpha.id))
-            .expect("port input renders")
-            .bounds()
-            .size
-            .width;
-        (bind, port)
-    });
-    assert!(
-        bind_w > px(100.) && bind_w < px(136.),
-        "bind picker holds its 118px cell, got {bind_w:?}"
-    );
-    assert!(
-        port_w > px(60.) && port_w < px(92.),
-        "port field holds its 76px cell, got {port_w:?}"
-    );
-    for (element, pinned) in [
-        ("engine-start", "Start the selected endpoint"),
-        ("row-menu", "More actions"),
-    ] {
-        let name = cx.update(|window, _| {
-            window
-                .try_find(element.to_string())
-                .unwrap_or_else(|| panic!("{element} renders"))
-                .label()
-                .map(str::to_string)
-        });
-        assert_eq!(name.as_deref(), Some(pinned), "{element} announces");
     }
 }
 
@@ -22235,327 +22073,6 @@ fn r3_row_serve_button_starts_that_row(cx: &mut TestAppContext) {
     assert_eq!(notification_count(cx), before + 1, "one honest toast");
 }
 
-#[gpui_kit::test]
-fn r3_row_endpoint_commit_writes_store(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                let delegate = list.delegate_mut();
-                let inputs = delegate
-                    .endpoint_inputs
-                    .get(&alpha.id)
-                    .expect("row editors exist after paint");
-                inputs.port.update(cx, |state, cx| {
-                    state.set_value("10961", window, cx);
-                });
-            });
-        });
-    });
-    let before = notification_count(cx);
-    let committed = cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.commit_row_endpoint(&alpha.id, window, cx)
-        })
-    });
-    assert!(committed, "clean draft commits");
-    cx.run_until_parked();
-    paint_frame(cx);
-    let stored = view.read_with(cx, |view, _| {
-        view.store
-            .get(&alpha.id)
-            .expect("store reads")
-            .expect("row")
-            .port
-    });
-    assert_eq!(stored, 10961, "store carries the edited port");
-    assert_eq!(notification_count(cx), before + 1, "one honest toast");
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_reserved_port_fails_gate(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                let delegate = list.delegate_mut();
-                let inputs = delegate
-                    .endpoint_inputs
-                    .get(&alpha.id)
-                    .expect("row editors exist after paint");
-                inputs.port.update(cx, |state, cx| {
-                    state.set_value("80", window, cx);
-                });
-            });
-        });
-    });
-    let before = notification_count(cx);
-    let committed = cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.commit_row_endpoint(&alpha.id, window, cx)
-        })
-    });
-    assert!(!committed, "privileged port refuses");
-    let (stored, draft) = view.read_with(cx, |view, cx| {
-        let stored = view
-            .store
-            .get(&alpha.id)
-            .expect("store reads")
-            .expect("row")
-            .port;
-        let draft = view
-            .libraries
-            .read(cx)
-            .delegate()
-            .endpoint_draft_texts(&alpha.id, cx)
-            .expect("drafts readable")
-            .1;
-        (stored, draft)
-    });
-    assert_eq!(stored, 10951, "rejected edit writes nothing");
-    assert_eq!(draft, "80", "failed draft stays for correction");
-    assert_eq!(notification_count(cx), before + 1, "one loud toast");
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_collision_warns_inline(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    store
-        .add(t30_engine_seed("Beta", "10952"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    // T-03: the collision warning rides the inspector's editor row, so the
-    // row is selected first.
-    select_library_row(&view, cx, &alpha.id);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                let delegate = list.delegate_mut();
-                let inputs = delegate
-                    .endpoint_inputs
-                    .get(&alpha.id)
-                    .expect("row editors exist after paint");
-                inputs.port.update(cx, |state, cx| {
-                    state.set_value("10952", window, cx);
-                });
-            });
-        });
-    });
-    paint_frame(cx);
-    let warn = format!("row-endpoint-warn-{}", alpha.id);
-    assert!(
-        cx.update(|window, _| window.try_find(warn.clone()).is_some()),
-        "collision warning paints inline"
-    );
-    let stored = view.read_with(cx, |view, _| {
-        view.store
-            .get(&alpha.id)
-            .expect("store reads")
-            .expect("row")
-            .port
-    });
-    assert_eq!(stored, 10951, "warning alone writes nothing");
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_escape_reverts_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                let delegate = list.delegate_mut();
-                let inputs = delegate
-                    .endpoint_inputs
-                    .get(&alpha.id)
-                    .expect("row editors exist after paint");
-                inputs.port.update(cx, |state, cx| {
-                    state.set_value("10961", window, cx);
-                });
-            });
-        });
-    });
-    let reverted = cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                list.delegate_mut().revert_row_inputs(&alpha.id, window, cx)
-            })
-        })
-    });
-    assert!(reverted, "dirty draft reverts");
-    let draft = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .endpoint_draft_texts(&alpha.id, cx)
-            .expect("drafts readable")
-            .1
-    });
-    assert_eq!(draft, "10951", "editors show stored truth again");
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_enter_key_commits(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    // T-03: the draft's Esc handler rides the inspector's editor row, so the
-    // row is selected first.
-    select_library_row(&view, cx, &alpha.id);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                let delegate = list.delegate_mut();
-                let inputs = delegate
-                    .endpoint_inputs
-                    .get(&alpha.id)
-                    .expect("row editors exist after paint");
-                inputs.port.update(cx, |state, cx| {
-                    state.focus(window, cx);
-                });
-                inputs.port.update(cx, |state, cx| {
-                    state.set_value("10961", window, cx);
-                });
-            });
-        });
-    });
-    cx.update(|window, cx| {
-        use gpui_kit::Keystroke;
-        window.dispatch_keystroke(Keystroke::parse("enter").expect("enter parses"), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    let stored = view.read_with(cx, |view, _| {
-        view.store
-            .get(&alpha.id)
-            .expect("store reads")
-            .expect("row")
-            .port
-    });
-    assert_eq!(stored, 10961, "Enter commits the draft");
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_escape_key_reverts(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    // T-03: the draft's Esc handler rides the inspector's editor row, so the
-    // row is selected first.
-    select_library_row(&view, cx, &alpha.id);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                let delegate = list.delegate_mut();
-                let inputs = delegate
-                    .endpoint_inputs
-                    .get(&alpha.id)
-                    .expect("row editors exist after paint");
-                inputs.port.update(cx, |state, cx| {
-                    state.focus(window, cx);
-                });
-                inputs.port.update(cx, |state, cx| {
-                    state.set_value("10961", window, cx);
-                });
-            });
-        });
-    });
-    cx.update(|window, cx| {
-        use gpui_kit::Keystroke;
-        window.dispatch_keystroke(Keystroke::parse("escape").expect("escape parses"), cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    let (stored, draft) = view.read_with(cx, |view, cx| {
-        let stored = view
-            .store
-            .get(&alpha.id)
-            .expect("store reads")
-            .expect("row")
-            .port;
-        let draft = view
-            .libraries
-            .read(cx)
-            .delegate()
-            .endpoint_draft_texts(&alpha.id, cx)
-            .expect("drafts readable")
-            .1;
-        (stored, draft)
-    });
-    assert_eq!(stored, 10951, "Escape writes nothing");
-    assert_eq!(draft, "10951", "Escape reverts the draft");
-}
-
-#[gpui_kit::test]
-fn r3_row_endpoint_inputs_pruned_on_remove(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    store
-        .add(t30_engine_seed("Beta", "10952"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    let cached = view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .endpoint_inputs
-            .contains_key(&alpha.id)
-    });
-    assert!(cached, "editors cached after paint");
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.store.remove(&alpha.id).expect("remove works");
-            view.reload(window, cx);
-        });
-    });
-    paint_frame(cx);
-    let pruned = view.read_with(cx, |view, cx| {
-        !view
-            .libraries
-            .read(cx)
-            .delegate()
-            .endpoint_inputs
-            .contains_key(&alpha.id)
-    });
-    assert!(pruned, "removed rows lose their editors");
-}
-
 fn t30_engine_seed(name: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -23856,9 +23373,10 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    // K1/A4-2: force a genuine overflow with the 620px minimum-height frame —
-    // at 700px the denser Health pane fits, so there is no scroll range.
-    paint_frame_at(cx, 1000., 620.);
+    // K1/A4-2: force a genuine overflow with a deliberately short frame — the
+    // slimmed endpoint section means the Health pane fits at the 620px window
+    // minimum, so 620 no longer has a scroll range.
+    paint_frame_at(cx, 1000., 540.);
     let (offset, max) = cx.update(|window, cx| {
         window.scroll(
             "config-detail-body",
@@ -30648,7 +30166,8 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Stop selected", "Shift-F5"),
         ("Test selected", "Ctrl-T"),
         ("Stop Testing", "Ctrl-."),
-        ("Edit selected", "Ctrl-E"),
+        ("Edit endpoint", "Ctrl-E"),
+        ("Edit config", "Ctrl-Shift-E"),
         ("Delete selected", "Delete"),
         ("Extend selection up", "Shift-Up"),
         ("Extend selection down", "Shift-Down"),
@@ -34335,34 +33854,10 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
         "the process summary keeps the ten-line body"
     );
 }
-
 // T-33: the bind picker and the Settings address list.
 
 fn t83_bind_hosts_of(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
     cx.update(|_, cx| view.update(cx, |view, _| view.store.bind_hosts()))
-}
-
-fn t83_draft_bind(view: &Entity<AppView>, id: &str, cx: &mut VisualTestContext) -> String {
-    view.read_with(cx, |view, cx| {
-        view.libraries
-            .read(cx)
-            .delegate()
-            .endpoint_draft_texts(id, cx)
-            .expect("row inputs exist")
-            .0
-    })
-}
-
-fn t83_pending_pick(view: &Entity<AppView>, id: &str, host: &str, cx: &mut VisualTestContext) {
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.libraries.update(cx, |list, cx| {
-                list.delegate_mut().queue_bind_pick(id, host);
-                cx.notify();
-            });
-        });
-    });
-    paint_frame(cx);
 }
 
 #[gpui_kit::test]
@@ -34460,92 +33955,7 @@ fn t83_hostname_rejected_in_list_editor(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t83_picker_drives_existing_save_gate(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(t30_engine_seed("Alpha", "10951"))
-        .expect("seed works");
-    store.add_bind_host("192.168.1.44").expect("extra accepted");
-    let (view, cx) = mount_view(store, cx);
-    paint_frame(cx);
-    // T-03: the bind editor rides the inspector, for the selected row.
-    select_library_row(&view, cx, &alpha.id);
-
-    assert_painted(cx, &format!("row-bind-picker-{}", alpha.id));
-    assert_absent(cx, format!("row-bind-input-{}", alpha.id));
-    assert_painted(cx, &format!("row-bind-add-{}", alpha.id));
-
-    t83_pending_pick(&view, &alpha.id, "192.168.1.44", cx);
-    assert_eq!(
-        t83_draft_bind(&view, &alpha.id, cx),
-        "192.168.1.44",
-        "the pick writes the row's bind draft"
-    );
-    let selected = view.read_with(cx, |view, cx| {
-        let list = view.libraries.read(cx);
-        list.delegate()
-            .endpoint_inputs
-            .get(&alpha.id)
-            .expect("row inputs exist")
-            .picker
-            .read(cx)
-            .selected_value()
-            .cloned()
-    });
-    assert_eq!(
-        selected.as_deref(),
-        Some("192.168.1.44"),
-        "the picker shows the picked host"
-    );
-
-    let committed = cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.commit_row_endpoint(&alpha.id, window, cx)
-        })
-    });
-    assert!(committed, "the ordinary endpoint commit applies the pick");
-    let saved = view
-        .read_with(cx, |view, _| view.store.get(&alpha.id))
-        .expect("store reads")
-        .expect("row survives");
-    assert_eq!(saved.bind_ip, "192.168.1.44");
-    assert_eq!(saved.port, 10951, "the free-text port is untouched");
-
-    // The gate is still the only writer: a draft the picker can never
-    // produce (a hostname) is refused and nothing lands.
-    let before = notification_count(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            let list = view.libraries.read(cx).delegate().endpoint_inputs[&alpha.id]
-                .bind
-                .clone();
-            list.update(cx, |state, cx| state.set_value("example.com", window, cx));
-        });
-    });
-    let refused = cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.commit_row_endpoint(&alpha.id, window, cx)
-        })
-    });
-    assert!(!refused, "save_listen_gate refuses a hostname draft");
-    assert_eq!(
-        notification_count(cx),
-        before + 1,
-        "the refusal toasts the gate's reason"
-    );
-    let kept = view
-        .read_with(cx, |view, _| view.store.get(&alpha.id))
-        .expect("store reads")
-        .expect("row survives");
-    assert_eq!(
-        kept.bind_ip, "192.168.1.44",
-        "the refused draft saves nothing"
-    );
-}
-
-#[gpui_kit::test]
-fn t83_lan_confirm_unchanged_for_nonloopback_pick(cx: &mut TestAppContext) {
+fn t83_lan_confirm_unchanged_for_nonloopback_bind(cx: &mut TestAppContext) {
     use crate::engine::EngineController;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -34555,7 +33965,11 @@ fn t83_lan_confirm_unchanged_for_nonloopback_pick(cx: &mut TestAppContext) {
     let loopback = store
         .add(t30_engine_seed("Loop", "10962"))
         .expect("seed works");
-    store.add_bind_host("192.168.1.44").expect("extra accepted");
+    let patch = crate::ConfigPatch {
+        bind_ip: Some("192.168.1.44".to_string()),
+        ..Default::default()
+    };
+    store.update(&lan.id, patch).expect("bind moves");
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
@@ -34565,11 +33979,6 @@ fn t83_lan_confirm_unchanged_for_nonloopback_pick(cx: &mut TestAppContext) {
     });
     paint_frame(cx);
 
-    t83_pending_pick(&view, &lan.id, "192.168.1.44", cx);
-    let committed = cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.commit_row_endpoint(&lan.id, window, cx))
-    });
-    assert!(committed);
     let saved = view
         .read_with(cx, |view, _| view.store.get(&lan.id))
         .expect("store reads")
@@ -34577,7 +33986,7 @@ fn t83_lan_confirm_unchanged_for_nonloopback_pick(cx: &mut TestAppContext) {
     assert_eq!(saved.bind_ip, "192.168.1.44");
     assert!(
         crate::engine::requires_lan_confirm(&saved.bind_ip),
-        "a non-loopback pick still asks"
+        "a non-loopback bind still asks"
     );
     let text = crate::engine::lan_confirm_text(&saved.name, &saved.bind_ip);
     assert!(
@@ -34640,13 +34049,14 @@ fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
         crate::engine::is_custom_config_protocol(&custom.protocol),
         "the row is JSON-governed"
     );
-    // T-03: the bind editor rides the inspector, for the selected row.
+    // A custom-config row's listens come from its JSON document, so it gets
+    // no endpoint editor. A generated row keeps both entry points.
     select_library_row(&view, cx, &custom.id);
-    assert_painted(cx, &format!("row-bind-input-{}", custom.id));
-    assert_absent(cx, format!("row-bind-picker-{}", custom.id));
-    assert_absent(cx, format!("row-bind-add-{}", custom.id));
+    assert_absent(cx, format!("row-endpoint-edit-{}", custom.id));
+    assert_absent(cx, "detail-endpoint-edit".to_string());
     select_library_row(&view, cx, &generated.id);
-    assert_painted(cx, &format!("row-bind-picker-{}", generated.id));
+    assert_painted(cx, &format!("row-endpoint-edit-{}", generated.id));
+    assert_painted(cx, "detail-endpoint-edit");
 
     let listens = crate::engine::custom_config_listens(
         &serde_json::from_str::<serde_json::Value>(&custom.params).expect("params are JSON"),
@@ -34656,24 +34066,725 @@ fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
         vec![("0.0.0.0".to_string(), 10970)],
         "the custom listen still comes from the JSON document"
     );
+}
 
-    // A list edit reaches the generated rows and leaves the custom row's
-    // free-text bind alone.
+// ---------------------------------------------------------------------------
+// Slice 5 - one endpoint draft, two hosts, one apply path.
+
+fn endpoint_open(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+    id: &str,
+    host: crate::app::endpoint_editor::EndpointHost,
+) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.commit_add_bind_host("192.168.1.20", window, cx)
-        })
-    })
-    .expect("extra accepted");
+            view.open_endpoint_draft(id, host, window, cx);
+        });
+    });
+    cx.run_until_parked();
     paint_frame(cx);
-    select_library_row(&view, cx, &custom.id);
-    assert_painted(cx, &format!("row-bind-input-{}", custom.id));
-    assert_absent(cx, format!("row-bind-picker-{}", custom.id));
+}
+
+/// The draft's two raw field values. Reading the inputs, not the stored row,
+/// is what proves Apply acts on what the user typed.
+fn endpoint_values(view: &Entity<AppView>, cx: &mut VisualTestContext) -> (String, String) {
+    view.read_with(cx, |view, cx| {
+        let draft = view
+            .endpoint_draft
+            .as_ref()
+            .expect("an endpoint draft is open");
+        (
+            draft.bind.read(cx).value().to_string(),
+            draft.port.read(cx).value().to_string(),
+        )
+    })
+}
+
+fn endpoint_set(view: &Entity<AppView>, cx: &mut VisualTestContext, field: &str, text: &str) {
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let draft = view
+                .endpoint_draft
+                .as_ref()
+                .expect("an endpoint draft is open");
+            let input = if field == "bind" {
+                draft.bind.clone()
+            } else {
+                draft.port.clone()
+            };
+            input.update(cx, |state, cx| state.set_value(text, window, cx));
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn endpoint_can_apply(view: &Entity<AppView>, cx: &mut VisualTestContext) -> bool {
+    view.read_with(cx, |view, cx| {
+        view.endpoint_check(cx)
+            .is_some_and(|check| check.can_apply())
+    })
+}
+
+fn endpoint_error(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Option<String> {
+    view.read_with(cx, |view, cx| {
+        view.endpoint_check(cx).and_then(|check| check.error)
+    })
+}
+
+fn endpoint_failed_reason(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Option<String> {
+    view.read_with(cx, |view, _| {
+        match view.endpoint_draft.as_ref().map(|draft| &draft.phase) {
+            Some(crate::app::endpoint_editor::EndpointPhase::Failed(reason)) => {
+                Some(reason.clone())
+            }
+            _ => None,
+        }
+    })
+}
+
+fn endpoint_apply_clicked(cx: &mut VisualTestContext) {
+    cx.update(|window, cx| window.click("endpoint-apply", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+fn endpoint_saved(view: &Entity<AppView>, cx: &mut VisualTestContext, id: &str) -> (String, u16) {
+    view.read_with(cx, |view, _| {
+        let row = view
+            .store
+            .get(id)
+            .expect("store reads")
+            .expect("row survives");
+        (row.bind_ip, row.port)
+    })
+}
+
+fn endpoint_fake_engine(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+) -> crate::engine::FakeHandle {
+    use crate::engine::EngineController;
+    let (engine, handle) = EngineController::fake();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| view.engine = engine);
+    });
+    handle
+}
+
+fn endpoint_served_ports(handle: &crate::engine::FakeHandle) -> Vec<u64> {
+    let config = handle
+        .last_config()
+        .expect("the fake engine served a config");
+    let value: serde_json::Value =
+        serde_json::from_str(&config).expect("the served config is JSON");
+    value["inbounds"]
+        .as_array()
+        .expect("inbounds is an array")
+        .iter()
+        .filter_map(|inbound| inbound["listen_port"].as_u64())
+        .collect()
+}
+
+fn endpoint_press(view: &Entity<AppView>, cx: &mut VisualTestContext, key: &str) {
+    let focus = view.read_with(cx, |view, cx| {
+        view.endpoint_frame(cx).map(|frame| frame.focus)
+    });
+    cx.update(|window, cx| {
+        if let Some(focus) = focus.as_ref() {
+            window.focus(focus, cx);
+        }
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        window.dispatch_keystroke(keystroke, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+}
+
+#[gpui_kit::test]
+fn endpoint_chip_pencil_inspector_edit_and_ctrl_e_open_the_same_draft(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Editable", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    // Entry 1: the chip's pencil opens the row popover.
+    cx.update(|window, cx| {
+        window.click(format!("row-endpoint-edit-{}", row.id), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "endpoint-form");
+    assert_painted(cx, "endpoint-bind-input");
+    assert_painted(cx, "endpoint-port-input");
     assert_eq!(
-        t83_draft_bind(&view, &custom.id, cx),
-        "127.0.0.1",
-        "the custom row keeps its own bind draft"
+        view.read_with(cx, |view, _| view
+            .endpoint_draft
+            .as_ref()
+            .map(|draft| draft.host)),
+        Some(EndpointHost::RowPopover)
     );
+    assert_eq!(
+        endpoint_values(&view, cx),
+        ("127.0.0.1".to_string(), "10951".to_string())
+    );
+
+    view.update(cx, |view, cx| view.cancel_endpoint_draft(cx));
+    paint_frame(cx);
+
+    // Entry 2: the inspector's Edit opens the same values inline.
+    select_library_row(&view, cx, &row.id);
+    assert_painted(cx, "detail-endpoint-edit");
+    cx.update(|window, cx| window.click("detail-endpoint-edit", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "endpoint-form");
+    assert_eq!(
+        view.read_with(cx, |view, _| view
+            .endpoint_draft
+            .as_ref()
+            .map(|draft| draft.host)),
+        Some(EndpointHost::InspectorInline)
+    );
+    assert_eq!(
+        endpoint_values(&view, cx),
+        ("127.0.0.1".to_string(), "10951".to_string())
+    );
+
+    view.update(cx, |view, cx| view.cancel_endpoint_draft(cx));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.close_inspector(window, cx);
+        });
+    });
+    paint_frame(cx);
+
+    // Entry 3: Ctrl+E with the inspector hidden anchors the row popover.
+    let focus = view.read_with(cx, |view, _| view.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    cx.update(|window, cx| {
+        let keystroke = gpui_kit::Keystroke::parse("ctrl-e").expect("test keystroke parses");
+        window.dispatch_keystroke(keystroke, cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_painted(cx, "endpoint-form");
+    assert_eq!(
+        view.read_with(cx, |view, _| view
+            .endpoint_draft
+            .as_ref()
+            .map(|draft| (draft.row_id.clone(), draft.host))),
+        Some((row.id.clone(), EndpointHost::RowPopover))
+    );
+    assert_eq!(
+        endpoint_values(&view, cx),
+        ("127.0.0.1".to_string(), "10951".to_string())
+    );
+    view.update(cx, |view, cx| view.cancel_endpoint_draft(cx));
+}
+
+#[gpui_kit::test]
+fn endpoint_apply_is_disabled_until_dirty_and_valid(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Stopped", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &row.id, EndpointHost::RowPopover);
+
+    assert!(!endpoint_can_apply(&view, cx), "a clean draft cannot apply");
+    endpoint_apply_clicked(cx);
+    assert!(view.read_with(cx, |view, _| view.endpoint_draft.is_some()));
+    assert_eq!(
+        endpoint_saved(&view, cx, &row.id),
+        ("127.0.0.1".to_string(), 10951)
+    );
+    assert_eq!(notification_count(cx), 0, "no toast before Apply lands");
+
+    let invalid_port = crate::t!("endpoint-invalid-port");
+    for port in ["", "0", "auto", "-1", "65536"] {
+        endpoint_set(&view, cx, "port", port);
+        assert_eq!(
+            endpoint_error(&view, cx).as_deref(),
+            Some(invalid_port.as_str()),
+            "port {port:?} is refused live"
+        );
+        assert!(
+            !endpoint_can_apply(&view, cx),
+            "port {port:?} disables Apply"
+        );
+        endpoint_apply_clicked(cx);
+        assert!(
+            view.read_with(cx, |view, _| view.endpoint_draft.is_some()),
+            "a refused apply leaves the draft open"
+        );
+        assert_eq!(
+            endpoint_saved(&view, cx, &row.id).1,
+            10951,
+            "a refused apply writes nothing"
+        );
+    }
+
+    endpoint_set(&view, cx, "port", "1");
+    let privileged = endpoint_error(&view, cx).expect("port 1 is refused live");
+    assert!(
+        privileged.contains("privileged"),
+        "port 1 names elevation: {privileged}"
+    );
+    assert_painted(cx, "endpoint-error");
+    assert!(!endpoint_can_apply(&view, cx));
+
+    endpoint_set(&view, cx, "port", "10952");
+    assert_eq!(endpoint_error(&view, cx), None);
+    assert!(
+        endpoint_can_apply(&view, cx),
+        "a free valid port enables Apply"
+    );
+    endpoint_apply_clicked(cx);
+    assert!(view.read_with(cx, |view, _| view.endpoint_draft.is_none()));
+    assert_eq!(
+        endpoint_saved(&view, cx, &row.id),
+        ("127.0.0.1".to_string(), 10952)
+    );
+    assert_eq!(notification_count(cx), 1, "one Endpoint updated toast");
+}
+
+#[gpui_kit::test]
+fn endpoint_duplicate_names_the_row_and_use_port_fills_the_suggestion(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10961"))
+        .expect("seed works");
+    store
+        .add(t30_engine_seed("Bravo", "10962"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &alpha.id, EndpointHost::RowPopover);
+
+    endpoint_set(&view, cx, "port", "10962");
+    let found = view
+        .read_with(cx, |view, cx| {
+            view.endpoint_check(cx).and_then(|check| check.collision)
+        })
+        .expect("Bravo holds the port");
+    assert_eq!(found.name, "Bravo");
+    assert_eq!(found.port, 10962);
+    assert!(!endpoint_can_apply(&view, cx), "a collision blocks Apply");
+    assert_painted(cx, "endpoint-collision");
+    assert_painted(cx, "endpoint-use-port");
+    assert_eq!(label_of("endpoint-use-port", cx), "Use 10963");
+
+    cx.update(|window, cx| window.click("endpoint-use-port", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert_eq!(
+        endpoint_values(&view, cx),
+        ("127.0.0.1".to_string(), "10963".to_string()),
+        "the suggestion button writes the free port into the field"
+    );
+    let check = view
+        .read_with(cx, |view, cx| view.endpoint_check(cx))
+        .expect("draft open");
+    assert!(check.collision.is_none());
+    assert!(check.can_apply());
+    assert_absent(cx, "endpoint-collision".to_string());
+
+    endpoint_apply_clicked(cx);
+    assert_eq!(
+        endpoint_saved(&view, cx, &alpha.id),
+        ("127.0.0.1".to_string(), 10963)
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_apply_on_a_stopped_row_writes_store_and_closes(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Stopped", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let handle = endpoint_fake_engine(&view, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &row.id, EndpointHost::RowPopover);
+
+    endpoint_set(&view, cx, "port", "10952");
+    assert!(endpoint_can_apply(&view, cx));
+    endpoint_apply_clicked(cx);
+
+    assert_eq!(
+        endpoint_saved(&view, cx, &row.id),
+        ("127.0.0.1".to_string(), 10952)
+    );
+    assert!(view.read_with(cx, |view, _| view.endpoint_draft.is_none()));
+    assert_eq!(
+        handle.last_config(),
+        None,
+        "a stopped row never reaches the engine"
+    );
+    assert_eq!(notification_count(cx), 1, "one Endpoint updated toast");
+    let (bind, port) = view.read_with(cx, |view, cx| {
+        let row = &view.libraries.read(cx).delegate().rows[0];
+        (row.bind_ip.clone(), row.port)
+    });
+    assert_eq!(
+        manyproxy_core::endpoint_display(&bind, port),
+        ":10952",
+        "the delegate the chip paints reloads with the saved endpoint"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_apply_on_a_running_row_restarts_and_closes(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Running", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let handle = endpoint_fake_engine(&view, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&row.id, window, cx));
+    });
+    assert_eq!(endpoint_served_ports(&handle), vec![10951]);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &row.id, EndpointHost::RowPopover);
+
+    endpoint_set(&view, cx, "port", "10953");
+    endpoint_apply_clicked(cx);
+
+    assert_eq!(
+        endpoint_saved(&view, cx, &row.id),
+        ("127.0.0.1".to_string(), 10953)
+    );
+    assert!(view.read_with(cx, |view, _| view.endpoint_draft.is_none()));
+    assert_eq!(
+        endpoint_served_ports(&handle),
+        vec![10953],
+        "the running row is restarted on the new endpoint"
+    );
+    assert!(
+        view.read_with(cx, |view, _| view.engine.running_ids().contains(&row.id)),
+        "the row is still serving"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_engine_failure_restores_store_and_restarts_old_endpoint(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Running", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    let handle = endpoint_fake_engine(&view, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_row(&row.id, window, cx));
+    });
+    handle.fail_start("address already in use");
+    paint_frame(cx);
+    let toasts_before = notification_count(cx);
+    endpoint_open(&view, cx, &row.id, EndpointHost::RowPopover);
+
+    endpoint_set(&view, cx, "port", "10952");
+    endpoint_apply_clicked(cx);
+
+    assert_eq!(
+        endpoint_saved(&view, cx, &row.id),
+        ("127.0.0.1".to_string(), 10951),
+        "the store rolls back to the old endpoint"
+    );
+    assert_eq!(
+        endpoint_values(&view, cx),
+        ("127.0.0.1".to_string(), "10952".to_string()),
+        "the attempted values stay in the open draft"
+    );
+    let reason = endpoint_failed_reason(&view, cx).expect("phase Failed");
+    assert!(
+        reason.contains("address already in use"),
+        "the engine error reaches the draft: {reason}"
+    );
+    assert_painted(cx, "endpoint-error");
+    assert_eq!(
+        endpoint_served_ports(&handle),
+        vec![10951],
+        "the old endpoint serves again"
+    );
+    assert!(handle.is_running());
+    assert_eq!(
+        notification_count(cx),
+        toasts_before + 1,
+        "one Endpoint not changed toast"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_port_65535_applies_and_port_1_shows_privileged_error(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Ports", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &row.id, EndpointHost::RowPopover);
+
+    endpoint_set(&view, cx, "port", "1");
+    let privileged = endpoint_error(&view, cx).expect("port 1 is refused live");
+    assert!(privileged.contains("privileged"), "{privileged}");
+    assert_painted(cx, "endpoint-error");
+    assert!(!endpoint_can_apply(&view, cx));
+
+    endpoint_set(&view, cx, "port", "65535");
+    assert_eq!(endpoint_error(&view, cx), None);
+    assert!(endpoint_can_apply(&view, cx), "65535 is a valid free port");
+    endpoint_apply_clicked(cx);
+    assert_eq!(
+        endpoint_saved(&view, cx, &row.id),
+        ("127.0.0.1".to_string(), 65535)
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_escape_reverts_dirty_and_closes_clean(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Escaped", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &row.id, EndpointHost::RowPopover);
+
+    endpoint_set(&view, cx, "bind", "localhost");
+    assert!(endpoint_can_apply(&view, cx));
+    endpoint_press(&view, cx, "escape");
+    assert!(
+        view.read_with(cx, |view, _| view.endpoint_draft.is_some()),
+        "a dirty Escape reverts instead of closing"
+    );
+    assert_eq!(
+        endpoint_values(&view, cx),
+        ("127.0.0.1".to_string(), "10951".to_string()),
+        "the stored values come back"
+    );
+
+    endpoint_press(&view, cx, "escape");
+    assert!(
+        view.read_with(cx, |view, _| view.endpoint_draft.is_none()),
+        "a clean Escape closes the draft"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_outside_click_cancels(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(t30_engine_seed("Alpha", "10961"))
+        .expect("seed works");
+    let bravo = store
+        .add(t30_engine_seed("Bravo", "10962"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &alpha.id, EndpointHost::RowPopover);
+    endpoint_set(&view, cx, "port", "10963");
+    assert!(view.read_with(cx, |view, _| view.endpoint_draft.is_some()));
+
+    cx.update(|window, cx| {
+        window.click(format!("row-name-text-{}", bravo.id), cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        view.read_with(cx, |view, _| view.endpoint_draft.is_none()),
+        "an outside click discards the draft"
+    );
+    assert_eq!(
+        endpoint_saved(&view, cx, &alpha.id),
+        ("127.0.0.1".to_string(), 10961),
+        "discarding writes nothing"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_popover_flips_above_when_the_row_is_near_the_bottom(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let mut ids = Vec::new();
+    for i in 0..20 {
+        let row = store
+            .add(t30_engine_seed(
+                &format!("Row {i}"),
+                &(10900 + i).to_string(),
+            ))
+            .expect("seed works");
+        ids.push(row.id);
+    }
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+
+    endpoint_open(&view, cx, &ids[0], EndpointHost::RowPopover);
+    assert!(
+        !view.read_with(cx, |view, cx| view.endpoint_frame(cx).expect("frame").flip),
+        "a top row opens below its chip"
+    );
+    view.update(cx, |view, cx| view.cancel_endpoint_draft(cx));
+    paint_frame(cx);
+
+    endpoint_open(&view, cx, &ids[10], EndpointHost::RowPopover);
+    assert!(
+        view.read_with(cx, |view, cx| view.endpoint_frame(cx).expect("frame").flip),
+        "a row near the bottom flips the popover above its chip"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_popover_closes_when_the_list_virtualizes_its_row_away(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let mut first = None;
+    for i in 0..30 {
+        let row = store
+            .add(t30_engine_seed(
+                &format!("Row {i}"),
+                &(10900 + i).to_string(),
+            ))
+            .expect("seed works");
+        first.get_or_insert(row);
+    }
+    let first = first.expect("one row");
+    let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    endpoint_open(&view, cx, &first.id, EndpointHost::RowPopover);
+    assert!(view.read_with(cx, |view, _| view.endpoint_draft.is_some()));
+
+    view.update(cx, |view, cx| {
+        view.libraries
+            .read(cx)
+            .scroll_handle()
+            .scroll_to_item(25, gpui_kit::ScrollStrategy::Top);
+        cx.notify();
+    });
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(
+        view.read_with(cx, |view, _| view.endpoint_draft.is_none()),
+        "scrolling the row out of the virtualized list closes its popover"
+    );
+}
+
+#[gpui_kit::test]
+fn endpoint_old_per_row_inputs_and_pending_commits_are_gone(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Only", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    select_library_row(&view, cx, &row.id);
+
+    for id in [
+        format!("row-bind-input-{}", row.id),
+        format!("row-port-input-{}", row.id),
+        format!("row-endpoint-warning-{}", row.id),
+    ] {
+        assert_absent(cx, id);
+    }
+    assert_painted(cx, &format!("row-endpoint-chip-{}", row.id));
+    assert_painted(cx, &format!("row-endpoint-edit-slot-{}", row.id));
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().rows.len()),
+        1,
+        "the delegate holds rows, not per-row endpoint inputs"
+    );
+}
+
+#[gpui_kit::test]
+fn ctrl_e_opens_endpoint_and_ctrl_shift_e_opens_config(cx: &mut TestAppContext) {
+    use crate::app::endpoint_editor::EndpointHost;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+
+    let endpoint = crate::app::actions::action("edit-endpoint");
+    assert_eq!(endpoint.shortcuts, &[("ctrl-e", "Ctrl+E")]);
+    assert_eq!(crate::t!("action-label-edit-endpoint"), "Edit endpoint");
+    let config = crate::app::actions::action("edit");
+    assert_eq!(config.shortcuts, &[("ctrl-shift-e", "Ctrl+Shift+E")]);
+    assert_eq!(crate::t!("action-label-edit"), "Edit config…");
+    assert!(crate::SHORTCUT_LINES.contains(&("Edit endpoint", "Ctrl-E")));
+    assert!(crate::SHORTCUT_LINES.contains(&("Edit config", "Ctrl-Shift-E")));
+
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(t30_engine_seed("Keyboard", "10951"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    select_library_row(&view, cx, &row.id);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.close_inspector(window, cx);
+        });
+    });
+    let focus = view.read_with(cx, |view, _| view.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+
+    let press = |cx: &mut VisualTestContext, key: &str| {
+        cx.update(|window, cx| {
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    };
+
+    press(cx, "ctrl-e");
+    assert_painted(cx, "endpoint-form");
+    assert_eq!(
+        view.read_with(cx, |view, _| view
+            .endpoint_draft
+            .as_ref()
+            .map(|draft| draft.host)),
+        Some(EndpointHost::RowPopover),
+        "Ctrl+E edits the endpoint"
+    );
+    view.update(cx, |view, cx| view.cancel_endpoint_draft(cx));
+    paint_frame(cx);
+    cx.update(|window, cx| window.focus(&focus, cx));
+
+    press(cx, "ctrl-shift-e");
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "Ctrl+Shift+E keeps the full config form"
+    );
+    assert!(
+        cx.update(|window, _| window.try_find("field-name").is_some()),
+        "the config form names the field"
+    );
+    cx.update(|window, cx| window.close_all_dialogs(cx));
 }
 
 /// T-06: Esc on the last overlay hands keyboard focus back to the shell, so the
@@ -37267,7 +37378,7 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
         ("stop", "Stop 3 configurations"),
         ("test", "Test 3 configurations"),
         ("copy-urls", "Copy 3 URLs"),
-        ("edit", "Edit"),
+        ("edit", "Edit config…"),
         ("delete", "Delete 3 configurations"),
     ] {
         assert_eq!(
