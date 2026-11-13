@@ -725,7 +725,9 @@ fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyE
                         });
                     }),
             );
-        return body.into_any_element();
+        return body
+            .child(render_console_runtime(view, cx))
+            .into_any_element();
     }
     if bars.is_empty() {
         return body
@@ -737,6 +739,7 @@ fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyE
                     .text_color(cx.theme().muted_foreground)
                     .child(t!("console-empty-traffic")),
             )
+            .child(render_console_runtime(view, cx))
             .into_any_element();
     }
 
