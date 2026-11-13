@@ -77,7 +77,7 @@ use qrcodegen::{QrCode, QrCodeEcc};
 use manyproxy_core::engine::{
     engine_binary_file_name, fork_binary_file_name, is_custom_config_protocol,
     requires_lan_confirm, resolve_engine_binary, resolve_fork_binary, resolve_xray_binary,
-    strip_ansi_codes, xray_binary_file_name, AutoRestartConfig, EngineController, EngineError,
+    xray_binary_file_name, AutoRestartConfig, EngineController, EngineError,
 };
 use manyproxy_core::health::{
     clamp_log_max_lines, outcome_is_neutral, ping_all, redact_secrets, sparkline_caption_tone,
@@ -116,11 +116,10 @@ use manyproxy_core::store::{
 /// width it collapses to a slide-over drawer, so the table never loses the
 /// width it needs.
 pub(crate) const INSPECTOR_DRAWER_BREAKPOINT: f32 = 1080.;
-/// The inspector's default width. The user may drag it inside the range
-/// below; the width is session-only — nothing about it is persisted.
-pub(crate) const INSPECTOR_WIDTH: f32 = 260.;
-pub(crate) const INSPECTOR_WIDTH_MIN: f32 = 240.;
-pub(crate) const INSPECTOR_WIDTH_MAX: f32 = 360.;
+/// R12: the inspector's width range. The default and the clamped range live
+/// in the store, which owns the `inspector_width` key.
+pub(crate) const INSPECTOR_WIDTH_MIN: f32 = store::Store::INSPECTOR_WIDTH_MIN;
+pub(crate) const INSPECTOR_WIDTH_MAX: f32 = store::Store::INSPECTOR_WIDTH_MAX;
 
 pub(crate) use i18n::t;
 
@@ -134,7 +133,7 @@ use app::focus::*;
 use app::kit_bits::*;
 use app::open::*;
 use app::selection::{BatchKind, BatchRun};
-use app::state::{ConnectionState, LogsState, PaneWindow, RefreshBatch};
+use app::state::{ConnectionState, ConsoleState, LogsState, PaneWindow, RefreshBatch};
 use app::window::*;
 use appearance::*;
 use chain::*;
@@ -161,19 +160,19 @@ pub(crate) use text::{
     export_overwrite_confirm_description, export_preview_description,
     group_delete_confirm_description, group_row_views, group_test_summary_toast,
     http_subscription_warning, import_files_label, import_preview_message, inspector_badge_text,
-    inspector_tab_label, lan_confirm_description, lan_confirm_text, lan_confirm_title,
-    lan_exposure_warning, lan_hint_for_bind, log_level_tooltip, logs_overwrite_text,
-    logs_save_path_text, no_selection_message, preset_delete_confirm_description,
-    preset_error_message, preset_imported_message, preset_row_summary, preset_summary_text,
-    probe_batched_toast, probe_result_toast, probe_start_toast, prune_duplicates_confirm_text,
+    lan_confirm_description, lan_confirm_text, lan_confirm_title, lan_exposure_warning,
+    lan_hint_for_bind, log_level_tooltip, logs_overwrite_text, logs_save_path_text,
+    no_selection_message, preset_delete_confirm_description, preset_error_message,
+    preset_imported_message, preset_row_summary, preset_summary_text, probe_batched_toast,
+    probe_result_toast, probe_start_toast, prune_duplicates_confirm_text,
     prune_invalid_confirm_text, prune_unavailable_confirm_text, refresh_summary_text,
     removed_message, restart_to_apply_message, restore_done_message, row_action_message,
     rule_set_summary, settings_clear_health_text, settings_clear_snapshot_text,
     settings_clear_traffic_text, sidecar_presence_line, start_all_message,
     start_all_partial_message, start_busy_message, stop_all_confirm_description, stop_all_message,
-    subscription_failures_text, subscription_interval_failure_message, traffic_other_line,
-    traffic_stats_summary_text, undo_failed_message, undo_restored_message,
-    unreadable_drop_message, update_all_confirm_text, update_feed_failure_message,
+    subscription_failures_text, subscription_interval_failure_message, undo_failed_message,
+    undo_restored_message, unreadable_drop_message, update_all_confirm_text,
+    update_feed_failure_message,
 };
 use update::*;
 
@@ -202,12 +201,8 @@ actions!(
         ToggleFocused,
         SelectAllRows,
         FocusSearch,
-        InspectorDetails,
-        InspectorHealth,
-        InspectorLogs,
-        InspectorLinks,
-        InspectorTraffic,
-        InspectorToggle,
+        ToggleInspector,
+        ToggleConsole,
         OpenPalette,
         CopyUrls,
         UpdateCurrentGroup
@@ -415,30 +410,35 @@ struct AppView {
     /// scroll container owns it, so the two can never drift apart.
     table_scroll: ScrollHandle,
 
-    inspector_tab: InspectorTab,
-
-    /// T-03: the split's own state. The inspector's width is session-only —
-    /// nothing about it is persisted — but the table's column budget has to
-    /// follow the drag, so the owner reads the live size from here.
+    /// T-03: the split's own state. The width is persisted under
+    /// `inspector_width` on mouse-up; between drags the split reads live.
     split_state: Entity<ResizableState>,
 
-    /// F19: ONE flag owns the inspector's presence in both presentations —
+    /// R6: ONE flag owns the inspector's presence in both presentations —
     /// docked (≥1080) and the slide-over drawer below it. It starts closed;
-    /// picking a row or an inspector shortcut opens it, Esc or the close
-    /// button shuts it. Esc hands focus back to the list.
+    /// `Ctrl+I` or picking a row opens it, Esc or the close button shuts it.
+    /// Esc hands focus back to the list. The target is the selection.
     inspector_visible: bool,
 
-    /// B3: one scroll window per row-listing pane, so an open inspector builds
-    /// only the rows it can show and a return to a pane keeps its position.
-    pane_logs: PaneWindow,
-    pane_links: PaneWindow,
-    pane_traffic: PaneWindow,
+    /// Slice 6: the console dock — open state, tab, scope, quick filter and
+    /// the pause snapshot. Session-only; a launch starts collapsed on Logs/All.
+    pub(crate) console: ConsoleState,
+
+    /// The console quick filter's input entity. One dock, one filter, rebuilt
+    /// with the view like the search field.
+    pub(crate) console_filter_input: Entity<InputState>,
+    _console_filter_subscription: Subscription,
+
+    /// B3: one scroll window per row-listing console pane, so an open console
+    /// builds only the rows it can show and a return to a pane keeps its
+    /// position. The old inspector `pane_*` handles renamed to their new home.
+    console_logs: PaneWindow,
+    console_connections: PaneWindow,
+    console_traffic: PaneWindow,
 
     conn: ConnectionState,
 
     palette: Option<Entity<CommandState>>,
-
-    traffic_period: store::TrafficPeriod,
 
     /// T-30: per-shard CPU (% of one core) / RAM (MB) rings, keyed by the
     /// shard label `poll_shards` uses. One entry per live shard, 60 samples.

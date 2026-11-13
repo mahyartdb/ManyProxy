@@ -169,9 +169,9 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
     selected(
         "logs",
         "action-label-logs",
-        &["log", "output"],
+        &["log", "output", "console"],
         &[],
-        AppView::open_logs_dialog,
+        open_console_for_logs,
     ),
     selected(
         "settings",
@@ -186,20 +186,6 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         &["about", "version", "shortcuts"],
         &[],
         AppView::open_about_dialog,
-    ),
-    selected(
-        "runtime-stats",
-        "action-label-runtime-stats",
-        &["runtime", "stats", "health", "cpu", "memory"],
-        &[],
-        AppView::open_runtime_stats_dialog,
-    ),
-    selected(
-        "traffic-stats",
-        "action-label-traffic-stats",
-        &["traffic", "stats", "usage", "profile"],
-        &[],
-        AppView::open_traffic_stats_dialog,
     ),
     selected(
         "row-columns",
@@ -230,46 +216,18 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         sort_none,
     ),
     selected(
-        "inspector-details",
-        "action-label-inspector-details",
-        &["details", "tab"],
-        &[("ctrl-1", "Ctrl+1"), ("ctrl-3", "Ctrl+3")],
-        show_details,
-    ),
-    selected(
-        "inspector-health",
-        "action-label-inspector-health",
-        &["health", "tab"],
-        &[("ctrl-2", "Ctrl+2")],
-        show_health,
-    ),
-    selected(
-        "inspector-logs",
-        "action-label-inspector-logs",
-        &["log", "output", "tab"],
-        &[("ctrl-4", "Ctrl+4")],
-        show_logs,
-    ),
-    selected(
-        "inspector-links",
-        "action-label-inspector-links",
-        &["links", "connections", "tab"],
-        &[("ctrl-5", "Ctrl+5")],
-        show_links,
-    ),
-    selected(
-        "inspector-traffic",
-        "action-label-inspector-traffic",
-        &["traffic", "tab"],
-        &[("ctrl-6", "Ctrl+6")],
-        show_traffic,
-    ),
-    selected(
         "inspector-toggle",
         "action-label-inspector-toggle",
         &["inspector", "panel", "toggle"],
         &[("ctrl-i", "Ctrl+I")],
-        toggle_inspector_presence,
+        toggle_inspector,
+    ),
+    selected(
+        "toggle-console",
+        "action-label-toggle-console",
+        &["console", "logs", "traffic", "connections", "toggle"],
+        &[("ctrl-`", "Ctrl+`")],
+        toggle_console,
     ),
     rows(
         "start",
@@ -509,8 +467,6 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "delete",
             "focus-search",
             "clear-selection",
-            "inspector-details",
-            "inspector-health",
             "paste-import",
             "export-library",
             "move",
@@ -527,11 +483,10 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "settings",
             "about",
             "inspector-toggle",
+            "toggle-console",
             "start-all",
             "stop-all",
             "test-all",
-            "runtime-stats",
-            "traffic-stats",
             "row-columns",
             "text-size",
             "density-comfortable",
@@ -620,30 +575,19 @@ fn test_all(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) 
     view.test_all_health(window, cx);
 }
 
-fn show_details(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.toggle_inspector(InspectorTab::Details);
+fn toggle_inspector(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
+    view.toggle_inspector();
 }
 
-fn show_health(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Health);
+/// R9: the palette's `Logs` verb opens the console scoped to the selection;
+/// the full log sheet survives only behind the console's `Filters…`.
+fn open_console_for_logs(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
+    view.open_console_scoped_to_selection(false, cx);
 }
 
-fn show_logs(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Logs);
-}
-
-fn show_links(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Links);
-}
-
-fn show_traffic(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Traffic);
-}
-
-/// Ctrl-I owns the inspector's presence: it opens the panel and closes the one
-/// that is already open.
-fn toggle_inspector_presence(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.toggle_inspector_presence();
+/// Ctrl-` toggles the dock; the engine-bar button lands in the same method.
+fn toggle_console(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+    view.toggle_console(window, cx);
 }
 
 fn sort_none(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {

@@ -1490,6 +1490,12 @@ impl HealthStore {
         self.latest_filtered(config_id, None)
     }
 
+    /// Whether any sample exists in memory. The engine bar's
+    /// `Clear test results…` reads this — never a store reload per frame.
+    pub fn has_samples(&self) -> bool {
+        !self.samples.is_empty()
+    }
+
     pub fn status(&self, config_id: &str) -> RowHealth {
         let url = self.latest_of(config_id, HealthKind::UrlTest);
         let ping = self.latest_of(config_id, HealthKind::TcpPing);
@@ -2023,6 +2029,13 @@ impl LogStore {
 
     pub fn all(&self) -> &VecDeque<LogRecord> {
         &self.records
+    }
+
+    /// The console's Clear: empty the ring in place. Logs are session
+    /// evidence, so no confirm guards this; the push sequence keeps growing,
+    /// which correctly marks every open tail view stale.
+    pub fn clear(&mut self) {
+        self.records.clear();
     }
 }
 
@@ -4718,6 +4731,39 @@ mod tests {
             MAX_LOG_MAX_LINES,
             "the 50,000-line choice is respected"
         );
+    }
+
+    #[test]
+    fn log_store_clear_empties_the_ring() {
+        let mut logs = LogStore::default();
+        let tags = LogTagIndex::default();
+        for i in 0..10 {
+            logs.push_raw(&format!("info line {i}"), &tags);
+        }
+        assert!(!logs.all().is_empty(), "the ring holds lines before clear");
+        let seq_before = logs.push_seq();
+        logs.clear();
+        assert!(logs.all().is_empty(), "clear empties the ring");
+        assert_eq!(logs.push_seq(), seq_before, "clear does not touch push_seq");
+        logs.push_raw("after clear", &tags);
+        assert_eq!(logs.all().len(), 1, "the ring accepts pushes after clear");
+    }
+
+    #[test]
+    fn health_has_samples_is_false_before_the_first_probe() {
+        let mut store = HealthStore::default();
+        assert!(!store.has_samples(), "a fresh store has no samples");
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "cfg".to_string(),
+                at: 1,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(12),
+                error: None,
+            },
+            success: None,
+        });
+        assert!(store.has_samples(), "one probe makes has_samples true");
     }
 
     #[test]

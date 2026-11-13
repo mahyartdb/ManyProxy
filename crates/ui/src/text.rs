@@ -389,14 +389,15 @@ pub(crate) fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[Stri
         )
     }
 }
-pub(crate) fn inspector_tab_label(tab: InspectorTab) -> String {
-    match tab {
-        InspectorTab::Details => t!("inspector-tab-details"),
-        InspectorTab::Health => t!("inspector-tab-health"),
-        InspectorTab::Logs => t!("inspector-tab-logs"),
-        InspectorTab::Links => t!("inspector-tab-links"),
-        InspectorTab::Traffic => t!("inspector-tab-traffic"),
-    }
+/// Slice 6: a console log row's clock. Same `rem_euclid(86_400)` local-time
+/// convention as the settings check time — the app never claims a zone it
+/// does not know.
+pub(crate) fn format_clock_time(at: i64) -> String {
+    let seconds = at.rem_euclid(86_400);
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let secs = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
 }
 pub(crate) fn inspector_badge_text(
     state: BadgeState,
@@ -675,30 +676,6 @@ pub(crate) fn clear_group_tests_confirm_text(group: &str, count: usize) -> Strin
 }
 pub(crate) fn auto_clear_opt_in_note(group: &str) -> String {
     t!("auto-clear-opt-in-note", group = group)
-}
-pub(crate) fn traffic_stats_summary_text(
-    period: store::TrafficPeriod,
-    exits: usize,
-    rx: u64,
-    tx: u64,
-) -> String {
-    t!(
-        "stats-summary",
-        period = period.label(),
-        exits = exits,
-        rx = format_bytes(rx),
-        tx = format_bytes(tx)
-    )
-}
-pub(crate) fn traffic_other_line(split: &TrafficExitSplit) -> Option<String> {
-    (split.other_exits > 0).then(|| {
-        t!(
-            "stats-other",
-            count = split.other_exits,
-            down = format_bytes(split.other_rx),
-            up = format_bytes(split.other_tx)
-        )
-    })
 }
 pub(crate) fn group_row_views(
     counts: &[(String, usize)],

@@ -420,7 +420,8 @@ fn about_body_carries_version_sidecars_paths_shortcuts() {
         "Ctrl-E",
         "Delete",
         "Ctrl-F",
-        "Ctrl-1",
+        "Ctrl-I",
+        "Ctrl-`",
         "Esc",
         "Opt-in only",
         "default off",
@@ -466,7 +467,7 @@ fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
         "stored record stripped at ingest, got {:?}",
         stored[0]
     );
-    let lines = cx.update(|_, cx| view.update(cx, |view, cx| view.visible_log_lines(cx)));
+    let lines = cx.update(|_, cx| view.update(cx, |view, cx| view.log_lines(cx)));
     assert_eq!(lines.len(), 1);
     assert!(
         !lines[0].contains('\u{1b}'),
@@ -733,7 +734,7 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
                     view.logs.regex = pattern.to_string();
                     view.logs.level = level;
                     view.logs.tail = tail;
-                    view.visible_log_lines(cx)
+                    view.log_lines(cx)
                 })
             });
             by_cap.push(lines);
@@ -760,7 +761,7 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
             view.logs.regex.clear();
             view.logs.level = None;
             view.logs.tail = true;
-            view.visible_log_lines(cx)
+            view.log_lines(cx)
         })
     });
     assert_eq!(tail.len(), 200, "tail keeps the newest 200 lines");
@@ -4972,12 +4973,12 @@ fn import_commit_selects_and_checks_new_rows(cx: &mut TestAppContext) {
         });
     cx.run_until_parked();
     assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
-    assert!(
-        view.read_with(cx, |view, cx| view
-            .selected_config(cx)
-            .map(|config| config.name))
-            .is_some(),
-        "first imported row is selected"
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_focus.clone()),
+        view.read_with(cx, |view, cx| {
+            view.selected_ids_in_visible_order(cx).first().cloned()
+        }),
+        "focus lands on the first imported row"
     );
     assert_eq!(
         view.read_with(cx, |view, _| view.selection_count()),
@@ -5902,7 +5903,13 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     }
 
     let (first, second) = view.read_with(cx, |view, _| {
-        let rows = crate::build_conn_rows(&view.conn.snapshot, &view.conn.delta, None, false, true);
+        let rows = crate::build_conn_rows(
+            &view.conn.snapshot,
+            &view.conn.delta,
+            &std::collections::HashSet::new(),
+            false,
+            true,
+        );
         (rows[0].row_id.clone(), rows[1].row_id.clone())
     });
     assert_eq!(first.as_deref(), Some(beta.id.as_str()), "heaviest first");
@@ -5944,29 +5951,29 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.inspector_tab = crate::InspectorTab::Links;
-            view.conn.selected_only = false;
+            view.console.open = true;
+            view.console.tab = crate::ConsoleTab::Connections;
+            view.console.scope = crate::ConsoleScope::All;
             view.select_visible_row(0, cx);
             cx.notify();
         });
     });
     cx.run_until_parked();
-    open_inspector(&view, cx);
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    assert_painted(cx, "config-links");
+    assert_painted(cx, "console-connections");
     assert!(
-        cx.update(|window, _| window.try_find("conn-copy-0".to_string()).is_some()),
+        cx.update(|window, _| window.try_find("console-conn-copy-0".to_string()).is_some()),
         "first flow copies"
     );
     assert!(
-        cx.update(|window, _| window.try_find("conn-copy-1".to_string()).is_some()),
+        cx.update(|window, _| window.try_find("console-conn-copy-1".to_string()).is_some()),
         "second flow copies"
     );
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.conn.selected_only = true;
+            view.console.scope = crate::ConsoleScope::Selected;
             view.select_visible_row(1, cx);
         });
     });
@@ -5975,10 +5982,10 @@ fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppCo
     cx.run_until_parked();
     paint_frame(cx);
     assert!(
-        cx.update(|window, _| window.try_find("conn-copy-0".to_string()).is_some()),
+        cx.update(|window, _| window.try_find("console-conn-copy-0".to_string()).is_some()),
         "selected row keeps its flow"
     );
-    assert_absent(cx, "conn-copy-1".to_string());
+    assert_absent(cx, "console-conn-copy-1".to_string());
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -6041,35 +6048,26 @@ fn t74_conn_setup<'a>(
                 },
             )];
             view.conn.delta = std::collections::HashMap::new();
-            view.inspector_tab = crate::InspectorTab::Links;
-            view.conn.selected_only = false;
+            // Slice 6: connections live in the console now, not the inspector.
+            view.console.open = true;
+            view.console.tab = crate::ConsoleTab::Connections;
+            view.console.scope = crate::ConsoleScope::All;
             view.conn.sort_desc = true;
             view.select_visible_row(0, cx);
-            // F19: setting the selection by hand skips the row pick that opens
-            // the inspector.
             view.open_inspector();
             cx.notify();
         });
     });
     t74_paint(cx);
     cx.run_until_parked();
-    cx.update(|window, cx| {
-        window.scroll(
-            "config-detail-body",
-            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-140.))),
-            cx,
-        );
-    });
-    t74_paint(cx);
-    cx.run_until_parked();
     let endpoint = view.read_with(cx, |view, cx| {
         let rows = view.libraries.read(cx).delegate().rows.clone();
-        let selected = view.selected_config(cx).map(|config| config.id);
+        let selected = view.selected_id_set(cx);
         let built = crate::build_conn_rows(
             &view.conn.snapshot,
             &view.conn.delta,
-            selected.as_deref(),
-            view.conn.selected_only,
+            &selected,
+            view.console.scope == crate::ConsoleScope::Selected,
             view.conn.sort_desc,
         );
         crate::conn_exit_of(&rows, built[0].row_id.as_deref()).1
@@ -6081,11 +6079,11 @@ fn t74_conn_setup<'a>(
 fn t74_click_dest_copies_exact_string(cx: &mut TestAppContext) {
     let dest = "flow-0.example.com";
     let (_view, cx, _endpoint) = t74_conn_setup(cx, dest);
-    assert_painted(cx, "config-links");
-    assert_painted(cx, "conn-copy-0");
+    assert_painted(cx, "console-connections");
+    assert_painted(cx, "console-conn-copy-0");
 
     cx.update(|window, cx| {
-        window.click("conn-copy-0", cx);
+        window.click("console-conn-copy-0", cx);
     });
     let clip = cx.update(|_, cx| {
         cx.read_from_clipboard()
@@ -6112,7 +6110,7 @@ fn t74_click_dest_copies_exact_string(cx: &mut TestAppContext) {
 
     // Repeat click copies again (idempotent; no state jam).
     cx.update(|window, cx| {
-        window.click("conn-copy-0", cx);
+        window.click("console-conn-copy-0", cx);
     });
     let clip_again = cx.update(|_, cx| {
         cx.read_from_clipboard()
@@ -6130,10 +6128,10 @@ fn t74_click_dest_copies_exact_string(cx: &mut TestAppContext) {
 fn t74_click_endpoint_copies_endpoint_only(cx: &mut TestAppContext) {
     let dest = "flow-0.example.com";
     let (_view, cx, endpoint) = t74_conn_setup(cx, dest);
-    assert_painted(cx, "conn-endpoint-0");
+    assert_painted(cx, "console-conn-endpoint-0");
 
     cx.update(|window, cx| {
-        window.click("conn-endpoint-0", cx);
+        window.click("console-conn-endpoint-0", cx);
     });
     let clip = cx.update(|_, cx| {
         cx.read_from_clipboard()
@@ -6166,13 +6164,13 @@ fn t74_copied_tooltip_transient_clears(cx: &mut TestAppContext) {
         1500,
         "the Copied! marker window is ~1.5s"
     );
-    assert_absent(cx, "conn-copied-dest-0".to_string());
+    assert_absent(cx, "console-conn-copied-dest-0".to_string());
 
     cx.update(|window, cx| {
-        window.click("conn-copy-0", cx);
+        window.click("console-conn-copy-0", cx);
     });
     t74_paint(cx);
-    assert_painted(cx, "conn-copied-dest-0");
+    assert_painted(cx, "console-conn-copied-dest-0");
 
     // Still painted just before the window elapses; a tick runs no timer yet.
     cx.executor()
@@ -6181,32 +6179,32 @@ fn t74_copied_tooltip_transient_clears(cx: &mut TestAppContext) {
         ));
     let _ = cx.executor().tick();
     t74_paint(cx);
-    assert_painted(cx, "conn-copied-dest-0");
+    assert_painted(cx, "console-conn-copied-dest-0");
 
     // Past the window it auto-dismisses with no further interaction.
     cx.executor()
         .advance_clock(std::time::Duration::from_millis(200));
     cx.run_until_parked();
     t74_paint(cx);
-    assert_absent(cx, "conn-copied-dest-0".to_string());
+    assert_absent(cx, "console-conn-copied-dest-0".to_string());
 }
 
 #[gpui_kit::test]
 fn t74_other_cells_not_click_copyable(cx: &mut TestAppContext) {
     let (_view, cx, _endpoint) = t74_conn_setup(cx, "flow-0.example.com");
-    assert_painted(cx, "conn-copy-0");
-    assert_painted(cx, "conn-endpoint-0");
-    assert_painted(cx, "conn-meta-0");
+    assert_painted(cx, "console-conn-copy-0");
+    assert_painted(cx, "console-conn-endpoint-0");
+    assert_painted(cx, "console-conn-meta-0");
 
     // The name · protocol · traffic cell has no copy handler: clicking it
     // leaves the clipboard untouched and lights no marker.
     let meta = cx
-        .update(|window, _| window.try_find("conn-meta-0".to_string()))
+        .update(|window, _| window.try_find("console-conn-meta-0".to_string()))
         .expect("meta cell renders");
     let bounds = meta.bounds();
     cx.update(|window, cx| {
         window.click_at(
-            "conn-meta-0",
+            "console-conn-meta-0",
             gpui_kit::point(px(2.), bounds.size.height * 0.5),
             cx,
         );
@@ -6221,16 +6219,16 @@ fn t74_other_cells_not_click_copyable(cx: &mut TestAppContext) {
         clip.is_empty(),
         "clicking a non-target cell copies nothing: {clip}"
     );
-    assert_absent(cx, "conn-copied-dest-0".to_string());
-    assert_absent(cx, "conn-copied-endpoint-0".to_string());
+    assert_absent(cx, "console-conn-copied-dest-0".to_string());
+    assert_absent(cx, "console-conn-copied-endpoint-0".to_string());
 
     // A dest click lights only the dest marker, never the endpoint's.
     cx.update(|window, cx| {
-        window.click("conn-copy-0", cx);
+        window.click("console-conn-copy-0", cx);
     });
     t74_paint(cx);
-    assert_painted(cx, "conn-copied-dest-0");
-    assert_absent(cx, "conn-copied-endpoint-0".to_string());
+    assert_painted(cx, "console-conn-copied-dest-0");
+    assert_absent(cx, "console-conn-copied-endpoint-0".to_string());
 }
 
 /// T-25/K12: a fake engine serves one row (no binaries, no network) while the
@@ -6588,17 +6586,17 @@ fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
             view.logs.exclude.clear();
             view.logs.regex.clear();
             view.logs.level = None;
-            assert_eq!(view.visible_log_lines(cx).len(), 2, "include narrows");
+            assert_eq!(view.log_lines(cx).len(), 2, "include narrows");
             view.logs.exclude = "probe".to_string();
             assert_eq!(
-                view.visible_log_lines(cx),
+                view.log_lines(cx),
                 vec!["[info] info alpha connection established".to_string()],
                 "exclude drops the noisy leg"
             );
             view.logs.filter.clear();
             view.logs.exclude.clear();
             view.logs.regex = "established|failed".to_string();
-            let visible = view.visible_log_lines(cx);
+            let visible = view.log_lines(cx);
             assert_eq!(visible.len(), 2, "regex replaces the keywords");
             for line in &visible {
                 assert!(
@@ -6608,13 +6606,13 @@ fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
             }
             view.logs.regex = "((".to_string();
             assert_eq!(
-                view.visible_log_lines(cx).len(),
+                view.log_lines(cx).len(),
                 3,
                 "invalid regex fails open, never a silent empty"
             );
             view.logs.regex.clear();
             view.logs.level = Some(crate::health::LogLevel::Error);
-            let visible = view.visible_log_lines(cx);
+            let visible = view.log_lines(cx);
             assert_eq!(visible.len(), 1, "level still composes");
             assert!(visible[0].starts_with("[error]"));
             assert!(
@@ -6628,27 +6626,27 @@ fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn t05_traffic_poll_cadence_visible_fast_hidden_slow(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    use crate::InspectorTab;
+    use crate::ConsoleTab;
     let now = 1_000_000i64;
     assert!(
-        crate::traffic_poll_due(InspectorTab::Links, now, now),
-        "visible Connections polls immediately"
+        crate::traffic_poll_due(true, ConsoleTab::Connections, now, now),
+        "an open Connections tab polls immediately"
     );
     assert!(
-        crate::traffic_poll_due(InspectorTab::Traffic, now, now),
-        "visible Traffic polls immediately"
+        crate::traffic_poll_due(true, ConsoleTab::Traffic, now, now),
+        "an open Traffic tab polls immediately"
     );
     assert!(
-        !crate::traffic_poll_due(InspectorTab::Details, now, now),
-        "hidden pane skips a just-ran poll"
+        !crate::traffic_poll_due(true, ConsoleTab::Logs, now, now),
+        "Logs waits a just-ran poll"
     );
     assert!(
-        !crate::traffic_poll_due(InspectorTab::Logs, now, now - 4),
-        "hidden pane waits the base cadence"
+        !crate::traffic_poll_due(false, ConsoleTab::Logs, now, now - 4),
+        "a closed console waits the base cadence"
     );
     assert!(
-        crate::traffic_poll_due(InspectorTab::Details, now, now - 5),
-        "hidden pane fires once the base cadence elapses"
+        crate::traffic_poll_due(false, ConsoleTab::Logs, now, now - 5),
+        "a closed console fires once the base cadence elapses"
     );
 }
 
@@ -7572,7 +7570,7 @@ fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.logs.level = Some(LogLevel::Error);
-            let visible = view.visible_log_lines(cx);
+            let visible = view.log_lines(cx);
             assert_eq!(visible, vec!["[error] error boom one".to_string()]);
         });
     });
@@ -7582,7 +7580,7 @@ fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
             view.logs.level = None;
             view.logs.tail = false;
             view.logs.filter = "boom".to_string();
-            let visible = view.visible_log_lines(cx);
+            let visible = view.log_lines(cx);
             assert_eq!(
                 visible,
                 vec![
@@ -8233,11 +8231,9 @@ fn t07_partial_import_toasts_counts_and_selects_checks(cx: &mut TestAppContext) 
         "both valid rows land"
     );
     assert!(
-        view.read_with(cx, |view, cx| view
-            .selected_config(cx)
-            .map(|config| config.name))
+        view.read_with(cx, |view, _| view.selection_focus.clone())
             .is_some(),
-        "first imported row is selected"
+        "first imported row owns focus"
     );
     assert_eq!(
         view.read_with(cx, |view, _| view.selection_count()),
@@ -9697,7 +9693,7 @@ fn laneb_logs_redact_and_save_gate(cx: &mut TestAppContext) {
             );
         });
     });
-    let lines = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
+    let lines = view.read_with(cx, |view, cx| view.log_lines(cx));
     assert!(
         lines.iter().all(|line| !line.contains("hunter2")),
         "rendered lines redact: {lines:?}"
@@ -9767,7 +9763,7 @@ fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
         });
     });
 
-    let visible = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
+    let visible = view.read_with(cx, |view, cx| view.log_lines(cx));
     assert_eq!(visible.len(), 200, "visible window caps the tail");
     assert!(
         visible.last().expect("tail nonempty").contains("9999"),
@@ -9860,7 +9856,7 @@ fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
         cx.update(|window, _| window.try_find("logs-level").is_none()),
         "no second level control beside Copy/tail/Save"
     );
-    let narrowed = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
+    let narrowed = view.read_with(cx, |view, cx| view.log_lines(cx));
     assert!(
         !narrowed.is_empty() && narrowed.iter().all(|line| line.contains("[error]")),
         "only errors survive: {narrowed:?}"
@@ -12354,7 +12350,9 @@ fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
     assert_painted(cx, &format!("row-endpoint-menu-{}", first.id));
     assert_painted(cx, "batch-bar");
     assert_painted(cx, "batch-count");
-    assert_painted(cx, "detail-acting-on");
+    assert_painted(cx, "inspector-selected-count");
+    assert_painted(cx, "inspector-use-selection-bar");
+    assert_absent(cx, "detail-acting-on".to_string());
 }
 
 #[gpui_kit::test]
@@ -13641,8 +13639,6 @@ fn honest_footer_labels_name_their_effect() {
     );
     assert_eq!(footer_commit_label("groups"), "Close");
     assert_eq!(footer_commit_label("preset-attach"), "Close");
-    assert_eq!(footer_commit_label("runtime-stats"), "Close");
-    assert_eq!(footer_commit_label("traffic-stats"), "Close");
     assert_eq!(footer_commit_label("bare-url"), "Close");
     assert_eq!(
         footer_commit_label("logs"),
@@ -13695,36 +13691,6 @@ fn single_close_footers_render_one_close_and_esc_closes(cx: &mut TestAppContext)
     assert!(
         !cx.update(|window, cx| window.has_active_dialog(cx)),
         "Esc closes Settings"
-    );
-    assert_eq!(notification_count(cx), before, "Esc commits nothing");
-
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
-    });
-    paint_dialog_open(cx);
-    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-    for ix in 0..10 {
-        assert!(
-            cx.update(|window, _| window.try_find(format!("runtime-stat-{ix}")).is_some()),
-            "runtime-stat-{ix} paints"
-        );
-    }
-    assert!(
-        cx.update(|window, _| window.try_find("runtime-stats-ok").is_some()),
-        "Runtime stats renders its Close"
-    );
-    assert!(
-        cx.update(|window, _| window.try_find("runtime-stats-cancel").is_none()),
-        "Runtime stats renders no Cancel sibling"
-    );
-    let before = notification_count(cx);
-    cx.update(|window, cx| {
-        window.dispatch_keystroke(esc.clone(), cx);
-    });
-    cx.run_until_parked();
-    assert!(
-        !cx.update(|window, cx| window.has_active_dialog(cx)),
-        "Esc closes Runtime stats"
     );
     assert_eq!(notification_count(cx), before, "Esc commits nothing");
 }
@@ -15539,7 +15505,6 @@ fn t05_latency_facet_filters_and_clears(cx: &mut TestAppContext) {
 fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
 
-    use gpui_kit::point;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -15550,13 +15515,6 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.select_visible_row(0, cx);
-        });
-    });
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.inspector_tab = crate::InspectorTab::Health;
-            cx.notify();
         });
     });
 
@@ -15576,23 +15534,11 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    // Slice 6: all sections ride one scroll, so the frame must be tall enough
+    // to show the Health section without scrolling.
+    paint_frame_at(cx, 1400., 1600.);
 
     assert_painted(cx, "config-health-alert");
-
-    cx.update(|window, cx| {
-        window.scroll(
-            "config-detail-body",
-            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-            cx,
-        );
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
     assert_painted(cx, "config-health");
 
     cx.update(|_, cx| {
@@ -15614,9 +15560,7 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1400., 1600.);
     assert_painted(cx, "config-health");
     assert_absent(cx, "config-health-alert".to_string());
 }
@@ -15625,7 +15569,6 @@ fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
 fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
 
-    use gpui_kit::point;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -15636,7 +15579,6 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.select_visible_row(0, cx);
-            view.inspector_tab = crate::InspectorTab::Health;
             cx.notify();
         });
     });
@@ -15657,54 +15599,33 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1400., 1600.);
 
-    assert!(
-        cx.update(|window, _| window.try_find("inspector-tabs".to_string()).is_some()),
-        "inspector tab bar renders"
-    );
+    // Slice 6: the five tabs are one stacked scroll. Every section — and the
+    // tab strip itself — is accounted for in a single frame.
+    assert_absent(cx, "inspector-tabs".to_string());
     for id in [
-        "inspector-tab-details",
-        "inspector-tab-health",
-        "inspector-tab-logs",
-        "inspector-tab-links",
-        "inspector-tab-traffic",
+        "inspector-identity",
+        "config-endpoints",
+        "inspector-health-section",
+        "inspector-actions",
+        "inspector-console-link",
     ] {
-        assert!(
-            cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders"
-        );
+        assert_painted(cx, id);
     }
 
-    assert_painted(cx, "config-endpoints");
-
     assert_painted(cx, "config-health-alert");
-
-    cx.update(|window, cx| {
-        window.scroll(
-            "config-detail-body",
-            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-            cx,
-        );
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
     assert_painted(cx, "config-health");
-
     assert!(
         cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
-        "config-history renders on the Health pane"
+        "config-history renders in the Health section"
     );
 
-    // K1/A4-8: the Health pane rides the same single-tier operate row.
+    // K1/A4-8: the stacked inspector still rides the single-tier operate row.
     for id in ["engine-start", "engine-stop", "health-test", "row-menu"] {
         assert!(
             cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} operates on the Health pane row"
+            "{id} operates in the Actions section"
         );
     }
 
@@ -15712,41 +15633,29 @@ fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
+fn laneb_stacked_inspector_shares_detail_header(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
         .add(row19_seed("Work", "a.example.com", "10801"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
-    for tab in [
-        crate::InspectorTab::Details,
-        crate::InspectorTab::Health,
-        crate::InspectorTab::Logs,
-        crate::InspectorTab::Links,
-        crate::InspectorTab::Traffic,
-    ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.select_visible_row(0, cx);
-                view.inspector_tab = tab;
-                cx.notify();
-            });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_visible_row(0, cx);
+            cx.notify();
         });
-        cx.run_until_parked();
-        open_inspector(&view, cx);
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
-        assert_painted(cx, "detail-acting-on");
-        assert_painted(cx, "detail-serving");
-
-        assert_painted(cx, "config-endpoints");
-        assert!(
-            cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
-            "detail-operate renders on every pane"
-        );
-    }
+    });
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    assert_painted(cx, "detail-acting-on");
+    assert_painted(cx, "detail-serving");
+    assert_painted(cx, "config-endpoints");
+    assert!(
+        cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
+        "detail-operate renders in the stacked scroll"
+    );
 }
 
 /// F16: the table is the single source. Ids are unique and round-trip, every
@@ -15879,11 +15788,11 @@ fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     open_inspector(&view, cx);
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.run_until_parked();
     cx.update(|window, cx| window.click("row-menu", cx));
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     let kebab = format!("kebab-{}", def.id);
     assert_eq!(
         label_of(&kebab, cx),
@@ -16197,6 +16106,7 @@ fn f13_sheet_header_close_paints_and_closes(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
+    use crate::app::actions::PALETTE_GROUPS;
     use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -16204,9 +16114,23 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
     store.add(seed_input("Work")).expect("seed works");
     let (view, cx) = mount_view(store, cx);
 
+    // Resolve by id: the palette is ordered by group, and ids survive the
+    // retirement of the stats verbs.
+    let palette_row = |id: &str| {
+        PALETTE_GROUPS
+            .iter()
+            .enumerate()
+            .find_map(|(section, (_, ids))| {
+                ids.iter()
+                    .position(|entry| *entry == id)
+                    .map(|row| IndexPath::new(row).section(section))
+            })
+            .unwrap_or_else(|| panic!("{id} is in the palette"))
+    };
+
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.run_palette_op(IndexPath::new(14).section(0), window, cx)
+            view.run_palette_op(palette_row("export-library"), window, cx)
         });
     });
     cx.run_until_parked();
@@ -16222,7 +16146,7 @@ fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
     let before = notification_count(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.run_palette_op(IndexPath::new(13).section(0), window, cx)
+            view.run_palette_op(palette_row("paste-import"), window, cx)
         });
     });
     cx.run_until_parked();
@@ -16414,7 +16338,6 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.select_visible_row(0, cx);
-            view.inspector_tab = crate::InspectorTab::Health;
             cx.notify();
         });
     });
@@ -16435,9 +16358,7 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1400., 1600.);
 
     assert_painted(cx, "config-health-alert");
     // K1/A4-2: the actions follow the content inside the ONE pane scroll, so
@@ -16451,7 +16372,7 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
         );
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1400., 1600.);
     assert_painted(cx, "detail-operate");
 }
 
@@ -16459,7 +16380,6 @@ fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
 fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext) {
     use crate::health::{HealthKind, HealthSample, TestOutcome};
 
-    use gpui_kit::point;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     let seeded = store
@@ -16474,9 +16394,7 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
 
     assert_painted(cx, "detail-acting-on");
 
@@ -16524,12 +16442,6 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
     }
 
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.inspector_tab = crate::InspectorTab::Health;
-            cx.notify();
-        });
-    });
-    cx.update(|_, cx| {
         view.update(cx, |view, _cx| {
             view.health_store.record_outcome(&TestOutcome {
                 sample: HealthSample {
@@ -16544,38 +16456,24 @@ fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext
         });
     });
     cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
 
     assert_painted(cx, "config-health-alert");
-
-    cx.update(|window, cx| {
-        window.scroll(
-            "config-detail-body",
-            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-            cx,
-        );
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
     assert_painted(cx, "config-health");
     assert!(
         cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
-        "detail-operate renders on the Health pane row"
+        "detail-operate renders in the stacked Actions section"
     );
     for id in ["engine-start", "health-test", "row-menu"] {
         assert!(
             cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} operates on the Health pane row"
+            "{id} rides the stacked operate row"
         );
     }
 }
 
 #[gpui_kit::test]
-fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
+fn operate_row_reachable_in_the_stacked_inspector(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -16587,72 +16485,47 @@ fn operate_row_reachable_on_every_inspector_tab(cx: &mut TestAppContext) {
             view.select_visible_row(0, cx);
         });
     });
-    for (tab, name) in [
-        (crate::InspectorTab::Details, "Details"),
-        (crate::InspectorTab::Health, "Health"),
-        (crate::InspectorTab::Logs, "Logs"),
-        (crate::InspectorTab::Links, "Links"),
-        (crate::InspectorTab::Traffic, "Traffic"),
-    ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.inspector_tab = tab;
-                cx.notify();
-            });
-        });
-        cx.run_until_parked();
-        open_inspector(&view, cx);
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
 
-        assert!(
-            cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
-            "{name}: detail-operate renders"
+    assert!(
+        cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
+        "detail-operate renders"
+    );
+    // K1/A4-2: the actions follow the content inside the ONE pane scroll —
+    // not pinned to the panel bottom. Scrolling to the end brings the row
+    // fully inside the 700px frame.
+    cx.update(|window, cx| {
+        window.scroll(
+            "config-detail-body",
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
         );
-        // K1/A4-2: the actions follow the content inside the ONE pane scroll —
-        // not pinned to the panel bottom. Scrolling to the end brings the row
-        // fully inside the 700px frame.
-        cx.update(|window, cx| {
-            window.scroll(
-                "config-detail-body",
-                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-                cx,
-            );
-        });
-        cx.run_until_parked();
-        paint_frame(cx);
-        let (operate_top, operate_bottom) = cx.update(|window, _| {
-            let bounds = window
-                .try_find("detail-operate".to_string())
-                .expect("operate row renders")
-                .bounds();
-            (bounds.origin.y, bounds.origin.y + bounds.size.height)
-        });
-        assert!(
-            operate_top >= px(0.) && operate_bottom <= px(700.) + px(1.),
-            "{name}: operate row sits inside the 700px frame at the end of the \
-             scroll, not clipped: {operate_top:?}..{operate_bottom:?}"
-        );
-
-        for id in ["engine-start", "engine-stop", "health-test", "row-menu"] {
-            assert!(
-                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-                "{name}: {id} rides the operate row"
-            );
-        }
-    }
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.inspector_tab = crate::InspectorTab::Health;
-            cx.notify();
-        });
     });
     cx.run_until_parked();
     paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    let (operate_top, operate_bottom) = cx.update(|window, _| {
+        let bounds = window
+            .try_find("detail-operate".to_string())
+            .expect("operate row renders")
+            .bounds();
+        (bounds.origin.y, bounds.origin.y + bounds.size.height)
+    });
+    assert!(
+        operate_top >= px(0.) && operate_bottom <= px(700.) + px(1.),
+        "operate row sits inside the 700px frame at the end of the scroll, not \
+         clipped: {operate_top:?}..{operate_bottom:?}"
+    );
+
+    for id in ["engine-start", "engine-stop", "health-test", "row-menu"] {
+        assert!(
+            cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+            "{id} rides the operate row"
+        );
+    }
 
     assert!(
         cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
@@ -16672,11 +16545,10 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
         .add(row19_seed("Work", "a.example.com", "10801"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
-    let select_health_tab = |view: &Entity<AppView>, cx: &mut gpui_kit::VisualTestContext| {
+    let select_row = |view: &Entity<AppView>, cx: &mut gpui_kit::VisualTestContext| {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.select_visible_row(0, cx);
-                view.inspector_tab = crate::InspectorTab::Health;
                 cx.notify();
             });
         });
@@ -16686,7 +16558,7 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
         cx.run_until_parked();
         paint_frame(cx);
     };
-    select_health_tab(&view, cx);
+    select_row(&view, cx);
 
     // K1/A4-2: the pane is ONE scroll. Slice 5 slimmed the endpoint section to
     // a summary plus Edit, so the Health pane now fits at the 620px window
@@ -16738,26 +16610,33 @@ fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) 
         });
     });
     cx.run_until_parked();
-    cx.update(|window, cx| {
-        window.dispatch_action(Box::new(crate::InspectorDetails), cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.toggle_inspector();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.toggle_inspector();
+            cx.notify();
+        });
     });
     cx.run_until_parked();
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    let (tab, offset) = cx.update(|_, cx| {
+    let (visible, offset) = cx.update(|_, cx| {
         let view = view.read(cx);
-        (view.inspector_tab.index(), view.detail_scroll.offset().y)
+        (view.inspector_visible, view.detail_scroll.offset().y)
     });
-    assert_eq!(
-        tab,
-        crate::InspectorTab::Details.index(),
-        "the action actually switched panes"
-    );
+    assert!(visible, "Ctrl+I reopened the inspector");
     assert_eq!(
         offset,
         px(0.),
-        "the Details pane starts scrolled to the top, not mid-history"
+        "reopening the inspector starts scrolled to the top, not mid-history"
     );
 }
 
@@ -16785,27 +16664,24 @@ fn t04_detail_fits_minimum_window(cx: &mut TestAppContext) {
         "endpoint-value-socks",
         "endpoint-value-http",
         "copy-endpoints",
-        "engine-start",
     ] {
         assert_painted(cx, id);
         assert_within_frame_min(cx, id);
     }
 
-    let (endpoints_bottom, operate_top) = cx.update(|window, _| {
-        let endpoints = window
-            .try_find("config-endpoints".to_string())
-            .expect("endpoints paints")
-            .bounds();
-        let operate = window
-            .try_find("detail-operate".to_string())
-            .expect("operate row paints")
-            .bounds();
-        (endpoints.origin.y + endpoints.size.height, operate.origin.y)
-    });
-    assert!(
-            endpoints_bottom <= operate_top,
-            "endpoints sit above the operate row at minimum size: {endpoints_bottom:?} <= {operate_top:?}"
+    // The stacked inspector is one scroll: Identity + Endpoint fit at the
+    // minimum window, while Actions sit below the fold until scrolled to.
+    cx.update(|window, cx| {
+        window.scroll(
+            "config-detail-body",
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
         );
+    });
+    cx.run_until_parked();
+    paint_frame_min(cx);
+    assert_painted(cx, "engine-start");
+    assert_within_frame_min(cx, "engine-start");
 }
 
 #[gpui_kit::test]
@@ -16887,9 +16763,9 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
 
     for id in ["engine-start", "engine-stop", "health-test", "row-menu"] {
         assert_painted(cx, id);
@@ -16967,7 +16843,7 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
         });
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     let before = notification_count(cx);
     cx.update(|window, cx| {
         window.click("engine-start", cx);
@@ -17124,9 +17000,9 @@ fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert_painted(cx, "row-menu");
     // K1/A4-8: the `…` kebab carries only the five overflow actions; row
     // management (Edit/Delete/Duplicate/Reset) lives in the row's context menu.
@@ -17148,9 +17024,9 @@ fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
         window.click("row-menu", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     for id in [
         "kebab-auto-start",
         "kebab-ping",
@@ -17173,43 +17049,32 @@ fn t05_row_menu_holds_overflow_actions_only(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
+fn t04_stacked_inspector_names_acting_row(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
         .add(row19_seed("Work", "a.example.com", "10801"))
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
-    for tab in [
-        crate::InspectorTab::Details,
-        crate::InspectorTab::Health,
-        crate::InspectorTab::Logs,
-        crate::InspectorTab::Links,
-        crate::InspectorTab::Traffic,
-    ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.select_visible_row(0, cx);
-                view.inspector_tab = tab;
-                cx.notify();
-            });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_visible_row(0, cx);
+            cx.notify();
         });
-        cx.run_until_parked();
-        open_inspector(&view, cx);
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
-        assert_painted(cx, "detail-acting-on");
-        let label = view.read_with(cx, |view, cx| {
-            view.selected_config(cx)
-                .map(|config| crate::acting_on_label(&config))
-                .unwrap_or_default()
-        });
-        assert_eq!(
-            label, "Acting on: Work",
-            "pane {tab:?} names the selected row"
-        );
-    }
+    });
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    assert_painted(cx, "detail-acting-on");
+    let label = view.read_with(cx, |view, cx| {
+        view.selected_config(cx)
+            .map(|config| crate::acting_on_label(&config))
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        label, "Acting on: Work",
+        "the stacked inspector names its row"
+    );
 }
 
 #[gpui_kit::test]
@@ -17229,9 +17094,9 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     // K1/A4-4: ONE copy action for the block; the per-row buttons are gone.
     assert!(
         cx.update(|window, _| window.try_find("copy-endpoints".to_string()).is_some()),
@@ -17275,7 +17140,7 @@ fn t06_endpoint_copy_copies_the_rows_urls(cx: &mut TestAppContext) {
         window.click("row-menu", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.update(|window, cx| {
         window.click("kebab-copy-proxy", cx);
     });
@@ -17315,76 +17180,30 @@ fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
         ),
         None => assert_eq!(line, "usage unavailable", "no buckets, no lying zero"),
     };
-    for tab in [
-        crate::InspectorTab::Details,
-        crate::InspectorTab::Health,
-        crate::InspectorTab::Logs,
-        crate::InspectorTab::Links,
-        crate::InspectorTab::Traffic,
-    ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.select_visible_row(0, cx);
-                view.inspector_tab = tab;
-                cx.notify();
-            });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_visible_row(0, cx);
+            cx.notify();
         });
-        cx.run_until_parked();
-        open_inspector(&view, cx);
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
+    });
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
 
-        assert_painted(cx, "config-endpoints");
-        match tab {
-            crate::InspectorTab::Details => {
-                for id in [
-                    "endpoint-value-socks",
-                    "endpoint-value-http",
-                    "copy-endpoints",
-                ] {
-                    assert_painted(cx, id);
-                }
-            }
-            crate::InspectorTab::Health
-            | crate::InspectorTab::Logs
-            | crate::InspectorTab::Links
-            | crate::InspectorTab::Traffic => {
-                for id in [
-                    "endpoint-value-socks",
-                    "endpoint-value-http",
-                    "copy-endpoints",
-                ] {
-                    assert!(
-                        cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-                        "{id} renders on {tab:?}"
-                    );
-                }
-            }
-        }
-
-        match tab {
-            crate::InspectorTab::Details => {
-                assert_painted(cx, "config-usage");
-            }
-            crate::InspectorTab::Health => {
-                assert_painted(cx, "config-health");
-                assert!(
-                    cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
-                    "config-history renders on the Health pane"
-                );
-            }
-            crate::InspectorTab::Logs => {
-                assert_painted(cx, "config-logs");
-            }
-            crate::InspectorTab::Links => {
-                assert_painted(cx, "config-links");
-            }
-            crate::InspectorTab::Traffic => {
-                assert_painted(cx, "config-traffic");
-            }
-        }
+    assert_painted(cx, "config-endpoints");
+    for id in [
+        "endpoint-value-socks",
+        "endpoint-value-http",
+        "copy-endpoints",
+    ] {
+        assert_painted(cx, id);
     }
+    assert_painted(cx, "config-usage");
+    assert_painted(cx, "config-health");
+    assert!(
+        cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
+        "config-history renders in the Health section"
+    );
 }
 
 #[gpui_kit::test]
@@ -17817,7 +17636,6 @@ fn t09_import_double_commit_ignored(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
-    use crate::InspectorTab;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -17832,31 +17650,27 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
         });
     });
 
-    for (index, marker) in [
-        (0, "config-usage"),
-        (1, "config-health"),
-        (2, "config-logs"),
-        (3, "config-links"),
-        (4, "config-traffic"),
+    // Slice 6: the five panes are one stacked scroll; the reduction is that
+    // every section still paints and the operate row is still reachable.
+    cx.run_until_parked();
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    assert_painted(cx, "config-detail-body");
+    for marker in [
+        "inspector-identity",
+        "config-endpoints",
+        "config-health",
+        "config-usage",
+        "inspector-actions",
+        "inspector-console-link",
     ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.inspector_tab = InspectorTab::from_index(index);
-                cx.notify();
-            });
-        });
-        cx.run_until_parked();
-        open_inspector(&view, cx);
-        paint_frame(cx);
-        assert_painted(cx, "inspector-tabs");
-        assert_painted(cx, "config-detail-body");
         assert_painted(cx, marker);
-
-        assert!(
-            cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
-            "operate row present on every pane"
-        );
     }
+
+    assert!(
+        cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
+        "operate row present in the stacked inspector"
+    );
 
     let row_id = view.read_with(cx, |view, cx| {
         view.libraries.read(cx).delegate().rows[0].id.clone()
@@ -19531,7 +19345,7 @@ fn keyboard_f5_starts_selected(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
+fn laneb_keyboard_edit_delete_search(cx: &mut TestAppContext) {
     use gpui_kit::Keystroke;
     cx.update(gpui_kit::init);
     cx.update(crate::bind_app_keys);
@@ -19558,42 +19372,17 @@ fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
         cx.run_until_parked();
     };
 
-    press(cx, "ctrl-2");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Health,
-        "Ctrl-2 switches pane"
-    );
-    press(cx, "ctrl-3");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Details,
-        "Ctrl-3 lands on Details (there is no Presets pane)"
-    );
-    press(cx, "ctrl-4");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Logs,
-        "Ctrl-4 switches pane"
-    );
-    press(cx, "ctrl-5");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Links,
-        "Ctrl-5 switches pane"
-    );
-    press(cx, "ctrl-6");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Traffic,
-        "Ctrl-6 switches pane"
-    );
-    press(cx, "ctrl-1");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Details,
-        "Ctrl-1 switches pane"
-    );
+    // Slice 6: the five literal tabs (and every `Ctrl+1..6`) are gone. The
+    // inspector stays exactly as it was when one of those keys is pressed.
+    let inspector_before = view.read_with(cx, |view, _| view.inspector_visible);
+    for key in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6"] {
+        press(cx, key);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_visible),
+            inspector_before,
+            "{key} no longer opens or closes the inspector"
+        );
+    }
 
     let before = notification_count(cx);
     press(cx, "ctrl-f");
@@ -20365,8 +20154,8 @@ fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppCon
         "the table keeps its 640px floor at 1400px, got {list_width}"
     );
     assert!(
-        (240. ..=280.).contains(&inspector_width),
-        "the inspector opens at 260px by default (240-360 range), got {inspector_width}"
+        (240. ..=360.).contains(&inspector_width),
+        "the inspector opens at its 300px default (240-360 range), got {inspector_width}"
     );
 
     // Narrow: the inspector slides over the table as a drawer, and the list
@@ -20387,7 +20176,7 @@ fn t03_inspector_docks_right_and_drawer_below_the_breakpoint(cx: &mut TestAppCon
             drawer.size.width.as_f32(),
         )
     });
-    assert_eq!(narrow_drawer, 260., "the drawer opens at its 260px width");
+    assert_eq!(narrow_drawer, 300., "the drawer opens at its 300px width");
     assert!(
         narrow_table >= 640.,
         "the table keeps its 640px floor in the drawer, got {narrow_table}"
@@ -20592,7 +20381,8 @@ fn f19_selection_opens_and_esc_closes_in_both_presentations(cx: &mut TestAppCont
     assert!(!view.read_with(cx, |view, _| view.inspector_visible));
 }
 
-/// F19: Ctrl-1 owns presence, so it toggles; another tab key is a way in.
+/// F19: `Ctrl+I` owns presence, so it toggles. The old per-pane tab actions
+/// are gone with the tab strip.
 #[gpui_kit::test]
 fn f19_inspector_shortcut_toggles_presence(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
@@ -20609,29 +20399,28 @@ fn f19_inspector_shortcut_toggles_presence(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     cx.update(|window, cx| {
-        window.dispatch_action(Box::new(crate::InspectorDetails), cx);
+        window.dispatch_action(Box::new(crate::ToggleInspector), cx);
     });
     cx.run_until_parked();
     paint_frame_at(cx, 1000., 700.);
     assert_painted(cx, "inspector-drawer");
 
     cx.update(|window, cx| {
-        window.dispatch_action(Box::new(crate::InspectorDetails), cx);
+        window.dispatch_action(Box::new(crate::ToggleInspector), cx);
     });
     cx.run_until_parked();
     paint_frame_at(cx, 1000., 700.);
     assert_absent(cx, "inspector-drawer".to_string());
 
     cx.update(|window, cx| {
-        window.dispatch_action(Box::new(crate::InspectorHealth), cx);
+        window.dispatch_action(Box::new(crate::ToggleInspector), cx);
     });
     cx.run_until_parked();
     paint_frame_at(cx, 1000., 700.);
     assert_painted(cx, "inspector-drawer");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Health,
-        "another tab key opens the inspector on that tab"
+    assert!(
+        cx.update(|window, _| window.try_find("inspector-tabs".to_string()).is_none()),
+        "the inspector opens stacked, with no tab strip"
     );
 }
 
@@ -20660,14 +20449,14 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     open_inspector(&view, cx);
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
 
     let notifications = notification_count(cx);
     cx.update(|window, cx| {
         window.click("engine-stop", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
         0,
@@ -20683,7 +20472,7 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
         window.click("health-test", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert!(
         !has_spinner(cx, "health-test-spinner"),
         "a stopped endpoint has nothing to test"
@@ -20698,7 +20487,7 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
         window.click("engine-start", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert_eq!(
         view.read_with(cx, |view, _| view.engine.running_count()),
         1,
@@ -20710,7 +20499,7 @@ fn f11_operate_buttons_follow_the_running_state(cx: &mut TestAppContext) {
         window.click("health-test", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert!(
         notification_count(cx) > after_start,
         "test wakes once the endpoint runs"
@@ -22059,6 +21848,7 @@ fn r3_row_serve_button_starts_that_row(cx: &mut TestAppContext) {
     // K1/A4-8: per-row Start is gone; the ONE operate row acts on the
     // selection, so the row is selected first.
     select_library_row(&view, cx, &alpha.id);
+    paint_frame_at(cx, 1000., 1600.);
     let before = notification_count(cx);
     cx.update(|window, cx| {
         window.click("engine-start", cx);
@@ -23219,315 +23009,6 @@ fn batch_bar_restores_filter_values(cx: &mut TestAppContext) {
 // fixed slots, at one fixed text size — `Details · Health · Logs · Links ·
 // Traffic` fit whole, so nothing scales them. Checked at the default drawer
 // width, on the wide side panel, and at the 240px panel floor.
-#[gpui_kit::test]
-fn t20_inspector_tab_row_fits_the_narrowest_drawer(cx: &mut TestAppContext) {
-    const SLUGS: [&str; 5] = ["details", "health", "logs", "links", "traffic"];
-
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    store
-        .add(row19_seed("Work", "a.example.com", "10801"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.select_visible_row(0, cx);
-        });
-    });
-    cx.run_until_parked();
-    open_inspector(&view, cx);
-
-    for (width, height) in [(1000., 700.), (1400., 800.), (960., 700.)] {
-        paint_frame_at(cx, width, height);
-        assert_painted(cx, "inspector-tabs");
-        for slug in SLUGS {
-            assert_painted(cx, &format!("inspector-tab-button-{slug}"));
-            assert_painted(cx, &format!("inspector-tab-{slug}"));
-        }
-
-        let (strip, labels) = cx.update(|window, _| {
-            let strip = window
-                .try_find("inspector-tabs".to_string())
-                .expect("strip paints")
-                .bounds();
-            let labels = SLUGS
-                .iter()
-                .map(|slug| {
-                    window
-                        .try_find(format!("inspector-tab-{slug}"))
-                        .expect("label paints")
-                        .bounds()
-                })
-                .collect::<Vec<_>>();
-            (strip, labels)
-        });
-
-        let left = strip.origin.x;
-        let right = strip.origin.x + strip.size.width;
-        for (index, label) in labels.iter().enumerate() {
-            let name = SLUGS[index];
-            assert_eq!(
-                label.origin.y, labels[0].origin.y,
-                "{name} shares the one tab row"
-            );
-            let end = label.origin.x + label.size.width;
-            assert!(
-                end <= right,
-                "{name} label ends at {end}, past the strip's right edge {right}"
-            );
-            assert!(
-                label.origin.x >= left,
-                "{name} label starts at {}, before the strip's left edge {left}",
-                label.origin.x
-            );
-            if index > 0 {
-                assert!(
-                    label.origin.x > labels[index - 1].origin.x,
-                    "{name} follows the row order"
-                );
-            }
-        }
-    }
-}
-
-#[gpui_kit::test]
-fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
-    use gpui_kit::point;
-    use gpui_kit::Keystroke;
-    cx.update(gpui_kit::init);
-    cx.update(crate::bind_app_keys);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    store
-        .add(row19_seed("Work", "a.example.com", "10801"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-
-    assert_eq!(crate::InspectorTab::Details.a11y_label(), "Details");
-    assert_eq!(crate::InspectorTab::Health.a11y_label(), "Health");
-    assert_eq!(crate::InspectorTab::Logs.a11y_label(), "Logs");
-    assert_eq!(crate::InspectorTab::Links.a11y_label(), "Links");
-    assert_eq!(crate::InspectorTab::Traffic.a11y_label(), "Traffic");
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.select_visible_row(0, cx);
-        });
-    });
-    let focus = view.read_with(cx, |view, _| view.focus.clone());
-    cx.update(|window, cx| window.focus(&focus, cx));
-
-    for (tab, specific) in [
-        (crate::InspectorTab::Details, "config-usage"),
-        (crate::InspectorTab::Health, "config-health"),
-        (crate::InspectorTab::Logs, "config-logs"),
-        (crate::InspectorTab::Links, "config-links"),
-        (crate::InspectorTab::Traffic, "config-traffic"),
-    ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, _| {
-                view.set_inspector_tab(tab);
-            });
-        });
-        cx.run_until_parked();
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
-        assert_painted(cx, "inspector-tabs");
-        for id in [
-            "inspector-tab-details",
-            "inspector-tab-health",
-            "inspector-tab-logs",
-            "inspector-tab-links",
-            "inspector-tab-traffic",
-        ] {
-            assert!(
-                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-                "{id} marker stays stable on {tab:?}"
-            );
-        }
-        let tops = cx.update(|window, _| {
-            ["detail-acting-on", "config-endpoints", specific]
-                .iter()
-                .map(|id| {
-                    window
-                        .try_find(id.to_string())
-                        .unwrap_or_else(|| panic!("{id} renders on {tab:?}"))
-                        .bounds()
-                        .origin
-                        .y
-                })
-                .collect::<Vec<_>>()
-        });
-        assert!(
-            tops[0] < tops[1] && tops[1] < tops[2],
-            "pane order frozen Header → Endpoints → tab-specific on {tab:?}: {tops:?}"
-        );
-    }
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, _| {
-            view.set_inspector_tab(crate::InspectorTab::Health);
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    // K1/A4-2: force a genuine overflow with a deliberately short frame — the
-    // slimmed endpoint section means the Health pane fits at the 620px window
-    // minimum, so 620 no longer has a scroll range.
-    paint_frame_at(cx, 1000., 540.);
-    let (offset, max) = cx.update(|window, cx| {
-        window.scroll(
-            "config-detail-body",
-            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-            cx,
-        );
-        let scrolled = view.read(cx);
-        (
-            scrolled.detail_scroll.offset().y,
-            scrolled.detail_scroll.max_offset().y,
-        )
-    });
-    assert!(
-        max > px(0.),
-        "the Health pane scrolls (something below the fold): {max:?}"
-    );
-    assert_eq!(offset, -max, "sunk to the bottom: {offset:?}");
-    let press = |cx: &mut VisualTestContext, key: &str| {
-        let keystroke = Keystroke::parse(key).expect("test keystroke parses");
-        cx.update(|window, cx| {
-            window.dispatch_keystroke(keystroke, cx);
-        });
-        cx.run_until_parked();
-    };
-    press(cx, "ctrl-1");
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-    let (tab, reset) = cx.update(|_, cx| {
-        let switched = view.read(cx);
-        (switched.inspector_tab, switched.detail_scroll.offset().y)
-    });
-    assert_eq!(tab, crate::InspectorTab::Details, "Ctrl-1 switches panes");
-    assert_eq!(
-        reset,
-        px(0.),
-        "the Details pane starts scrolled to the top, not mid-pane"
-    );
-
-    press(cx, "ctrl-2");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Health,
-        "Ctrl-2 switches pane"
-    );
-    press(cx, "ctrl-3");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Details,
-        "Ctrl-3 lands on Details (there is no Presets pane)"
-    );
-    press(cx, "ctrl-4");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Logs,
-        "Ctrl-4 switches pane"
-    );
-    press(cx, "ctrl-5");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Links,
-        "Ctrl-5 switches pane"
-    );
-    press(cx, "ctrl-6");
-    assert_eq!(
-        view.read_with(cx, |view, _| view.inspector_tab),
-        crate::InspectorTab::Traffic,
-        "Ctrl-6 switches pane"
-    );
-}
-
-#[gpui_kit::test]
-fn throne04_inspector_overview_shared_across_panes(cx: &mut TestAppContext) {
-    use crate::health::{HealthKind, HealthSample, TestOutcome};
-
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let seeded = store
-        .add(row19_seed("Work", "a.example.com", "10801"))
-        .expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.select_visible_row(0, cx);
-        });
-    });
-
-    cx.update(|_, cx| {
-        view.update(cx, |view, _cx| {
-            view.health_store.record_outcome(&TestOutcome {
-                sample: HealthSample {
-                    config_id: seeded.id.clone(),
-                    at: 1,
-                    kind: HealthKind::UrlTest,
-                    latency_ms: None,
-                    error: Some("timeout".to_string()),
-                },
-                success: None,
-            });
-        });
-    });
-    for (tab, specific) in [
-        (crate::InspectorTab::Details, "config-usage"),
-        (crate::InspectorTab::Health, "config-health"),
-        (crate::InspectorTab::Logs, "config-logs"),
-        (crate::InspectorTab::Links, "config-links"),
-        (crate::InspectorTab::Traffic, "config-traffic"),
-    ] {
-        cx.update(|_, cx| {
-            view.update(cx, |view, _| {
-                view.set_inspector_tab(tab);
-            });
-        });
-        cx.run_until_parked();
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
-
-        for id in [
-            "inspector-overview",
-            "detail-acting-on",
-            "config-health-alert",
-            "config-endpoints",
-        ] {
-            assert_painted(cx, id);
-        }
-
-        let tops = cx.update(|window, _| {
-            [
-                "detail-acting-on",
-                "config-health-alert",
-                "config-endpoints",
-                specific,
-            ]
-            .iter()
-            .map(|id| {
-                window
-                    .try_find(id.to_string())
-                    .unwrap_or_else(|| panic!("{id} renders on {tab:?}"))
-                    .bounds()
-                    .origin
-                    .y
-            })
-            .collect::<Vec<_>>()
-        });
-        assert!(
-            tops[0] < tops[1] && tops[1] < tops[2] && tops[2] < tops[3],
-            "pane order frozen Header → Alert → Endpoints → tab-specific on {tab:?}: {tops:?}"
-        );
-    }
-}
 
 #[gpui_kit::test]
 fn empty_library_offers_one_entry_point(cx: &mut TestAppContext) {
@@ -26362,58 +25843,6 @@ fn t61_invalid_lines_block_save(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t10_stats_dialogs_open_with_matching_bars(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    cx.update(|cx| cx.set_reduce_motion(true));
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let alpha = store
-        .add(tick12_seed("Alpha", "10871"))
-        .expect("seed works");
-    let beta = store.add(tick12_seed("Beta", "10872")).expect("seed works");
-    store
-        .add_traffic_batch(&[(alpha.id.clone(), 1000, 50), (beta.id.clone(), 3000, 90)])
-        .expect("traffic persists");
-    let (view, cx) = mount_view(store, cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    assert!(
-        cx.update(|window, _| window.try_find("runtime-stat-0").is_some()),
-        "runtime lines paint"
-    );
-    cx.update(|window, cx| window.close_all_dialogs(cx));
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    assert!(
-        cx.update(|window, _| window.try_find("traffic-stats-summary").is_some()),
-        "traffic summary paints"
-    );
-    assert!(
-        cx.update(|window, _| window
-            .try_find(format!("traffic-stat-{}", beta.id))
-            .is_some()),
-        "heaviest exit paints its By Profile row"
-    );
-    let before = view.read_with(cx, |view, _| view.traffic_period);
-    cx.update(|window, cx| {
-        window.click("traffic-stats-period", cx);
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    assert_ne!(
-        view.read_with(cx, |view, _| view.traffic_period),
-        before,
-        "period cycles"
-    );
-    cx.update(|window, cx| window.close_all_dialogs(cx));
-}
-
-#[gpui_kit::test]
 fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -26459,33 +25888,6 @@ fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
         notification_count(cx),
         before + 1,
         "no selection explains itself"
-    );
-}
-
-#[gpui_kit::test]
-fn t10_conn_widths_persist_and_refresh(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    store.add(tick12_seed("Work", "10871")).expect("seed works");
-    let (view, cx) = mount_view(store, cx);
-    let defaults = Store::default_conn_column_widths();
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.adjust_conn_column_widths(20, window, cx)
-        });
-    });
-    assert_eq!(
-        view.read_with(cx, |view, _| view.store.conn_column_widths()[0]),
-        defaults[0] + 20,
-        "widen persists"
-    );
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.refresh_conn_column_widths(window, cx));
-    });
-    assert_eq!(
-        view.read_with(cx, |view, _| view.store.conn_column_widths()),
-        defaults,
-        "refresh restores defaults"
     );
 }
 
@@ -29195,12 +28597,11 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
     assert_painted(cx, "config-endpoints");
     assert_within_frame(cx, "config-endpoints");
     for id in [
-        "inspector-tabs",
-        "inspector-tab-details",
-        "inspector-tab-health",
-        "inspector-tab-logs",
-        "inspector-tab-links",
-        "inspector-tab-traffic",
+        "inspector-identity",
+        "config-endpoints",
+        "config-health",
+        "inspector-actions",
+        "inspector-console-link",
         "engine-start",
         "engine-stop",
         "health-test",
@@ -29208,7 +28609,7 @@ fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id.to_string()).is_some()),
-            "{id} renders in the inspector"
+            "{id} renders in the stacked inspector"
         );
     }
 
@@ -29620,15 +29021,15 @@ fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
         });
     });
     open_inspector(&view, cx);
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert_painted(cx, "row-menu");
     cx.update(|window, cx| {
         window.click("row-menu", cx);
     });
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     cx.run_until_parked();
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
     assert_painted(cx, "kebab-auto-start");
     assert_eq!(
         label_of("kebab-auto-start", cx),
@@ -30178,13 +29579,8 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Toggle focused row", "Space"),
         ("Select all visible", "Ctrl-A"),
         ("Focus search", "Ctrl-F"),
-        ("Inspector details", "Ctrl-1"),
-        ("Inspector health", "Ctrl-2"),
-        ("Inspector details", "Ctrl-3"),
-        ("Inspector logs", "Ctrl-4"),
-        ("Inspector links", "Ctrl-5"),
-        ("Inspector traffic", "Ctrl-6"),
         ("Toggle inspector", "Ctrl-I"),
+        ("Toggle console", "Ctrl-`"),
         ("Clear selection", "Esc"),
         ("Copy URLs", "Ctrl-U"),
         ("Command palette", "Ctrl-K"),
@@ -30777,10 +30173,16 @@ fn t04_shortcut_lines_cover_every_bound_key(cx: &mut TestAppContext) {
             "{action} is bound as {canonical}: {added:?}"
         );
     }
-    for key in ["ctrl-4", "ctrl-5", "ctrl-6", "ctrl-r"] {
+    for key in ["ctrl-r", "ctrl-`"] {
         assert!(
             added.contains(&key.to_string()),
             "{key} is bound and must be listed"
+        );
+    }
+    for key in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6"] {
+        assert!(
+            !added.contains(&key.to_string()),
+            "{key} no longer switches inspector panes and must not be bound"
         );
     }
 }
@@ -32005,11 +31407,10 @@ fn t65_failed_tone_distinct_from_unknown_in_row_text(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t65_failed_tone_distinct_in_health_tab_detail(cx: &mut TestAppContext) {
+fn t65_failed_tone_distinct_in_health_section(cx: &mut TestAppContext) {
     use crate::health::{sparkline_caption_tone, LatencyTone};
     use crate::health_tone_color;
     use crate::store::HealthHistoryEntry;
-    use gpui_kit::point;
 
     cx.update(gpui_kit::init);
     let (view, cx, failed, untested, _gamma) =
@@ -32042,29 +31443,12 @@ fn t65_failed_tone_distinct_in_health_tab_detail(cx: &mut TestAppContext) {
         assert_ne!(
             health_tone_color(failed_tone, cx.theme()),
             health_tone_color(untested_tone, cx.theme()),
-            "failed and untested tones render distinctly on the Health tab"
+            "failed and untested tones render distinctly in the Health section"
         );
     });
 
-    cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.inspector_tab = crate::InspectorTab::Health;
-            cx.notify();
-        });
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.update(|window, cx| {
-        window.scroll(
-            "config-detail-body",
-            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-            cx,
-        );
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
 
     assert_painted(cx, "config-health");
     assert_painted(cx, "config-history");
@@ -33037,128 +32421,6 @@ fn t79_top9_other_split_math() {
     assert_eq!(nine.other_line(), None);
 }
 
-#[gpui_kit::test]
-fn t79_top9_renders_without_other_when_few_exits(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    cx.update(|cx| cx.set_reduce_motion(true));
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let mut ids = Vec::new();
-    for (index, port) in ["10861", "10862", "10863"].into_iter().enumerate() {
-        let row = store
-            .add(tick12_seed(&format!("Exit {index}"), port))
-            .expect("seed works");
-        ids.push(row.id);
-    }
-    store
-        .add_traffic_batch(&[
-            (ids[0].clone(), 500, 5),
-            (ids[1].clone(), 7_000, 70),
-            (ids[2].clone(), 3_000, 30),
-        ])
-        .expect("traffic persists");
-    let (view, cx) = mount_view(store, cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    for id in &ids {
-        assert!(
-            cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_some()),
-            "three exits keep every row listed"
-        );
-    }
-    assert!(
-        cx.update(|window, _| window.try_find("traffic-stats-other").is_none()),
-        "no Other line until a tenth exit exists"
-    );
-}
-
-#[gpui_kit::test]
-fn t79_other_line_count_and_bytes_correct(cx: &mut TestAppContext) {
-    use crate::{
-        aggregate_exit_traffic, format_bytes, traffic_bar_max, traffic_other_line_text,
-        traffic_top9_split,
-    };
-
-    cx.update(gpui_kit::init);
-    cx.update(|cx| cx.set_reduce_motion(true));
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    let mut seeded: Vec<(String, u64, u64)> = Vec::new();
-    for index in 0..12u64 {
-        let row = store
-            .add(tick12_seed(
-                &format!("Exit {index:02}"),
-                &(10_861 + index).to_string(),
-            ))
-            .expect("seed works");
-        let rx = if index == 0 { 100 } else { 51 - index };
-        seeded.push((row.id, rx, 0));
-    }
-    store.add_traffic_batch(&seeded).expect("traffic persists");
-
-    let rows = store.list().expect("rows list");
-    let totals = store.traffic_totals().expect("totals read");
-    let exits = aggregate_exit_traffic(&rows, &totals);
-    let split = traffic_top9_split(&exits);
-    assert_eq!(split.top.len(), 9);
-    assert_eq!(split.other_exits, 3);
-    let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
-    let top_rx: u64 = split.top.iter().map(|exit| exit.rx_bytes).sum();
-    assert_eq!(split.other_rx, all_rx - top_rx, "Other = total − top 9");
-    assert_eq!(split.other_rx, 123, "42 + 41 + 40 bytes are rolled up");
-    assert_eq!(split.other_tx, 0);
-    let expected = traffic_other_line_text(3, 123, 0);
-    assert_eq!(
-        expected,
-        format!(
-            "Other (3 more · ↓{} ↑{})",
-            format_bytes(123),
-            format_bytes(0)
-        )
-    );
-    assert_eq!(split.other_line().as_deref(), Some(expected.as_str()));
-    assert!(
-        !expected.contains("Exit") && !expected.contains("127.0.0.1"),
-        "aggregate line carries count + bytes only: {expected}"
-    );
-    // Bar denominator is the heaviest raw row (100 B), never the 123 B
-    // aggregate: proportions stay computed over all rows, not the roll-up.
-    assert_eq!(traffic_bar_max(&exits), 100);
-    assert!(split.other_rx > traffic_bar_max(&exits));
-
-    let listed: Vec<String> = split.top.iter().map(|exit| exit.row_id.clone()).collect();
-    let rolled: Vec<String> = seeded
-        .iter()
-        .map(|(id, _, _)| id.clone())
-        .filter(|id| !listed.contains(id))
-        .collect();
-    assert_eq!(rolled.len(), 3);
-
-    let (view, cx) = mount_view(store, cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
-    });
-    cx.run_until_parked();
-    paint_dialog_open(cx);
-    for id in &listed {
-        assert!(
-            cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_some()),
-            "top-9 row {id} paints"
-        );
-    }
-    for id in &rolled {
-        assert!(
-            cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_none()),
-            "ranked-below-nine row {id} stays nameless"
-        );
-    }
-    assert!(
-        cx.update(|window, _| window.try_find("traffic-stats-other").is_some()),
-        "the aggregate line paints after rank 9"
-    );
-}
-
 #[test]
 fn t79_periods_compute_independently() {
     use crate::store::TrafficPeriod;
@@ -33828,12 +33090,28 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
         });
     });
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
+        view.update(cx, |view, cx| {
+            view.toggle_console(window, cx);
+            view.console.tab = crate::ConsoleTab::Traffic;
+            cx.notify();
+        });
     });
-    paint_dialog_open(cx);
-    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    paint_frame(cx);
+    cx.update(|window, cx| {
+        window.scroll(
+            "console-traffic",
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
     for id in [
-        "runtime-shard-stats",
+        "console-runtime",
+        "console-runtime-title",
+        "console-runtime-stat-0",
+        "console-runtime-stat-8",
+        "console-runtime-shards",
         "shard-stat-stock",
         "shard-label-stock",
         "shard-chart-stock",
@@ -33842,16 +33120,12 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
-            "{id} paints"
+            "{id} paints in the console's Runtime group"
         );
     }
     assert!(
         cx.update(|window, _| window.try_find("shard-chart-fork").is_none()),
         "a shard with no samples paints no chart"
-    );
-    assert!(
-        cx.update(|window, _| window.try_find("runtime-stat-9").is_some()),
-        "the process summary keeps the ten-line body"
     );
 }
 // T-33: the bind picker and the Settings address list.
@@ -36121,10 +35395,7 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     select_library_row(&view, cx, &work.id);
-    cx.update(|_window, cx| {
-        view.update(cx, |view, cx| view.select_all_visible_rows(cx));
-    });
-    paint_frame(cx);
+    paint_frame_at(cx, 1000., 1600.);
 
     let snapshot = |cx: &mut VisualTestContext, id: &str| {
         cx.update(|window, _| {
@@ -36148,9 +35419,6 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
         ("engine-bar-start-all", "Start all"),
         ("engine-bar-stop-all", "Stop all"),
         ("engine-bar-overflow", "More actions"),
-        ("batch-start", "Start"),
-        ("batch-stop", "Stop"),
-        ("batch-more", "More batch actions"),
         ("row-menu", "More actions"),
         ("inspector-drawer-close", "Close inspector"),
     ] {
@@ -36172,6 +35440,27 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
             label.as_ref().is_some_and(|label| !label.is_empty()),
             "{id} announces a name: {label:?}"
         );
+    }
+
+    // Two or more selected rows show the selection bar instead of the
+    // single-row operate actions.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.select_all_visible_rows(cx));
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1000., 1600.);
+    for (id, pinned) in [
+        ("batch-start", "Start"),
+        ("batch-stop", "Stop"),
+        ("batch-more", "More batch actions"),
+    ] {
+        let (role, label) = snapshot(cx, id);
+        assert_eq!(
+            role.as_deref(),
+            Some("Button"),
+            "{id} exposes the Button role (and its click action)"
+        );
+        assert_eq!(label.as_deref(), Some(pinned), "{id} announces its name");
     }
 
     // Static segments: no action, but each still names itself.
@@ -36254,12 +35543,12 @@ fn single_instance_argv_line_round_trips() {
     assert_eq!(decode_argv(b"{}"), None);
 }
 
-/// B3: the whole point of the pane window — an open inspector builds the rows
-/// the panel can show, not every row the pane owns. The counter is the proof;
-/// the same frame also pins that a pane that is not on screen builds nothing.
+/// B3: the console's log list builds the rows the dock can show, not every
+/// row the session owns. The counter is the proof; the same frame also pins
+/// that a tab that is not on screen builds nothing.
 #[gpui_kit::test]
-fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+fn b3_console_logs_build_only_the_rows_they_show(cx: &mut TestAppContext) {
+    use crate::app::detail::{console_rows_built, reset_console_rows_built, ConsoleRows};
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -36269,8 +35558,8 @@ fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
         view.select_visible_row(0, cx);
-        view.inspector_tab = crate::InspectorTab::Logs;
-        view.open_inspector();
+        view.console.open = true;
+        view.console.tab = crate::ConsoleTab::Logs;
         let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
         let tag = crate::inbound_tag(&seeded.id);
         for ix in 0..200 {
@@ -36278,7 +35567,6 @@ fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
                 .store
                 .push_raw(&format!("{tag} info line {ix} of the pane window"), &tags);
         }
-        view.logs.tail = true;
         cx.notify();
     });
     cx.run_until_parked();
@@ -36286,47 +35574,44 @@ fn b3_pane_builds_only_the_rows_it_shows(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    let rows = view.read_with(cx, |view, cx| view.visible_log_lines(cx).len());
-    assert_eq!(rows, 200, "the pane owns 200 rows");
+    let rows = view.read_with(cx, |view, cx| view.console_log_rows(cx).len());
+    assert_eq!(rows, 200, "the console owns 200 rows");
 
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
-    let built = pane_rows_built(PaneRows::Logs);
+    let built = console_rows_built(ConsoleRows::Logs);
     assert!(built > 0, "the visible log rows build, got {built}");
     // A frame lays the list out more than once, so pin the shape of the cost
     // rather than an exact count: a window's worth stays a small fraction of
     // the page.
     assert!(
         built * 3 < rows,
-        "a 200-row pane builds a window's worth, not the page: {built}"
+        "a 200-row console builds a window's worth, not the page: {built}"
     );
     assert_eq!(
-        pane_rows_built(PaneRows::Links),
+        console_rows_built(ConsoleRows::Links),
         0,
-        "a pane that is not on screen builds nothing"
+        "a tab that is not on screen builds nothing"
     );
-    assert_eq!(pane_rows_built(PaneRows::Traffic), 0);
 
     view.update(cx, |view, cx| {
-        view.inspector_tab = crate::InspectorTab::Details;
+        view.console.tab = crate::ConsoleTab::Connections;
         cx.notify();
     });
     cx.run_until_parked();
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
-    for pane in [PaneRows::Logs, PaneRows::Links, PaneRows::Traffic] {
-        assert_eq!(
-            pane_rows_built(pane),
-            0,
-            "{pane:?} stays unbuilt when another tab is on screen"
-        );
-    }
+    assert_eq!(
+        console_rows_built(ConsoleRows::Logs),
+        0,
+        "Logs stays unbuilt while Connections is on screen"
+    );
 }
 
-/// B3: the closed inspector builds no pane at all.
+/// B3: the collapsed console builds no rows at all.
 #[gpui_kit::test]
-fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+fn b3_collapsed_console_builds_no_pane_rows(cx: &mut TestAppContext) {
+    use crate::app::detail::{console_rows_built, reset_console_rows_built, ConsoleRows};
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -36336,7 +35621,6 @@ fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
         view.select_visible_row(0, cx);
-        view.inspector_tab = crate::InspectorTab::Logs;
         let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
         let tag = crate::inbound_tag(&seeded.id);
         for ix in 0..200 {
@@ -36349,25 +35633,25 @@ fn b3_closed_inspector_builds_no_pane_rows(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
     assert!(
-        !view.read_with(cx, |view, _| view.inspector_visible),
-        "the inspector starts closed"
+        !view.read_with(cx, |view, _| view.console.open),
+        "the console starts collapsed"
     );
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
-    for pane in [PaneRows::Logs, PaneRows::Links, PaneRows::Traffic] {
+    for pane in [ConsoleRows::Logs, ConsoleRows::Links] {
         assert_eq!(
-            pane_rows_built(pane),
+            console_rows_built(pane),
             0,
-            "{pane:?} builds nothing while the inspector is closed"
+            "{pane:?} builds nothing while the console is collapsed"
         );
     }
 }
 
-/// B3: coming back to a pane lands where the user left it, and the rows that
+/// B3: coming back to Logs lands where the user left it, and the rows that
 /// scrolled away were never built.
 #[gpui_kit::test]
-fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
+fn b3_console_logs_keep_their_scroll_across_tabs(cx: &mut TestAppContext) {
+    use crate::app::detail::{console_rows_built, reset_console_rows_built, ConsoleRows};
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -36377,8 +35661,8 @@ fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     view.update(cx, |view, cx| {
         view.select_visible_row(0, cx);
-        view.inspector_tab = crate::InspectorTab::Logs;
-        view.open_inspector();
+        view.console.open = true;
+        view.console.tab = crate::ConsoleTab::Logs;
         let tags = crate::health::LogTagIndex::build(std::slice::from_ref(&seeded));
         let tag = crate::inbound_tag(&seeded.id);
         for ix in 0..200 {
@@ -36386,7 +35670,6 @@ fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
                 .store
                 .push_raw(&format!("{tag} info line {ix} of the pane window"), &tags);
         }
-        view.logs.tail = true;
         cx.notify();
     });
     cx.run_until_parked();
@@ -36394,82 +35677,41 @@ fn b3_pane_keeps_its_scroll_position_across_tabs(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    // The pane's own handle is the state a wheel would move; the list reads it
+    // The list's own handle is the state a wheel would move; the list reads it
     // back when it lays out.
     view.update(cx, |view, cx| {
-        view.pane_logs
+        view.console_logs
             .scroll
             .scroll_to_item(120, gpui_kit::ScrollStrategy::Top);
         cx.notify();
     });
     paint_frame(cx);
-    let scrolled = view.read_with(cx, |view, _| view.pane_logs.scroll.offset().y);
+    let scrolled = view.read_with(cx, |view, _| view.console_logs.scroll.offset().y);
     assert!(
         scrolled < px(0.),
-        "the pane list scrolls on its own: {scrolled:?}"
+        "the console log list scrolls on its own: {scrolled:?}"
     );
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
-    let built_while_scrolled = pane_rows_built(PaneRows::Logs);
+    let built_while_scrolled = console_rows_built(ConsoleRows::Logs);
     assert!(
         built_while_scrolled > 0 && built_while_scrolled * 3 < 200,
-        "a scrolled pane still builds a window, not the page: {built_while_scrolled}"
+        "a scrolled console still builds a window, not the page: {built_while_scrolled}"
     );
 
-    for tab in [crate::InspectorTab::Details, crate::InspectorTab::Logs] {
+    for tab in [crate::ConsoleTab::Connections, crate::ConsoleTab::Logs] {
         view.update(cx, |view, cx| {
-            view.inspector_tab = tab;
+            view.console.tab = tab;
             cx.notify();
         });
         cx.run_until_parked();
         paint_frame(cx);
     }
     assert_eq!(
-        view.read_with(cx, |view, _| view.pane_logs.scroll.offset().y),
+        view.read_with(cx, |view, _| view.console_logs.scroll.offset().y),
         scrolled,
-        "the pane returns to the same row instead of jumping to the top"
+        "Logs returns to the same row instead of jumping to the top"
     );
-}
-
-/// B3: the traffic pane lists one row per exit, so a large library is exactly
-/// the case that used to build every row on every frame.
-#[gpui_kit::test]
-fn b3_traffic_pane_windows_a_large_library(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, PaneRows};
-
-    cx.update(gpui_kit::init);
-    let mut store = Store::open_in_memory().expect("in-memory store opens");
-    for ix in 0..150 {
-        let row = store
-            .add(row19_seed(
-                &format!("Row {ix}"),
-                "a.example.com",
-                &format!("{}", 10800 + ix),
-            ))
-            .expect("seed works");
-        store.add_traffic(&row.id, 10, 20).expect("traffic seeds");
-    }
-    let (view, cx) = mount_view(store, cx);
-    view.update(cx, |view, cx| {
-        view.select_visible_row(0, cx);
-        view.inspector_tab = crate::InspectorTab::Traffic;
-        view.open_inspector();
-        cx.notify();
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
-
-    reset_pane_rows_built();
-    paint_frame(cx);
-    let built = pane_rows_built(PaneRows::Traffic);
-    assert!(built > 0, "the visible exits build, got {built}");
-    assert!(
-        built < 150,
-        "a 150-exit library builds a window: {built} of 150"
-    );
-    assert_eq!(pane_rows_built(PaneRows::Logs), 0, "other panes stay cold");
 }
 
 /// B16: a fetch in flight is not an empty library. The load state is set the
@@ -37882,17 +37124,24 @@ fn every_retired_menu_action_has_one_reachable_surface(cx: &mut TestAppContext) 
         .iter()
         .flat_map(|(_, ids)| ids.iter().copied())
         .collect();
-    for id in [
-        "subscriptions",
-        "groups",
-        "logs",
-        "runtime-stats",
-        "traffic-stats",
-        "row-columns",
-    ] {
+    for id in ["subscriptions", "groups", "logs", "row-columns"] {
         assert!(
             palette.contains(&id),
             "{id} stays in the palette until its own home lands"
+        );
+    }
+    // Slice 6 retires the two stats dialogs: their content lives in the
+    // console, so the palette verbs are gone rather than duplicated.
+    for id in ["runtime-stats", "traffic-stats"] {
+        assert!(
+            !palette.contains(&id),
+            "{id} moved into the console and left the palette"
+        );
+    }
+    for id in ["inspector-toggle", "toggle-console"] {
+        assert!(
+            palette.contains(&id),
+            "{id} reaches the inspector and console from the palette"
         );
     }
 }
@@ -38816,5 +38065,1043 @@ fn header_and_blank_table_clicks_clear_selection(cx: &mut TestAppContext) {
         view.read_with(cx, |view, _| view.selection_count()),
         0,
         "a blank-table click clears the selection"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 6 — the stacked inspector and the console dock
+// ---------------------------------------------------------------------------
+
+/// The five-tab strip is gone. One scroll carries Identity, Endpoint, Health,
+/// Actions and the console link.
+#[gpui_kit::test]
+fn inspector_stacked_sections_replace_the_five_tabs(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    select_library_row(&view, cx, &work.id);
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+
+    for id in [
+        "inspector-identity",
+        "config-endpoints",
+        "inspector-health-section",
+        "inspector-actions",
+        "inspector-console-link",
+    ] {
+        assert_painted(cx, id);
+    }
+    for id in ["inspector-tabs", "inspector-tab-bar"] {
+        assert_absent(cx, id.to_string());
+    }
+}
+
+/// The inspector's console link is the only inspector control that opens the
+/// dock. It lands on Logs/Selected and clears the console filter.
+#[gpui_kit::test]
+fn inspector_console_link_opens_logs_scoped_to_the_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let work = store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    select_library_row(&view, cx, &work.id);
+    view.update(cx, |view, _| {
+        view.console.filter = "stale".to_string();
+        view.console.tab = crate::ConsoleTab::Traffic;
+        view.console.scope = crate::ConsoleScope::All;
+    });
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+
+    cx.update(|window, cx| window.click("inspector-open-console", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+
+    let (open, tab, scope, filter) = view.read_with(cx, |view, _| {
+        (
+            view.console.open,
+            view.console.tab,
+            view.console.scope,
+            view.console.filter.clone(),
+        )
+    });
+    assert!(open, "the link opens the console");
+    assert_eq!(tab, crate::ConsoleTab::Logs);
+    assert_eq!(scope, crate::ConsoleScope::Selected);
+    assert!(filter.is_empty(), "the link lands with an empty filter");
+    assert_painted(cx, "console");
+}
+
+/// R6: one selected row shows its sections; three show the aggregate counts
+/// and no action buttons at all.
+#[gpui_kit::test]
+fn inspector_follows_one_row_and_aggregates_two_or_more(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Charlie", "vless", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.select_visible_row(0, cx));
+    });
+    open_inspector(&view, cx);
+    paint_frame_at(cx, 1400., 1600.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+    assert_painted(cx, "inspector-actions");
+    assert_absent(cx, "inspector-aggregate".to_string());
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.select_all_visible_rows(cx));
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+    assert_painted(cx, "inspector-aggregate");
+    assert_eq!(label_of("inspector-selected-count", cx), "3 selected");
+    assert_eq!(label_of("inspector-running-count", cx), "0 running");
+    assert_eq!(label_of("inspector-failed-count", cx), "0 failed");
+    assert_eq!(label_of("inspector-stopped-count", cx), "3 stopped");
+    assert_eq!(
+        label_of("inspector-use-selection-bar", cx),
+        "Use the selection bar to act."
+    );
+    assert_absent(cx, "inspector-actions".to_string());
+    assert_absent(cx, "config-endpoints".to_string());
+}
+
+/// The aggregate's hidden count clears the facet filters, keeps the selection,
+/// and goes away once every selected row is visible again.
+#[gpui_kit::test]
+fn inspector_multi_selection_hidden_count_clears_filters(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Bravo", "vless", "team", "10802"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Charlie", "vmess", "team", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_all_visible_rows(cx);
+            view.open_inspector();
+        });
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_protocol_facet("vless".to_string(), true, cx);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+
+    assert_eq!(view.read_with(cx, |view, _| view.visible.len()), 2);
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.selection_hidden_count(cx)),
+        1
+    );
+    assert_painted(cx, "inspector-hidden-count");
+    assert_eq!(label_of("inspector-hidden-count", cx), "1 hidden");
+
+    cx.update(|window, cx| window.click("inspector-hidden-count", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 1600.);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.visible.len()),
+        3,
+        "the hidden count clears the filters"
+    );
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 3);
+    assert_absent(cx, "inspector-hidden-count".to_string());
+}
+
+/// `Ctrl+I` toggles the docked inspector without taking the keyboard away from
+/// the table.
+#[gpui_kit::test]
+fn ctrl_i_toggles_inspector_without_moving_focus_off_the_table(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    focus_library(&view, cx);
+
+    let table_focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    let toggle = || Keystroke::parse("ctrl-i").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert!(view.read_with(cx, |view, _| view.inspector_visible));
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(table_focus.clone()),
+        "opening the inspector leaves focus on the table"
+    );
+
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert!(!view.read_with(cx, |view, _| view.inspector_visible));
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(table_focus),
+        "closing the inspector leaves focus on the table"
+    );
+}
+
+/// `Ctrl+\`` opens the dock above the engine bar: the table shrinks by exactly
+/// the dock height and the engine bar never moves.
+#[gpui_kit::test]
+fn ctrl_backtick_toggles_console_and_engine_bar_does_not_move(cx: &mut TestAppContext) {
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    focus_library(&view, cx);
+
+    let bounds = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| {
+            let bar = window
+                .try_find("engine-bar".to_string())
+                .expect("engine bar renders")
+                .bounds();
+            let content = window
+                .try_find("main-content".to_string())
+                .expect("main content renders")
+                .bounds();
+            (bar.origin.y, content.size.height)
+        })
+    };
+    let (bar_y, content_h) = bounds(cx);
+
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_painted(cx, "console");
+    let (open_bar_y, open_content_h) = bounds(cx);
+    assert_eq!(
+        open_bar_y, bar_y,
+        "the engine bar never moves when the console opens"
+    );
+    assert_eq!(
+        content_h - open_content_h,
+        px(240.),
+        "the comfortable console takes exactly its 240px from the rows"
+    );
+
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_absent(cx, "console".to_string());
+    let (closed_bar_y, closed_content_h) = bounds(cx);
+    assert_eq!(closed_bar_y, bar_y);
+    assert_eq!(
+        closed_content_h, content_h,
+        "closing gives the rows their height back"
+    );
+}
+
+/// A launch starts collapsed on Logs / All with no filter and no pause.
+#[gpui_kit::test]
+fn console_starts_collapsed_and_launch_defaults_are_logs_all(cx: &mut TestAppContext) {
+    use crate::{ConsoleScope, ConsoleTab};
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let defaults = view.read_with(cx, |view, _| {
+        (
+            view.console.open,
+            view.console.tab,
+            view.console.scope,
+            view.console.filter.clone(),
+            view.console.paused.is_some(),
+        )
+    });
+    assert_eq!(
+        defaults,
+        (
+            false,
+            ConsoleTab::Logs,
+            ConsoleScope::All,
+            String::new(),
+            false
+        ),
+        "the console starts collapsed on Logs / All, empty and live"
+    );
+    assert_absent(cx, "console".to_string());
+
+    focus_library(&view, cx);
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_painted(cx, "console");
+    let selected = |cx: &mut VisualTestContext, id: &str| {
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .selected()
+        })
+        .unwrap_or(false)
+    };
+    assert!(selected(cx, "console-tab-logs"));
+    assert!(!selected(cx, "console-tab-connections"));
+    assert!(selected(cx, "console-scope-all"));
+    assert!(!selected(cx, "console-scope-selected"));
+}
+
+/// `Selected` keeps the whole selection's log lines and drops the global lines
+/// that belong to no config.
+#[gpui_kit::test]
+fn console_logs_selected_scope_uses_the_whole_selection(cx: &mut TestAppContext) {
+    use crate::engine::inbound_tag;
+    use gpui_kit::{Keystroke, Modifiers};
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(row19_seed("Bravo", "b.example.com", "10802"))
+        .expect("seed works");
+    let charlie = store
+        .add(row19_seed("Charlie", "c.example.com", "10803"))
+        .expect("seed works");
+    let tags = crate::health::LogTagIndex::build(&[alpha.clone(), bravo.clone(), charlie.clone()]);
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.logs.store.push_raw(
+                &format!("info {}: alpha connected", inbound_tag(&alpha.id)),
+                &tags,
+            );
+            view.logs.store.push_raw(
+                &format!("warn {}: bravo retried", inbound_tag(&bravo.id)),
+                &tags,
+            );
+            view.logs.store.push_raw("info engine started", &tags);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", alpha.id),
+        Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", bravo.id),
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 2);
+
+    focus_library(&view, cx);
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.update(|window, cx| window.click("console-scope-selected", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+
+    let rows = view.read_with(cx, |view, cx| view.console_log_rows(cx));
+    assert_eq!(rows.len(), 2, "both selected configs keep their lines");
+    for id in [&alpha.id, &bravo.id] {
+        assert!(
+            rows.iter()
+                .any(|row| row.config_id.as_deref() == Some(id.as_str())),
+            "the selection's {id} line survives Selected scope"
+        );
+    }
+    assert_painted(cx, "console-log-line-0");
+    assert_painted(cx, "console-log-line-1");
+    assert_absent(cx, "console-log-line-2".to_string());
+}
+
+/// `Selected` keeps every flow claimed by any selected row, and nothing else.
+#[gpui_kit::test]
+fn console_connections_selected_scope_uses_the_whole_selection(cx: &mut TestAppContext) {
+    use crate::health::ClashConn;
+    use gpui_kit::{Keystroke, Modifiers};
+
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(row19_seed("Bravo", "b.example.com", "10802"))
+        .expect("seed works");
+    store
+        .add(row19_seed("Charlie", "c.example.com", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.conn.snapshot = vec![
+                (
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-a".to_string(),
+                        row_id: Some(alpha.id.clone()),
+                        rx_bytes: 1000,
+                        tx_bytes: 10,
+                        dest: "alpha.example.com:443".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                ),
+                (
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-b".to_string(),
+                        row_id: Some(bravo.id.clone()),
+                        rx_bytes: 2000,
+                        tx_bytes: 20,
+                        dest: "bravo.example.com:443".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                ),
+                (
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-c".to_string(),
+                        row_id: None,
+                        rx_bytes: 9000,
+                        tx_bytes: 90,
+                        dest: "unclaimed.example.com:443".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                ),
+            ];
+            view.conn.delta.clear();
+            view.conn.sort_desc = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", alpha.id),
+        Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", bravo.id),
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+
+    focus_library(&view, cx);
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.update(|window, cx| window.click("console-tab-connections", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.update(|window, cx| window.click("console-scope-selected", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+
+    assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 2);
+    assert_painted(cx, "console-connections");
+    assert_eq!(
+        label_of("console-conn-copy-0", cx),
+        "bravo.example.com:443",
+        "the heavier selected flow paints first"
+    );
+    assert_eq!(
+        label_of("console-conn-copy-1", cx),
+        "alpha.example.com:443",
+        "the second selected flow stays"
+    );
+    assert_absent(cx, "console-conn-copy-2".to_string());
+    assert_absent(cx, "console-conn-row-2".to_string());
+}
+
+/// The Traffic tab totals the current scope from the session snapshot and
+/// carries the old runtime lines in the same scroll.
+#[gpui_kit::test]
+fn console_traffic_scope_totals_and_runtime_lines(cx: &mut TestAppContext) {
+    use crate::health::ClashConn;
+    use gpui_kit::Keystroke;
+
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let bravo = store
+        .add(row19_seed("Bravo", "b.example.com", "10802"))
+        .expect("seed works");
+    store
+        .add(row19_seed("Charlie", "c.example.com", "10803"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.conn.snapshot = vec![
+                (
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-a".to_string(),
+                        row_id: Some(alpha.id.clone()),
+                        rx_bytes: 1000,
+                        tx_bytes: 10,
+                        dest: "alpha.example.com:443".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                ),
+                (
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-b".to_string(),
+                        row_id: Some(bravo.id.clone()),
+                        rx_bytes: 2000,
+                        tx_bytes: 20,
+                        dest: "bravo.example.com:443".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                ),
+                (
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-c".to_string(),
+                        row_id: None,
+                        rx_bytes: 4000,
+                        tx_bytes: 40,
+                        dest: "unclaimed.example.com:443".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                ),
+            ];
+            view.conn.delta.clear();
+            view.conn.sort_desc = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", alpha.id),
+        gpui_kit::Modifiers::default(),
+    );
+    click_row_with(
+        cx,
+        &format!("row-name-text-{}", bravo.id),
+        gpui_kit::Modifiers {
+            control: true,
+            ..gpui_kit::Modifiers::default()
+        },
+    );
+
+    focus_library(&view, cx);
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.update(|window, cx| window.click("console-tab-traffic", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+
+    assert_eq!(label_of("console-traffic-rx", cx), "Session RX: 6.8 KB");
+    assert_eq!(label_of("console-traffic-tx", cx), "Session TX: 70 B");
+    assert_eq!(label_of("console-traffic-rows", cx), "Visible rows: 2");
+
+    cx.update(|window, cx| window.click("console-scope-selected", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_eq!(label_of("console-traffic-rx", cx), "Session RX: 2.9 KB");
+    assert_eq!(label_of("console-traffic-tx", cx), "Session TX: 30 B");
+    assert_eq!(label_of("console-traffic-rows", cx), "Visible rows: 2");
+
+    cx.update(|window, cx| {
+        window.scroll(
+            "console-traffic",
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    for id in [
+        "console-runtime",
+        "console-runtime-title",
+        "console-runtime-stat-0",
+        "console-runtime-stat-8",
+        "console-runtime-shards",
+    ] {
+        assert!(
+            cx.update(|window, _| window.try_find(id).is_some()),
+            "{id} paints in the console's Runtime group"
+        );
+    }
+    assert_painted(cx, "console-runtime-stat-8");
+    assert_painted(cx, "console-runtime-shards");
+}
+
+/// Pause freezes the painted rows through new records; Resume recomputes;
+/// Clear empties the ring and shows the empty line.
+#[gpui_kit::test]
+fn console_pause_freezes_rows_and_clear_empties_the_ring(cx: &mut TestAppContext) {
+    use gpui_kit::Keystroke;
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let tags = crate::health::LogTagIndex::default();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.logs.store.push_raw("info first line", &tags);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    focus_library(&view, cx);
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_painted(cx, "console-log-line-0");
+
+    cx.update(|window, cx| window.click("console-pause", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_painted(cx, "console-paused-badge");
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.logs.store.push_raw("warn second line", &tags);
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_absent(cx, "console-log-line-1".to_string());
+
+    cx.update(|window, cx| window.click("console-pause", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_absent(cx, "console-paused-badge".to_string());
+    assert_painted(cx, "console-log-line-1");
+
+    cx.update(|window, cx| window.click("console-clear", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_painted(cx, "console-empty-logs");
+    assert!(
+        view.read_with(cx, |view, _| view.logs.store.all().is_empty()),
+        "Clear empties the log ring"
+    );
+}
+
+/// Both close controls hand the keyboard back to the table.
+#[gpui_kit::test]
+fn console_close_and_inspector_close_return_focus_to_the_table(cx: &mut TestAppContext) {
+    use gpui_kit::{Focusable as _, Keystroke};
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    focus_library(&view, cx);
+    let toggle = || Keystroke::parse("ctrl-`").expect("test keystroke parses");
+    cx.update(|window, cx| window.dispatch_keystroke(toggle(), cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    let filter_focus = view.read_with(cx, |view, cx| {
+        view.console_filter_input.read(cx).focus_handle(cx)
+    });
+    cx.update(|window, cx| window.focus(&filter_focus, cx));
+    cx.update(|window, cx| window.click("console-close", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(!view.read_with(cx, |view, _| view.console.open));
+    let table_focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(table_focus.clone()),
+        "closing the console lands focus on the table"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_visible_row(0, cx);
+            view.open_inspector();
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    let search_focus = view.read_with(cx, |view, cx| view.search_input.read(cx).focus_handle(cx));
+    cx.update(|window, cx| window.focus(&search_focus, cx));
+    cx.update(|window, cx| window.click("inspector-drawer-close", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(!view.read_with(cx, |view, _| view.inspector_visible));
+    assert_eq!(
+        cx.update(|window, cx| window.focused(cx)),
+        Some(table_focus),
+        "closing the inspector lands focus on the table"
+    );
+}
+
+/// The engine bar's Console button paints its open state and toggles the dock.
+#[gpui_kit::test]
+fn engine_bar_console_button_reflects_open_state(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(row19_seed("Work", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    assert_eq!(
+        label_of("engine-bar-console", cx),
+        "Show console",
+        "the closed console's button offers Show console"
+    );
+
+    cx.update(|window, cx| window.click("engine-bar-console", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(view.read_with(cx, |view, _| view.console.open));
+    assert_painted(cx, "console");
+    assert_eq!(
+        label_of("engine-bar-console", cx),
+        "Hide console",
+        "the open console swaps the button's name"
+    );
+
+    cx.update(|window, cx| window.click("engine-bar-console", cx));
+    cx.run_until_parked();
+    paint_frame(cx);
+    assert!(!view.read_with(cx, |view, _| view.console.open));
+    assert_eq!(label_of("engine-bar-console", cx), "Show console");
+}
+
+/// `Clear test results…` runs the existing confirm, clears the samples, and is
+/// inert while there is nothing to clear.
+#[gpui_kit::test]
+fn engine_bar_clear_test_results_opens_the_existing_confirm_and_clears(cx: &mut TestAppContext) {
+    use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.health_store.record_outcome(&TestOutcome {
+                sample: HealthSample {
+                    config_id: alpha.id.clone(),
+                    at: 1,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: Some(120),
+                    error: None,
+                },
+                success: Some(ProbeSuccess {
+                    latency_ms: 120,
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                }),
+            });
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert!(view.read_with(cx, |view, _| view.health_store.has_samples()));
+
+    cx.update(|window, cx| window.click("engine-bar-overflow", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert_painted(cx, "engine-bar-clear-tests");
+    cx.update(|window, cx| window.click("engine-bar-clear-tests", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert!(
+        cx.update(|window, cx| window.has_active_dialog(cx)),
+        "the existing clear-health confirm opens"
+    );
+    cx.update(|window, cx| window.click("ok", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert!(
+        !view.read_with(cx, |view, _| view.health_store.has_samples()),
+        "confirming clears the health evidence"
+    );
+
+    // With no samples the item is disabled: clicking it opens nothing.
+    cx.update(|window, cx| {
+        let escape = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+        window.dispatch_keystroke(escape, cx);
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.update(|window, cx| window.click("engine-bar-overflow", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    cx.update(|window, cx| window.click("engine-bar-clear-tests", cx));
+    cx.run_until_parked();
+    paint_frame_at(cx, 1400., 900.);
+    assert!(
+        !cx.update(|window, cx| window.has_active_dialog(cx)),
+        "a disabled Clear test results opens no confirm"
+    );
+}
+
+/// The retired tab verbs, their Ctrl+1..6 bindings and the status strip are
+/// gone from every surface.
+#[gpui_kit::test]
+fn old_tab_actions_shortcuts_and_status_strip_are_gone(cx: &mut TestAppContext) {
+    use crate::app::actions::{ACTIONS, PALETTE_GROUPS};
+
+    cx.update(gpui_kit::init);
+    cx.update(crate::bind_app_keys);
+    let added = bound_key_strings(cx);
+    for key in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6"] {
+        assert!(
+            !added.contains(&key.to_string()),
+            "{key} must not be bound after the tabs retire"
+        );
+    }
+    for (_, keys) in crate::SHORTCUT_LINES.iter() {
+        for key in ["1", "2", "3", "4", "5", "6"] {
+            assert!(
+                !keys.contains(&format!("Ctrl-{key}")),
+                "the shortcut reference lists no inspector tab key: {keys}"
+            );
+        }
+    }
+    assert!(
+        crate::SHORTCUT_LINES
+            .iter()
+            .any(|(action, keys)| *action == "Toggle console" && *keys == "Ctrl-`"),
+        "Ctrl+` replaces the tab shortcuts"
+    );
+
+    let action_ids: Vec<&str> = ACTIONS.iter().map(|def| def.id).collect();
+    let palette: Vec<&str> = PALETTE_GROUPS
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    for id in [
+        "inspector-details",
+        "inspector-health",
+        "inspector-logs",
+        "inspector-links",
+        "inspector-traffic",
+        "runtime-stats",
+        "traffic-stats",
+    ] {
+        assert!(!action_ids.contains(&id), "{id} is not an action any more");
+        assert!(!palette.contains(&id), "{id} left the palette");
+    }
+
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (_view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    for id in [
+        "status-bar",
+        "runtime-stats",
+        "traffic-stats",
+        "inspector-tabs",
+    ] {
+        assert_absent(cx, id.to_string());
+    }
+}
+
+/// A dragged width survives a restart, and a bad stored value falls back to
+/// the 300px default.
+#[gpui_kit::test]
+fn inspector_width_persists_across_reopen(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let path =
+        std::env::temp_dir().join(format!("manyproxy-slice6-width-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    {
+        let mut store = Store::open_file(&path).expect("file store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+    }
+
+    let store = Store::open_file(&path).expect("reopen works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_visible_row(0, cx);
+            view.open_inspector();
+        });
+    });
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+
+    let (from, to) = cx.update(|window, _| {
+        let detail = window
+            .try_find("config-detail")
+            .expect("the inspector panel renders")
+            .bounds();
+        let x = detail.origin.x - px(2.);
+        let y = detail.origin.y + detail.size.height / 2.;
+        (point(x, y), point(x - px(40.), y))
+    });
+    cx.update(|window, cx| window.drag(from, to, cx));
+    cx.run_until_parked();
+    let stored = view.read_with(cx, |view, _| view.store.inspector_width());
+    assert!(
+        (stored - 340.).abs() <= 3.,
+        "mouse-up writes the dragged width, got {stored}"
+    );
+    paint_frame_at(cx, 1440., 900.);
+    let live = view.read_with(cx, |view, cx| view.inspector_width(cx));
+    assert!(
+        (live - stored).abs() <= 1.,
+        "the live split reads the dragged width, got {live}"
+    );
+    drop(view);
+
+    let store = Store::open_file(&path).expect("restart reopen works");
+    let (reopened, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+    let reopened_width = reopened.read_with(cx, |view, cx| view.inspector_width(cx));
+    assert!(
+        (reopened_width - stored).abs() <= 1.,
+        "a restart restores the persisted width, got {reopened_width}"
+    );
+
+    drop(reopened);
+    let mut store = Store::open_file(&path).expect("bad-value reopen works");
+    store
+        .set_meta(Store::META_INSPECTOR_WIDTH, "not-a-number")
+        .expect("meta write works");
+    drop(store);
+
+    let store = Store::open_file(&path).expect("bad-value reload works");
+    let (fallback, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame_at(cx, 1440., 900.);
+    assert_eq!(
+        fallback.read_with(cx, |view, cx| view.inspector_width(cx)),
+        Store::INSPECTOR_WIDTH_DEFAULT,
+        "an unreadable stored width falls back to 300"
     );
 }

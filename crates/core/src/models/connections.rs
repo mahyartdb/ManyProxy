@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnRow {
@@ -29,16 +29,16 @@ pub enum ConnCopyTarget {
 pub fn build_conn_rows(
     snapshot: &[(String, crate::health::ClashConn)],
     deltas: &HashMap<String, (u64, u64)>,
-    selected_row: Option<&str>,
+    selected: &HashSet<String>,
     selected_only: bool,
     desc: bool,
 ) -> Vec<ConnRow> {
     let mut rows: Vec<ConnRow> = snapshot
         .iter()
         .filter(
-            |(_, entry)| match (selected_only, selected_row, entry.row_id.as_deref()) {
-                (true, Some(selected), Some(row)) => row == selected,
-                (true, Some(_), None) => false,
+            |(_, entry)| match (selected_only, entry.row_id.as_deref()) {
+                (true, Some(row)) => selected.contains(row),
+                (true, None) => false,
                 _ => true,
             },
         )

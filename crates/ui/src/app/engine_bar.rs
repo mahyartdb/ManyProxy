@@ -118,13 +118,44 @@ impl AppView {
                         view.stop_all_engines(window, cx);
                     })),
             )
+            .child(self.render_console_toggle(cx))
             .child(self.render_engine_menu(view, testing))
             .into_any_element()
     }
 
+    /// Slice 6: the engine bar's `Console` toggle. It shows its active state
+    /// and swaps its tooltip between Show/Hide; the shortcut lives on
+    /// `toggle-console` (`Ctrl+\``).
+    fn render_console_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.console.open;
+        let label = if open {
+            t!("console-hide")
+        } else {
+            t!("console-show")
+        };
+        let tip = if open {
+            t!("console-hide-tip")
+        } else {
+            t!("console-show-tip")
+        };
+        Button::new("engine-bar-console")
+            .small()
+            .selected(open)
+            .toggled(open)
+            .label(t!("console-title"))
+            .accessibility_label(label)
+            .tooltip(tip)
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.toggle_console(window, cx);
+            }))
+            .into_any_element()
+    }
+
     /// The engine bar's `⋯`: the verbs that act on the pool rather than on
-    /// one row. `Stop testing` is only live while a probe batch runs.
+    /// one row. `Stop testing` is only live while a probe batch runs;
+    /// `Clear test results…` is only live while health samples exist.
     pub(crate) fn render_engine_menu(&self, view: Entity<AppView>, testing: bool) -> AnyElement {
+        let has_samples = self.health_store.has_samples();
         Button::new("engine-bar-overflow")
             .small()
             .ghost()
@@ -134,6 +165,7 @@ impl AppView {
             .dropdown_menu(move |menu, _, _| {
                 let test_view = view.clone();
                 let stop_view = view.clone();
+                let clear_view = view.clone();
                 menu.item(
                     PopupMenuItem::element(|_, _| {
                         topbar_menu_row(
@@ -164,6 +196,27 @@ impl AppView {
                     .on_click(move |_, window, cx| {
                         stop_view.update(cx, |view, cx| {
                             view.stop_group_tests(window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(move |_, _| {
+                        topbar_menu_row(
+                            "engine-bar-clear-tests",
+                            t!("engine-bar-clear-tests"),
+                            t!("engine-bar-clear-tests"),
+                            if has_samples {
+                                t!("engine-bar-clear-tests-tip")
+                            } else {
+                                t!("engine-bar-clear-tests-empty")
+                            },
+                            None,
+                        )
+                    })
+                    .disabled(!has_samples)
+                    .on_click(move |_, window, cx| {
+                        clear_view.update(cx, |view, cx| {
+                            view.open_clear_health_confirm(window, cx);
                         });
                     }),
                 )

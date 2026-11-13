@@ -47,7 +47,7 @@ impl AppView {
             self.show_window_from_tray(window, cx);
             match target {
                 crate::os::notify::NoticeTarget::Logs => {
-                    self.set_inspector_tab(InspectorTab::Logs);
+                    self.open_console_scoped_to_selection(false, cx);
                 }
                 crate::os::notify::NoticeTarget::Subscriptions => {
                     self.open_subscriptions_dialog(window, cx);

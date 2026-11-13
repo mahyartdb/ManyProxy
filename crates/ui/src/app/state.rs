@@ -190,6 +190,31 @@ pub(crate) struct LogsState {
     pub(crate) list: Option<Entity<ListState<LogLinesDelegate>>>,
 }
 
+/// Slice 6: the console dock's session state. It never persists: a launch is
+/// collapsed, on Logs, scoped to All, with an empty filter and live rows.
+/// Closing keeps every field so reopening restores the session's view.
+pub(crate) struct ConsoleState {
+    pub(crate) open: bool,
+    pub(crate) tab: ConsoleTab,
+    pub(crate) scope: ConsoleScope,
+    /// The one quick filter the three tabs share, case-insensitive substring.
+    pub(crate) filter: String,
+    /// Some(rows) while paused: the frozen paint. `None` recomputes live.
+    pub(crate) paused: Option<Vec<crate::ConsoleLogRow>>,
+}
+
+impl Default for ConsoleState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            tab: ConsoleTab::Logs,
+            scope: ConsoleScope::All,
+            filter: String::new(),
+            paused: None,
+        }
+    }
+}
+
 /// B3: one row-listing inspector pane's scroll window. `sizes` is the list's
 /// caller-owned height cache: rows are uniform, so it only changes when the row
 /// count does, and the list never needs a measure-then-correct pass beyond the
@@ -239,7 +264,6 @@ pub(crate) struct ConnectionState {
     /// bar never walks the snapshot per frame.
     pub(crate) counts: crate::health::ConnCounts,
     pub(crate) delta: HashMap<String, (u64, u64)>,
-    pub(crate) selected_only: bool,
     pub(crate) sort_desc: bool,
     pub(crate) copied: Option<ConnCopyTarget>,
     pub(crate) copied_generation: u64,
@@ -413,15 +437,30 @@ impl AppView {
             None => (store.write_probe().err(), None, false),
         };
         let split_state = cx.new(|_| ResizableState::default());
+        let console_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("console-filter-placeholder")));
+        let _console_filter_subscription = cx.subscribe(
+            &console_filter_input,
+            |view: &mut Self, _emitter: Entity<InputState>, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                view.console.filter = view.console_filter_input.read(cx).value().to_string();
+                cx.notify();
+            },
+        );
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
             detail_scroll: ScrollHandle::new(),
             split_state,
             inspector_visible: false,
-            pane_logs: PaneWindow::new(),
-            pane_links: PaneWindow::new(),
-            pane_traffic: PaneWindow::new(),
+            console: ConsoleState::default(),
+            console_filter_input,
+            _console_filter_subscription,
+            console_logs: PaneWindow::new(),
+            console_connections: PaneWindow::new(),
+            console_traffic: PaneWindow::new(),
             store,
             write_blocked,
             write_blocked_folder,
@@ -523,14 +562,11 @@ impl AppView {
             column_resize: None,
             column_drop: None,
             table_scroll: ScrollHandle::new(),
-            inspector_tab: InspectorTab::Details,
             conn: ConnectionState {
-                selected_only: true,
                 sort_desc: true,
                 ..ConnectionState::default()
             },
             palette: None,
-            traffic_period: store::TrafficPeriod::Day,
             shard_rings: BTreeMap::new(),
             shard_baselines: BTreeMap::new(),
             shard_denied: HashSet::new(),
@@ -591,16 +627,22 @@ impl AppView {
         self.libraries.read(cx).delegate().counts().0
     }
 
+    /// R6: the one row the inspector's sections act on. Exactly one selected
+    /// row targets the inspector; a focused-but-unselected row never does —
+    /// focus and selection are independent, and the inspector reads the set.
     pub(crate) fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
-        // The one row the inspector reads: the focused row, or the only
-        // selected row when the focus is elsewhere.
-        let id = self.selection_focus.clone().or_else(|| {
-            (self.selection.len() == 1)
-                .then(|| self.selection.iter().next().cloned())
-                .flatten()
-        })?;
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next().cloned()?;
         let libraries = self.libraries.read(cx);
         libraries.delegate().row_by_id(&id).cloned()
+    }
+
+    /// R6: the selection set, ordered as the table paints it. Every console
+    /// scope and the inspector aggregate read this one list.
+    pub(crate) fn selected_id_set(&self, cx: &App) -> HashSet<String> {
+        self.selected_ids_in_visible_order(cx).into_iter().collect()
     }
 
     pub(crate) fn cached_upstream(&self, cx: &App, config: &ProxyConfig) -> String {
@@ -1598,58 +1640,41 @@ impl AppView {
     }
 
     pub(crate) fn log_lines(&self, cx: &App) -> Vec<String> {
-        self.visible_log_lines(cx)
-    }
-
-    pub(crate) fn log_line_passes_filters(
-        line: &str,
-        exclude_lower: &str,
-        pattern: Option<&regex::Regex>,
-    ) -> bool {
-        if !exclude_lower.is_empty() && line.to_lowercase().contains(exclude_lower) {
-            return false;
-        }
-        pattern.is_none_or(|re| re.is_match(line))
-    }
-
-    pub(crate) fn visible_log_lines(&self, cx: &App) -> Vec<String> {
-        let selected = self.selected_config(cx).map(|config| config.id);
-        let filter = self.logs.filter.trim().to_lowercase();
-        let level = self.logs.level;
-        let render = |level: &str, message: &str| {
-            format!("[{}] {}", level, redact_secrets(&strip_ansi_codes(message)))
-        };
-        let records: Vec<&crate::health::LogRecord> = match selected.as_deref() {
-            Some(id) => self.logs.store.for_config(id),
-            None => self.logs.store.all().iter().collect(),
-        };
-        let mut lines: Vec<String> = records
+        self.console_log_rows(cx)
             .iter()
-            .filter(|record| level.is_none_or(|want| record.level == want))
-            .map(|record| render(record.level.as_str(), &record.message))
-            .collect();
-        if !filter.is_empty() {
-            lines.retain(|line| line.to_lowercase().contains(&filter));
-        }
+            .map(crate::ConsoleLogRow::line)
+            .collect()
+    }
 
-        let exclude = self.logs.exclude.trim().to_lowercase();
-        let raw_pattern = self.logs.regex.trim();
-        let pattern = if raw_pattern.is_empty() {
+    /// Slice 6: the console's log rows for the current scope and filters.
+    /// The pure `console::log_rows` does the work; this adapter owns the
+    /// committed log-sheet filters and the pause snapshot. A paused console
+    /// paints its frozen rows and ignores new records until resume.
+    pub(crate) fn console_log_rows(&self, cx: &App) -> Vec<crate::ConsoleLogRow> {
+        if let Some(frozen) = &self.console.paused {
+            return frozen.clone();
+        }
+        let selected = self.selected_id_set(cx);
+        let regex = self.logs.regex.trim();
+        let regex = if regex.is_empty() {
             None
         } else {
-            regex::Regex::new(raw_pattern).ok()
+            regex::Regex::new(regex).ok()
         };
-        if !exclude.is_empty() || pattern.is_some() {
-            lines.retain(|line| Self::log_line_passes_filters(line, &exclude, pattern.as_ref()));
-        }
-        if lines.len() > 200 {
-            if self.logs.tail {
-                lines = lines.split_off(lines.len() - 200);
-            } else {
-                lines.truncate(200);
-            }
-        }
-        lines
+        let filters = crate::ConsoleLogFilters {
+            include: &self.logs.filter,
+            exclude: &self.logs.exclude,
+            regex: regex.as_ref(),
+            level: self.logs.level,
+        };
+        let records: Vec<crate::LogRecord> = self.logs.store.all().iter().cloned().collect();
+        crate::log_rows(
+            &records,
+            &selected,
+            self.console.scope,
+            filters,
+            &self.console.filter,
+        )
     }
 
     pub(crate) fn set_log_level(
@@ -2562,7 +2587,12 @@ impl AppView {
         }
 
         let now = now_unix();
-        if !traffic_poll_due(self.inspector_tab, now, self.conn.last_poll_at) {
+        if !traffic_poll_due(
+            self.console.open,
+            self.console.tab,
+            now,
+            self.conn.last_poll_at,
+        ) {
             return 0;
         }
         self.conn.last_poll_at = now;
@@ -2708,14 +2738,6 @@ impl AppView {
         )
     }
 
-    pub(crate) fn motion_enter(
-        child: impl IntoElement + 'static,
-        id: impl Into<ElementId>,
-        cx: &App,
-    ) -> impl IntoElement {
-        Self::motion_fade(div().child(child), id, cx)
-    }
-
     /// The accent spends half the budget going up and half coming back down —
     /// one blink, never a loop, and never longer than the entry fade.
     pub(crate) const fn motion_accent_halves_ms() -> u64 {
@@ -2748,74 +2770,105 @@ impl AppView {
         ))
     }
 
-    /// F19: picking a tab is a way in — the shortcut and the tab strip both
-    /// land here, so a hidden inspector can never keep a chosen tab to itself.
-    pub(crate) fn set_inspector_tab(&mut self, tab: InspectorTab) {
-        self.inspector_visible = true;
-        self.inspector_tab = tab;
-        self.detail_scroll.set_offset(point(px(0.), px(0.)));
-    }
-
-    /// F19: Ctrl-1 is the one key that owns presence, so it toggles the panel
-    /// shut instead of only ever opening it. Another tab key still opens.
-    pub(crate) fn toggle_inspector(&mut self, tab: InspectorTab) {
-        let already = self.inspector_visible && self.inspector_tab == tab;
-        if already {
-            self.inspector_visible = false;
-            return;
-        }
-        self.set_inspector_tab(tab);
-    }
-
-    /// Ctrl-I owns the inspector's presence on its own: it opens the panel,
-    /// and closes the one that is already open. The tab it shows is the tab
-    /// the user last read.
-    pub(crate) fn toggle_inspector_presence(&mut self) {
+    /// F19/Slice 6: `Ctrl+I` owns the inspector's presence on its own: it
+    /// opens the panel and closes the one that is already open. Focus stays
+    /// on the table, so the arrows keep moving the inspector's target.
+    pub(crate) fn toggle_inspector(&mut self) {
+        self.inspector_visible = !self.inspector_visible;
         if self.inspector_visible {
-            self.inspector_visible = false;
-            return;
+            self.detail_scroll.set_offset(point(px(0.), px(0.)));
         }
-        self.inspector_visible = true;
-        self.detail_scroll.set_offset(point(px(0.), px(0.)));
     }
 
-    pub(crate) fn adjust_conn_column_widths(
-        &mut self,
-        delta: i32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let widths = self.store.conn_column_widths();
-        for (index, width) in widths.iter().enumerate() {
-            let next = (*width as i32 + delta).clamp(40, 600) as u32;
-            if let Err(error) = self.store.set_conn_column_width(index, next) {
-                window.push_notification(
-                    Notification::error(t!("column-width-failed", error = error.to_string())),
-                    cx,
-                );
-                return;
-            }
+    /// Slice 6: `Ctrl+\`` and the engine-bar button toggle the dock. Opening
+    /// never steals focus; closing hands focus to the table only when the
+    /// keyboard was inside the console (the quick filter is its one focusable
+    /// field), so a dialog or sheet keeps its own focus.
+    pub(crate) fn toggle_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let filter_focused = self
+            .console_filter_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        self.console.open = !self.console.open;
+        if !self.console.open && filter_focused {
+            self.close_console_focus_table(window, cx);
         }
         cx.notify();
     }
 
-    pub(crate) fn refresh_conn_column_widths(
+    /// R9: the row menu's `Open logs`, and the inspector's console link. Opens
+    /// the dock on Logs with scope `Selected`; the console filter stays as the
+    /// session left it — only the inspector link lands with it empty.
+    pub(crate) fn open_console_scoped_to_selection(
+        &mut self,
+        clear_filter: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.console.open = true;
+        self.console.tab = ConsoleTab::Logs;
+        self.console.scope = ConsoleScope::Selected;
+        if clear_filter {
+            self.console.filter.clear();
+        }
+        self.console.paused = None;
+        cx.notify();
+    }
+
+    pub(crate) fn clear_console_filter(&mut self, cx: &mut Context<Self>) {
+        self.console.filter.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn pause_console(&mut self, cx: &mut Context<Self>) {
+        if self.console.paused.is_some() {
+            return;
+        }
+        let frozen = self.console_log_rows(cx);
+        self.console.paused = Some(frozen);
+        cx.notify();
+    }
+
+    pub(crate) fn resume_console(&mut self, cx: &mut Context<Self>) {
+        self.console.paused = None;
+        cx.notify();
+    }
+
+    /// The console's Clear: empty the log ring, reset the sheet's seen mark,
+    /// and drop the pause snapshot. No confirm — logs are session evidence.
+    pub(crate) fn clear_console_logs(&mut self, cx: &mut Context<Self>) {
+        self.logs.store.clear();
+        self.logs.seen = self.logs.store.push_seq();
+        self.console.paused = None;
+        cx.notify();
+    }
+
+    /// R12: persist the dragged width. A failed write keeps the session width
+    /// and surfaces one toast; the drag itself is never undone.
+    pub(crate) fn persist_inspector_width(
+        &mut self,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.store.set_inspector_width(width) {
+            self.toast_error(
+                t!("cannot-save-inspector-width", error = error.to_string()),
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Focus the table. Closing a dock (console or inspector) lands here —
+    /// never the root handle, so arrows keep driving rows.
+    pub(crate) fn close_console_focus_table(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.store.reset_conn_column_widths() {
-            Ok(()) => {
-                window.push_notification(Notification::success(t!("column-widths-reset")), cx);
-                cx.notify();
-            }
-            Err(error) => {
-                window.push_notification(
-                    Notification::error(t!("column-width-reset-failed", error = error.to_string())),
-                    cx,
-                );
-            }
-        }
+        let list = self.libraries.read(cx).focus_handle(cx);
+        window.focus(&list, cx);
     }
 
     pub(crate) fn detail_failed(&self, config: &ProxyConfig) -> bool {

@@ -8582,6 +8582,31 @@ impl Store {
         self.set_meta(Self::META_ROW_DENSITY, density.token())
     }
 
+    /// R12: the inspector's persisted width. Absent, unparsable, or
+    /// out-of-range values read as the 300px default — the pre-feature shape —
+    /// and in-window values clamp to `240..=360`.
+    pub const META_INSPECTOR_WIDTH: &str = "inspector_width";
+
+    pub const INSPECTOR_WIDTH_DEFAULT: f32 = 300.;
+    pub const INSPECTOR_WIDTH_MIN: f32 = 240.;
+    pub const INSPECTOR_WIDTH_MAX: f32 = 360.;
+
+    pub fn inspector_width(&self) -> f32 {
+        match self.get_meta(Self::META_INSPECTOR_WIDTH) {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<f32>()
+                .map(|width| width.clamp(Self::INSPECTOR_WIDTH_MIN, Self::INSPECTOR_WIDTH_MAX))
+                .unwrap_or(Self::INSPECTOR_WIDTH_DEFAULT),
+            _ => Self::INSPECTOR_WIDTH_DEFAULT,
+        }
+    }
+
+    pub fn set_inspector_width(&mut self, width: f32) -> Result<(), StoreError> {
+        let clamped = width.clamp(Self::INSPECTOR_WIDTH_MIN, Self::INSPECTOR_WIDTH_MAX);
+        self.set_meta(Self::META_INSPECTOR_WIDTH, &clamped.to_string())
+    }
+
     /// T-31: the kept-log ring cap, additive beside the other meta keys.
     pub const META_LOG_MAX_LINES: &str = "log_max_lines";
 
@@ -17805,6 +17830,47 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// R12: the inspector's width persists beside the other meta keys and
+    /// clamps hard, so a corrupt or wild value can only ever reshape the
+    /// panel, never break the layout.
+    #[test]
+    fn inspector_width_round_trips_and_clamps_to_240_360() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.inspector_width(),
+            Store::INSPECTOR_WIDTH_DEFAULT,
+            "absent meta reads as 300"
+        );
+        assert_eq!(
+            store
+                .get_meta(Store::META_INSPECTOR_WIDTH)
+                .expect("meta read"),
+            None,
+            "the default writes no meta row"
+        );
+
+        for width in [260.0f32, 300.0, 340.0] {
+            store.set_inspector_width(width).expect("width writes");
+            assert_eq!(store.inspector_width(), width, "{width} round-trips");
+        }
+
+        store.set_inspector_width(100.0).expect("low width writes");
+        assert_eq!(store.inspector_width(), 240.0, "low widths clamp to 240");
+        store
+            .set_inspector_width(1_000.0)
+            .expect("high width writes");
+        assert_eq!(store.inspector_width(), 360.0, "high widths clamp to 360");
+
+        store
+            .set_meta(Store::META_INSPECTOR_WIDTH, "not-a-number")
+            .expect("junk writes");
+        assert_eq!(
+            store.inspector_width(),
+            Store::INSPECTOR_WIDTH_DEFAULT,
+            "junk reads as the default"
+        );
     }
 
     /// T-32: the window rectangle rides the meta family as
