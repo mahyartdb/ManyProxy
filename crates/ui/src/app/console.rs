@@ -374,7 +374,8 @@ fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElem
                 let line = lines.get(ix).cloned().unwrap_or_default();
                 note_pane_row(ConsoleRows::Logs);
                 div()
-                    .id(("console-log-line", ix))
+                    .id(format!("console-log-line-{ix}"))
+                    .test_support()
                     .w_full()
                     .h(px(PANE_LOG_ROW_H))
                     .text_sm()
@@ -689,6 +690,7 @@ fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyE
                     div()
                         .id("console-traffic-rx")
                         .test_support()
+                        .aria_label(t!("console-traffic-rx", bytes = format_bytes(session_rx)))
                         .text_sm()
                         .child(t!("console-traffic-rx", bytes = format_bytes(session_rx))),
                 )
@@ -696,6 +698,7 @@ fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyE
                     div()
                         .id("console-traffic-tx")
                         .test_support()
+                        .aria_label(t!("console-traffic-tx", bytes = format_bytes(session_tx)))
                         .text_sm()
                         .child(t!("console-traffic-tx", bytes = format_bytes(session_tx))),
                 )
@@ -703,6 +706,7 @@ fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> AnyE
                     div()
                         .id("console-traffic-rows")
                         .test_support()
+                        .aria_label(t!("console-traffic-rows", count = exits.len()))
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(t!("console-traffic-rows", count = exits.len())),
