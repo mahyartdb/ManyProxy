@@ -6,6 +6,14 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Added
 
+- The nav is a scope chooser. `All configs` carries the library total; a flat alphabetical `Groups` section lists every group with its count, puts a zero-count `New group` creation at the top and `Ungrouped` last; a `Sources` section lists each subscription with a freshness dot, its label and row count, a per-source `↻` and a `Manage.` header; `Routing presets` and `Settings` stay pinned at the bottom. Scope entries scroll; the utilities never move.
+- Groups are managed where they live now: `New group` creates a session group that becomes the scope, a group's context menu offers `Manage group.` and `Delete group.`, and the manage sheet carries rename, edit, refresh, auto-clear, the four prune verbs and delete for exactly the group it was opened from. Dragging a row onto a group moves just that row. A group with rows or subscriptions refuses to delete.
+- Selecting a scope filters the library to it without touching the search, facets or column state, clears the selection, and names itself in the action bar. `Ctrl+R` (`Update current scope`) refreshes the source behind a source scope or the subscriptions feeding a group scope, and refuses in `All configs` with a reason instead of guessing a target.
+- The source strip sits above the filter row inside a source scope: the source's label, freshness (`Fresh`/`Stale`/`Failed`/never refreshed), config and running counts, last update, quota (`Used X of Y · Expires …` when the subscription reports one) and live session traffic, with `↻`, `All configs` and `Manage.` on its right.
+- The nav's 56px collapsed state keeps every entry reachable: letters for `All configs`, groups and `Ungrouped`, the freshness dot for sources, `+` and the sources `…`, and the utilities' letters, each with a tooltip. A long group list scrolls inside the nav; the pinned utilities stay put.
+
+### Added
+
 - A workbench shell: a left nav carrying `All configs` and the bottom utilities, an action bar with the view title, its count, `Import`, `Add`, the command palette and a `⋯` overflow, a 36px filter slot above the table, and an engine bar under the table with the engine's state, the running count, the session traffic, `Start all`, `Stop all` and a `⋯` menu with `Test all` and `Stop testing`.
 - The filter row searches configs and narrows by Status, Protocol, and a Filter popover for latency, bind, port range and custom endpoints, with `N of M` always visible and a no-match state that clears in place. Search is session-only.
 - The nav collapses to its letters below 1200px and expands again at 1200px, so the window's new minimum still fits the table beside it.
@@ -25,10 +33,12 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - The window's minimum size is 1100×640 and it opens at 1200×700, so the nav starts expanded.
 - Toasts park above the engine bar, so a toast never covers the engine's own controls.
 - `Ctrl+1..6`, the five inspector-tab actions, the tab strip, and the Runtime stats and Traffic stats dialogs are retired. Their evidence lives in the console and the stacked inspector, and the palette no longer offers those commands.
-- Closing the inspector or the console returns keyboard focus to the table.
+- The old all-groups sheet and the palette's `groups` action are gone; the nav owns the group list and every group verb acts on one named group. Group order is alphabetical and no longer persisted, so `Move up`/`Move down` are gone too.
+- `Update current group` became `Update current scope`: it acts on the scope, never on the selected row's group, and its shortcut copy says so.
 
 ### Fixed
 
+- Closing the inspector or the console returns keyboard focus to the table.
 - The About dialog prints its body as lines instead of the literal `\n` escape sequence.
 - Stopping every endpoint asks "Stop N running configs" with a real plural.
 
