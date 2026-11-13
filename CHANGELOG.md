@@ -13,6 +13,9 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - The library table has seven columns — Name, Group, Protocol, Upstream, Endpoint, Health and Traffic. Every header opens one menu with Size Column to Fit, Size All Columns to Fit, per-column visibility and `More…`; the Columns sheet adds order buttons and Reset width, order, visibility and all.
 - The table scrolls horizontally when the chosen widths exceed the pane, with the header and rows sharing one offset. Name and Endpoint stay visible, and no column is dropped to fit.
 - One endpoint editor on every surface: the endpoint chip's pencil, `Edit` in the inspector, and `Ctrl+E` on the selected row all open the same form. It validates the bind and port as you type, offers the first free port on that bind when the port is taken, saves in place while the endpoint is stopped, and restarts it with rollback while it is running. `Ctrl+Shift+E` still opens the full config form.
+- The inspector is one stacked scroll — Identity, Endpoint, Health, Actions and `Open in console →` — with no tabs. One selected row shows that row; two or more show counts and point at the selection bar; none shows the empty state. Its width persists between sessions (240–360, default 300).
+- A console dock above the engine bar with `Logs | Connections | Traffic`, `All | Selected` scopes, one shared quick filter, log pause/clear with auto-tail, live connections, and session traffic plus runtime stats. `Ctrl+\`` or the engine bar's `Console` button toggles it; it starts collapsed.
+- The engine bar's `⋯` gains `Clear test results…`, enabled only while health evidence exists and routed through the existing confirm.
 
 ### Changed
 
@@ -21,6 +24,8 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - The five-menu toolbar, the three-segment status strip and the facet band are gone. Export, About and `Check for updates` live in the action bar's `⋯`, Routing presets and Settings at the bottom of the nav, and the transport controls in the engine bar.
 - The window's minimum size is 1100×640 and it opens at 1200×700, so the nav starts expanded.
 - Toasts park above the engine bar, so a toast never covers the engine's own controls.
+- `Ctrl+1..6`, the five inspector-tab actions, the tab strip, and the Runtime stats and Traffic stats dialogs are retired. Their evidence lives in the console and the stacked inspector, and the palette no longer offers those commands.
+- Closing the inspector or the console returns keyboard focus to the table.
 
 ### Fixed
 
