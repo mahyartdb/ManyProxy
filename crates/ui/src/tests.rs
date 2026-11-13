@@ -35548,7 +35548,7 @@ fn single_instance_argv_line_round_trips() {
 /// that a tab that is not on screen builds nothing.
 #[gpui_kit::test]
 fn b3_console_logs_build_only_the_rows_they_show(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, ConsoleRows};
+    use crate::app::detail::{console_rows_built, reset_console_rows_built, ConsoleRows};
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -35577,9 +35577,9 @@ fn b3_console_logs_build_only_the_rows_they_show(cx: &mut TestAppContext) {
     let rows = view.read_with(cx, |view, cx| view.console_log_rows(cx).len());
     assert_eq!(rows, 200, "the console owns 200 rows");
 
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
-    let built = pane_rows_built(ConsoleRows::Logs);
+    let built = console_rows_built(ConsoleRows::Logs);
     assert!(built > 0, "the visible log rows build, got {built}");
     // A frame lays the list out more than once, so pin the shape of the cost
     // rather than an exact count: a window's worth stays a small fraction of
@@ -35589,7 +35589,7 @@ fn b3_console_logs_build_only_the_rows_they_show(cx: &mut TestAppContext) {
         "a 200-row console builds a window's worth, not the page: {built}"
     );
     assert_eq!(
-        pane_rows_built(ConsoleRows::Links),
+        console_rows_built(ConsoleRows::Links),
         0,
         "a tab that is not on screen builds nothing"
     );
@@ -35599,10 +35599,10 @@ fn b3_console_logs_build_only_the_rows_they_show(cx: &mut TestAppContext) {
         cx.notify();
     });
     cx.run_until_parked();
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
     assert_eq!(
-        pane_rows_built(ConsoleRows::Logs),
+        console_rows_built(ConsoleRows::Logs),
         0,
         "Logs stays unbuilt while Connections is on screen"
     );
@@ -35611,7 +35611,7 @@ fn b3_console_logs_build_only_the_rows_they_show(cx: &mut TestAppContext) {
 /// B3: the collapsed console builds no rows at all.
 #[gpui_kit::test]
 fn b3_collapsed_console_builds_no_pane_rows(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, ConsoleRows};
+    use crate::app::detail::{console_rows_built, reset_console_rows_built, ConsoleRows};
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -35636,11 +35636,11 @@ fn b3_collapsed_console_builds_no_pane_rows(cx: &mut TestAppContext) {
         !view.read_with(cx, |view, _| view.console.open),
         "the console starts collapsed"
     );
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
     for pane in [ConsoleRows::Logs, ConsoleRows::Links] {
         assert_eq!(
-            pane_rows_built(pane),
+            console_rows_built(pane),
             0,
             "{pane:?} builds nothing while the console is collapsed"
         );
@@ -35651,7 +35651,7 @@ fn b3_collapsed_console_builds_no_pane_rows(cx: &mut TestAppContext) {
 /// scrolled away were never built.
 #[gpui_kit::test]
 fn b3_console_logs_keep_their_scroll_across_tabs(cx: &mut TestAppContext) {
-    use crate::app::detail::{pane_rows_built, reset_pane_rows_built, ConsoleRows};
+    use crate::app::detail::{console_rows_built, reset_console_rows_built, ConsoleRows};
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -35691,9 +35691,9 @@ fn b3_console_logs_keep_their_scroll_across_tabs(cx: &mut TestAppContext) {
         scrolled < px(0.),
         "the console log list scrolls on its own: {scrolled:?}"
     );
-    reset_pane_rows_built();
+    reset_console_rows_built();
     paint_frame(cx);
-    let built_while_scrolled = pane_rows_built(ConsoleRows::Logs);
+    let built_while_scrolled = console_rows_built(ConsoleRows::Logs);
     assert!(
         built_while_scrolled > 0 && built_while_scrolled * 3 < 200,
         "a scrolled console still builds a window, not the page: {built_while_scrolled}"

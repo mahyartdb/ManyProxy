@@ -46,12 +46,12 @@ pub(crate) enum ConsoleRows {
 // mounts views in parallel.
 #[cfg(any(debug_assertions, test))]
 thread_local! {
-    static PANE_ROWS_BUILT: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+    static CONSOLE_ROWS_BUILT: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
-pub(crate) fn note_pane_row(pane: ConsoleRows) {
+pub(crate) fn note_console_row(pane: ConsoleRows) {
     #[cfg(any(debug_assertions, test))]
-    PANE_ROWS_BUILT.with(|built| {
+    CONSOLE_ROWS_BUILT.with(|built| {
         let mut counts = built.get();
         counts[pane as usize] += 1;
         built.set(counts);
@@ -61,13 +61,13 @@ pub(crate) fn note_pane_row(pane: ConsoleRows) {
 }
 
 #[cfg(test)]
-pub(crate) fn pane_rows_built(pane: ConsoleRows) -> usize {
-    PANE_ROWS_BUILT.with(|built| built.get()[pane as usize])
+pub(crate) fn console_rows_built(pane: ConsoleRows) -> usize {
+    CONSOLE_ROWS_BUILT.with(|built| built.get()[pane as usize])
 }
 
 #[cfg(test)]
-pub(crate) fn reset_pane_rows_built() {
-    PANE_ROWS_BUILT.with(|built| built.set([0; 2]));
+pub(crate) fn reset_console_rows_built() {
+    CONSOLE_ROWS_BUILT.with(|built| built.set([0; 2]));
 }
 
 /// B3: the pane's row area. The list is handed the visible range only, so rows

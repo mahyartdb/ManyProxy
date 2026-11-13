@@ -8,7 +8,7 @@
 
 use crate::*;
 
-use super::detail::{note_pane_row, pane_rows, ConsoleRows, PANE_LINK_ROW_H, PANE_LOG_ROW_H};
+use super::detail::{note_console_row, pane_rows, ConsoleRows, PANE_LINK_ROW_H, PANE_LOG_ROW_H};
 
 /// R4/fork 2: the dock is fixed-height. Comfortable is the default; compact
 /// is what the density row asks for. It never resizes and never persists.
@@ -372,7 +372,7 @@ fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElem
             PANE_LOG_ROW_H,
             move |_view, ix, _cx| {
                 let line = lines.get(ix).cloned().unwrap_or_default();
-                note_pane_row(ConsoleRows::Logs);
+                note_console_row(ConsoleRows::Logs);
                 div()
                     .id(format!("console-log-line-{ix}"))
                     .test_support()
@@ -604,7 +604,7 @@ fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>) -> 
                     up = format_bytes(row.tx_bytes),
                     delta = format_bytes(row.delta_rx.saturating_add(row.delta_tx))
                 ));
-                note_pane_row(ConsoleRows::Links);
+                note_console_row(ConsoleRows::Links);
                 div()
                     .id(("console-conn-row", painted_ix))
                     .h(px(PANE_LINK_ROW_H))
