@@ -1169,195 +1169,6 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_groups_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity();
-        let counts = self.store.group_counts().unwrap_or_default();
-        let subs = self.store.list_subscriptions().unwrap_or_default();
-        let flagged: HashSet<String> = self
-            .store
-            .group_skip_flags()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        // T-19: auto-clear opt-ins snapshot at sheet open; every toggle
-        // re-opens this sheet so the switch always reads the store.
-        let auto_flagged: HashSet<String> =
-            self.store.auto_clear_enabled_groups().into_iter().collect();
-
-        let rows = group_row_views(
-            &counts,
-            &subs,
-            &|group| flagged.contains(group),
-            &|group| auto_flagged.contains(group),
-            now_unix(),
-        );
-        let commit: DialogCommit = Rc::new(|_, _| true);
-
-        open_app_sheet(window, cx, move |sheet: Sheet, _, _| {
-            let commit_click = commit.clone();
-
-            let mut form = v_form().small();
-
-            {
-                let current_view = view.clone();
-                let all_view = view.clone();
-                form = form.child(
-                    field().label_indent(false).child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("groups-update-current")
-                                    .label(t!("group-update-current"))
-                                    .tooltip(t!("group-update-current-tip"))
-                                    .on_click(move |_, window, cx| {
-                                        current_view.update(cx, |view, cx| {
-                                            view.update_current_group(window, cx);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("groups-update-all")
-                                    .label(t!("group-update-all"))
-                                    .tooltip(t!("group-update-all-tip"))
-                                    .on_click(move |_, window, cx| {
-                                        all_view.update(cx, |view, cx| {
-                                            view.open_update_all_confirm(window, cx);
-                                        });
-                                    }),
-                            ),
-                    ),
-                );
-            }
-            if rows.is_empty() {
-                form = form.child(field().label_indent(false).child(t!("groups-empty")));
-            }
-            for row in &rows {
-                let rename_view = view.clone();
-                let edit_view = view.clone();
-                let update_view = view.clone();
-                let delete_view = view.clone();
-                let rename_group = row.name.clone();
-                let edit_group = row.name.clone();
-                let update_group = row.name.clone();
-                let delete_group = row.name.clone();
-                let slug = slugify_group_id(&row.name);
-                let mut buttons = div().flex().flex_row().items_center().gap_2().child(
-                    Button::new(format!("group-rename-{slug}"))
-                        .label(t!("group-rename"))
-                        .on_click(move |_, window, cx| {
-                            let group = rename_group.clone();
-                            rename_view.update(cx, |view, cx| {
-                                view.open_group_rename_dialog(&group, window, cx);
-                            });
-                        }),
-                );
-                buttons = buttons.child(
-                    Button::new(format!("group-edit-{slug}"))
-                        .label(t!("group-edit"))
-                        .tooltip(t!("group-edit-tip"))
-                        .on_click(move |_, window, cx| {
-                            let group = edit_group.clone();
-                            edit_view.update(cx, |view, cx| {
-                                view.open_group_edit_dialog(&group, window, cx);
-                            });
-                        }),
-                );
-
-                if !row.sub_ids.is_empty() {
-                    buttons = buttons.child(
-                        Button::new(format!("group-update-{slug}"))
-                            .label(t!("group-update"))
-                            .tooltip(t!("group-update-tip"))
-                            .on_click(move |_, window, cx| {
-                                let group = update_group.clone();
-                                update_view.update(cx, |view, cx| {
-                                    view.update_group_subs(&group, window, cx);
-                                });
-                            }),
-                    );
-                }
-                buttons = buttons.child(
-                    Button::new(format!("group-delete-{slug}"))
-                        .label(t!("group-delete"))
-                        .on_click(move |_, window, cx| {
-                            let group = delete_group.clone();
-                            delete_view.update(cx, |view, cx| {
-                                view.open_group_delete_confirm(&group, window, cx);
-                            });
-                        }),
-                );
-
-                // T-19: the sheet render is a snapshot; the toggle never writes
-                // silently — enable opens this switch's own confirm note, and
-                // both handlers re-open the sheet to re-read the store.
-                let auto_view = view.clone();
-                let auto_group = row.name.clone();
-                let auto_switch = Switch::new(format!("group-auto-clear-{slug}"))
-                    .checked(row.auto_clear)
-                    .label(t!("group-auto-clear"))
-                    .tooltip(t!("group-auto-clear-tip"))
-                    .accessibility_label(t!("group-auto-clear-aria", group = row.name.as_str()))
-                    .on_change(move |next: &bool, window, cx| {
-                        let group = auto_group.clone();
-                        let view = auto_view.clone();
-                        if *next {
-                            view.update(cx, |view, cx| {
-                                view.open_auto_clear_opt_in_confirm(&group, true, window, cx)
-                            });
-                        } else {
-                            view.update(cx, |view, cx| {
-                                view.commit_auto_clear_off(&group, window, cx)
-                            });
-                        }
-                    });
-
-                let mut column = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(buttons)
-                    .child(
-                        div()
-                            .id(format!("group-auto-clear-{slug}"))
-                            .test_support()
-                            .child(auto_switch),
-                    )
-                    .child(
-                        div()
-                            .id(format!("group-kind-{slug}"))
-                            .test_support()
-                            .child(row.kind.clone()),
-                    );
-                if let Some(quota) = row.quota.clone() {
-                    column = column.child(
-                        div()
-                            .id(format!("group-quota-{slug}"))
-                            .test_support()
-                            .child(quota),
-                    );
-                }
-                form = form.child(
-                    field()
-                        .label(format!("{} ({})", row.name, row.count))
-                        .child(column),
-                );
-            }
-            sheet
-                .title(t!("groups-title"))
-                .child(form)
-                .size(px(520.))
-                .footer(sheet_footer(
-                    "groups-dialog-ok",
-                    None,
-                    &footer_commit_label("groups"),
-                    commit_click,
-                ))
-        });
-    }
-
     pub(crate) fn open_group_rename_dialog(
         &mut self,
         old: &str,
@@ -1372,7 +1183,7 @@ impl AppView {
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let new_name = reader.read(cx).value().to_string();
             view.update(cx, |view, cx| {
-                view.commit_rename_group(&old_for_commit, &new_name, window, cx)
+                view.rename_group_scope(&old_for_commit, &new_name, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -1479,7 +1290,14 @@ impl AppView {
         let renamed = new.trim().to_string();
         if renamed != old {
             match self.store.rename_group(old, &renamed) {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(index) = self.created_groups.iter().position(|group| group == old) {
+                        self.created_groups[index] = renamed.clone();
+                    }
+                    if matches!(&self.scope, LibraryScope::Group(name) if name == old) {
+                        self.scope = LibraryScope::Group(renamed.clone());
+                    }
+                }
                 Err(error) => {
                     window.push_notification(
                         Notification::error(t!("cannot-rename-group", error = error.to_string())),
@@ -1502,12 +1320,12 @@ impl AppView {
         self.reload(window, cx);
 
         window.push_notification(
-            Notification::success(t!("group-updated", name = renamed)),
+            Notification::success(t!("group-updated", name = renamed.as_str())),
             cx,
         );
         window.close_all_dialogs(cx);
         reclaim_shell_focus(window, cx);
-        self.open_groups_dialog(window, cx);
+        self.open_group_manage_sheet(&renamed, window, cx);
         true
     }
 
@@ -1520,6 +1338,29 @@ impl AppView {
     ) -> bool {
         match self.store.rename_group(old, new) {
             Ok(outcome) if outcome.rows == 0 && outcome.subscriptions == 0 => {
+                // A group created from the nav exists only in the session
+                // until a row moves into it; its rename has no store rows to
+                // touch.
+                if let Some(index) = self.created_groups.iter().position(|group| group == old) {
+                    let renamed = new.trim().to_string();
+                    self.created_groups[index] = renamed.clone();
+                    if matches!(&self.scope, LibraryScope::Group(name) if name == old) {
+                        self.scope = LibraryScope::Group(renamed.clone());
+                    }
+                    self.refresh_scope_index(cx);
+                    window.push_notification(
+                        Notification::success(t!(
+                            "group-renamed",
+                            old = old,
+                            new = renamed,
+                            moved = ""
+                        )),
+                        cx,
+                    );
+                    window.close_all_dialogs(cx);
+                    reclaim_shell_focus(window, cx);
+                    return true;
+                }
                 window.push_notification(
                     Notification::warning(t!("group-holds-no-rows", name = old)),
                     cx,
@@ -1528,6 +1369,12 @@ impl AppView {
             }
             Ok(outcome) => {
                 let renamed = new.trim().to_string();
+                if matches!(&self.scope, LibraryScope::Group(name) if name == old) {
+                    self.scope = LibraryScope::Group(renamed.clone());
+                }
+                if let Some(index) = self.created_groups.iter().position(|group| group == old) {
+                    self.created_groups[index] = renamed.clone();
+                }
                 self.reload(window, cx);
 
                 let mut moved = Vec::new();
@@ -1568,6 +1415,10 @@ impl AppView {
     ) {
         match self.store.delete_group(name) {
             Ok(()) => {
+                self.created_groups.retain(|group| group != name);
+                if matches!(&self.scope, LibraryScope::Group(group) if group == name) {
+                    self.scope = LibraryScope::All;
+                }
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(t!("group-deleted-empty", name = name)),
@@ -1623,11 +1474,10 @@ impl AppView {
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
-                        view.commit_delete_group(&group, window, cx);
+                        view.delete_group_scope(&group, window, cx);
 
                         window.close_dialog(cx);
                         window.close_dialog(cx);
-                        view.open_groups_dialog(window, cx);
                         reclaim_shell_focus(window, cx);
                     });
                     false

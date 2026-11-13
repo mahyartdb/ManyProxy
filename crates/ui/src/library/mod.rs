@@ -904,8 +904,19 @@ impl ListDelegate for LibraryDelegate {
                 let edit_id = row_id.clone();
                 let menu_view = app_view.clone();
                 let menu_id = row_id.clone();
+                let drag_view = app_view.clone();
+                let drag_name = row_name.clone();
                 item.child(
                     surface
+                        // The row is the drag source; the nav's group entries are
+                        // the drop targets. The kit's drag threshold keeps the
+                        // row's click and selection intact.
+                        .on_drag(RowDrag { id: row_id.clone() }, move |_, _, _, cx| {
+                            drag_view.update(cx, |view, cx| view.clear_row_drop(cx));
+                            cx.new(|_| RowDragPreview {
+                                label: drag_name.clone(),
+                            })
+                        })
                         // The row's own click. It lives on the surface, not on
                         // the list item, so the endpoint chip keeps its own
                         // click: the chip copies, the rest of the row selects.

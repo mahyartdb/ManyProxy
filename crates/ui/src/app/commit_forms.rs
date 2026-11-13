@@ -588,19 +588,16 @@ impl AppView {
         }
     }
 
-    /// The retired Library menu's prune family. Slice 7 re-homes it in the
-    /// group and source manage sheet.
-    #[allow(dead_code)]
+    /// The group manage sheet's prune family. The sheet names its group; no
+    /// selected row is required.
     pub(crate) fn commit_prune(
         &mut self,
         kind: GroupPruneKind,
+        group: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(Notification::info(t!("no-group-focus")), cx);
-            return;
-        };
+        let group = group.to_string();
 
         let targets: Vec<ProxyConfig> = match kind {
             GroupPruneKind::Duplicates => self

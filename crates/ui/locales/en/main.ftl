@@ -17,6 +17,53 @@ titlebar-close = Close the window
 
 # Shell
 nav-all-configs = All configs
+nav-all-tip =
+    { $count } { $count ->
+        [one] configuration
+       *[other] configurations
+    } in the library
+nav-groups = Groups
+nav-sources = Sources
+nav-ungrouped = Ungrouped
+nav-ungrouped-tip = Configs in the default group "{ $group }"
+nav-group-tip =
+    { $count } { $count ->
+        [one] config
+       *[other] configs
+    } in { $name }
+nav-source-tip =
+    { $name } · { $count } { $count ->
+        [one] configuration
+       *[other] configurations
+    } · { $group }
+nav-new-group = New group
+nav-new-group-tip = Create a group
+nav-manage = Manage.
+nav-manage-sources = Manage sources.
+nav-refresh-source = Refresh { $name }
+scope-update-disabled = Select a group or source scope first
+
+# Source strip
+source-strip-fresh = Fresh
+source-strip-stale = Stale
+source-strip-failed = Failed
+source-strip-never = Never refreshed
+source-strip-configs =
+    { $count } { $count ->
+        [one] config
+       *[other] configs
+    }
+source-strip-running =
+    { $count } running
+source-strip-updated = Updated { $when }
+source-strip-quota = Used { $used } of { $total }
+source-strip-quota-used = Used { $used }
+source-strip-quota-total = { $total } available
+source-strip-expires = Expires { $when }
+source-strip-refresh = Refresh
+source-strip-manage = Manage.
+source-strip-all = All configs
+
 nav-routing-presets = Routing presets
 action-overflow = More actions
 engine-bar-aria = Engine status and global actions
@@ -46,22 +93,6 @@ toolbar-export-tip = Export library to JSON
 toolbar-about = About
 toolbar-about-tip = Version, sidecars, shortcuts
 toolbar-settings-tip = Settings
-toolbar-library = Library
-toolbar-library-tip = Subscriptions, groups, and cleanup
-toolbar-subscriptions = Subscriptions…
-toolbar-subscriptions-tip = Manage subscription lists
-toolbar-groups = Groups…
-toolbar-groups-tip = Rename or merge groups
-toolbar-prune-duplicates-tip = Remove later copies in the focused group (asks first)
-toolbar-prune-unavailable-tip = Remove dead rows in the focused group (asks first)
-toolbar-prune-invalid-tip = Remove validation-failing rows in the focused group (asks first)
-toolbar-prune-clear-tests-tip = Clear test results in the focused group (rows kept, asks first)
-toolbar-routing = Routing
-toolbar-routing-tip = Routing presets and settings
-toolbar-routing-presets = Routing presets
-toolbar-routing-presets-tip = Manage routing presets
-toolbar-attach-preset = Attach preset to selected row
-toolbar-attach-preset-tip = Pick a routing preset for the selected row
 toolbar-open-settings-tip = Open Settings
 toolbar-tools = Tools
 toolbar-tools-tip = Selection, diagnostics, and commands
@@ -77,8 +108,6 @@ toolbar-runtime-stats = Runtime stats
 toolbar-runtime-stats-tip = Process health on one screen
 toolbar-traffic-stats = Traffic stats
 toolbar-traffic-stats-tip = Per-exit traffic with period and By Profile
-toolbar-show-security = Show security
-toolbar-show-security-tip = Toggle the transport-security column
 toolbar-check-updates = Check for updates
 toolbar-check-updates-tip = Fetch the release feed once (JSON only — nothing downloads or runs)
 toolbar-palette-tip = Every action, searchable (Ctrl-K)
@@ -430,6 +459,24 @@ group-quota-used = Used { $bytes }
 group-quota-remain = Remain { $bytes }
 group-quota-expire = Expire { $expire }
 group-kind-basic = Basic group
+group-manage-action = Manage group.
+group-manage-title = Manage group "{ $group }"
+group-manage-count =
+    { $count } { $count ->
+        [one] configuration
+       *[other] configurations
+    }
+group-manage-refresh = Refresh subscriptions
+group-manage-refresh-tip = Refresh every subscription feeding this group
+group-manage-refresh-disabled = No subscription feeds this group
+group-new-title = New group
+group-new-field = Group name
+group-new-empty = Enter a name for the group
+group-new-reserved = That name is reserved - it is the Ungrouped bucket
+group-new-exists = Group "{ $name }" already exists
+group-moved = Moved "{ $name }" to { $group }
+group-already-in = "{ $name }" is already in { $group }
+group-drop-all = All configs has no group to move a config into
 group-kind-subscription = Subscription ({ $count })
 group-skip-marker = auto-refresh skipped
 group-quota-with-skip = { $line } · { $marker }
@@ -445,6 +492,7 @@ group-edit-tip = Rename + auto-refresh skip for this group
 group-update = Update
 group-update-tip = Refresh this group's subscription(s) now (manual — runs even when auto-skipped)
 group-delete = Delete
+group-delete-action = Delete group.
 group-delete-title = Delete group
 group-auto-clear = Auto-clear unavailable
 group-auto-clear-tip = Opt-in per group: after this group's URL test ends, its unavailable rows are removed automatically. Running rows and the row being edited are never removed; enabling asks its own confirmation.
@@ -1059,7 +1107,7 @@ shortcut-toggle-focused = Toggle focused row
 shortcut-clear-selection = Clear selection
 shortcut-copy-urls = Copy URLs
 shortcut-command-palette = Command palette
-shortcut-update-group = Update the group in focus
+shortcut-update-group = Update the current scope
 settings-dialog-title = Settings
 settings-footer-esc = Esc cancels without saving
 settings-save-tooltip = Save the text fields and close
@@ -1572,7 +1620,7 @@ action-label-paste-import = Import from clipboard
 action-label-export-library = Export library
 action-label-open-palette = Command palette
 action-label-focus-search = Focus search field
-action-label-update-current-group = Update current group
+action-label-update-current-scope = Update the current scope
 action-label-stop-testing = Stop testing
 action-label-start-all = Start all
 action-label-stop-all = Stop all

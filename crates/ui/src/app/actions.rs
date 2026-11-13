@@ -110,13 +110,15 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         &[],
         AppView::set_compact_density,
     ),
-    selected(
-        "update-current-group",
-        "action-label-update-current-group",
-        &["update", "group"],
-        &[("ctrl-r", "Ctrl+R")],
-        AppView::update_current_group,
-    ),
+    ActionDef {
+        id: "update-current-group",
+        label_key: "action-label-update-current-scope",
+        keywords: &["update", "group", "source", "scope"],
+        tooltip_key: None,
+        shortcuts: &[("ctrl-r", "Ctrl+R")],
+        enabled: scope_has_update_target,
+        run: Handler::Selected(AppView::update_current_group),
+    },
     selected(
         "stop-testing",
         "action-label-stop-testing",
@@ -158,13 +160,6 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         &["preset", "routing", "rules"],
         &[],
         AppView::open_presets_dialog,
-    ),
-    selected(
-        "groups",
-        "action-label-groups",
-        &["group", "move"],
-        &[],
-        AppView::open_groups_dialog,
     ),
     selected(
         "logs",
@@ -363,6 +358,12 @@ fn always(_view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
     true
 }
 
+/// R20: `Ctrl+R` updates the scope, so it refuses under `All configs` rather
+/// than guessing a group from the selected row.
+fn scope_has_update_target(view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
+    !matches!(view.scope, LibraryScope::All)
+}
+
 /// A row verb only runs when there is a row. A `Row` target is always one;
 /// a selection target can be empty, and that refusal is the only place the
 /// palette, the menus and the shortcuts say "select a row first".
@@ -478,7 +479,6 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
         &[
             "subscriptions",
             "presets",
-            "groups",
             "logs",
             "settings",
             "about",
@@ -521,7 +521,14 @@ pub(crate) fn run_action(
 ) {
     let def = action(id);
     if !(def.enabled)(view, target, cx) {
-        window.push_notification(Notification::info(no_selection_message()), cx);
+        // R20 carries its own reason: the action is refused because the scope
+        // has no update target, not because no row is selected.
+        let message = if id == "update-current-group" {
+            t!("scope-update-disabled")
+        } else {
+            no_selection_message()
+        };
+        window.push_notification(Notification::info(message), cx);
         return;
     }
     match def.run {

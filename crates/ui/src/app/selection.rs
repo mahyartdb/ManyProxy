@@ -176,18 +176,24 @@ impl AppView {
     /// back to the shell: with no row selected there is nothing for the
     /// list's key context to drive.
     pub(crate) fn clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.selection_changed();
-        self.selection.clear();
-        self.selection_anchor = None;
-        self.selection_focus = None;
+        self.reset_selection(cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
+    /// Drop every trace of the selection without moving the keyboard focus.
+    /// `clear_selection` adds the focus move; `refresh_scope_index` uses this
+    /// when a scope's bucket disappeared and it falls back to `All`.
+    pub(crate) fn reset_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection_changed();
+        self.selection.clear();
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        cx.notify();
+    }
+
     /// A scope change drops the selection, the anchor and the focus: the rows
-    /// the old scope held are not in the new one. Slice 7 owns the scope
-    /// switch and calls this.
-    #[allow(dead_code)]
+    /// the old scope held are not in the new one.
     pub(crate) fn clear_selection_for_scope_change(
         &mut self,
         window: &mut Window,

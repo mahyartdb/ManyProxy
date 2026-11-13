@@ -2,14 +2,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::*;
 
-/// The library scope. Slice 3 only launches `All`; the group and source arms
-/// exist so the query never grows a second, mirrored filter axis when the nav
-/// starts passing one (R1).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The library scope. The nav is the only place a group or source is chosen
+/// (R1); the query composes it with the facets instead of mirroring it into
+/// `FilterQuery`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum LibraryScope {
     #[default]
     All,
     Group(String),
+    /// The store's default group, labelled `Ungrouped` in the nav.
+    Ungrouped,
     Source(String),
 }
 
@@ -18,9 +20,16 @@ impl LibraryScope {
         match self {
             Self::All => true,
             Self::Group(name) => &row.group == name,
+            Self::Ungrouped => row.group == DEFAULT_GROUP,
             Self::Source(id) => row.subscription_id.as_deref() == Some(id.as_str()),
         }
     }
+}
+
+/// The scope predicate as a free function, for callers that keep the scope
+/// beside the row list rather than inside the query.
+pub fn scope_matches(scope: &LibraryScope, row: &ProxyConfig) -> bool {
+    scope.contains(row)
 }
 
 /// The five values the status multi-select offers. This is the pure spelling
@@ -207,6 +216,19 @@ pub fn visible_count(
 /// M: the rows in the current scope before search and facets.
 pub fn scope_total(rows: &[ProxyConfig], scope: &LibraryScope) -> usize {
     rows.iter().filter(|row| scope.contains(row)).count()
+}
+
+/// Every scope's total, measured before search and facets. The nav stores
+/// this on the row-load path so a repaint never recounts the library.
+pub fn scope_counts(rows: &[ProxyConfig], scopes: &[LibraryScope]) -> Vec<(LibraryScope, usize)> {
+    scopes
+        .iter()
+        .cloned()
+        .map(|scope| {
+            let count = scope_total(rows, &scope);
+            (scope, count)
+        })
+        .collect()
 }
 
 /// How many selected ids the current visible set hides. The selection is not
@@ -697,6 +719,144 @@ mod tests {
         query.set_search("alpha");
         assert_eq!(visible_count(&rows, &index, &facts, &scope, &query), 1);
         assert_eq!(scope_total(&rows, &scope), 2);
+    }
+
+    #[test]
+    fn scope_matches_all_group_ungrouped_and_source() {
+        #[allow(clippy::useless_vec)] // rows[2] is mutated below
+        let mut rows = [
+            row("1", "alpha", "vless", "work", "127.0.0.1", 10801),
+            row("2", "beta", "vless", DEFAULT_GROUP, "127.0.0.1", 10802),
+            row("3", "gamma", "vless", "home", "127.0.0.1", 10803),
+        ];
+        rows[2].subscription_id = Some("sub-1".to_string());
+
+        assert!(scope_matches(&LibraryScope::All, &rows[0]));
+        assert!(scope_matches(
+            &LibraryScope::Group("work".to_string()),
+            &rows[0]
+        ));
+        assert!(!scope_matches(
+            &LibraryScope::Group("work".to_string()),
+            &rows[1]
+        ));
+        assert!(scope_matches(&LibraryScope::Ungrouped, &rows[1]));
+        assert!(!scope_matches(&LibraryScope::Ungrouped, &rows[0]));
+        assert!(scope_matches(
+            &LibraryScope::Source("sub-1".to_string()),
+            &rows[2]
+        ));
+        assert!(!scope_matches(
+            &LibraryScope::Source("sub-1".to_string()),
+            &rows[0]
+        ));
+    }
+
+    #[test]
+    fn ungrouped_is_the_default_group_bucket() {
+        let rows = vec![
+            row("1", "alpha", "vless", DEFAULT_GROUP, "127.0.0.1", 10801),
+            row("2", "beta", "vless", "Home", "127.0.0.1", 10802),
+        ];
+        assert_eq!(
+            filter(
+                &rows,
+                &indexes(&rows),
+                &facts(
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &HashSet::new(),
+                    &HashMap::new()
+                ),
+                &LibraryScope::Ungrouped,
+                &FilterQuery::default()
+            ),
+            vec![0],
+            "the default bucket holds only the store's default group"
+        );
+        assert_eq!(
+            scope_total(&rows, &LibraryScope::Group("Home".to_string())),
+            1
+        );
+    }
+
+    #[test]
+    fn scope_counts_ignore_the_query() {
+        let rows = vec![
+            row("1", "alpha", "vless", "work", "127.0.0.1", 10801),
+            row("2", "beta", "vless", "work", "127.0.0.1", 10802),
+            row("3", "gamma", "vless", DEFAULT_GROUP, "127.0.0.1", 10803),
+        ];
+        let scopes = vec![
+            LibraryScope::All,
+            LibraryScope::Group("work".to_string()),
+            LibraryScope::Ungrouped,
+        ];
+        let counts = scope_counts(&rows, &scopes);
+        assert_eq!(
+            counts,
+            vec![
+                (LibraryScope::All, 3),
+                (scopes[1].clone(), 2),
+                (LibraryScope::Ungrouped, 1)
+            ]
+        );
+
+        let mut query = FilterQuery::default();
+        query.set_search("alpha");
+        assert_eq!(
+            filter(
+                &rows,
+                &indexes(&rows),
+                &facts(
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &HashSet::new(),
+                    &HashMap::new()
+                ),
+                &LibraryScope::All,
+                &query
+            )
+            .len(),
+            1,
+            "the query narrows the table"
+        );
+        assert_eq!(
+            scope_counts(&rows, &scopes),
+            counts,
+            "the nav counts do not move with a search"
+        );
+    }
+
+    #[test]
+    fn scope_total_is_the_rows_in_the_scope_before_the_query() {
+        let rows = vec![
+            row("1", "alpha", "vless", "work", "127.0.0.1", 10801),
+            row("2", "beta", "vless", "work", "127.0.0.1", 10802),
+        ];
+        let mut query = FilterQuery::default();
+        query.set_search("alpha");
+        assert_eq!(
+            filter(
+                &rows,
+                &indexes(&rows),
+                &facts(
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &HashSet::new(),
+                    &HashMap::new()
+                ),
+                &LibraryScope::Group("work".to_string()),
+                &query
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            scope_total(&rows, &LibraryScope::Group("work".to_string())),
+            2,
+            "M ignores the query"
+        );
     }
 
     #[test]
