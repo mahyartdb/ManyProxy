@@ -207,9 +207,8 @@ impl AppView {
                     }
                     refresh.on_click(move |_, window, cx| {
                         let group = refresh_group.clone();
-                        refresh_view.update(cx, |view, cx| {
-                            view.update_group_subs(&group, window, cx)
-                        });
+                        refresh_view
+                            .update(cx, |view, cx| view.update_group_subs(&group, window, cx));
                     })
                 });
             let auto_clear_switch = Switch::new("group-manage-auto-clear-switch")
@@ -251,29 +250,25 @@ impl AppView {
                 .child(field().label(group.clone()).child(detail))
                 .child(field().label_indent(false).child(actions))
                 .child(
-                    field()
-                        .label_indent(false)
-                        .child(
-                            div()
-                                .id("group-manage-auto-clear")
-                                .test_support()
-                                .child(auto_clear_switch),
-                        ),
+                    field().label_indent(false).child(
+                        div()
+                            .id("group-manage-auto-clear")
+                            .test_support()
+                            .child(auto_clear_switch),
+                    ),
                 )
                 .child(field().label_indent(false).child(prunes))
                 .child(
-                    field()
-                        .label_indent(false)
-                        .child(
-                            Button::new("group-manage-delete")
-                                .label(t!("group-delete-action"))
-                                .on_click(move |_, window, cx| {
-                                    let group = delete_group.clone();
-                                    delete_view.update(cx, |view, cx| {
-                                        view.open_group_delete_confirm(&group, window, cx)
-                                    });
-                                }),
-                        ),
+                    field().label_indent(false).child(
+                        Button::new("group-manage-delete")
+                            .label(t!("group-delete-action"))
+                            .on_click(move |_, window, cx| {
+                                let group = delete_group.clone();
+                                delete_view.update(cx, |view, cx| {
+                                    view.open_group_delete_confirm(&group, window, cx)
+                                });
+                            }),
+                    ),
                 );
             sheet
                 .title(t!("group-manage-title", group = group.as_str()))

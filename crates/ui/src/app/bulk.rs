@@ -1291,11 +1291,7 @@ impl AppView {
         if renamed != old {
             match self.store.rename_group(old, &renamed) {
                 Ok(_) => {
-                    if let Some(index) = self
-                        .created_groups
-                        .iter()
-                        .position(|group| group == old)
-                    {
+                    if let Some(index) = self.created_groups.iter().position(|group| group == old) {
                         self.created_groups[index] = renamed.clone();
                     }
                     if matches!(&self.scope, LibraryScope::Group(name) if name == old) {
@@ -1345,11 +1341,7 @@ impl AppView {
                 // A group created from the nav exists only in the session
                 // until a row moves into it; its rename has no store rows to
                 // touch.
-                if let Some(index) = self
-                    .created_groups
-                    .iter()
-                    .position(|group| group == old)
-                {
+                if let Some(index) = self.created_groups.iter().position(|group| group == old) {
                     let renamed = new.trim().to_string();
                     self.created_groups[index] = renamed.clone();
                     if matches!(&self.scope, LibraryScope::Group(name) if name == old) {
@@ -1380,11 +1372,7 @@ impl AppView {
                 if matches!(&self.scope, LibraryScope::Group(name) if name == old) {
                     self.scope = LibraryScope::Group(renamed.clone());
                 }
-                if let Some(index) = self
-                    .created_groups
-                    .iter()
-                    .position(|group| group == old)
-                {
+                if let Some(index) = self.created_groups.iter().position(|group| group == old) {
                     self.created_groups[index] = renamed.clone();
                 }
                 self.reload(window, cx);

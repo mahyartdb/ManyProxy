@@ -721,9 +721,7 @@ impl AppView {
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     let group = ok_group.clone();
-                    view.update(cx, |view, cx| {
-                        view.commit_prune(kind, &group, window, cx)
-                    });
+                    view.update(cx, |view, cx| view.commit_prune(kind, &group, window, cx));
                     true
                 })
         });

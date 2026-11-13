@@ -83,9 +83,7 @@ impl AppView {
                     *source_running.entry(sub_id.to_string()).or_default() += 1;
                 }
                 if let Some((rx, tx)) = delegate.traffic.get(&row.id) {
-                    let slot = source_traffic
-                        .entry(sub_id.to_string())
-                        .or_insert((0, 0));
+                    let slot = source_traffic.entry(sub_id.to_string()).or_insert((0, 0));
                     slot.0 = slot.0.saturating_add(*rx);
                     slot.1 = slot.1.saturating_add(*tx);
                 }
@@ -135,7 +133,11 @@ impl AppView {
 
             let scopes: Vec<LibraryScope> = std::iter::once(LibraryScope::All)
                 .chain(groups.iter().map(|group| group.scope.clone()))
-                .chain(sources.iter().map(|source| LibraryScope::Source(source.id.clone())))
+                .chain(
+                    sources
+                        .iter()
+                        .map(|source| LibraryScope::Source(source.id.clone())),
+                )
                 .collect();
             let counts = scope_counts(&delegate.rows, &scopes);
             (counts, groups, sources)
@@ -143,9 +145,9 @@ impl AppView {
 
         let scope_lives = match &self.scope {
             LibraryScope::All => true,
-            LibraryScope::Group(name) => groups
-                .iter()
-                .any(|group| matches!(&group.scope, LibraryScope::Group(candidate) if candidate == name)),
+            LibraryScope::Group(name) => groups.iter().any(
+                |group| matches!(&group.scope, LibraryScope::Group(candidate) if candidate == name),
+            ),
             LibraryScope::Ungrouped => groups.iter().any(|group| group.ungrouped),
             LibraryScope::Source(id) => sources.iter().any(|source| &source.id == id),
         };
@@ -323,7 +325,11 @@ impl AppView {
             let tip = if group.ungrouped {
                 t!("nav-ungrouped-tip", group = DEFAULT_GROUP)
             } else {
-                t!("nav-group-tip", count = group.count, name = group.name.as_str())
+                t!(
+                    "nav-group-tip",
+                    count = group.count,
+                    name = group.name.as_str()
+                )
             };
             section = section.child(self.render_scope_entry(
                 ScopeEntrySpec {
@@ -680,15 +686,16 @@ impl AppView {
                 let hover_group = group.clone();
                 let drop_group = group.clone();
                 row = row
-                    .on_drag_move(
-                        cx.listener(move |view, event: &DragMoveEvent<RowDrag>, _, cx| {
+                    .on_drag_move(cx.listener(
+                        move |view, event: &DragMoveEvent<RowDrag>, _, cx| {
                             if event.bounds.contains(&event.event.position) {
                                 view.hover_row_drop(&hover_group, cx);
-                            } else if view.row_drop_target.as_deref() == Some(hover_group.as_str()) {
+                            } else if view.row_drop_target.as_deref() == Some(hover_group.as_str())
+                            {
                                 view.clear_row_drop(cx);
                             }
-                        }),
-                    )
+                        },
+                    ))
                     .on_drop(cx.listener(move |view, drag: &RowDrag, window, cx| {
                         view.drop_row_on_group(&drag.id, Some(&drop_group), window, cx);
                     }));
@@ -713,11 +720,7 @@ impl AppView {
         row.into_any_element()
     }
 
-    fn group_context_menu(
-        menu: PopupMenu,
-        group: &str,
-        view: &Entity<AppView>,
-    ) -> PopupMenu {
+    fn group_context_menu(menu: PopupMenu, group: &str, view: &Entity<AppView>) -> PopupMenu {
         let slug = slugify_group_id(group);
         let manage_slug = slug.clone();
         let manage_view = view.clone();
