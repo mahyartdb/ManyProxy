@@ -22,9 +22,8 @@ impl AppView {
     /// The count truncates before the buttons do: at the minimum width the
     /// numbers give up their room first, never a control.
     pub(crate) fn render_action_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let libraries = self.libraries.read(cx);
-        let delegate = libraries.delegate();
-        let (total, enabled) = delegate.counts();
+        let total = self.scope_count(&self.scope);
+        let enabled = self.scope_enabled;
         let count_text = status_count_text(total, enabled);
         let view = cx.entity();
         let update_available = self.update_available.is_some();
@@ -34,7 +33,7 @@ impl AppView {
             .id("action-bar-title")
             .test_support()
             .flex_shrink_0()
-            .child(t!("nav-all-configs"));
+            .child(self.scope_label());
         let count = div()
             .id("action-bar-count")
             .test_support()

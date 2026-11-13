@@ -602,12 +602,13 @@ impl AppView {
         });
     }
 
-    /// The retired Library menu's prune family. Slice 7 re-homes it in the
-    /// group and source manage sheet.
-    #[allow(dead_code)]
+    /// The retired Library menu's prune family, re-homed in the group manage
+    /// sheet. The sheet names its group, so a right-click on an unselected
+    /// group prunes the group it opened for.
     pub(crate) fn open_prune_confirm(
         &mut self,
         kind: GroupPruneKind,
+        group: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -615,10 +616,7 @@ impl AppView {
             GroupPruneKind::ALL.contains(&kind),
             "prune kinds stay the pinned four"
         );
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(Notification::info(t!("no-group-focus")), cx);
-            return;
-        };
+        let group = group.to_string();
         let (title, description, ok) = match kind {
             GroupPruneKind::Duplicates => {
                 let (total, preview) = self
@@ -705,10 +703,12 @@ impl AppView {
             }
         };
         let view = cx.entity();
+        let ok_group = group.clone();
         open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let title = title.clone();
             let description = description.clone();
+            let ok_group = ok_group.clone();
             alert
                 .confirm()
                 .button_props(
@@ -720,7 +720,10 @@ impl AppView {
                 .title(title)
                 .description(description)
                 .on_ok(move |_, window, cx| {
-                    view.update(cx, |view, cx| view.commit_prune(kind, window, cx));
+                    let group = ok_group.clone();
+                    view.update(cx, |view, cx| {
+                        view.commit_prune(kind, &group, window, cx)
+                    });
                     true
                 })
         });
@@ -744,6 +747,8 @@ impl AppView {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let group = group.clone();
+            let cancel_group = group.clone();
+            let close_group = group.clone();
             let description = description.clone();
             alert
                 .confirm()
@@ -763,7 +768,7 @@ impl AppView {
                             if from_groups_sheet {
                                 window.close_all_dialogs(cx);
                                 reclaim_shell_focus(window, cx);
-                                view.open_groups_dialog(window, cx);
+                                view.open_group_manage_sheet(&group, window, cx);
                             }
                         });
                         !from_groups_sheet
@@ -778,7 +783,7 @@ impl AppView {
                         view.update(cx, |exposed, cx| {
                             window.close_all_dialogs(cx);
                             reclaim_shell_focus(window, cx);
-                            exposed.open_groups_dialog(window, cx);
+                            exposed.open_group_manage_sheet(&cancel_group, window, cx);
                         });
                         false
                     }
@@ -791,7 +796,7 @@ impl AppView {
                         }
                         view.update(cx, |exposed, cx| {
                             window.close_all_dialogs(cx);
-                            exposed.open_groups_dialog(window, cx);
+                            exposed.open_group_manage_sheet(&close_group, window, cx);
                         });
                         reclaim_shell_focus(window, cx);
                     }
@@ -2472,6 +2477,7 @@ impl AppView {
         focus_shell_before_overlay(window, cx);
         let kill_view = view.clone();
         let due_view = view.clone();
+        let update_all_view = view.clone();
 
         let close_view = view.clone();
 
@@ -2481,6 +2487,7 @@ impl AppView {
             let close_subs = close_view.clone();
             let kill_buttons = kill_view.clone();
             let due_buttons = due_view.clone();
+            let update_all_buttons = update_all_view.clone();
             let batch_progress = batch_progress;
             let refreshing_rows = refreshing_rows.clone();
             let mut body = div().flex().flex_col().gap_2();
@@ -2513,6 +2520,16 @@ impl AppView {
                             .on_click(move |_, window, cx| {
                                 due_buttons.update(cx, |view, cx| {
                                     view.refresh_all_due(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("subs-update-all")
+                            .label(t!("group-update-all"))
+                            .tooltip(t!("group-update-all-tip"))
+                            .on_click(move |_, window, cx| {
+                                update_all_buttons.update(cx, |view, cx| {
+                                    view.open_update_all_confirm(window, cx);
                                 });
                             }),
                     ),

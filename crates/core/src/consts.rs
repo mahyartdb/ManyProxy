@@ -40,5 +40,5 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Clear selection", "Esc"),
     ("Copy URLs", "Ctrl-U"),
     ("Command palette", "Ctrl-K"),
-    ("Update the group in focus", "Ctrl-R"),
+    ("Update the current scope", "Ctrl-R"),
 ];

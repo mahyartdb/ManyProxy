@@ -140,6 +140,33 @@ fn spawn_probe_progress_poller(
     .detach();
 }
 
+/// One group entry the nav paints. `scope` is the arm that selects it;
+/// `stored` is the store's group name, which `Ungrouped` maps to the default
+/// bucket. `sub_count` is what the manage sheet's refresh button reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupEntry {
+    pub(crate) name: String,
+    pub(crate) scope: LibraryScope,
+    pub(crate) count: usize,
+    pub(crate) sub_count: usize,
+    pub(crate) ungrouped: bool,
+}
+
+/// One source entry the nav paints. Health, quota and traffic are snapshotted
+/// on the row-load path so the nav and the strip never read the store per
+/// frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceEntry {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) group: String,
+    pub(crate) count: usize,
+    pub(crate) running: usize,
+    pub(crate) health: SourceHealth,
+    pub(crate) quota: Option<SourceQuotaLine>,
+    pub(crate) traffic: Option<(u64, u64)>,
+}
+
 /// F16: the refresh batch's progress counters and the in-flight set, together
 /// so a refresh starts, reports and clears as one unit. `AppView` reads
 /// `refresh_batch_progress` through it; nothing else may be added here without
@@ -546,6 +573,13 @@ impl AppView {
             ),
             query: FilterQuery::default(),
             scope: LibraryScope::All,
+            scope_counts: Vec::new(),
+            scope_enabled: 0,
+            created_groups: Vec::new(),
+            group_list: Vec::new(),
+            source_list: Vec::new(),
+            row_drop_target: None,
+            nav_scroll: ScrollHandle::new(),
             visible: Vec::new(),
             failure_filter: None,
             search_debounce: None,
@@ -617,6 +651,7 @@ impl AppView {
 
             list_cx.notify();
         });
+        view.refresh_scope_index(cx);
         view.apply_query(cx);
 
         cx.notify();
@@ -2530,21 +2565,20 @@ impl AppView {
         self.selected_config(cx).map(|config| config.group)
     }
 
+    /// `Ctrl+R` acts on the scope, never on the selected row. Under
+    /// `All configs` there is no scope to update; the action's enabled state
+    /// refuses it before this point, and this guard keeps a direct call honest.
     pub(crate) fn update_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(Notification::info(t!("no-group-focus")), cx);
-            return;
-        };
-        let subs = self
-            .store
-            .list_subscriptions()
-            .map(|subs| update_target_subs(&subs, &group))
-            .unwrap_or_default();
-        if subs.is_empty() {
-            window.push_notification(Notification::info(t!("group-no-subs", group = group)), cx);
-            return;
+        match self.scope.clone() {
+            LibraryScope::All => {
+                window.push_notification(Notification::info(t!("scope-update-disabled")), cx);
+            }
+            LibraryScope::Group(group) => self.update_group_subs(&group, window, cx),
+            LibraryScope::Ungrouped => self.update_group_subs(DEFAULT_GROUP, window, cx),
+            LibraryScope::Source(id) => {
+                self.refresh_subscription_by_id(&id, window, cx);
+            }
         }
-        self.start_explicit_refresh(subs, window, cx);
     }
 
     pub(crate) fn update_group_subs(

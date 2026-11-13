@@ -191,6 +191,7 @@ impl Render for AppView {
             // the window at a large text size.
             .min_w_0()
             .child(action_bar)
+            .children(self.render_scope_strip(cx))
             .child(filter_slot)
             .children(self.render_writable_banner(cx))
             .child(

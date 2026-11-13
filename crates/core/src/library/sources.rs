@@ -1,8 +1,8 @@
 //! Pure source health for the nav and the source strip.
 //!
 //! The store already records the last refresh, its error and the quota. This
-//! module turns those fields into the one status word and the one quota line
-//! the UI paints, so the nav dot and the strip can never disagree.
+//! module turns those fields into the one status word the nav dot paints and
+//! the quota parts the strip formats, so the two surfaces cannot disagree.
 
 use crate::*;
 
@@ -53,30 +53,28 @@ pub fn source_health(subscription: &Subscription, now: i64) -> SourceHealth {
     SourceHealth::from_last_refresh(status, subscription.last_refresh_at)
 }
 
-/// The quota segment of the strip. `Used X of Y` needs both numbers; a known
-/// used count alone still says something. The expiry is the second segment.
-pub fn source_quota_line(subscription: &Subscription, now: i64) -> Option<String> {
-    let mut segments = Vec::new();
-    match (subscription.quota_used, subscription.quota_total) {
-        (Some(used), Some(total)) => segments.push(format!(
-            "Used {} of {}",
-            format_bytes(used.max(0) as u64),
-            format_bytes(total.max(0) as u64)
-        )),
-        (Some(used), None) => segments.push(format!("Used {}", format_bytes(used.max(0) as u64))),
-        (None, Some(total)) => {
-            segments.push(format!("{} available", format_bytes(total.max(0) as u64)))
-        }
-        (None, None) => {}
+/// The quota numbers a source reported. The strip turns these into localized
+/// `Used X of Y` and `Expires …` segments; the core keeps the raw parts so it
+/// never owns UI copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceQuotaLine {
+    pub used: Option<i64>,
+    pub total: Option<i64>,
+    pub expire_at: Option<i64>,
+}
+
+pub fn source_quota_line(subscription: &Subscription) -> Option<SourceQuotaLine> {
+    if subscription.quota_used.is_none()
+        && subscription.quota_total.is_none()
+        && subscription.quota_expire.is_none()
+    {
+        return None;
     }
-    if let Some(expire) = subscription.quota_expire {
-        segments.push(format!("Expires {}", format_expire(expire, now)));
-    }
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments.join(" · "))
-    }
+    Some(SourceQuotaLine {
+        used: subscription.quota_used,
+        total: subscription.quota_total,
+        expire_at: subscription.quota_expire,
+    })
 }
 
 #[cfg(test)]
@@ -141,26 +139,31 @@ mod tests {
     }
 
     #[test]
-    fn source_quota_line_names_used_total_and_expiry() {
-        let now = 10_000;
-        let mut sub = subscription(Some(now), 3_600);
+    fn source_quota_line_keeps_raw_parts_and_skips_silent_sources() {
+        let mut sub = subscription(Some(10_000), 3_600);
+        assert_eq!(source_quota_line(&sub), None, "no quota, no line");
+
         sub.quota_used = Some(1_024);
         sub.quota_total = Some(4_096);
-        sub.quota_expire = Some(now + 86_400);
-        let line = source_quota_line(&sub, now).expect("quota line");
-        assert!(line.contains("Used 1.0 KB of 4.0 KB"), "{line}");
-        assert!(line.contains("Expires 24h left"), "{line}");
-
-        let mut used_only = subscription(None, 3_600);
-        used_only.quota_used = Some(1_024);
+        sub.quota_expire = Some(96_400);
         assert_eq!(
-            source_quota_line(&used_only, now).as_deref(),
-            Some("Used 1.0 KB")
+            source_quota_line(&sub),
+            Some(SourceQuotaLine {
+                used: Some(1_024),
+                total: Some(4_096),
+                expire_at: Some(96_400),
+            })
         );
+
+        let mut expire_only = subscription(None, 3_600);
+        expire_only.quota_expire = Some(96_400);
         assert_eq!(
-            source_quota_line(&subscription(None, 3_600), now),
-            None,
-            "no quota, no line"
+            source_quota_line(&expire_only),
+            Some(SourceQuotaLine {
+                used: None,
+                total: None,
+                expire_at: Some(96_400),
+            })
         );
     }
 }

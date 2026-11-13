@@ -81,6 +81,9 @@ impl AppView {
 
             list_cx.notify();
         });
+        // The nav index is a row-load product: one pass over the rows here,
+        // never a per-frame recount.
+        self.refresh_scope_index(cx);
         self.apply_query(cx);
         // A row that stopped existing leaves the selection; a row that is
         // merely filtered out stays.

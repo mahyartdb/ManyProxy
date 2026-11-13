@@ -131,9 +131,12 @@ use app::endpoint_editor::{
 };
 use app::focus::*;
 use app::kit_bits::*;
+use app::nav_scopes::{RowDrag, RowDragPreview};
 use app::open::*;
 use app::selection::{BatchKind, BatchRun};
-use app::state::{ConnectionState, ConsoleState, LogsState, PaneWindow, RefreshBatch};
+use app::state::{
+    ConnectionState, ConsoleState, GroupEntry, LogsState, PaneWindow, RefreshBatch, SourceEntry,
+};
 use app::window::*;
 use appearance::*;
 use chain::*;
@@ -363,8 +366,23 @@ struct AppView {
 
     /// Slice 3: the one query. Session-only, never written to the store.
     pub(crate) query: FilterQuery,
-    /// Slice 3: `All` until the nav starts owning group/source scopes.
+    /// Slice 7: the nav-owned scope. `All` until the user picks a group or a
+    /// source; the delegate reads it and never owns one.
     pub(crate) scope: LibraryScope,
+    /// Slice 7: every scope's total, recomputed on the row-load path. The nav
+    /// reads this instead of walking the library per frame.
+    pub(crate) scope_counts: Vec<(LibraryScope, usize)>,
+    /// Slice 7: enabled rows in the current scope, for the action-bar count.
+    pub(crate) scope_enabled: usize,
+    /// Slice 7: groups created in this session before any row used them.
+    /// Session-only; the store has no group registry.
+    pub(crate) created_groups: Vec<String>,
+    pub(crate) group_list: Vec<GroupEntry>,
+    pub(crate) source_list: Vec<SourceEntry>,
+    /// Slice 7: the group entry the row drag is hovering, for the drop rim.
+    pub(crate) row_drop_target: Option<String>,
+    /// Slice 7: the scope list's scroll offset. Session-only, never persisted.
+    pub(crate) nav_scroll: ScrollHandle,
     /// Slice 3: the rows the query keeps, in paint order. Owned here so the
     /// filter row, the batch bar and the empty state read one list.
     pub(crate) visible: Vec<usize>,
