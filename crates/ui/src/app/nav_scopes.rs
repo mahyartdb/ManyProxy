@@ -950,7 +950,10 @@ impl AppView {
             );
             return;
         }
-        match self.store.move_to_group(&[config.id.clone()], group) {
+        match self
+            .store
+            .move_to_group(std::slice::from_ref(&config.id), group)
+        {
             Ok(_) => {
                 self.reload(window, cx);
                 window.push_notification(

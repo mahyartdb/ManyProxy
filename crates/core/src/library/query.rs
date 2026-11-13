@@ -723,7 +723,8 @@ mod tests {
 
     #[test]
     fn scope_matches_all_group_ungrouped_and_source() {
-        let mut rows = vec![
+        #[allow(clippy::useless_vec)] // rows[2] is mutated below
+        let mut rows = [
             row("1", "alpha", "vless", "work", "127.0.0.1", 10801),
             row("2", "beta", "vless", DEFAULT_GROUP, "127.0.0.1", 10802),
             row("3", "gamma", "vless", "home", "127.0.0.1", 10803),
