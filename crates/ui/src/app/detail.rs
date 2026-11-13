@@ -846,32 +846,6 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child(acting_on_label(config)),
             )
-            .child({
-                // T-03: the dirty marker rides the inspector's row header —
-                // the row is one line and has no room for it.
-                let dirty = self
-                    .libraries
-                    .read(cx)
-                    .delegate()
-                    .endpoint_is_dirty(&config.id, cx);
-                if !dirty {
-                    div().id("row-dirty-idle").test_support().into_any_element()
-                } else {
-                    let dirty_tip = t!("detail-dirty-tip", name = config.name.as_str());
-                    div()
-                        .id(format!("row-dirty-{}", config.id))
-                        .test_support()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(warning_text_color(cx.theme()))
-                        .tooltip({
-                            let tip = dirty_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(dirty_tip)
-                        .into_any_element()
-                }
-            })
             // K1/A4-3: the badge stays on the SAME line — the spacer pushes it
             // flush right instead of letting a long name wrap it onto a second
             // line.
@@ -895,7 +869,7 @@ impl AppView {
     /// pinned below the pane body).
     pub(crate) fn render_detail_endpoints(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
@@ -913,7 +887,17 @@ impl AppView {
             .to_string();
 
         let upstream = self.cached_upstream(cx, config);
-        let strip = self.render_row_editors(window, cx, config);
+        // Custom-config rows read their listens from JSON; the stored bind and
+        // port are display only, so there is nothing here to edit.
+        let endpoint_editable = !is_custom_config_protocol(&config.protocol);
+        let inline_editing = endpoint_editable
+            && self.endpoint_draft.as_ref().is_some_and(|draft| {
+                draft.row_id == config.id && draft.host == EndpointHost::InspectorInline
+            });
+        let inline_form = inline_editing
+            .then(|| self.endpoint_frame(cx))
+            .flatten()
+            .map(|frame| render_endpoint_form(cx.entity(), &frame, cx));
 
         div().id("config-endpoints").test_support().child(
             GroupBox::new()
@@ -949,29 +933,51 @@ impl AppView {
                         // per-row `[Copy]` buttons are gone.
                         .child({
                             let copy_id = config.id.clone();
-                            div()
+                            let edit_id = config.id.clone();
+                            let edit_view = cx.entity();
+                            let mut row = div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap_2()
                                 .w_full()
                                 .flex_shrink_0()
-                                .child(div().flex_1().min_w_0())
-                                .child(
-                                    Button::new("copy-endpoints")
+                                .child(div().flex_1().min_w_0());
+                            if endpoint_editable && !inline_editing {
+                                row = row.child(
+                                    Button::new("detail-endpoint-edit")
                                         .small()
-                                        .label(t!("detail-copy-urls"))
-                                        .accessibility_label(t!("detail-copy-urls-aria"))
-                                        .tooltip(t!("detail-copy-urls-tip"))
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.copy_row_urls(&copy_id, window, cx);
-                                        })),
-                                )
+                                        .label(t!("endpoint-edit"))
+                                        .accessibility_label(t!(
+                                            "endpoint-edit-aria",
+                                            name = config.name.as_str()
+                                        ))
+                                        .tooltip(t!("endpoint-edit-tip"))
+                                        .on_click(move |_, window, cx| {
+                                            edit_view.update(cx, |view, cx| {
+                                                view.open_endpoint_draft(
+                                                    &edit_id,
+                                                    EndpointHost::InspectorInline,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                );
+                            }
+                            row.child(
+                                Button::new("copy-endpoints")
+                                    .small()
+                                    .label(t!("detail-copy-urls"))
+                                    .accessibility_label(t!("detail-copy-urls-aria"))
+                                    .tooltip(t!("detail-copy-urls-tip"))
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.copy_row_urls(&copy_id, window, cx);
+                                    })),
+                            )
                         })
-                        // K1/A4-7: the editor strip lives INSIDE the block it edits.
-                        .child(strip)
-                        // The draft's live warning rides the strip that caused it.
-                        .children(self.render_row_endpoint_warning(cx, config)),
+                        // The one editor, inline, directly under the values.
+                        .children(inline_form),
                 ),
         )
     }
@@ -1172,218 +1178,6 @@ impl AppView {
                 .title(t!("detail-history-title"))
                 .gap_1()
                 .child(body),
-        )
-    }
-
-    /// The row's endpoint editors — K1/A4-4 now mounts this strip INSIDE the
-    /// endpoints block, with the ids kept stable (`row-bind-<id>`,
-    /// `row-port-input-<id>`) so the row and the inspector speak the same
-    /// names. Start/Stop live in the operate row; Edit lives in the row's
-    /// context menu — neither rides the strip anymore (K1/A4-8).
-    pub(crate) fn render_row_editors(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> AnyElement {
-        let row_id = config.id.clone();
-        let port_stored = config.port.to_string();
-        // The drafts live per row in the delegate; the inspector makes sure
-        // the selected row's editors exist before it draws them.
-        let editors = self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().ensure_row_inputs(
-                &row_id,
-                &config.bind_ip,
-                &port_stored,
-                window,
-                list_cx,
-            );
-            state.delegate().endpoint_inputs.get(&row_id).map(|inputs| {
-                (
-                    inputs.bind.clone(),
-                    inputs.port.clone(),
-                    inputs.picker.clone(),
-                )
-            })
-        });
-        let Some((bind_state, port_state, bind_picker)) = editors else {
-            return div().id("row-editors").test_support().into_any_element();
-        };
-        // T-33: custom-config rows stay JSON-governed — their listen comes
-        // from the document, so they keep the free-text bind field.
-        let custom_config_row = is_custom_config_protocol(&config.protocol);
-        let name = config.name.clone();
-        let bind_cell = if custom_config_row {
-            div()
-                .id(format!("row-bind-{}", config.id))
-                .test_support()
-                .w(px(118.))
-                .tooltip({
-                    let tip = t!("detail-bind-custom-tip", name = name.as_str());
-                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                })
-                .child(
-                    div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(
-                            Input::new(&bind_state)
-                                .id(format!("row-bind-input-{}", config.id))
-                                .small()
-                                // K1/A4-7: every strip input is bordered + mono.
-                                .bordered(true)
-                                .aria_label(t!("detail-bind-aria", name = name.as_str())),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .id(format!("row-bind-{}", config.id))
-                .test_support()
-                .w(px(118.))
-                .tooltip({
-                    let tip = t!("detail-bind-tip", name = name.as_str());
-                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                })
-                .child(
-                    // K1/A4-7: the picker matches the port field's mono frame.
-                    div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(
-                            Select::new(&bind_picker)
-                                .id(format!("row-bind-picker-{}", config.id))
-                                .small()
-                                .placeholder(t!("detail-bind-placeholder"))
-                                .accessibility_label(t!("detail-bind-aria", name = name.as_str())),
-                        ),
-                )
-                .into_any_element()
-        };
-        let add_button = (!custom_config_row).then(|| {
-            let add_view = cx.entity();
-            Button::new(format!("row-bind-add-{}", config.id))
-                .small()
-                .label(t!("detail-add-address"))
-                .accessibility_label(t!("detail-add-address-aria"))
-                .tooltip(t!("detail-add-address-tip", name = name.as_str()))
-                .on_click(move |_, window, cx| {
-                    add_view.update(cx, |view, cx| {
-                        view.open_settings_dialog(window, cx);
-                    });
-                })
-                .into_any_element()
-        });
-        div()
-            .id("row-editors")
-            .test_support()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .min_w_0()
-            // K1/A4-4: inside the Endpoints frame the strip needs no hairline
-            // or own padding — the GroupBox already separates it.
-            .key_context("row-endpoint")
-            .on_key_down(cx.listener({
-                let revert_id = row_id.clone();
-                move |view: &mut AppView,
-                      event: &KeyDownEvent,
-                      window: &mut Window,
-                      cx: &mut Context<AppView>| {
-                    if event.keystroke.key != "escape" {
-                        return;
-                    }
-                    let reverted = {
-                        let focused = view
-                            .libraries
-                            .read(cx)
-                            .delegate()
-                            .row_inputs_focused(&revert_id, window, cx);
-                        if !focused {
-                            false
-                        } else {
-                            let mut reverted = false;
-                            view.libraries.update(cx, |state, list_cx| {
-                                reverted = state
-                                    .delegate_mut()
-                                    .revert_row_inputs(&revert_id, window, list_cx);
-                            });
-                            reverted
-                        }
-                    };
-                    if reverted {
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }
-            }))
-            .child(bind_cell)
-            .children(add_button)
-            .child(
-                div()
-                    .id(format!("row-port-editor-{}", config.id))
-                    .test_support()
-                    .w(px(76.))
-                    .tooltip({
-                        let tip = t!(
-                            "detail-port-tip",
-                            bind = config.bind_ip.as_str(),
-                            port = config.port
-                        );
-                        move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                    })
-                    .child(
-                        div()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(
-                                Input::new(&port_state)
-                                    .id(format!("row-port-input-{}", config.id))
-                                    .small()
-                                    // K1/A4-7: the port field stopped being the
-                                    // borderless one wedged between Add… and value.
-                                    .bordered(true)
-                                    .aria_label(t!("detail-port-aria", name = name.as_str())),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// T-03: the draft's live warning — a colliding endpoint or a bind that
-    /// leaves loopback — rides with the editors that caused it.
-    pub(crate) fn render_row_endpoint_warning(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> Option<AnyElement> {
-        let delegate = self.libraries.read(cx).delegate();
-        let (bind_text, port_text) = delegate.endpoint_draft_texts(&config.id, cx)?;
-        if let Some(warning) =
-            bind_port_collision_warning(&delegate.rows, Some(&config.id), &bind_text, &port_text)
-        {
-            return Some(
-                div()
-                    .id(format!("row-endpoint-warn-{}", config.id))
-                    .test_support()
-                    .w_full()
-                    .text_sm()
-                    .text_color(danger_text_color(cx.theme()))
-                    .truncate()
-                    .child(warning)
-                    .into_any_element(),
-            );
-        }
-        let hint = lan_hint_for_bind(bind_text.trim())?;
-        Some(
-            div()
-                .id(format!("row-endpoint-warn-{}", config.id))
-                .test_support()
-                .w_full()
-                .text_sm()
-                .truncate()
-                .child(hint)
-                .into_any_element(),
         )
     }
 

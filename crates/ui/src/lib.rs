@@ -50,7 +50,7 @@ use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, ResizableState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::sheet::Sheet;
 use gpui_kit::component::shimmer::ShimmerText;
@@ -126,7 +126,10 @@ pub(crate) use i18n::t;
 
 use app::actions::*;
 use app::bits::*;
-use app::endpoint_editor::EndpointDraft;
+use app::endpoint_editor::{
+    render_endpoint_form, render_endpoint_popover, EndpointDraft, EndpointFrame, EndpointHost,
+    ENDPOINT_EDITOR_CONTEXT,
+};
 use app::focus::*;
 use app::kit_bits::*;
 use app::open::*;
@@ -154,7 +157,7 @@ pub(crate) use text::{
     bind_port_collision_warning, bulk_start_enable_flag_failed_message, bulk_start_failed_message,
     bulk_start_refused_message, bulk_start_unreadable_message, clear_group_tests_confirm_text,
     close_confirm_description, crash_notification_text, db_list_error_message,
-    dirty_endpoint_message, enabled_flag_message, export_confirm_description, export_count_message,
+    enabled_flag_message, export_confirm_description, export_count_message,
     export_overwrite_confirm_description, export_preview_description,
     group_delete_confirm_description, group_row_views, group_test_summary_toast,
     http_subscription_warning, import_files_label, import_preview_message, inspector_badge_text,
@@ -166,7 +169,7 @@ pub(crate) use text::{
     prune_invalid_confirm_text, prune_unavailable_confirm_text, refresh_summary_text,
     removed_message, restart_to_apply_message, restore_done_message, row_action_message,
     rule_set_summary, settings_clear_health_text, settings_clear_snapshot_text,
-    settings_clear_traffic_text, sidecar_presence_line, skipped_dirty_message, start_all_message,
+    settings_clear_traffic_text, sidecar_presence_line, start_all_message,
     start_all_partial_message, start_busy_message, stop_all_confirm_description, stop_all_message,
     subscription_failures_text, subscription_interval_failure_message, traffic_other_line,
     traffic_stats_summary_text, undo_failed_message, undo_restored_message,
@@ -187,6 +190,8 @@ actions!(
         ClearSelection,
         EditSelected,
         EditEndpoint,
+        ApplyEndpoint,
+        EscapeEndpoint,
         DeleteSelected,
         SelectPreviousRow,
         SelectNextRow,

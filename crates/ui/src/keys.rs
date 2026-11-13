@@ -87,6 +87,19 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
         ClearSelection,
         Some(APP_KEY_CONTEXT),
     ));
+    // The endpoint form is deeper than both the app and the kit popover, so
+    // Escape reverts/closes the draft and Enter applies before either host
+    // consumes the key.
+    keys.push(KeyBinding::new(
+        "escape",
+        EscapeEndpoint,
+        Some(ENDPOINT_EDITOR_CONTEXT),
+    ));
+    keys.push(KeyBinding::new(
+        "enter",
+        ApplyEndpoint,
+        Some(ENDPOINT_EDITOR_CONTEXT),
+    ));
     bind(&mut keys, "focus-search", FocusSearch);
     bind(&mut keys, "inspector-details", InspectorDetails);
     bind(&mut keys, "inspector-health", InspectorHealth);
