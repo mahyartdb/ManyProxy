@@ -314,7 +314,7 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
     row(
         "edit-endpoint",
         "action-label-edit-endpoint",
-        &["edit", "endpoint", "bind", "port", "address"],
+        &["edit", "endpoint", "bind", "port"],
         &[("ctrl-e", "Ctrl+E")],
         "action-tip-edit-endpoint",
         AppView::open_endpoint_for_row,

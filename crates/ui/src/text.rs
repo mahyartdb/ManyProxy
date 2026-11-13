@@ -795,7 +795,8 @@ pub(crate) fn shortcut_action_label(action: &str) -> String {
         "Stop selected" => t!("shortcut-stop-selected"),
         "Test selected" => t!("shortcut-test-selected"),
         "Stop Testing" => t!("shortcut-stop-testing"),
-        "Edit selected" => t!("shortcut-edit-selected"),
+        "Edit endpoint" => t!("shortcut-edit-endpoint"),
+        "Edit config" => t!("shortcut-edit-config"),
         "Delete selected" => t!("shortcut-delete-selected"),
         "Extend selection up" => t!("shortcut-extend-up"),
         "Extend selection down" => t!("shortcut-extend-down"),
@@ -928,9 +929,6 @@ pub(crate) fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
     }
     summary
 }
-pub(crate) fn skipped_dirty_message(names: &[String]) -> String {
-    t!("skipped-dirty", names = names.join(", "))
-}
 pub(crate) fn bulk_start_unreadable_message(ids: &[String]) -> String {
     t!(
         "bulk-start-unreadable",
@@ -979,9 +977,6 @@ pub(crate) fn start_busy_message() -> String {
 }
 pub(crate) fn already_running_message(name: &str) -> String {
     t!("already-running-toast", name = name)
-}
-pub(crate) fn dirty_endpoint_message(name: &str) -> String {
-    t!("dirty-endpoint-toast", name = name)
 }
 pub(crate) fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
     let failed = failed_names.len();
