@@ -5400,26 +5400,23 @@ fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String>
 }
 
 fn is_executable(path: &Path) -> bool {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let meta = match file.metadata() {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        return meta.permissions().mode() & 0o111 != 0;
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    // The engine sidecars are plain files; a directory that opens is not a
+    // runnable binary, and a missing one was already refused by the open.
+    std::fs::File::open(path).is_ok_and(|file| {
+        file.metadata().is_ok_and(|meta| {
+            meta.is_file() && {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
+        })
+    })
 }
 
 pub fn normalize_bind_key(bind: &str) -> String {
