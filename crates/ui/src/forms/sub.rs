@@ -1,17 +1,17 @@
 use crate::*;
 
 #[derive(Clone)]
-pub(crate) struct SubForm {
-    pub(crate) label: Entity<InputState>,
-    pub(crate) url: Entity<InputState>,
-    pub(crate) group: Entity<InputState>,
-    pub(crate) auto_refresh: Rc<RefCell<bool>>,
+pub struct SubForm {
+    pub label: Entity<InputState>,
+    pub url: Entity<InputState>,
+    pub group: Entity<InputState>,
+    pub auto_refresh: Rc<RefCell<bool>>,
 
-    pub(crate) interval_secs: Rc<RefCell<i64>>,
+    pub interval_secs: Rc<RefCell<i64>>,
 }
 
 impl SubForm {
-    pub(crate) fn restored(
+    pub fn restored(
         window: &mut Window,
         cx: &mut Context<AppView>,
         label: &str,
@@ -33,7 +33,7 @@ impl SubForm {
         }
     }
 
-    pub(crate) fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
+    pub fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
         let auto = self.auto_refresh.clone();
         let checked = *auto.borrow();
         let url = self.url.read(cx).value().to_string();

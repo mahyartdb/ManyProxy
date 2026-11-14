@@ -3,14 +3,14 @@ use crate::*;
 /// T-11: a snapshot of the three simple-rules boxes read from a form at
 /// commit time. Empty boxes contribute nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SimpleRuleBoxes {
-    pub(crate) direct: String,
-    pub(crate) block: String,
-    pub(crate) proxy: String,
+pub struct SimpleRuleBoxes {
+    pub direct: String,
+    pub block: String,
+    pub proxy: String,
 }
 
 impl SimpleRuleBoxes {
-    pub(crate) fn from_form(form: &PresetForm, cx: &App) -> Self {
+    pub fn from_form(form: &PresetForm, cx: &App) -> Self {
         Self {
             direct: form.simple_direct.read(cx).value().to_string(),
             block: form.simple_block.read(cx).value().to_string(),
@@ -18,7 +18,7 @@ impl SimpleRuleBoxes {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.direct.trim().is_empty()
             && self.block.trim().is_empty()
             && self.proxy.trim().is_empty()
@@ -29,7 +29,7 @@ impl SimpleRuleBoxes {
 /// fold always mirrors the text as typed and exists for this session only —
 /// nothing is persisted. Cheap: the parser is pure and small inputs are the
 /// norm.
-pub(crate) fn simple_rules_invalid_rows(
+pub fn simple_rules_invalid_rows(
     form: &PresetForm,
     cx: &App,
 ) -> Vec<(crate::preset::SimpleRulesBox, String)> {

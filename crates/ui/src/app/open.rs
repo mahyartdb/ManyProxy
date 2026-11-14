@@ -3,17 +3,18 @@
 //! Not here: commit handlers (see `commit_forms`) or plain rendering.
 use crate::*;
 
+use crate::app::columns::ColumnsSheetBody;
 use gpui_kit::component::list::ListState;
 
-const SING_BOX_RELEASES_URL: &str = "https://github.com/SagerNet/sing-box/releases";
-const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
+pub const SING_BOX_RELEASES_URL: &str = "https://github.com/SagerNet/sing-box/releases";
+pub const XRAY_RELEASES_URL: &str = "https://github.com/XTLS/Xray-core/releases";
 
 /// F10: the footer hint the palette carries, in one place so the test pins the
 /// same string the user reads.
-pub(crate) fn palette_footer_hint() -> String {
+pub fn palette_footer_hint() -> String {
     t!("palette-footer-hint")
 }
-pub(crate) fn palette_group_label(group: usize) -> String {
+pub fn palette_group_label(group: usize) -> String {
     match group {
         0 => t!("palette-group-library"),
         1 => t!("palette-group-manage"),
@@ -25,7 +26,7 @@ pub(crate) fn palette_group_label(group: usize) -> String {
 /// keywords and first shortcut chip; the table owns those, and the confirm
 /// handler resolves them through `run_action`, so a palette row cannot drift
 /// from the menus that show the same verb.
-fn palette_item(def: &'static ActionDef) -> CommandItem {
+pub fn palette_item(def: &'static ActionDef) -> CommandItem {
     let label = def.label();
     let mut item = CommandItem::new()
         .label(label.clone())
@@ -46,7 +47,7 @@ fn palette_item(def: &'static ActionDef) -> CommandItem {
     item
 }
 
-fn palette_items(group: usize) -> Vec<CommandItem> {
+pub fn palette_items(group: usize) -> Vec<CommandItem> {
     PALETTE_GROUPS[group]
         .1
         .iter()
@@ -55,7 +56,7 @@ fn palette_items(group: usize) -> Vec<CommandItem> {
 }
 
 impl AppView {
-    pub(crate) fn open_alert_dialog_after_root<F>(
+    pub fn open_alert_dialog_after_root<F>(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -68,12 +69,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_edit_for_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_edit_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -81,7 +77,8 @@ impl AppView {
         self.open_edit_dialog(config, window, cx);
     }
 
-    pub(crate) fn open_remove_for_row(
+    /// The row menu's `Assign preset`: the attach sheet for one config.
+    pub fn open_preset_attach_for_row(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -91,10 +88,30 @@ impl AppView {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
-        self.open_remove_confirm(config, window, cx);
+        let ids = vec![config.id.clone()];
+        self.open_preset_attach_dialog(config, ids, window, cx);
     }
 
-    pub(crate) fn open_traffic_reset_for_row(
+    /// The batch bar's `Assign preset`: the same sheet, applied to every
+    /// selected config.
+    pub fn open_preset_attach_for_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.selected_ids_in_visible_order(cx);
+        let Some(first) = ids.first().cloned() else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        };
+        let Some(config) = self.row_config(&first) else {
+            window.push_notification(Notification::warning(t!("already-removed")), cx);
+            return;
+        };
+        self.open_preset_attach_dialog(config, ids, window, cx);
+    }
+
+    pub fn open_traffic_reset_for_row(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -107,7 +124,7 @@ impl AppView {
         self.open_traffic_reset_confirm(config, window, cx);
     }
 
-    pub(crate) fn open_usage_reset_for_row(
+    pub fn open_usage_reset_for_row(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -120,7 +137,7 @@ impl AppView {
         self.open_usage_reset_confirm(config, window, cx);
     }
 
-    pub(crate) fn open_traffic_reset_confirm(
+    pub fn open_traffic_reset_confirm(
         &mut self,
         config: ProxyConfig,
         window: &mut Window,
@@ -161,11 +178,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_clear_traffic_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_clear_traffic_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description =
             settings_clear_traffic_text(self.libraries.read(cx).delegate().counts().0);
@@ -189,11 +202,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_clear_health_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_clear_health_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_health_text();
         open_app_alert_dialog(window, cx, move |alert, _, _| {
@@ -216,11 +225,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_clear_snapshot_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_clear_snapshot_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_snapshot_text();
         open_app_alert_dialog(window, cx, move |alert, _, _| {
@@ -243,12 +248,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_share_for_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_share_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -306,7 +306,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_lan_confirm_single(
+    pub fn open_lan_confirm_single(
         &mut self,
         config: ProxyConfig,
         window: &mut Window,
@@ -335,235 +335,25 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_tray_exit_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_tray_exit_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_preset_chooser_for_selected(window, cx);
     }
 
-    pub(crate) fn open_preset_chooser_for_selected(
+    pub fn open_preset_chooser_for_selected(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match self.selected_config(cx) {
-            Some(config) => self.open_preset_attach_dialog(config, window, cx),
+            Some(config) => {
+                let ids = vec![config.id.clone()];
+                self.open_preset_attach_dialog(config, ids, window, cx);
+            }
             None => window.push_notification(Notification::info(no_selection_message()), cx),
         }
     }
 
-    pub(crate) fn open_runtime_stats_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let uptime = format_uptime(self.started_at.elapsed().as_secs());
-        let running = self.engine.running_count();
-        let rows = self.store.list().unwrap_or_default();
-        let total = rows.len();
-        let running_binds: Vec<String> = rows
-            .iter()
-            .filter(|row| self.engine.is_running(&row.id))
-            .map(|row| format!("{}:{}", row.bind_ip, row.port))
-            .collect();
-        let traffic_line =
-            summed_traffic_text(&self.store).unwrap_or_else(|| t!("stats-usage-unavailable"));
-        let conns = self.conn.snapshot.len();
-        let (delta_rx, delta_tx) = self
-            .conn
-            .delta
-            .values()
-            .fold((0u64, 0u64), |(rx, tx), (d_rx, d_tx)| {
-                (rx.saturating_add(*d_rx), tx.saturating_add(*d_tx))
-            });
-        let subs = self.store.list_subscriptions().unwrap_or_default();
-        let now = now_unix();
-        let due = subs
-            .iter()
-            .filter(|sub| due_for_refresh_for(sub, now))
-            .count();
-        let subs_line = if self.store.subs_auto_refresh_enabled() {
-            t!("stats-subs-due", count = subs.len(), due = due)
-        } else {
-            t!("stats-subs-due-off", count = subs.len(), due = due)
-        };
-        let db_line = self
-            .store
-            .db_path()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map(|meta| format_bytes(meta.len()))
-            .unwrap_or_else(|| t!("stats-unknown"));
-        let selected_line = match self.selected_config(cx) {
-            Some(config) => {
-                let health = self.health_store.row_summary(&config.id);
-                let health = health.trim();
-                if health.is_empty() {
-                    t!("stats-selected-no-probes", name = config.name)
-                } else {
-                    t!("stats-selected-health", name = config.name, health = health)
-                }
-            }
-            None => t!("stats-none-selected"),
-        };
-        let shard_rows = shard_stat_rows(
-            &self.engine.shard_processes(),
-            &self.shard_rings,
-            &self.shard_denied,
-        );
-        let mut lines = vec![
-            t!("stats-uptime", uptime = uptime),
-            t!("stats-endpoints", running = running, total = total),
-            t!(
-                "stats-running",
-                list = if running_binds.is_empty() {
-                    "—".to_string()
-                } else {
-                    running_binds.join(", ")
-                }
-            ),
-            t!("stats-traffic", line = traffic_line),
-            t!("stats-connections", conns = conns),
-            t!(
-                "stats-session-delta",
-                down = format_bytes(delta_rx),
-                up = format_bytes(delta_tx)
-            ),
-            t!("stats-subscriptions", line = subs_line),
-            t!("stats-database", line = db_line),
-            t!("stats-selected", line = selected_line),
-        ];
-        lines.push(t!(
-            "stats-processes",
-            line = shard_stats_summary(&shard_rows)
-        ));
-        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
-            let mut body = div().flex().flex_col().gap_1();
-            for (ix, line) in lines.iter().enumerate() {
-                body = body.child(
-                    div()
-                        .id(format!("runtime-stat-{ix}"))
-                        .test_support()
-                        .text_sm()
-                        .child(line.clone()),
-                );
-            }
-            body = body.child(
-                div()
-                    .id("runtime-shard-stats")
-                    .test_support()
-                    .mt_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(div().text_xs().child(t!("stats-sidecar-tip"))),
-            );
-            for row in shard_rows.iter() {
-                body = body.child(shard_stat_row_view(row));
-            }
-            dialog
-                .title(t!("stats-runtime-title"))
-                .child(body)
-                .button_props(DialogButtonProps::default())
-                .footer(dialog_footer(
-                    "runtime-stats-ok",
-                    "runtime-stats-cancel",
-                    &footer_commit_label("runtime-stats"),
-                    Rc::new(|_, _| true),
-                ))
-        });
-    }
-
-    pub(crate) fn open_traffic_stats_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let view = cx.entity();
-        let period = self.traffic_period;
-        let rows = self.store.list().unwrap_or_default();
-        let totals = self.store.traffic_totals().unwrap_or_default();
-        let exits = aggregate_exit_traffic(&rows, &totals);
-        let (exit_count, rx, tx) = store::Store::traffic_period_summary(&totals, period);
-        let summary = traffic_stats_summary_text(period, exit_count, rx, tx);
-        let split = traffic_top9_split(&exits);
-        let max = traffic_bar_max(&exits);
-        let cycle_view = view.clone();
-        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
-            let cycle_view = cycle_view.clone();
-            let mut body = div().flex().flex_col().gap_1();
-            body = body.child(
-                div()
-                    .id("traffic-stats-summary")
-                    .test_support()
-                    .text_sm()
-                    .child(summary.clone()),
-            );
-            body = body.child(
-                Button::new("traffic-stats-period")
-                    .small()
-                    .label(t!("stats-period", label = period.label()))
-                    .tooltip(t!("stats-period-tip"))
-                    .on_click(move |_, window, cx| {
-                        cycle_view.update(cx, |view, cx| {
-                            let next = match view.traffic_period {
-                                store::TrafficPeriod::Day => store::TrafficPeriod::Week,
-                                store::TrafficPeriod::Week => store::TrafficPeriod::Month,
-                                store::TrafficPeriod::Month => store::TrafficPeriod::Quarter,
-                                store::TrafficPeriod::Quarter => store::TrafficPeriod::Day,
-                            };
-                            view.traffic_period = next;
-                            window.close_all_dialogs(cx);
-                            reclaim_shell_focus(window, cx);
-                            view.open_traffic_stats_dialog(window, cx);
-                        });
-                    }),
-            );
-            if exits.is_empty() {
-                body = body.child(
-                    div()
-                        .id("traffic-stats-empty")
-                        .test_support()
-                        .text_sm()
-                        .child(t!("stats-empty")),
-                );
-            }
-            for exit in &split.top {
-                body = body.child(
-                    div()
-                        .id(format!("traffic-stat-{}", exit.row_id))
-                        .test_support()
-                        .text_sm()
-                        .child(t!(
-                            "stats-exit-row",
-                            bar = traffic_stacked_bar(exit.rx_bytes, exit.tx_bytes, max),
-                            name = exit.name.as_str(),
-                            bind = exit.bind.as_str(),
-                            down = format_bytes(exit.rx_bytes),
-                            up = format_bytes(exit.tx_bytes),
-                        )),
-                );
-            }
-            if let Some(other) = traffic_other_line(&split) {
-                body = body.child(
-                    div()
-                        .id("traffic-stats-other")
-                        .test_support()
-                        .text_sm()
-                        .child(other),
-                );
-            }
-            dialog
-                .title(t!("stats-traffic-title"))
-                .child(body)
-                .button_props(DialogButtonProps::default())
-                .footer(dialog_footer(
-                    "traffic-stats-ok",
-                    "traffic-stats-cancel",
-                    &footer_commit_label("traffic-stats"),
-                    Rc::new(|_, _| true),
-                ))
-        });
-    }
-
-    pub(crate) fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sidecars = self.sidecar_presence.clone();
         let about_view = cx.entity();
         let body = about_body(
@@ -573,6 +363,10 @@ impl AppView {
             &Store::default_path().display().to_string(),
             &Store::default_export_path().display().to_string(),
         );
+        // The bundle carries its line breaks as the two characters `\n`, and a
+        // text child paints them as they are. The body is cut on them here so
+        // the dialog shows lines, not escape sequences.
+        let body_lines = body.split("\\n").map(str::to_string).collect::<Vec<_>>();
         open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
             let check_view = about_view.clone();
             dialog
@@ -587,7 +381,7 @@ impl AppView {
                                 .id("about-body")
                                 .test_support()
                                 .text_sm()
-                                .child(body.clone()),
+                                .children(body_lines.iter().map(|line| div().child(line.clone()))),
                         )
                         .child(
                             Button::new("about-check-for-updates")
@@ -613,7 +407,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_update_check_dialog(
+    pub fn open_update_check_dialog(
         &mut self,
         outcome: UpdateCheckOutcome,
         window: &mut Window,
@@ -668,11 +462,7 @@ impl AppView {
     /// The status hint and the tray balloon both land here: show the release
     /// the passive check stored, and clear the hint as it becomes the dialog.
     /// A missing release means a later check already took over.
-    pub(crate) fn open_available_update(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn open_available_update(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(release) = self.update_available.take() else {
             return false;
         };
@@ -685,7 +475,7 @@ impl AppView {
     /// hides. No markdown viewer exists in the kit, so this dialog renders
     /// `docs/user/cores.md`'s three facts in place, with the project pages one
     /// browser-open away — the same affordance the update dialog uses.
-    pub(crate) fn open_cores_help_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_cores_help_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         open_app_dialog(window, cx, move |dialog: Dialog, _, cx| {
             let body = div()
                 .id("cores-help-body")
@@ -748,7 +538,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if overlay_open(window, cx) {
             return;
         }
@@ -786,9 +576,13 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_prune_confirm(
+    /// The retired Library menu's prune family, re-homed in the group manage
+    /// sheet. The sheet names its group, so a right-click on an unselected
+    /// group prunes the group it opened for.
+    pub fn open_prune_confirm(
         &mut self,
         kind: GroupPruneKind,
+        group: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -796,10 +590,7 @@ impl AppView {
             GroupPruneKind::ALL.contains(&kind),
             "prune kinds stay the pinned four"
         );
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(Notification::info(t!("no-group-focus")), cx);
-            return;
-        };
+        let group = group.to_string();
         let (title, description, ok) = match kind {
             GroupPruneKind::Duplicates => {
                 let (total, preview) = self
@@ -886,10 +677,12 @@ impl AppView {
             }
         };
         let view = cx.entity();
+        let ok_group = group.clone();
         open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
             let title = title.clone();
             let description = description.clone();
+            let ok_group = ok_group.clone();
             alert
                 .confirm()
                 .button_props(
@@ -901,7 +694,8 @@ impl AppView {
                 .title(title)
                 .description(description)
                 .on_ok(move |_, window, cx| {
-                    view.update(cx, |view, cx| view.commit_prune(kind, window, cx));
+                    let group = ok_group.clone();
+                    view.update(cx, |view, cx| view.commit_prune(kind, &group, window, cx));
                     true
                 })
         });
@@ -910,7 +704,7 @@ impl AppView {
     /// T-19: toggling auto-clear on opens this note once per group; the sheet
     /// origin re-opens the sheet on every exit so the switch re-reads the
     /// store, the facet origin just lets the window redraw revert visuals.
-    pub(crate) fn open_auto_clear_opt_in_confirm(
+    pub fn open_auto_clear_opt_in_confirm(
         &mut self,
         group: &str,
         from_groups_sheet: bool,
@@ -925,6 +719,8 @@ impl AppView {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let group = group.clone();
+            let cancel_group = group.clone();
+            let close_group = group.clone();
             let description = description.clone();
             alert
                 .confirm()
@@ -944,7 +740,7 @@ impl AppView {
                             if from_groups_sheet {
                                 window.close_all_dialogs(cx);
                                 reclaim_shell_focus(window, cx);
-                                view.open_groups_dialog(window, cx);
+                                view.open_group_manage_sheet(&group, window, cx);
                             }
                         });
                         !from_groups_sheet
@@ -959,7 +755,7 @@ impl AppView {
                         view.update(cx, |exposed, cx| {
                             window.close_all_dialogs(cx);
                             reclaim_shell_focus(window, cx);
-                            exposed.open_groups_dialog(window, cx);
+                            exposed.open_group_manage_sheet(&cancel_group, window, cx);
                         });
                         false
                     }
@@ -972,7 +768,7 @@ impl AppView {
                         }
                         view.update(cx, |exposed, cx| {
                             window.close_all_dialogs(cx);
-                            exposed.open_groups_dialog(window, cx);
+                            exposed.open_group_manage_sheet(&close_group, window, cx);
                         });
                         reclaim_shell_focus(window, cx);
                     }
@@ -980,7 +776,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A control-driven swap hands over the live draft; otherwise seed from
         // the committed filter fields.
         let (current, current_exclude, current_pattern) =
@@ -1255,7 +1051,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
 
         let Some(rows) = self.list_or_notify(window, cx) else {
@@ -1330,7 +1126,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_restore_confirm(
+    pub fn open_restore_confirm(
         &mut self,
         payload: String,
         window: &mut Window,
@@ -1362,98 +1158,25 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_row_columns_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let live: Rc<RefCell<RowColumns>> = Rc::new(RefCell::new(self.row_columns));
+    pub fn open_columns_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        open_app_dialog(window, cx, move |dialog: Dialog, _, _| {
-            let view = view.clone();
-            let current = *live.borrow();
-            let mut body = div().flex().flex_col().gap_2();
-            for (id, label, tip, enabled) in [
-                (
-                    "columns-upstream",
-                    t!("columns-upstream"),
-                    t!("columns-upstream-tip"),
-                    current.upstream,
-                ),
-                (
-                    "columns-health",
-                    t!("columns-health"),
-                    t!("columns-health-tip"),
-                    current.health,
-                ),
-                (
-                    "columns-group",
-                    t!("columns-group"),
-                    t!("columns-group-tip"),
-                    current.group,
-                ),
-                (
-                    "columns-traffic",
-                    t!("columns-traffic"),
-                    t!("columns-traffic-tip"),
-                    current.traffic,
-                ),
-            ] {
-                let column = match id {
-                    "columns-upstream" => "upstream",
-                    "columns-health" => "health",
-                    "columns-group" => "group",
-                    _ => "traffic",
-                };
-                let live = live.clone();
-                let switch_view = view.clone();
-                body = body.child(
-                    Switch::new(id)
-                        .checked(enabled)
-                        .label(label.as_str())
-                        .accessibility_label(label.as_str())
-                        .tooltip(tip)
-                        .on_change(move |enabled: &bool, window, cx| {
-                            let enabled = *enabled;
-                            {
-                                let mut current = live.borrow_mut();
-                                match column {
-                                    "upstream" => current.upstream = enabled,
-                                    "health" => current.health = enabled,
-                                    "group" => current.group = enabled,
-                                    _ => current.traffic = enabled,
-                                }
-                            }
-                            switch_view.update(cx, |view, cx| {
-                                view.set_row_column(column, enabled, window, cx);
-                            });
-                        }),
-                );
-            }
-            let reset_view = view.clone();
-            body = body.child(
-                div().flex().justify_end().pt_1().child(
-                    Button::new("columns-dialog-reset")
-                        .small()
-                        .label(t!("columns-reset-button"))
-                        .tooltip(t!("columns-reset-tip"))
-                        .on_click(move |_, window, cx| {
-                            reset_view.update(cx, |view, cx| {
-                                view.reset_all_columns(window, cx);
-                            });
-                        }),
-                ),
-            );
-            let close: DialogCommit = Rc::new(|_, _| true);
-            dialog
+        let body = cx.new(|cx| ColumnsSheetBody::new(view, cx));
+        open_app_sheet(window, cx, move |sheet: Sheet, _, _| {
+            let body = body.clone();
+            sheet
                 .title(t!("columns-title"))
                 .child(body)
-                .footer(dialog_footer(
-                    "columns-dialog-close",
-                    "columns-dialog-cancel",
+                .size(px(520.))
+                .footer(sheet_footer(
+                    "columns-sheet-done",
+                    None,
                     &t!("dialog-close"),
-                    close,
+                    Rc::new(|_, _| true),
                 ))
         });
     }
 
-    pub(crate) fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut form = ConfigForm::blank(window, cx);
         let view = cx.entity();
 
@@ -1523,7 +1246,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_edit_dialog(
+    pub fn open_edit_dialog(
         &mut self,
         config: ProxyConfig,
         window: &mut Window,
@@ -1658,20 +1381,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_remove_confirm(
-        &mut self,
-        config: ProxyConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // K5: deletion is immediate — no blocking confirm for a single row.
-        // The undo toast (commit_remove) is the safety net; the rows stay in
-        // memory for its lifetime and vanish with it. K17 ruling: the bulk
-        // More ▾ path is immediate too (spec line 91) — same pipeline.
-        self.commit_remove(&config.id, window, cx);
-    }
-
-    pub(crate) fn open_usage_reset_confirm(
+    pub fn open_usage_reset_confirm(
         &mut self,
         config: ProxyConfig,
         window: &mut Window,
@@ -1700,7 +1410,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_import_dialog(
+    pub fn open_import_dialog(
         &mut self,
         prefill_text: &str,
         prefill_group: &str,
@@ -1718,7 +1428,7 @@ impl AppView {
         );
     }
 
-    pub(crate) fn open_import_dialog_with_files(
+    pub fn open_import_dialog_with_files(
         &mut self,
         prefill_text: &str,
         prefill_group: &str,
@@ -1839,17 +1549,13 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_import_from_clipboard(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // K5: the clipboard paste imports directly into the current group;
         // ambiguous grammar keeps its dialog inside import_text_direct.
         self.import_from_clipboard_direct(window, cx);
     }
 
-    pub(crate) fn open_bare_url_chooser(
+    pub fn open_bare_url_chooser(
         &mut self,
         url: String,
         window: &mut Window,
@@ -1913,7 +1619,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn begin_refresh_batch(&mut self, ids: &[String]) {
+    pub fn begin_refresh_batch(&mut self, ids: &[String]) {
         if ids.is_empty() {
             return;
         }
@@ -1927,11 +1633,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn reopen_subscriptions_if_open(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn reopen_subscriptions_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
             self.subs_form = None;
             return;
@@ -1950,7 +1652,7 @@ impl AppView {
         reclaim_shell_focus(window, cx);
     }
 
-    pub(crate) fn open_preset_edit_dialog(
+    pub fn open_preset_edit_dialog(
         &mut self,
         preset: store::RoutePreset,
         window: &mut Window,
@@ -2064,7 +1766,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_preset_detach_delete_confirm(
+    pub fn open_preset_detach_delete_confirm(
         &mut self,
         id: &str,
         name: &str,
@@ -2098,7 +1800,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_rule_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_rule_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name_state = cx.new(|cx| InputState::new(window, cx));
         let url_state = cx
             .new(|cx| InputState::new(window, cx).placeholder(t!("preset-remote-url-placeholder")));
@@ -2160,7 +1862,7 @@ impl AppView {
     /// subscriptions (internal hosts block, plaintext http warn at the
     /// confirm), allocate a collision-free staged name, then request the
     /// explicit confirm. Nothing is fetched here.
-    pub(crate) fn begin_rule_set_download(
+    pub fn begin_rule_set_download(
         &mut self,
         name: String,
         url: String,
@@ -2225,7 +1927,7 @@ impl AppView {
 
     /// The exact one-confirmation-per-download callout. Blocked URLs never get
     /// here; http warns through the same policy verdicts subscriptions use.
-    pub(crate) fn open_rule_set_download_confirm(
+    pub fn open_rule_set_download_confirm(
         &mut self,
         grant: RuleSetDownloadGrant,
         window: &mut Window,
@@ -2281,11 +1983,11 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_presets_dialog_restored("", "", &SimpleRuleBoxes::default(), window, cx);
     }
 
-    pub(crate) fn open_presets_dialog_restored(
+    pub fn open_presets_dialog_restored(
         &mut self,
         name: &str,
         rules: &str,
@@ -2459,7 +2161,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn reopen_presets_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reopen_presets_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.has_active_dialog(cx) {
             self.preset_form = None;
             return;
@@ -2475,9 +2177,10 @@ impl AppView {
         self.open_presets_dialog_restored(&name, &rules, &boxes, window, cx);
     }
 
-    pub(crate) fn open_preset_attach_dialog(
+    pub fn open_preset_attach_dialog(
         &mut self,
         config: ProxyConfig,
+        config_ids: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2562,6 +2265,7 @@ impl AppView {
             for preset in &presets {
                 let attach_view = view.clone();
                 let attach_config = config_id.clone();
+                let attach_ids = config_ids.clone();
                 let attach_preset = preset.id.clone();
                 let mut line = div()
                     .flex()
@@ -2577,9 +2281,11 @@ impl AppView {
                             .label(t!("preset-attach-action"))
                             .on_click(move |_, window, cx| {
                                 let config = attach_config.clone();
+                                let ids = attach_ids.clone();
                                 let preset = attach_preset.clone();
                                 attach_view.update(cx, |view, cx| {
-                                    view.commit_preset_attach(&config, Some(preset), window, cx);
+                                    view.commit_preset_attach_ids(&ids, Some(preset), window, cx);
+                                    let _ = config;
                                 });
                             }),
                     );
@@ -2588,14 +2294,14 @@ impl AppView {
             }
             if current.is_some() {
                 let detach_view = view.clone();
-                let detach_config = config_id.clone();
+                let detach_ids = config_ids.clone();
                 body = body.child(
                     Button::new("preset-detach")
                         .label(t!("preset-detach-action"))
                         .on_click(move |_, window, cx| {
-                            let config = detach_config.clone();
+                            let ids = detach_ids.clone();
                             detach_view.update(cx, |view, cx| {
-                                view.commit_preset_attach(&config, None, window, cx);
+                                view.commit_preset_attach_ids(&ids, None, window, cx);
                             });
                         }),
                 );
@@ -2615,7 +2321,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_sub_full_url_confirm(
+    pub fn open_sub_full_url_confirm(
         &mut self,
         label: &str,
         url: &str,
@@ -2645,11 +2351,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_subscriptions_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_subscriptions_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_subscriptions_dialog_restored(
             "",
             "",
@@ -2662,7 +2364,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open_subscriptions_dialog_restored(
+    pub fn open_subscriptions_dialog_restored(
         &mut self,
         label: &str,
         url: &str,
@@ -2735,6 +2437,7 @@ impl AppView {
         focus_shell_before_overlay(window, cx);
         let kill_view = view.clone();
         let due_view = view.clone();
+        let update_all_view = view.clone();
 
         let close_view = view.clone();
 
@@ -2744,6 +2447,7 @@ impl AppView {
             let close_subs = close_view.clone();
             let kill_buttons = kill_view.clone();
             let due_buttons = due_view.clone();
+            let update_all_buttons = update_all_view.clone();
             let batch_progress = batch_progress;
             let refreshing_rows = refreshing_rows.clone();
             let mut body = div().flex().flex_col().gap_2();
@@ -2776,6 +2480,16 @@ impl AppView {
                             .on_click(move |_, window, cx| {
                                 due_buttons.update(cx, |view, cx| {
                                     view.refresh_all_due(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("subs-update-all")
+                            .label(t!("group-update-all"))
+                            .tooltip(t!("group-update-all-tip"))
+                            .on_click(move |_, window, cx| {
+                                update_all_buttons.update(cx, |view, cx| {
+                                    view.open_update_all_confirm(window, cx);
                                 });
                             }),
                     ),
@@ -2836,7 +2550,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_subscription_edit_dialog(
+    pub fn open_subscription_edit_dialog(
         &mut self,
         sub: ProxySubscription,
         window: &mut Window,
@@ -2932,7 +2646,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_subscription_remove_confirm(
+    pub fn open_subscription_remove_confirm(
         &mut self,
         sub: ProxySubscription,
         window: &mut Window,
@@ -2963,7 +2677,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_update_all_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_update_all_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let subs = self.store.list_subscriptions().unwrap_or_default();
         let flagged: HashSet<String> = self
             .store
@@ -3019,7 +2733,7 @@ impl AppView {
 /// close button all end in `reclaim_shell_focus`. The kit fires `on_close`
 /// after `Root::close_dialog` has already popped the layer, which is what makes
 /// the end-of-path predicate correct.
-pub(crate) fn open_app_dialog(
+pub fn open_app_dialog(
     window: &mut Window,
     cx: &mut App,
     build: impl Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
@@ -3036,7 +2750,7 @@ pub(crate) fn open_app_dialog(
     });
 }
 
-pub(crate) fn open_app_alert_dialog(
+pub fn open_app_alert_dialog(
     window: &mut Window,
     cx: &mut App,
     build: impl Fn(AlertDialog, &mut Window, &mut App) -> AlertDialog + 'static,
@@ -3047,7 +2761,7 @@ pub(crate) fn open_app_alert_dialog(
     });
 }
 
-pub(crate) fn open_app_sheet(
+pub fn open_app_sheet(
     window: &mut Window,
     cx: &mut App,
     build: impl Fn(Sheet, &mut Window, &mut App) -> Sheet + 'static,

@@ -16,34 +16,36 @@ use web_time::Instant;
 /// success toast (~4s) beats an error toast (~8s). `autohide(false)` plus a
 /// timer closed by `remove_notification1` is the only route to a non-default
 /// lifetime, because the kit itself bakes 5s into `NotificationList::push`.
-pub(crate) struct ToastLifetime;
+pub struct ToastLifetime;
 
 /// ~4s for success toasts (spec: ~4s success).
-pub(crate) const TOAST_SUCCESS_MS: u64 = 4200;
+pub const TOAST_SUCCESS_MS: u64 = 4200;
 /// ~8s for error toasts (spec: ~8s error).
-pub(crate) const TOAST_ERROR_MS: u64 = 8000;
+pub const TOAST_ERROR_MS: u64 = 8000;
 /// Error toasts stop yielding to hover after this. Hover buys reading time,
 /// not a permanent corner resident: a mouse parked on a toast from hours ago
 /// must not hide every later toast behind it.
-pub(crate) const TOAST_ERROR_HARD_CAP_MS: u64 = 15_000;
+pub const TOAST_ERROR_HARD_CAP_MS: u64 = 15_000;
 /// Delete→Undo toast lifetime; the removed rows live in memory exactly as long.
-pub(crate) const TOAST_UNDO_MS: u64 = 8000;
-/// The status bar is ~26px tall; a cushion above it is the small safe-area
-/// offset, so a toast can never cover the bar or sit on the window edge.
-const TOAST_BOTTOM_MARGIN: f32 = 36.0;
-const TOAST_EDGE_MARGIN: f32 = 16.0;
+pub const TOAST_UNDO_MS: u64 = 8000;
+/// The engine bar is 40px tall and its transport controls sit at the right
+/// end — exactly where the park is. A cushion above the bar is the safe-area
+/// offset, so a toast can never cover the bar's controls or sit on the
+/// window edge.
+pub const TOAST_BOTTOM_MARGIN: f32 = 52.0;
+pub const TOAST_EDGE_MARGIN: f32 = 16.0;
 
 /// Buttons a toast may carry. The kit's `Notification::action` renders one
 /// button on the right; a second action needs a row of its own, so every
 /// action is rendered by the toast body and the whole body owns the hover
 /// state. Two is the ceiling named by the feedback spec.
-const TOAST_MAX_ACTIONS: usize = 2;
+pub const TOAST_MAX_ACTIONS: usize = 2;
 
 /// K5 install of the parking rules. Runs right after every `Theme::change`
 /// (boot via `apply_appearance`, plus every appearance toggle): the theme
 /// change rebuilds the whole theme — including these settings — so the park
 /// must be re-stamped on the fresh theme each time.
-pub(crate) fn configure_notification_toasts(cx: &mut App) {
+pub fn configure_notification_toasts(cx: &mut App) {
     let defaults = gpui_kit::component::notification::NotificationSettings::default();
     let notification = &mut gpui_kit::component::Theme::global_mut(cx).notification;
     notification.placement = Anchor::BottomRight;
@@ -58,30 +60,30 @@ pub(crate) fn configure_notification_toasts(cx: &mut App) {
 
 /// K5 counter for unique element ids of timed toasts; undo batch ids share
 /// it, so a batch maps one-to-one onto one removable toast.
-static NEXT_TOAST_KEY: AtomicU64 = AtomicU64::new(1);
+pub static NEXT_TOAST_KEY: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) fn next_undo_batch_id() -> u64 {
+pub fn next_undo_batch_id() -> u64 {
     NEXT_TOAST_KEY.fetch_add(1, Ordering::SeqCst)
 }
 
-pub(crate) fn next_toast_key() -> u64 {
+pub fn next_toast_key() -> u64 {
     NEXT_TOAST_KEY.fetch_add(1, Ordering::SeqCst)
 }
 
 /// Each timer scheduling owns a generation, so a replaced or paused clock's
 /// pending wake-up can never close the toast that now holds the same key.
-static NEXT_CLOCK_GENERATION: AtomicU64 = AtomicU64::new(1);
+pub static NEXT_CLOCK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-fn next_clock_generation() -> u64 {
+pub fn next_clock_generation() -> u64 {
     NEXT_CLOCK_GENERATION.fetch_add(1, Ordering::SeqCst)
 }
 
-struct UndoBatch {
-    key: u64,
-    rows: Vec<ProxyConfig>,
+pub struct UndoBatch {
+    pub key: u64,
+    pub rows: Vec<ProxyConfig>,
 }
 
-fn undo_stash() -> &'static Mutex<Vec<UndoBatch>> {
+pub fn undo_stash() -> &'static Mutex<Vec<UndoBatch>> {
     static STASH: OnceLock<Mutex<Vec<UndoBatch>>> = OnceLock::new();
     STASH.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -90,29 +92,29 @@ fn undo_stash() -> &'static Mutex<Vec<UndoBatch>> {
 /// by another wave, so the undo records live beside the toasts that carry
 /// them — the toast lifetime literally keeping the rows readable is what the
 /// ticket names ("stores removed rows in memory for the toast lifetime").
-pub(crate) fn stash_undo_rows(rows: Vec<ProxyConfig>, key: u64) {
+pub fn stash_undo_rows(rows: Vec<ProxyConfig>, key: u64) {
     undo_stash()
         .lock()
         .expect("undo stash lock")
         .push(UndoBatch { key, rows });
 }
 
-pub(crate) fn take_undo_rows(key: u64) -> Option<Vec<ProxyConfig>> {
+pub fn take_undo_rows(key: u64) -> Option<Vec<ProxyConfig>> {
     let mut stash = undo_stash().lock().expect("undo stash lock");
     let index = stash.iter().position(|batch| batch.key == key)?;
     let batch = stash.remove(index);
     Some(batch.rows)
 }
 
-pub(crate) fn drop_undo_batch(key: u64) {
+pub fn drop_undo_batch(key: u64) {
     let mut stash = undo_stash().lock().expect("undo stash lock");
     stash.retain(|batch| batch.key != key);
 }
 
 /// Hermetic read of the cross-test stash; tests in one process share it, so
 /// assertions are name-scoped instead of absolute. Never called in prod.
-#[cfg(test)]
-pub(crate) fn undo_stash_count_named(name: &str) -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn undo_stash_count_named(name: &str) -> usize {
     undo_stash()
         .lock()
         .expect("undo stash lock")
@@ -122,7 +124,7 @@ pub(crate) fn undo_stash_count_named(name: &str) -> usize {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToastTone {
+pub enum ToastTone {
     Info,
     Success,
     Warning,
@@ -130,7 +132,7 @@ pub(crate) enum ToastTone {
 }
 
 impl ToastTone {
-    fn notification(self) -> Notification {
+    pub fn notification(self) -> Notification {
         Notification::new().with_type(match self {
             ToastTone::Info => NotificationType::Info,
             ToastTone::Success => NotificationType::Success,
@@ -139,14 +141,14 @@ impl ToastTone {
         })
     }
 
-    fn lifetime_ms(self) -> u64 {
+    pub fn lifetime_ms(self) -> u64 {
         match self {
             ToastTone::Error => TOAST_ERROR_MS,
             _ => TOAST_SUCCESS_MS,
         }
     }
 
-    fn hard_cap_ms(self) -> Option<u64> {
+    pub fn hard_cap_ms(self) -> Option<u64> {
         match self {
             ToastTone::Error => Some(TOAST_ERROR_HARD_CAP_MS),
             _ => None,
@@ -154,25 +156,25 @@ impl ToastTone {
     }
 }
 
-type ToastRun = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type ToastRun = Rc<dyn Fn(&mut Window, &mut App)>;
 
-pub(crate) struct ToastAction {
-    id: &'static str,
-    label: String,
-    run: ToastRun,
+pub struct ToastAction {
+    pub id: &'static str,
+    pub label: String,
+    pub run: ToastRun,
 }
 
 /// Identifies one push, not just the key. A replacement under the same key
 /// must not let the previous sweep close or repaint the new toast.
 #[derive(Clone, Copy)]
-pub(crate) struct ToastHandle {
-    key: u64,
-    instance: u64,
+pub struct ToastHandle {
+    pub key: u64,
+    pub instance: u64,
 }
 
 impl ToastHandle {
-    #[cfg(test)]
-    pub(crate) fn key(self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn key(self) -> u64 {
         self.key
     }
 }
@@ -180,20 +182,20 @@ impl ToastHandle {
 /// One toast worth of intent, decoupled from the timer and the element tree.
 /// Callers describe tone/copy/actions/progress; `push_toast_spec` owns the
 /// key, the hover clock and the notification's lifetime.
-pub(crate) struct ToastSpec {
-    tone: ToastTone,
-    message: String,
-    actions: Vec<ToastAction>,
-    progress: Option<(usize, usize)>,
-    key: Option<u64>,
-    timed: bool,
-    lifetime_ms: u64,
-    hard_cap_ms: Option<u64>,
-    cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
+pub struct ToastSpec {
+    pub tone: ToastTone,
+    pub message: String,
+    pub actions: Vec<ToastAction>,
+    pub progress: Option<(usize, usize)>,
+    pub key: Option<u64>,
+    pub timed: bool,
+    pub lifetime_ms: u64,
+    pub hard_cap_ms: Option<u64>,
+    pub cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl ToastSpec {
-    pub(crate) fn new(tone: ToastTone, message: impl Into<String>) -> Self {
+    pub fn new(tone: ToastTone, message: impl Into<String>) -> Self {
         Self {
             tone,
             message: message.into(),
@@ -207,47 +209,47 @@ impl ToastSpec {
         }
     }
 
-    pub(crate) fn info(message: impl Into<String>) -> Self {
+    pub fn info(message: impl Into<String>) -> Self {
         Self::new(ToastTone::Info, message)
     }
 
-    pub(crate) fn success(message: impl Into<String>) -> Self {
+    pub fn success(message: impl Into<String>) -> Self {
         Self::new(ToastTone::Success, message)
     }
 
-    pub(crate) fn warning(message: impl Into<String>) -> Self {
+    pub fn warning(message: impl Into<String>) -> Self {
         Self::new(ToastTone::Warning, message)
     }
 
-    pub(crate) fn error(message: impl Into<String>) -> Self {
+    pub fn error(message: impl Into<String>) -> Self {
         Self::new(ToastTone::Error, message)
     }
 
     /// Fixed key: a repeat push replaces the previous toast instead of
     /// stacking a second copy of the same story.
-    pub(crate) fn key(mut self, key: u64) -> Self {
+    pub fn key(mut self, key: u64) -> Self {
         self.key = Some(key);
         self
     }
 
-    pub(crate) fn lifetime(mut self, lifetime_ms: u64) -> Self {
+    pub fn lifetime(mut self, lifetime_ms: u64) -> Self {
         self.timed = true;
         self.lifetime_ms = lifetime_ms;
         self
     }
 
     /// No expiry timer; the caller closes the toast when the work ends.
-    pub(crate) fn no_timeout(mut self) -> Self {
+    pub fn no_timeout(mut self) -> Self {
         self.timed = false;
         self
     }
 
-    pub(crate) fn progress(mut self, done: usize, total: usize) -> Self {
+    pub fn progress(mut self, done: usize, total: usize) -> Self {
         self.progress = Some((done, total));
         self
     }
 
-    pub(crate) fn action(
+    pub fn action(
         mut self,
         id: &'static str,
         label: impl Into<String>,
@@ -265,7 +267,7 @@ impl ToastSpec {
 
     /// Runs when the toast leaves, by timer or by the user. Undo uses it to
     /// drop the stashed rows at exactly the toast's lifetime.
-    pub(crate) fn cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
+    pub fn cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
         self.cleanup = Some(Box::new(cleanup));
         self
     }
@@ -274,17 +276,17 @@ impl ToastSpec {
 /// A live progress ring. It lives as its own entity so the probe sweep can
 /// repaint just the ring when a row finishes; re-pushing the notification
 /// would replay the enter animation on every probe.
-pub(crate) struct ToastProgress {
-    done: usize,
-    total: usize,
+pub struct ToastProgress {
+    pub done: usize,
+    pub total: usize,
 }
 
 impl ToastProgress {
-    fn new(done: usize, total: usize) -> Self {
+    pub fn new(done: usize, total: usize) -> Self {
         Self { done, total }
     }
 
-    fn value(&self) -> f32 {
+    pub fn value(&self) -> f32 {
         if self.total == 0 {
             0.
         } else {
@@ -292,13 +294,13 @@ impl ToastProgress {
         }
     }
 
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         probe_remaining_label(self.done, self.total)
     }
 }
 
 /// The one copy for "how much is left", shared by the ring and its tests.
-pub(crate) fn probe_remaining_label(done: usize, total: usize) -> String {
+pub fn probe_remaining_label(done: usize, total: usize) -> String {
     match total.saturating_sub(done) {
         1 => t!("probe-remaining-one"),
         remaining => t!("probe-remaining", count = remaining),
@@ -327,16 +329,16 @@ impl Render for ToastProgress {
 /// Expiry lives outside the toast entity: the kit bakes its own 5s autohide
 /// and never exposes a hover hook on the card. One clock per key keeps timer
 /// replacement, hover pause and the error hard cap in one place.
-struct ToastClock {
-    remaining: Duration,
-    running_since: Instant,
-    paused: bool,
-    hard_deadline: Option<Instant>,
-    generation: u64,
+pub struct ToastClock {
+    pub remaining: Duration,
+    pub running_since: Instant,
+    pub paused: bool,
+    pub hard_deadline: Option<Instant>,
+    pub generation: u64,
 }
 
 impl ToastClock {
-    fn new(lifetime_ms: u64, hard_cap_ms: Option<u64>, now: Instant) -> Self {
+    pub fn new(lifetime_ms: u64, hard_cap_ms: Option<u64>, now: Instant) -> Self {
         Self {
             remaining: Duration::from_millis(lifetime_ms),
             running_since: now,
@@ -347,34 +349,34 @@ impl ToastClock {
     }
 }
 
-struct ToastEntry {
+pub struct ToastEntry {
     /// Identifies the push that owns this entry. An old notification's close
     /// callback must not evict the entry a replacement already registered
     /// under the same key while the old one finishes its exit animation.
-    instance: u64,
-    clock: Option<ToastClock>,
-    progress: Option<WeakEntity<ToastProgress>>,
-    cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
+    pub instance: u64,
+    pub clock: Option<ToastClock>,
+    pub progress: Option<WeakEntity<ToastProgress>>,
+    pub cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
-fn toast_registry() -> &'static Mutex<HashMap<u64, ToastEntry>> {
+pub fn toast_registry() -> &'static Mutex<HashMap<u64, ToastEntry>> {
     static REGISTRY: OnceLock<Mutex<HashMap<u64, ToastEntry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock_toasts() -> std::sync::MutexGuard<'static, HashMap<u64, ToastEntry>> {
+pub fn lock_toasts() -> std::sync::MutexGuard<'static, HashMap<u64, ToastEntry>> {
     toast_registry()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn run_cleanup(cleanup: Option<Box<dyn FnOnce() + Send + 'static>>) {
+pub fn run_cleanup(cleanup: Option<Box<dyn FnOnce() + Send + 'static>>) {
     if let Some(cleanup) = cleanup {
         cleanup();
     }
 }
 
-fn register_toast(key: u64, entry: ToastEntry) {
+pub fn register_toast(key: u64, entry: ToastEntry) {
     let previous = lock_toasts().insert(key, entry);
     if let Some(previous) = previous {
         run_cleanup(previous.cleanup);
@@ -384,7 +386,7 @@ fn register_toast(key: u64, entry: ToastEntry) {
 /// The time until this toast's next reason to wake, plus the generation that
 /// owns the answer. A paused toast only wakes for its hard cap; without one
 /// it has no timer at all until the pointer leaves.
-fn toast_wait(key: u64, now: Instant) -> Option<(u64, Duration)> {
+pub fn toast_wait(key: u64, now: Instant) -> Option<(u64, Duration)> {
     let map = lock_toasts();
     let clock = map.get(&key)?.clock.as_ref()?;
     let wait = if clock.paused {
@@ -401,7 +403,7 @@ fn toast_wait(key: u64, now: Instant) -> Option<(u64, Duration)> {
     Some((clock.generation, wait))
 }
 
-fn toast_due(key: u64, generation: u64, now: Instant) -> bool {
+pub fn toast_due(key: u64, generation: u64, now: Instant) -> bool {
     let mut map = lock_toasts();
     let Some(clock) = map.get_mut(&key).and_then(|entry| entry.clock.as_mut()) else {
         return false;
@@ -421,7 +423,7 @@ fn toast_due(key: u64, generation: u64, now: Instant) -> bool {
         .is_zero()
 }
 
-fn schedule_toast_clock(key: u64, handle: AnyWindowHandle, cx: &mut App) {
+pub fn schedule_toast_clock(key: u64, handle: AnyWindowHandle, cx: &mut App) {
     let now = cx.background_executor().now();
     let Some((generation, wait)) = toast_wait(key, now) else {
         return;
@@ -438,14 +440,14 @@ fn schedule_toast_clock(key: u64, handle: AnyWindowHandle, cx: &mut App) {
     .detach();
 }
 
-fn close_timed_toast(key: u64, window: &mut Window, cx: &mut App) {
+pub fn close_timed_toast(key: u64, window: &mut Window, cx: &mut App) {
     if let Some(entry) = lock_toasts().remove(&key) {
         run_cleanup(entry.cleanup);
     }
     window.remove_notification1::<ToastLifetime>(("k5-toast", key as usize), cx);
 }
 
-fn pause_toast_clock(key: u64, now: Instant) -> bool {
+pub fn pause_toast_clock(key: u64, now: Instant) -> bool {
     let mut map = lock_toasts();
     let Some(clock) = map.get_mut(&key).and_then(|entry| entry.clock.as_mut()) else {
         return false;
@@ -461,7 +463,7 @@ fn pause_toast_clock(key: u64, now: Instant) -> bool {
     true
 }
 
-fn resume_toast_clock(key: u64, now: Instant) -> bool {
+pub fn resume_toast_clock(key: u64, now: Instant) -> bool {
     let mut map = lock_toasts();
     let Some(clock) = map.get_mut(&key).and_then(|entry| entry.clock.as_mut()) else {
         return false;
@@ -475,7 +477,7 @@ fn resume_toast_clock(key: u64, now: Instant) -> bool {
     true
 }
 
-fn on_toast_hover(key: u64, hovered: bool, window: &mut Window, cx: &mut App) {
+pub fn on_toast_hover(key: u64, hovered: bool, window: &mut Window, cx: &mut App) {
     let now = cx.background_executor().now();
     let changed = if hovered {
         pause_toast_clock(key, now)
@@ -489,7 +491,7 @@ fn on_toast_hover(key: u64, hovered: bool, window: &mut Window, cx: &mut App) {
     }
 }
 
-fn forget_toast(key: u64, instance: u64) {
+pub fn forget_toast(key: u64, instance: u64) {
     // Drop the registry guard before running cleanup: cleanup is arbitrary
     // caller code and must not execute under the lock.
     let entry = {
@@ -508,7 +510,7 @@ fn forget_toast(key: u64, instance: u64) {
     }
 }
 
-fn action_button(action: &ToastAction) -> Button {
+pub fn action_button(action: &ToastAction) -> Button {
     let run = action.run.clone();
     Button::new(action.id)
         .label(action.label.clone())
@@ -516,7 +518,7 @@ fn action_button(action: &ToastAction) -> Button {
         .on_click(move |_, window, cx| run(window, cx))
 }
 
-fn toast_body(
+pub fn toast_body(
     key: u64,
     message: SharedString,
     actions: Rc<Vec<ToastAction>>,
@@ -553,7 +555,7 @@ fn toast_body(
         .into_any_element()
 }
 
-fn build_toast_notification(
+pub fn build_toast_notification(
     key: u64,
     instance: u64,
     tone: ToastTone,
@@ -573,7 +575,7 @@ fn build_toast_notification(
 /// Shared pusher for every app-timed toast. `Context<AppView>` and bare `App`
 /// both reach it, because probe callbacks run inside window-handle updates
 /// where only `&mut App` is at hand.
-pub(crate) fn push_toast_spec(spec: ToastSpec, window: &mut Window, cx: &mut App) -> ToastHandle {
+pub fn push_toast_spec(spec: ToastSpec, window: &mut Window, cx: &mut App) -> ToastHandle {
     let key = spec.key.unwrap_or_else(next_toast_key);
     let ToastSpec {
         tone,
@@ -611,7 +613,7 @@ pub(crate) fn push_toast_spec(spec: ToastSpec, window: &mut Window, cx: &mut App
 
 /// Update the ring without replacing the notification: the entity repaints,
 /// the toast keeps its enter animation and its place in the stack.
-pub(crate) fn update_toast_progress(handle: ToastHandle, done: usize, total: usize, cx: &mut App) {
+pub fn update_toast_progress(handle: ToastHandle, done: usize, total: usize, cx: &mut App) {
     let progress = {
         let map = lock_toasts();
         let Some(entry) = map.get(&handle.key) else {
@@ -642,8 +644,8 @@ pub(crate) fn update_toast_progress(handle: ToastHandle, done: usize, total: usi
 
 /// Test-only read of the live ring so the suite can pin the remaining-count
 /// copy without reaching into a rendered text node.
-#[cfg(test)]
-pub(crate) fn toast_progress_label(key: u64, cx: &App) -> Option<String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn toast_progress_label(key: u64, cx: &App) -> Option<String> {
     let progress = lock_toasts()
         .get(&key)
         .and_then(|entry| entry.progress.clone())
@@ -652,7 +654,7 @@ pub(crate) fn toast_progress_label(key: u64, cx: &App) -> Option<String> {
 }
 
 impl AppView {
-    pub(crate) fn push_toast(
+    pub fn push_toast(
         &mut self,
         spec: ToastSpec,
         window: &mut Window,
@@ -661,28 +663,18 @@ impl AppView {
         push_toast_spec(spec, window, cx)
     }
 
-    pub(crate) fn toast_success(
-        &mut self,
-        message: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toast_success(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
         self.push_toast(ToastSpec::success(message), window, cx);
     }
 
-    pub(crate) fn toast_error(
-        &mut self,
-        message: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toast_error(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
         self.push_toast(ToastSpec::error(message), window, cx);
     }
 }
 
 /// The `Testing N…` start toast. The key lives on the view, so each window
 /// owns one probe toast and a sweep's completion closes exactly that one.
-pub(crate) fn push_probe_start_toast(
+pub fn push_probe_start_toast(
     key: u64,
     message: String,
     done: usize,
@@ -700,11 +692,11 @@ pub(crate) fn push_probe_start_toast(
     )
 }
 
-pub(crate) fn update_probe_progress(handle: ToastHandle, done: usize, total: usize, cx: &mut App) {
+pub fn update_probe_progress(handle: ToastHandle, done: usize, total: usize, cx: &mut App) {
     update_toast_progress(handle, done, total, cx);
 }
 
-pub(crate) fn close_probe_start_toast(handle: ToastHandle, window: &mut Window, cx: &mut App) {
+pub fn close_probe_start_toast(handle: ToastHandle, window: &mut Window, cx: &mut App) {
     let entry = {
         let mut map = lock_toasts();
         if map
@@ -729,7 +721,7 @@ impl AppView {
     /// K17: the caller builds the note, so a partial bulk delete can arrive
     /// as a warning (single-row keeps its success tint) — the Undo offer is
     /// unchanged.
-    pub(crate) fn push_delete_undo_toast(
+    pub fn push_delete_undo_toast(
         &mut self,
         batch: u64,
         note: ToastSpec,
@@ -753,12 +745,7 @@ impl AppView {
     /// group assignments. Restore re-adds the rows through `add_batch`, never
     /// restarting engines: the row returns disabled, exactly as a manual
     /// re-add would.
-    pub(crate) fn undo_expired_delete(
-        &mut self,
-        batch: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn undo_expired_delete(&mut self, batch: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(rows) = take_undo_rows(batch) else {
             return;
         };

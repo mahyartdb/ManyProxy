@@ -48,7 +48,7 @@ pub fn action_for_button_id(id: u32) -> Option<ThumbAction> {
         .map(|(_, action)| *action)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn button_id_for_action(action: ThumbAction) -> u32 {
     THUMB_BUTTONS
         .iter()

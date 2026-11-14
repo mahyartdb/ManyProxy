@@ -5,60 +5,53 @@ use crate::*;
 use gpui_kit::base::{v_virtual_list, Scrollbar, ScrollbarAxis};
 use gpui_kit::component::scroll::ScrollableElement as _;
 
+use super::console::console_height;
+
 /// T-02: a key never rides inside a label or an accessible name. The operate
 /// row announces the action alone and keeps the key in its tooltip, so the
 /// key-bearing tooltip text is named here and pinned by the test suite.
-pub(crate) fn operate_start_tooltip() -> String {
+pub fn operate_start_tooltip() -> String {
     t!("detail-start-tip")
 }
-pub(crate) fn operate_stop_tooltip() -> String {
+pub fn operate_stop_tooltip() -> String {
     t!("detail-stop-tip")
 }
-pub(crate) fn operate_test_tooltip() -> String {
+pub fn operate_test_tooltip() -> String {
     t!("detail-test-tip")
 }
-
-/// K20/D1 metrics for the inspector tab strip: one fixed text size for all
-/// five, pinned so `Details · Health · Logs · Links · Traffic` fit whole at the
-/// 240px drawer floor. Nothing scales them.
-const TAB_LABEL_REM: f32 = 0.6875;
-const TAB_LABEL_PAD_X: f32 = 2.;
-const TAB_LABEL_GAP: f32 = 1.;
 
 /// B3: the panes that list rows build a virtual window instead of a full
 /// subtree. Uniform row heights keep the size cache exact: a declared height
 /// that is too small clips a row, so each row is pinned to one line (log and
 /// traffic text truncates, the link card is a fixed two-line block).
-const PANE_LOG_ROW_H: f32 = 20.;
-const PANE_LINK_ROW_H: f32 = 48.;
-const PANE_TRAFFIC_ROW_H: f32 = 20.;
-/// A row list never eats the whole pane: header, endpoints and the operate row
-/// share the same scroll, so the list is capped to a share of what the panel
-/// can show and scrolls itself past it. A short list keeps its natural height.
-const PANE_LIST_SHARE: f32 = 0.6;
+pub const PANE_LOG_ROW_H: f32 = 20.;
+pub const PANE_LINK_ROW_H: f32 = 48.;
+/// A row list never eats the whole pane: the console body caps the list to a
+/// share of what it can show and scrolls itself past it. A short list keeps
+/// its natural height.
+pub const PANE_LIST_SHARE: f32 = 0.6;
 /// The panel's own height is only known after the first layout; until then the
 /// list falls back to this so the pane is never blank on its first frame.
-const PANE_LIST_FALLBACK_H: f32 = 320.;
+pub const PANE_LIST_FALLBACK_H: f32 = 320.;
 
-/// B3 acceptance probe: counts the rows a pane actually builds. Debug-only —
-/// release builds compile the counter away.
+/// B3 acceptance probe: counts the rows a console pane actually builds.
+/// Debug-only — release builds compile the counter away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PaneRows {
+pub enum ConsoleRows {
     Logs = 0,
     Links = 1,
-    Traffic = 2,
 }
 
 // Per-thread, because a frame runs on the thread that draws it and the suite
 // mounts views in parallel.
 #[cfg(any(debug_assertions, test))]
 thread_local! {
-    static PANE_ROWS_BUILT: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    static CONSOLE_ROWS_BUILT: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
-fn note_pane_row(pane: PaneRows) {
+pub fn note_console_row(pane: ConsoleRows) {
     #[cfg(any(debug_assertions, test))]
-    PANE_ROWS_BUILT.with(|built| {
+    CONSOLE_ROWS_BUILT.with(|built| {
         let mut counts = built.get();
         counts[pane as usize] += 1;
         built.set(counts);
@@ -67,20 +60,20 @@ fn note_pane_row(pane: PaneRows) {
     let _ = pane;
 }
 
-#[cfg(test)]
-pub(crate) fn pane_rows_built(pane: PaneRows) -> usize {
-    PANE_ROWS_BUILT.with(|built| built.get()[pane as usize])
+#[cfg(any(test, feature = "test-support"))]
+pub fn console_rows_built(pane: ConsoleRows) -> usize {
+    CONSOLE_ROWS_BUILT.with(|built| built.get()[pane as usize])
 }
 
-#[cfg(test)]
-pub(crate) fn reset_pane_rows_built() {
-    PANE_ROWS_BUILT.with(|built| built.set([0; 3]));
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_console_rows_built() {
+    CONSOLE_ROWS_BUILT.with(|built| built.set([0; 2]));
 }
 
 /// B3: the pane's row area. The list is handed the visible range only, so rows
 /// outside the window are never built; the paired handle remembers the offset
 /// and the scrollbar makes the extra scroll range visible in a narrow panel.
-fn pane_rows(
+pub fn pane_rows(
     cx: &mut Context<AppView>,
     pane: &mut PaneWindow,
     id: &'static str,
@@ -129,7 +122,7 @@ impl AppView {
     /// drawer. It is an overlay: the table keeps its own pane beside it, so
     /// the list is never squeezed under its floor. The root occludes input,
     /// or a blank click reaches the rows behind it and retargets the inspector.
-    pub(crate) fn render_inspector_drawer(
+    pub fn render_inspector_drawer(
         &mut self,
         width: f32,
         window: &mut Window,
@@ -182,42 +175,53 @@ impl AppView {
 
     /// F19: picking a row opens the inspector again — it is the only way back
     /// to the row's controls once Esc closed it.
-    pub(crate) fn open_inspector(&mut self) {
+    pub fn open_inspector(&mut self) {
         self.inspector_visible = true;
     }
 
     /// F19: Esc and the close button shut the inspector in BOTH presentations
     /// and hand focus back to the list. It reports whether it closed
-    /// anything, so the caller can leave the checked set alone — one overlay
+    /// anything, so the caller can leave the selection alone - one overlay
     /// layer per Esc.
-    pub(crate) fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.inspector_visible {
             return false;
         }
         self.inspector_visible = false;
-        window.focus(&self.focus, cx);
+        self.close_console_focus_table(window, cx);
         cx.notify();
         true
     }
 
-    pub(crate) fn render_detail(
+    pub fn render_detail(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let Some(config) = self.selected_config(cx) else {
-            if self.config_count(cx) == 0 {
-                return div().id("config-detail").test_support().into_any_element();
+        // R6: the inspector follows the selection. Exactly one selected row
+        // shows its sections; two or more show the aggregate; zero (or an
+        // empty library) shows the empty state.
+        match self.selection_count() {
+            0 => {
+                if self.config_count(cx) == 0 {
+                    return div().id("config-detail").test_support().into_any_element();
+                }
+                self.render_detail_empty(cx).into_any_element()
             }
-            return self.render_detail_empty(cx).into_any_element();
-        };
-        self.render_detail_selected(window, cx, &config)
-            .into_any_element()
+            1 => {
+                let Some(config) = self.selected_config(cx) else {
+                    return self.render_detail_empty(cx).into_any_element();
+                };
+                self.render_detail_selected(window, cx, &config)
+                    .into_any_element()
+            }
+            _ => self.render_inspector_aggregate(cx).into_any_element(),
+        }
     }
 
     /// T-03: rows but no selection. The Add and Import calls to action belong
     /// to an EMPTY library only — here the inspector just asks for a row.
-    pub(crate) fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("config-detail")
             .test_support()
@@ -241,12 +245,16 @@ impl AppView {
             .into_any_element()
     }
 
-    pub(crate) fn render_detail_selected(
+    pub fn render_detail_selected(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
+        // Slice 6: one stacked scroll — Identity, Endpoint, Health, Actions —
+        // no tabs. Health and traffic updates repaint inside; only a target
+        // CHANGE resets the scroll, and that resets live in the selection
+        // handler, never here.
         div()
             .id("config-detail")
             .test_support()
@@ -261,11 +269,6 @@ impl AppView {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .child(self.render_inspector_tabs(cx))
-            // K1/A4-2: ONE scroll for the whole pane — header, endpoints (with
-            // their editors), the pane module, then the operate row. Nothing
-            // is pinned to the panel bottom: actions follow content, so the
-            // dead gap and the stranded editor strip cannot come back.
             .child(
                 div()
                     .id("config-detail-body")
@@ -274,9 +277,9 @@ impl AppView {
                     .flex_col()
                     .gap_1()
                     // A scroll container must own a BOUNDED height: `flex_1`
-                    // takes the space left by the tabs so the body scrolls
-                    // instead of growing past the panel (which clipped the
-                    // operate row and reported a 0px scroll range).
+                    // takes the space left over so the body scrolls instead
+                    // of growing past the panel (which clipped the operate
+                    // row and reported a 0px scroll range).
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -286,39 +289,25 @@ impl AppView {
                     // Appears on hover/wheel: a clipped line alone is a poor
                     // scroll cue once the body carries the whole pane.
                     .vertical_scrollbar(&self.detail_scroll)
-                    .child(self.render_inspector_overview(window, cx, config))
-                    .child(Self::motion_enter(
-                        match self.inspector_tab {
-                            InspectorTab::Links => {
-                                self.render_inspector_connections(cx).into_any_element()
-                            }
-                            InspectorTab::Traffic => {
-                                self.render_inspector_traffic(cx).into_any_element()
-                            }
-                            InspectorTab::Health => {
-                                self.render_inspector_health(cx, config).into_any_element()
-                            }
-                            InspectorTab::Logs => self.render_inspector_logs(cx).into_any_element(),
-                            InspectorTab::Details => {
-                                self.render_inspector_details(cx, config).into_any_element()
-                            }
-                        },
-                        format!("inspector-pane-enter-{}", self.inspector_tab.index()),
-                        cx,
-                    ))
-                    .child(self.render_detail_actions(cx, config)),
+                    .child(self.render_inspector_identity(cx, config))
+                    .child(self.render_inspector_endpoint(window, cx, config))
+                    .child(self.render_inspector_health_section(cx, config))
+                    .child(self.render_inspector_actions(cx, config))
+                    .child(self.render_inspector_console_link(cx)),
             )
             .into_any_element()
     }
 
-    /// B3: how tall the pane's row area is. A short list keeps its natural
-    /// height; past its share of the panel the list scrolls itself, because the
-    /// panel's own scroll cannot tell which rows are on screen.
-    fn pane_list_height(&self, rows: usize, row_h: f32) -> f32 {
+    /// Slice 6: the console body's row-area height. A short list keeps its
+    /// natural height; past its share of the dock the list scrolls itself.
+    /// The dock's height is fixed (240/220), so the share of it a list may
+    /// paint is a constant, not a measurement — one less layout read per
+    /// frame, and the dock never resizes anyway.
+    pub fn console_list_height(&self, rows: usize, row_h: f32) -> f32 {
         if rows == 0 {
             return 0.;
         }
-        let viewport = self.detail_scroll.bounds().size.height.as_f32();
+        let viewport = console_height(self.density) - 36.; // header row
         let viewport = if viewport > 0. {
             viewport
         } else {
@@ -327,469 +316,7 @@ impl AppView {
         (rows as f32 * row_h).min((viewport * PANE_LIST_SHARE).max(row_h * 3.))
     }
 
-    pub(crate) fn render_inspector_logs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let lines = self.visible_log_lines(cx);
-
-        const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
-        let current_level = self.logs.level;
-        let selected_level = LOG_LEVEL_LABELS
-            .iter()
-            .position(|label| LogLevel::from_label(label) == current_level);
-        let mut level_group = RadioGroup::horizontal("log-pane-level-options")
-            .selected_index(selected_level)
-            .on_change({
-                let group_view = cx.entity();
-                move |ix, window, cx| {
-                    let level = LOG_LEVEL_LABELS
-                        .get(*ix)
-                        .map(|label| LogLevel::from_label(label))
-                        .unwrap_or(current_level);
-                    let level_view = group_view.clone();
-                    level_view.update(cx, |view, cx| {
-                        view.set_log_level(level, window, cx);
-                    });
-                }
-            });
-        for label in LOG_LEVEL_LABELS {
-            let level = LogLevel::from_label(label);
-            level_group = level_group.child(
-                Radio::new(label)
-                    .label(log_level_label(level))
-                    .tooltip(log_level_tooltip(level)),
-            );
-        }
-        let mut parts = Vec::new();
-        if !self.logs.filter.trim().is_empty() {
-            parts.push(t!(
-                "detail-log-filter-include",
-                value = self.logs.filter.trim()
-            ));
-        }
-        if !self.logs.exclude.trim().is_empty() {
-            parts.push(t!(
-                "detail-log-filter-exclude",
-                value = self.logs.exclude.trim()
-            ));
-        }
-        if !self.logs.regex.trim().is_empty() {
-            parts.push(t!(
-                "detail-log-filter-regex",
-                value = self.logs.regex.trim()
-            ));
-        }
-        if let Some(level) = self.logs.level {
-            parts.push(t!("detail-log-filter-level", value = level.as_str()));
-        }
-        let summary = if parts.is_empty() {
-            t!("detail-log-filters-none")
-        } else {
-            t!("detail-log-filters", parts = parts.join(" · "))
-        };
-        let filter_active = !self.logs.filter.trim().is_empty()
-            || !self.logs.exclude.trim().is_empty()
-            || !self.logs.regex.trim().is_empty()
-            || self.logs.level.is_some();
-        let mut pane = div()
-            .id("config-logs")
-            .test_support()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                GroupBox::new()
-                    .title(t!("detail-logs-title", count = lines.len()))
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("log-pane-level-row")
-                            .test_support()
-                            .child(level_group),
-                    )
-                    .child(
-                        div()
-                            .id("log-pane-filters")
-                            .test_support()
-                            .text_sm()
-                            .child(summary),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("log-pane-edit-filters")
-                                    .small()
-                                    .label(t!("detail-edit-filters"))
-                                    .tooltip(t!("detail-edit-filters-tip"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.open_logs_dialog(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("log-pane-copy")
-                                    .small()
-                                    .label(t!("detail-copy-visible"))
-                                    .tooltip(t!("detail-copy-visible-tip"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.copy_visible_logs(window, cx);
-                                    })),
-                            ),
-                    ),
-            );
-        if lines.is_empty() {
-            let mut empty = div()
-                .id("log-pane-empty")
-                .test_support()
-                .text_sm()
-                .child(t!("detail-logs-empty"));
-            if filter_active {
-                empty = empty.child(
-                    Button::new("log-pane-clear")
-                        .small()
-                        .label(t!("detail-clear-filter"))
-                        .tooltip(t!("detail-clear-filter-tip"))
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.clear_log_filter(window, cx);
-                        })),
-                );
-            }
-            pane = pane.child(empty);
-        } else {
-            let rows = lines.len();
-            let height = self.pane_list_height(rows, PANE_LOG_ROW_H);
-            pane = pane.child(pane_rows(
-                cx,
-                &mut self.pane_logs,
-                "log-pane-list",
-                height,
-                rows,
-                PANE_LOG_ROW_H,
-                move |_view, ix, _cx| {
-                    let line = lines.get(ix).cloned().unwrap_or_default();
-                    note_pane_row(PaneRows::Logs);
-                    div()
-                        .id(("log-line", ix))
-                        .w_full()
-                        .h(px(PANE_LOG_ROW_H))
-                        .text_sm()
-                        .truncate()
-                        .child(line)
-                        .into_any_element()
-                },
-            ));
-        }
-        pane
-    }
-
-    pub(crate) fn render_inspector_connections(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let selected = self.selected_config(cx).map(|config| config.id);
-        let rows = build_conn_rows(
-            &self.conn.snapshot,
-            &self.conn.delta,
-            selected.as_deref(),
-            self.conn.selected_only,
-            self.conn.sort_desc,
-        );
-        let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
-
-        let dest_width_px = self.store.conn_column_widths()[0] as f32;
-        let mut pane = div()
-            .id("config-links")
-            .test_support()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                GroupBox::new()
-                    .title(t!("detail-links-title", count = rows.len()))
-                    .gap_1()
-                    .child(div().text_sm().child(t!("detail-links-description")))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("conn-toggle-scope")
-                                    .small()
-                                    .label(if self.conn.selected_only {
-                                        t!("detail-scope-on")
-                                    } else {
-                                        t!("detail-scope-off")
-                                    })
-                                    .tooltip(t!("detail-scope-tip"))
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.conn.selected_only = !view.conn.selected_only;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("conn-toggle-sort")
-                                    .small()
-                                    .label(if self.conn.sort_desc {
-                                        t!("detail-sort-desc")
-                                    } else {
-                                        t!("detail-sort-asc")
-                                    })
-                                    .tooltip(t!("detail-sort-tip"))
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.conn.sort_desc = !view.conn.sort_desc;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("conn-columns-narrow")
-                                    .small()
-                                    .label(t!("detail-columns-narrow"))
-                                    .tooltip(t!("detail-columns-narrow-tip"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.adjust_conn_column_widths(-20, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("conn-columns-widen")
-                                    .small()
-                                    .label(t!("detail-columns-widen"))
-                                    .tooltip(t!("detail-columns-widen-tip"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.adjust_conn_column_widths(20, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("conn-columns-refresh")
-                                    .small()
-                                    .label(t!("detail-columns-reset"))
-                                    .tooltip(t!("detail-columns-reset-tip"))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.refresh_conn_column_widths(window, cx);
-                                    })),
-                            ),
-                    ),
-            );
-        if rows.is_empty() {
-            pane = pane.child(
-                div()
-                    .id("config-links-empty")
-                    .test_support()
-                    .text_sm()
-                    .child(t!("detail-links-empty")),
-            );
-        } else {
-            let count = rows.len();
-            let height = self.pane_list_height(count, PANE_LINK_ROW_H);
-            let library = Rc::new(library);
-            pane = pane.child(pane_rows(
-                cx,
-                &mut self.pane_links,
-                "config-link-list",
-                height,
-                count,
-                PANE_LINK_ROW_H,
-                move |view, ix, cx| {
-                    let Some(row) = rows.get(ix) else {
-                        return div().into_any_element();
-                    };
-                    let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
-                    let dest = row.dest.clone();
-                    let dest_display = if dest.is_empty() {
-                        t!("detail-no-destination")
-                    } else {
-                        redact_secrets(&dest)
-                    };
-                    // Copy the displayed string; an empty dest has no hostname to copy.
-                    let dest_value = if dest.is_empty() {
-                        String::new()
-                    } else {
-                        dest_display.clone()
-                    };
-                    let mut dest_cell = div()
-                        .id(format!("conn-col-dest-{ix}"))
-                        .test_support()
-                        .w(px(dest_width_px))
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            Button::new(format!("conn-copy-{ix}"))
-                                .small()
-                                .label(dest_display)
-                                .tooltip(t!("detail-copy-destination"))
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.copy_conn_cell(
-                                        ConnCopyTarget::Dest(ix),
-                                        &dest_value,
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        );
-                    if view.conn.copied == Some(ConnCopyTarget::Dest(ix)) {
-                        dest_cell = dest_cell.child(
-                            div()
-                                .id(format!("conn-copied-dest-{ix}"))
-                                .test_support()
-                                .text_sm()
-                                .child(t!("detail-copied")),
-                        );
-                    }
-
-                    // The endpoint cell copies the row's active `bind:port` contact
-                    // verbatim; unclaimed rows (no exit) stay non-copyable.
-                    let endpoint_value = bind.clone();
-                    let endpoint_claimed = row.row_id.is_some();
-                    let mut endpoint_button = Button::new(format!("conn-endpoint-{ix}"))
-                        .small()
-                        .label(bind);
-                    if endpoint_claimed {
-                        endpoint_button = endpoint_button
-                            .tooltip(t!("detail-copy-endpoint"))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.copy_conn_cell(
-                                    ConnCopyTarget::Endpoint(ix),
-                                    &endpoint_value,
-                                    window,
-                                    cx,
-                                );
-                            }));
-                    }
-                    let mut meta = div()
-                        .id(format!("conn-meta-{ix}"))
-                        .test_support()
-                        .flex()
-                        .flex_row()
-                        .flex_nowrap()
-                        .items_center()
-                        .gap_1()
-                        .text_sm()
-                        .overflow_hidden()
-                        .child(name)
-                        .child("·")
-                        .child(endpoint_button);
-                    if view.conn.copied == Some(ConnCopyTarget::Endpoint(ix)) {
-                        meta = meta.child(
-                            div()
-                                .id(format!("conn-copied-endpoint-{ix}"))
-                                .test_support()
-                                .child(t!("detail-copied")),
-                        );
-                    }
-                    meta = meta.child(t!(
-                        "detail-conn-meta",
-                        protocol = protocol,
-                        down = format_bytes(row.rx_bytes),
-                        up = format_bytes(row.tx_bytes),
-                        delta = format_bytes(row.delta_rx.saturating_add(row.delta_tx))
-                    ));
-
-                    note_pane_row(PaneRows::Links);
-                    div()
-                        .id(("conn-row", ix))
-                        .h(px(PANE_LINK_ROW_H))
-                        .w_full()
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(dest_cell)
-                        .child(meta)
-                        .into_any_element()
-                },
-            ));
-        }
-        pane
-    }
-
-    pub(crate) fn render_inspector_traffic(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
-        let totals = self.store.traffic_totals().unwrap_or_default();
-        let exits = aggregate_exit_traffic(&library, &totals);
-        let max = exits
-            .iter()
-            .map(ExitTraffic::total)
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let mut pane = div()
-            .id("config-traffic")
-            .test_support()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                GroupBox::new()
-                    .title(t!("detail-traffic-title"))
-                    .gap_1()
-                    .child(
-                        div().text_sm().child(
-                            summed_traffic_text(&self.store)
-                                .unwrap_or_else(|| t!("detail-usage-unavailable")),
-                        ),
-                    )
-                    .child(div().text_sm().child(t!("detail-traffic-description"))),
-            );
-        if exits.is_empty() {
-            pane = pane.child(
-                div()
-                    .id("config-traffic-empty")
-                    .test_support()
-                    .text_sm()
-                    .child(t!("detail-traffic-empty")),
-            );
-        } else {
-            let count = exits.len();
-            let height = self.pane_list_height(count, PANE_TRAFFIC_ROW_H);
-            pane = pane.child(pane_rows(
-                cx,
-                &mut self.pane_traffic,
-                "config-traffic-list",
-                height,
-                count,
-                PANE_TRAFFIC_ROW_H,
-                move |_view, ix, _cx| {
-                    let Some(exit) = exits.get(ix) else {
-                        return div().into_any_element();
-                    };
-                    let filled = ((exit.total() as f64 / max as f64) * 12.0).round() as usize;
-                    let bar = format!(
-                        "{}{}",
-                        "█".repeat(filled.min(12)),
-                        "░".repeat(12usize.saturating_sub(filled.min(12)))
-                    );
-                    note_pane_row(PaneRows::Traffic);
-                    div()
-                        .id(format!("traffic-exit-{}", exit.row_id))
-                        .test_support()
-                        .w_full()
-                        .h(px(PANE_TRAFFIC_ROW_H))
-                        .text_sm()
-                        .truncate()
-                        .child(t!(
-                            "detail-traffic-row",
-                            bar = bar,
-                            name = exit.name.as_str(),
-                            bind = exit.bind.as_str(),
-                            down = format_bytes(exit.rx_bytes),
-                            up = format_bytes(exit.tx_bytes)
-                        ))
-                        .into_any_element()
-                },
-            ));
-        }
-        pane
-    }
-
-    /// K1/A4-3: ONE non-wrapping header line — acting echo and the dirty dot on
-    /// the left, the single serving badge flush right (a spacer, not a wrap).
-    /// The badge is a lamp div plus `<state> · <bind:port> · <latency>` text: no
-    /// `●`/`○` glyph, no kit overlay dot, and `dead` is never co-signed with
-    /// `Running`.
-    pub(crate) fn render_detail_header(
+    pub fn render_detail_header(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -846,32 +373,6 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child(acting_on_label(config)),
             )
-            .child({
-                // T-03: the dirty marker rides the inspector's row header —
-                // the row is one line and has no room for it.
-                let dirty = self
-                    .libraries
-                    .read(cx)
-                    .delegate()
-                    .endpoint_is_dirty(&config.id, cx);
-                if !dirty {
-                    div().id("row-dirty-idle").test_support().into_any_element()
-                } else {
-                    let dirty_tip = t!("detail-dirty-tip", name = config.name.as_str());
-                    div()
-                        .id(format!("row-dirty-{}", config.id))
-                        .test_support()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(warning_text_color(cx.theme()))
-                        .tooltip({
-                            let tip = dirty_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(dirty_tip)
-                        .into_any_element()
-                }
-            })
             // K1/A4-3: the badge stays on the SAME line — the spacer pushes it
             // flush right instead of letting a long name wrap it onto a second
             // line.
@@ -893,9 +394,9 @@ impl AppView {
     /// selected row's editable bind/port strip share one frame, one draft
     /// warning, and ONE copy action (was three per-row copies plus a strip
     /// pinned below the pane body).
-    pub(crate) fn render_detail_endpoints(
+    pub fn render_detail_endpoints(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
@@ -913,7 +414,17 @@ impl AppView {
             .to_string();
 
         let upstream = self.cached_upstream(cx, config);
-        let strip = self.render_row_editors(window, cx, config);
+        // Custom-config rows read their listens from JSON; the stored bind and
+        // port are display only, so there is nothing here to edit.
+        let endpoint_editable = !is_custom_config_protocol(&config.protocol);
+        let inline_editing = endpoint_editable
+            && self.endpoint_draft.as_ref().is_some_and(|draft| {
+                draft.row_id == config.id && draft.host == EndpointHost::InspectorInline
+            });
+        let inline_form = inline_editing
+            .then(|| self.endpoint_frame(cx))
+            .flatten()
+            .map(|frame| render_endpoint_form(cx.entity(), &frame, cx));
 
         div().id("config-endpoints").test_support().child(
             GroupBox::new()
@@ -949,29 +460,51 @@ impl AppView {
                         // per-row `[Copy]` buttons are gone.
                         .child({
                             let copy_id = config.id.clone();
-                            div()
+                            let edit_id = config.id.clone();
+                            let edit_view = cx.entity();
+                            let mut row = div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap_2()
                                 .w_full()
                                 .flex_shrink_0()
-                                .child(div().flex_1().min_w_0())
-                                .child(
-                                    Button::new("copy-endpoints")
+                                .child(div().flex_1().min_w_0());
+                            if endpoint_editable && !inline_editing {
+                                row = row.child(
+                                    Button::new("detail-endpoint-edit")
                                         .small()
-                                        .label(t!("detail-copy-urls"))
-                                        .accessibility_label(t!("detail-copy-urls-aria"))
-                                        .tooltip(t!("detail-copy-urls-tip"))
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.copy_row_urls(&copy_id, window, cx);
-                                        })),
-                                )
+                                        .label(t!("endpoint-edit"))
+                                        .accessibility_label(t!(
+                                            "endpoint-edit-aria",
+                                            name = config.name.as_str()
+                                        ))
+                                        .tooltip(t!("endpoint-edit-tip"))
+                                        .on_click(move |_, window, cx| {
+                                            edit_view.update(cx, |view, cx| {
+                                                view.open_endpoint_draft(
+                                                    &edit_id,
+                                                    EndpointHost::InspectorInline,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                );
+                            }
+                            row.child(
+                                Button::new("copy-endpoints")
+                                    .small()
+                                    .label(t!("detail-copy-urls"))
+                                    .accessibility_label(t!("detail-copy-urls-aria"))
+                                    .tooltip(t!("detail-copy-urls-tip"))
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.copy_row_urls(&copy_id, window, cx);
+                                    })),
+                            )
                         })
-                        // K1/A4-7: the editor strip lives INSIDE the block it edits.
-                        .child(strip)
-                        // The draft's live warning rides the strip that caused it.
-                        .children(self.render_row_endpoint_warning(cx, config)),
+                        // The one editor, inline, directly under the values.
+                        .children(inline_form),
                 ),
         )
     }
@@ -979,7 +512,7 @@ impl AppView {
     /// One read-only contact row. T-03: the value takes the leftover width and
     /// truncates at the 260px default; the full text stays in its tooltip.
     /// K1/A4-4: the per-row Copy left — the block carries the single action.
-    pub(crate) fn endpoint_row(
+    pub fn endpoint_row(
         cx: &mut Context<Self>,
         label: String,
         value: String,
@@ -1016,7 +549,7 @@ impl AppView {
     /// K1/A4-5: red ONLY for a failing state — live numbers ride dim mono and
     /// the probe wording drops `(s)` plus the `probe:`/byte jargon. The full
     /// detail line keeps its job inside the failed ALERT, where red is earned.
-    pub(crate) fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+    pub fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         let status = self.health_store.status(&config.id);
         let mono_number = |text: String| {
             div()
@@ -1112,7 +645,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn render_detail_usage(
+    pub fn render_detail_usage(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -1143,7 +676,7 @@ impl AppView {
     /// one-or-two-point "trend" is noise, so the block says how many probes
     /// it has instead. The real trend (caption + chart) still comes from
     /// `history_line` once the row has enough history to draw honestly.
-    pub(crate) fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+    pub fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         // Same 90-day window the sparkline reads, so the count matches the
         // samples `history_line` would chart.
         let since = now_unix().saturating_sub(90 * 86_400);
@@ -1175,219 +708,7 @@ impl AppView {
         )
     }
 
-    /// The row's endpoint editors — K1/A4-4 now mounts this strip INSIDE the
-    /// endpoints block, with the ids kept stable (`row-bind-<id>`,
-    /// `row-port-input-<id>`) so the row and the inspector speak the same
-    /// names. Start/Stop live in the operate row; Edit lives in the row's
-    /// context menu — neither rides the strip anymore (K1/A4-8).
-    pub(crate) fn render_row_editors(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> AnyElement {
-        let row_id = config.id.clone();
-        let port_stored = config.port.to_string();
-        // The drafts live per row in the delegate; the inspector makes sure
-        // the selected row's editors exist before it draws them.
-        let editors = self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().ensure_row_inputs(
-                &row_id,
-                &config.bind_ip,
-                &port_stored,
-                window,
-                list_cx,
-            );
-            state.delegate().endpoint_inputs.get(&row_id).map(|inputs| {
-                (
-                    inputs.bind.clone(),
-                    inputs.port.clone(),
-                    inputs.picker.clone(),
-                )
-            })
-        });
-        let Some((bind_state, port_state, bind_picker)) = editors else {
-            return div().id("row-editors").test_support().into_any_element();
-        };
-        // T-33: custom-config rows stay JSON-governed — their listen comes
-        // from the document, so they keep the free-text bind field.
-        let custom_config_row = is_custom_config_protocol(&config.protocol);
-        let name = config.name.clone();
-        let bind_cell = if custom_config_row {
-            div()
-                .id(format!("row-bind-{}", config.id))
-                .test_support()
-                .w(px(118.))
-                .tooltip({
-                    let tip = t!("detail-bind-custom-tip", name = name.as_str());
-                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                })
-                .child(
-                    div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(
-                            Input::new(&bind_state)
-                                .id(format!("row-bind-input-{}", config.id))
-                                .small()
-                                // K1/A4-7: every strip input is bordered + mono.
-                                .bordered(true)
-                                .aria_label(t!("detail-bind-aria", name = name.as_str())),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .id(format!("row-bind-{}", config.id))
-                .test_support()
-                .w(px(118.))
-                .tooltip({
-                    let tip = t!("detail-bind-tip", name = name.as_str());
-                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                })
-                .child(
-                    // K1/A4-7: the picker matches the port field's mono frame.
-                    div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(
-                            Select::new(&bind_picker)
-                                .id(format!("row-bind-picker-{}", config.id))
-                                .small()
-                                .placeholder(t!("detail-bind-placeholder"))
-                                .accessibility_label(t!("detail-bind-aria", name = name.as_str())),
-                        ),
-                )
-                .into_any_element()
-        };
-        let add_button = (!custom_config_row).then(|| {
-            let add_view = cx.entity();
-            Button::new(format!("row-bind-add-{}", config.id))
-                .small()
-                .label(t!("detail-add-address"))
-                .accessibility_label(t!("detail-add-address-aria"))
-                .tooltip(t!("detail-add-address-tip", name = name.as_str()))
-                .on_click(move |_, window, cx| {
-                    add_view.update(cx, |view, cx| {
-                        view.open_settings_dialog(window, cx);
-                    });
-                })
-                .into_any_element()
-        });
-        div()
-            .id("row-editors")
-            .test_support()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .min_w_0()
-            // K1/A4-4: inside the Endpoints frame the strip needs no hairline
-            // or own padding — the GroupBox already separates it.
-            .key_context("row-endpoint")
-            .on_key_down(cx.listener({
-                let revert_id = row_id.clone();
-                move |view: &mut AppView,
-                      event: &KeyDownEvent,
-                      window: &mut Window,
-                      cx: &mut Context<AppView>| {
-                    if event.keystroke.key != "escape" {
-                        return;
-                    }
-                    let reverted = {
-                        let focused = view
-                            .libraries
-                            .read(cx)
-                            .delegate()
-                            .row_inputs_focused(&revert_id, window, cx);
-                        if !focused {
-                            false
-                        } else {
-                            let mut reverted = false;
-                            view.libraries.update(cx, |state, list_cx| {
-                                reverted = state
-                                    .delegate_mut()
-                                    .revert_row_inputs(&revert_id, window, list_cx);
-                            });
-                            reverted
-                        }
-                    };
-                    if reverted {
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }
-            }))
-            .child(bind_cell)
-            .children(add_button)
-            .child(
-                div()
-                    .id(format!("row-port-editor-{}", config.id))
-                    .test_support()
-                    .w(px(76.))
-                    .tooltip({
-                        let tip = t!(
-                            "detail-port-tip",
-                            bind = config.bind_ip.as_str(),
-                            port = config.port
-                        );
-                        move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                    })
-                    .child(
-                        div()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(
-                                Input::new(&port_state)
-                                    .id(format!("row-port-input-{}", config.id))
-                                    .small()
-                                    // K1/A4-7: the port field stopped being the
-                                    // borderless one wedged between Add… and value.
-                                    .bordered(true)
-                                    .aria_label(t!("detail-port-aria", name = name.as_str())),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// T-03: the draft's live warning — a colliding endpoint or a bind that
-    /// leaves loopback — rides with the editors that caused it.
-    pub(crate) fn render_row_endpoint_warning(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> Option<AnyElement> {
-        let delegate = self.libraries.read(cx).delegate();
-        let (bind_text, port_text) = delegate.endpoint_draft_texts(&config.id, cx)?;
-        if let Some(warning) =
-            bind_port_collision_warning(&delegate.rows, Some(&config.id), &bind_text, &port_text)
-        {
-            return Some(
-                div()
-                    .id(format!("row-endpoint-warn-{}", config.id))
-                    .test_support()
-                    .w_full()
-                    .text_sm()
-                    .text_color(danger_text_color(cx.theme()))
-                    .truncate()
-                    .child(warning)
-                    .into_any_element(),
-            );
-        }
-        let hint = lan_hint_for_bind(bind_text.trim())?;
-        Some(
-            div()
-                .id(format!("row-endpoint-warn-{}", config.id))
-                .test_support()
-                .w_full()
-                .text_sm()
-                .truncate()
-                .child(hint)
-                .into_any_element(),
-        )
-    }
-
-    pub(crate) fn render_detail_actions(
+    pub fn render_detail_actions(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -1489,7 +810,7 @@ impl AppView {
 
     /// A context-menu row for one table action. The target row travels by id
     /// and is resolved when the handler runs, never at render.
-    fn context_menu_item(
+    pub fn context_menu_item(
         id: &'static str,
         row_id: &str,
         view: &Entity<AppView>,
@@ -1498,7 +819,7 @@ impl AppView {
         Self::context_menu_item_with_label(id, row_id, view, multi, None)
     }
 
-    fn context_menu_item_with_label(
+    pub fn context_menu_item_with_label(
         id: &'static str,
         row_id: &str,
         view: &Entity<AppView>,
@@ -1540,7 +861,7 @@ impl AppView {
 
     /// The row verbs that widen to the whole set, and the copy they wear when
     /// they do. Edit / Share / Duplicate stay row-scoped by nature.
-    fn multi_row_label(id: &str, count: usize) -> Option<String> {
+    pub fn multi_row_label(id: &str, count: usize) -> Option<String> {
         if count <= 1 {
             return None;
         }
@@ -1556,7 +877,7 @@ impl AppView {
         }
     }
 
-    fn row_context_item(
+    pub fn row_context_item(
         id: &'static str,
         row_id: &str,
         view: &Entity<AppView>,
@@ -1572,64 +893,73 @@ impl AppView {
         }
     }
 
-    pub(crate) fn row_context_menu(
+    /// R31: the row's `More` menu. The order is exhaustive and signed: every
+    /// verb the surface map gives a row lives here, and nothing is dropped.
+    ///
+    /// The menu acts on the row it was opened on, unless that row is part of a
+    /// multi-selection — then the verb that widens to the set widens.
+    pub fn row_more_menu(
         menu: PopupMenu,
         row_id: &str,
         view: &Entity<AppView>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let multi_count = view
-            .read(cx)
-            .libraries
-            .read(cx)
-            .delegate()
-            .selected_ids()
-            .len();
-        let multi_count = if view
-            .read(cx)
-            .libraries
-            .read(cx)
-            .delegate()
-            .is_selected(row_id)
-        {
-            multi_count
-        } else {
-            1
+        let multi_count = {
+            let app = view.read(cx);
+            if app.is_selected(row_id) {
+                app.selection_count()
+            } else {
+                1
+            }
         };
-        // K8/A6-2: 7 core verbs at top level (Reset… is its own submenu) and
-        // the demoted row chores behind `More ▾`. Speedtest / Resolve Out-IP /
-        // Resolve domain are retired (K8): they appear in no menu at all.
-        let menu = ["start", "stop", "test", "copy-proxy", "edit"]
+        let mut menu = ["start", "stop", "test"]
             .into_iter()
             .fold(menu, |menu, id| {
                 menu.item(Self::row_context_item(id, row_id, view, multi_count))
             });
+        menu = menu
+            .item(Self::row_context_item("edit", row_id, view, multi_count))
+            .item(Self::row_context_item(
+                "copy-urls",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("move", row_id, view, multi_count))
+            .item(Self::row_context_item(
+                "assign-preset",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("logs", row_id, view, multi_count))
+            .item(Self::row_context_item("share", row_id, view, multi_count))
+            .item(Self::row_context_item(
+                "duplicate",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("ping", row_id, view, multi_count));
         let reset_id = row_id.to_string();
         let reset_view = view.clone();
-        let menu = menu
-            .submenu(t!("rowctx-reset"), window, cx, move |menu, _, _| {
-                ["reset-traffic", "reset-usage"]
-                    .into_iter()
-                    .fold(menu, |menu, id| {
-                        menu.item(Self::context_menu_item(id, &reset_id, &reset_view, None))
-                    })
-            })
-            .item(Self::row_context_item("delete", row_id, view, multi_count));
-        let more_id = row_id.to_string();
-        let more_view = view.clone();
-        menu.submenu(t!("rowctx-more"), window, cx, move |menu, _, _| {
-            ["move", "copy-urls", "share", "duplicate", "ping"]
+        menu = menu.submenu(t!("rowctx-reset"), window, cx, move |menu, _, _| {
+            ["reset-traffic", "reset-usage"]
                 .into_iter()
                 .fold(menu, |menu, id| {
-                    menu.item(Self::row_context_item(
-                        id,
-                        &more_id,
-                        &more_view,
-                        multi_count,
-                    ))
+                    menu.item(Self::context_menu_item(id, &reset_id, &reset_view, None))
                 })
-        })
+        });
+        menu = menu
+            .item(Self::row_context_item(
+                "auto-start",
+                row_id,
+                view,
+                multi_count,
+            ))
+            .item(Self::row_context_item("delete", row_id, view, multi_count));
+        menu
     }
 
     /// K1/A4-8: the operate row's overflow — ONE `…` trigger holding the five
@@ -1637,7 +967,7 @@ impl AppView {
     /// flag only), Ping, Logs, Copy URLs, Copy SOCKS. Row management (Edit /
     /// Delete / Duplicate / Reset) lives in the row's context menu — this
     /// button used to duplicate half of it above itself.
-    pub(crate) fn render_row_menu(
+    pub fn render_row_menu(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -1667,7 +997,7 @@ impl AppView {
 
     /// An inspector-menu row for one table action against the selection. Only
     /// the auto-start row carries a state suffix; the label is the table's.
-    fn selection_menu_item(
+    pub fn selection_menu_item(
         id: &'static str,
         note: Option<String>,
         view: &Entity<AppView>,
@@ -1702,7 +1032,7 @@ impl AppView {
         })
     }
 
-    pub(crate) fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {
+    pub fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {
         struct SparkPoint {
             x: String,
             y: f64,
@@ -1726,135 +1056,73 @@ impl AppView {
 }
 
 impl AppView {
-    /// K1/A4-1: ONE segmented switcher — Details · Health · Logs ·
-    /// Links · Traffic, one row. Presets has no tab of its own here
-    /// (Routing is its home). The Ctrl-1…5 keys live in Settings → Shortcuts,
-    /// not on the tab labels.
-    pub(crate) fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::prelude::FluentBuilder as _;
-
-        let view = cx.entity();
-        let (tab_fg_active, tab_fg_muted, tab_bar_bg, pill_bg, radius) = {
-            let theme = cx.theme();
-            (
-                theme.tab_active_foreground,
-                theme.muted_foreground,
-                theme.tokens.tab_bar_segmented,
-                // Task 11: the selected tab is the inspector's active pill, so
-                // it wears the accent wash instead of a neutral surface.
-                theme.list_active,
-                theme.radius,
-            )
-        };
-        let pill_radius = (radius - px(2.)).max(px(0.));
-
-        // K20/D1: the five labels size the row instead of splitting it into
-        // five equal `flex_1` slots — that clipped the last tab whole.
-
-        let tabs = [
-            InspectorTab::Details,
-            InspectorTab::Health,
-            InspectorTab::Logs,
-            InspectorTab::Links,
-            InspectorTab::Traffic,
-        ];
-
-        let mut buttons = Vec::with_capacity(tabs.len());
-        for (index, tab) in tabs.into_iter().enumerate() {
-            let label = inspector_tab_label(tab);
-            let slug = tab.a11y_label().to_lowercase();
-            let selected = self.inspector_tab == tab;
-            buttons.push(
-                div()
-                    .id(format!("inspector-tab-button-{slug}"))
-                    .test_support()
-                    .role(Role::Tab)
-                    .aria_label(label.clone())
-                    .aria_selected(selected)
-                    // The drawer overlays the table, so a press must not leak
-                    // through to the rows underneath it. Mirrors the kit Tab.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click({
-                        let view = view.clone();
-                        move |_, _, cx| {
-                            view.update(cx, |view, _| {
-                                view.set_inspector_tab(InspectorTab::from_index(index));
-                            });
-                        }
-                    })
-                    .flex()
-                    .h_full()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .px(px(TAB_LABEL_PAD_X))
-                    .rounded(pill_radius)
-                    .text_color(if selected {
-                        tab_fg_active
-                    } else {
-                        tab_fg_muted
-                    })
-                    .when(selected, |this| this.bg(pill_bg))
-                    .when(!selected, |this| {
-                        this.hover(|style| style.text_color(tab_fg_active))
-                    })
-                    .child(
-                        div()
-                            .id(format!("inspector-tab-{slug}"))
-                            .test_support()
-                            .text_size(rems(TAB_LABEL_REM))
-                            .line_height(relative(1.0))
-                            .whitespace_nowrap()
-                            .child(label),
-                    ),
-            );
+    /// Slice 6, Identity section: the old Details content — name (tooltip
+    /// carries the whole name), Protocol, Group, Source (`Manual` when the
+    /// row has no subscription), Upstream, and Preset when one is attached.
+    pub fn render_inspector_identity(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        let delegate = self.libraries.read(cx).delegate();
+        let source = crate::row_source(config, &delegate.sub_labels);
+        let preset = config
+            .preset_id
+            .as_deref()
+            .and_then(|id| delegate.preset_names.get(id))
+            .cloned();
+        let upstream = self.cached_upstream(cx, config);
+        let mut list = DescriptionList::new()
+            .bordered(false)
+            .small()
+            .columns(2)
+            .label_width(px(72.))
+            .item(t!("detail-identity-name"), config.name.to_string(), 1)
+            .item(t!("detail-identity-protocol"), config.protocol.clone(), 1)
+            .item(t!("detail-identity-group"), config.group.clone(), 1)
+            .item(t!("detail-identity-source"), source, 1)
+            .item(t!("detail-endpoint-upstream"), upstream, 1);
+        if let Some(preset) = preset {
+            list = list.item(t!("detail-identity-preset"), preset, 1);
         }
-
         div()
-            .id("inspector-tabs")
+            .id("inspector-identity")
             .test_support()
-            .w_full()
-            .min_w_0()
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .id("inspector-tab-bar")
-                    .role(Role::TabList)
-                    .w_full()
-                    .min_w_0()
-                    .h(px(24.))
-                    .flex()
-                    .items_center()
-                    .gap(px(TAB_LABEL_GAP))
-                    .overflow_hidden()
-                    .p(px(2.))
-                    .rounded(radius)
-                    .bg(tab_bar_bg)
-                    .children(buttons),
-            )
+            .child(self.render_detail_header(cx, config))
+            .child(list)
     }
 
-    /// K1/A4-4: the single-scroll head — header, failed alert (only when the
-    /// endpoint is the failure source), then the merged endpoints+editors
-    /// block. It needs `window` because the folded editor strip materializes
-    /// the row's draft inputs.
-    pub(crate) fn render_inspector_overview(
-        &self,
+    /// Slice 6, Endpoint section: the same values the old endpoints block
+    /// read, still hosting slice 5's one inline draft. No second editor.
+    pub fn render_inspector_endpoint(
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        let mut overview = div()
-            .id("inspector-overview")
+        self.render_detail_endpoints(window, cx, config)
+    }
+
+    /// Slice 6, Health section: state, latency probes, the failure reason,
+    /// the probe/usage block and the honest history line. `Test` rides the
+    /// actions section; this section only reports.
+    pub fn render_inspector_health_section(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        let mut section = div()
+            .id("inspector-health-section")
             .test_support()
             .flex()
             .flex_col()
-            .gap_0()
-            .child(self.render_detail_header(cx, config));
+            .gap_1()
+            .child(self.render_detail_health(cx, config));
         if self.detail_failed(config) {
-            overview = overview.child(
+            section = section.child(
                 div().id("config-health-alert").test_support().child(
                     Alert::error(
                         "config-health-alert-box",
@@ -1864,31 +1132,138 @@ impl AppView {
                 ),
             );
         }
-        overview.child(self.render_detail_endpoints(window, cx, config))
-    }
-
-    pub(crate) fn render_inspector_details(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
+        section
             .child(self.render_detail_usage(cx, config))
+            .child(self.render_detail_history(cx, config))
     }
 
-    pub(crate) fn render_inspector_health(
+    /// Slice 6, Actions section: Start/Stop (Start is primary while stopped),
+    /// Test, and the row's `More` kebab — the same menu the row uses, not a
+    /// second one. The F5/Shift+F5/Ctrl+T hints stay pinned.
+    pub fn render_inspector_actions(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
         div()
+            .id("inspector-actions")
+            .test_support()
+            .child(self.render_detail_actions(cx, config))
+    }
+
+    /// The inspector's one console entry: `Open in console →` opens the dock
+    /// on Logs with scope `Selected` and an empty console filter.
+    pub fn render_inspector_console_link(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        div()
+            .id("inspector-console-link")
+            .test_support()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .child(
+                Button::new("inspector-open-console")
+                    .small()
+                    .ghost()
+                    .label(t!("inspector-open-console"))
+                    .tooltip(t!("inspector-open-console"))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |view, cx| {
+                            view.open_console_scoped_to_selection(true, cx);
+                        });
+                    }),
+            )
+    }
+
+    /// R6: the 2+ selection aggregate. Counts only — no action buttons, no
+    /// endpoint editor, no second batch panel. `{N} hidden` clears filters,
+    /// exactly as the batch bar's hidden count does.
+    pub fn render_inspector_aggregate(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.selection_count();
+        let (running, failed, stopped) = {
+            let mut counts = (0usize, 0usize, 0usize);
+            let delegate = self.libraries.read(cx).delegate();
+            for id in self.selection.iter() {
+                let Some(row) = delegate.row_by_id(id) else {
+                    continue;
+                };
+                if self.engine.is_running(id) {
+                    counts.0 += 1;
+                } else if self.detail_failed(row) {
+                    counts.1 += 1;
+                } else {
+                    counts.2 += 1;
+                }
+            }
+            counts
+        };
+        let hidden = self.selection_hidden_count(cx);
+        let selected = t!("inspector-selected-count", count = count);
+        let running = t!("inspector-running-count", count = running);
+        let failed = t!("inspector-failed-count", count = failed);
+        let stopped = t!("inspector-stopped-count", count = stopped);
+        let mut section = div()
+            .id("inspector-aggregate")
+            .test_support()
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.render_detail_health(cx, config))
-            .child(self.render_detail_history(cx, config))
+            .p_2()
+            .child(
+                div()
+                    .id("inspector-selected-count")
+                    .test_support()
+                    .aria_label(selected.clone())
+                    .text_sm()
+                    .child(selected),
+            )
+            .child(
+                div()
+                    .id("inspector-running-count")
+                    .test_support()
+                    .aria_label(running.clone())
+                    .text_sm()
+                    .child(running),
+            )
+            .child(
+                div()
+                    .id("inspector-failed-count")
+                    .test_support()
+                    .aria_label(failed.clone())
+                    .text_sm()
+                    .child(failed),
+            )
+            .child(
+                div()
+                    .id("inspector-stopped-count")
+                    .test_support()
+                    .aria_label(stopped.clone())
+                    .text_sm()
+                    .child(stopped),
+            );
+        if hidden > 0 {
+            let view = cx.entity();
+            section = section.child(
+                Button::new("inspector-hidden-count")
+                    .small()
+                    .ghost()
+                    .label(t!("selection-hidden", count = hidden))
+                    .tooltip(t!("selection-hidden-tip"))
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.reveal_hidden_selection(window, cx);
+                        });
+                    }),
+            );
+        }
+        section.child(
+            div()
+                .id("inspector-use-selection-bar")
+                .test_support()
+                .aria_label(t!("inspector-use-selection-bar"))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("inspector-use-selection-bar")),
+        )
     }
 }

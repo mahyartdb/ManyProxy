@@ -1,9 +1,7 @@
-mod choices;
-mod facet;
-mod panel;
-mod protocol;
+pub mod choices;
+pub mod panel;
+pub mod protocol;
 
-pub(crate) use choices::*;
-pub(crate) use facet::*;
-pub(crate) use panel::*;
-pub(crate) use protocol::*;
+pub use choices::*;
+pub use panel::*;
+pub use protocol::*;

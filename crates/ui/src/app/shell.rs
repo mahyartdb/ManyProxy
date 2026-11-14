@@ -1,7 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn render_shell(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub fn render_shell(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let drop_view = cx.entity();
         div()
             .id("manyproxy-shell")
@@ -32,9 +32,9 @@ impl AppView {
                 shortcut_action(view, "stop-testing", window, cx);
             }))
             // Escape reaches here with a dialog open on purpose: clearing the
-            // check is the one shortcut the overlay does not own.
-            .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
-                run_action(view, "clear-checked", ActionTarget::Selection, window, cx);
+            // selection is the one shortcut the overlay does not own.
+            .on_action(cx.listener(|view, _: &ClearSelection, window, cx| {
+                run_action(view, "clear-selection", ActionTarget::Selection, window, cx);
             }))
             .on_action(cx.listener(|view, _: &OpenPalette, window, cx| {
                 shortcut_action(view, "open-palette", window, cx);
@@ -44,6 +44,9 @@ impl AppView {
             }))
             .on_action(cx.listener(|view, _: &UpdateCurrentGroup, window, cx| {
                 shortcut_action(view, "update-current-group", window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &EditEndpoint, window, cx| {
+                shortcut_action(view, "edit-endpoint", window, cx);
             }))
             .on_action(cx.listener(|view, _: &EditSelected, window, cx| {
                 shortcut_action(view, "edit", window, cx);
@@ -57,28 +60,32 @@ impl AppView {
             .on_action(cx.listener(|view, _: &SelectNextRow, window, cx| {
                 view.extend_selection_by(1, window, cx);
             }))
+            .on_action(cx.listener(|view, _: &FocusPreviousRow, window, cx| {
+                view.move_focus(-1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusNextRow, window, cx| {
+                view.move_focus(1, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusFirstRow, window, cx| {
+                view.focus_first_row(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusLastRow, window, cx| {
+                view.focus_last_row(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ToggleFocused, _window, cx| {
+                view.toggle_focused_row(cx);
+            }))
             .on_action(cx.listener(|view, _: &SelectAllRows, window, cx| {
                 view.select_all_visible(window, cx);
             }))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
                 shortcut_action(view, "focus-search", window, cx);
             }))
-            .on_action(cx.listener(|view, _: &InspectorDetails, window, cx| {
-                // F19: Ctrl-1 is the one key that owns presence — it toggles
-                // the panel shut when it is already showing Details.
-                shortcut_action(view, "inspector-details", window, cx);
+            .on_action(cx.listener(|view, _: &ToggleInspector, window, cx| {
+                shortcut_action(view, "inspector-toggle", window, cx);
             }))
-            .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {
-                shortcut_action(view, "inspector-health", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorLogs, window, cx| {
-                shortcut_action(view, "inspector-logs", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorLinks, window, cx| {
-                shortcut_action(view, "inspector-links", window, cx);
-            }))
-            .on_action(cx.listener(|view, _: &InspectorTraffic, window, cx| {
-                shortcut_action(view, "inspector-traffic", window, cx);
+            .on_action(cx.listener(|view, _: &ToggleConsole, window, cx| {
+                shortcut_action(view, "toggle-console", window, cx);
             }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
@@ -91,7 +98,7 @@ impl AppView {
     /// its own folder; a session that fell back to memory carries the folder
     /// the failed open was using; a deliberate in-memory store has none, and
     /// never raises the banner anyway.
-    pub(crate) fn writable_folder(&self) -> String {
+    pub fn writable_folder(&self) -> String {
         self.write_blocked_folder
             .clone()
             .or_else(|| self.store.data_dir())
@@ -104,7 +111,7 @@ impl AppView {
     /// A failed OPEN names its own cause; the probe path keeps the write
     /// refusal. Both name the folder and both promise the same outcome: this
     /// session does not save.
-    pub(crate) fn write_banner_text(&self) -> Option<String> {
+    pub fn write_banner_text(&self) -> Option<String> {
         let reason = self.write_blocked.as_ref()?;
         Some(write_banner_sentence(
             &self.writable_folder(),
@@ -116,7 +123,7 @@ impl AppView {
     /// column — under the toolbar, above the table — so it takes its own height
     /// and the table shrinks. It carries no focus handle and no click-absorbing
     /// layer: the app keeps working, only saving is affected.
-    pub(crate) fn render_writable_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_writable_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let reason = self.write_blocked.as_ref()?;
         let text = self.write_banner_text()?;
         let tip = reason.clone();
@@ -168,7 +175,7 @@ impl AppView {
 /// `open_failure` carries the real reason a store could not open — a corrupt or
 /// locked database is not a write refusal — while the probe path keeps the
 /// write sentence.
-fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
+pub fn write_banner_sentence(folder: &str, open_failure: Option<&str>) -> String {
     // The consequence leads. The strip is one truncated line, and a folder
     // path can be longer than the window: with the promise last, a long path
     // silently cut off the only part that matters. The OS reason rides the

@@ -1,12 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn commit_reset_traffic(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_reset_traffic(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .store
             .get(id)
@@ -35,7 +30,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_clear_traffic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_clear_traffic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_all_traffic() {
             Ok(count) => {
                 self.traffic_last_seen.clear();
@@ -54,9 +49,13 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_clear_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_clear_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_health_snapshots() {
             Ok(count) => {
+                // The store is authoritative on disk, but `health_store` was
+                // hydrated once at boot. Reset it here or the inspector and the
+                // engine-bar enablement keep reporting the cleared samples.
+                self.health_store = HealthStore::default();
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(t!("cleared-health-toast", count = count)),
@@ -72,7 +71,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_clear_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_clear_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_running_snapshot() {
             Ok(()) => {
                 self.last_snapshot = Vec::new();
@@ -87,12 +86,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_start_selected(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
@@ -100,12 +94,14 @@ impl AppView {
         self.start_in_flight = true;
         let Ok(Some(config)) = self.store.get(id) else {
             self.start_in_flight = false;
+            self.settle_batch_start(&[]);
             return;
         };
 
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
             window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
+            self.settle_batch_start(&[]);
             return;
         };
         let was_running = self.engine.is_running(id);
@@ -148,9 +144,15 @@ impl AppView {
             }
         }
         self.start_in_flight = false;
+        let applied: Vec<String> = if self.engine.is_running(id) {
+            vec![id.to_string()]
+        } else {
+            Vec::new()
+        };
+        self.settle_batch_start(&applied);
     }
 
-    pub(crate) fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
@@ -297,7 +299,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let running = self.engine.running_count();
         let stop_error = self.engine.stop_all_result().map(|error| error.to_string());
         if let Some(error) = stop_error {

@@ -42,6 +42,8 @@ pub fn sort_header_marker(sort: LibrarySort) -> String {
         _ => format!(" {}", t!("sort-marker-asc")),
     }
 }
+/// The retired facet band's hint. Slice 3's filter row owns it.
+#[allow(dead_code)]
 pub fn facet_tip_text(
     dimension: &str,
     active_display: &str,
@@ -68,20 +70,26 @@ pub fn empty_library_text() -> String {
 
 /// The core enums keep their labels for persistence and core tests; the UI
 /// names them through these wrappers so the visible words come from Fluent.
-pub(crate) fn library_column_label(column: LibraryColumn) -> String {
+pub fn library_column_label(column: ColumnId) -> String {
     match column {
-        LibraryColumn::Group => t!("column-group"),
-        LibraryColumn::Protocol => t!("column-protocol"),
-        LibraryColumn::Upstream => t!("column-upstream"),
-        LibraryColumn::Endpoint => t!("column-endpoint"),
-        LibraryColumn::Health => t!("column-health"),
-        LibraryColumn::Traffic => t!("column-traffic"),
+        ColumnId::Name => t!("column-name"),
+        ColumnId::Group => t!("column-group"),
+        ColumnId::Protocol => t!("column-protocol"),
+        ColumnId::Upstream => t!("column-upstream"),
+        ColumnId::Endpoint => t!("column-endpoint"),
+        ColumnId::Health => t!("column-health"),
+        ColumnId::Traffic => t!("column-traffic"),
     }
 }
 
-pub(crate) fn library_sort_key_label(key: LibrarySortKey) -> String {
+pub fn library_sort_key_label(key: LibrarySortKey) -> String {
     match key {
         LibrarySortKey::None => t!("sort-key-none"),
+        LibrarySortKey::Name => t!("sort-key-name"),
+        LibrarySortKey::Group => t!("sort-key-group"),
+        LibrarySortKey::Protocol => t!("sort-key-protocol"),
+        LibrarySortKey::Upstream => t!("sort-key-upstream"),
+        LibrarySortKey::Endpoint => t!("sort-key-endpoint"),
         LibrarySortKey::Latency => t!("sort-key-latency"),
         LibrarySortKey::Download => t!("sort-key-download"),
         LibrarySortKey::Upload => t!("sort-key-upload"),
@@ -93,14 +101,14 @@ pub(crate) fn library_sort_key_label(key: LibrarySortKey) -> String {
     }
 }
 
-pub(crate) fn sort_direction_label(direction: SortDirection) -> String {
+pub fn sort_direction_label(direction: SortDirection) -> String {
     match direction {
         SortDirection::Ascending => t!("sort-direction-ascending"),
         SortDirection::Descending => t!("sort-direction-descending"),
     }
 }
 
-pub(crate) fn latency_bucket_label(bucket: LatencyBucket) -> String {
+pub fn latency_bucket_label(bucket: LatencyBucket) -> String {
     match bucket {
         LatencyBucket::Any => t!("latency-any"),
         LatencyBucket::Ms100 => t!("latency-100"),
@@ -109,7 +117,10 @@ pub(crate) fn latency_bucket_label(bucket: LatencyBucket) -> String {
     }
 }
 
-pub(crate) fn group_prune_label(kind: GroupPruneKind) -> String {
+/// The retired Library menu's prune family. Slice 7 re-homes it in the
+/// group and source manage sheet.
+#[allow(dead_code)]
+pub fn group_prune_label(kind: GroupPruneKind) -> String {
     match kind {
         GroupPruneKind::Duplicates => t!("prune-duplicates"),
         GroupPruneKind::Unavailable => t!("prune-unavailable"),
@@ -118,28 +129,9 @@ pub(crate) fn group_prune_label(kind: GroupPruneKind) -> String {
     }
 }
 
-/// The toolbar's one start/stop control. The glyphs are not copy; the name is.
-pub(crate) fn global_toggle_text(running: usize, busy: bool) -> (String, String) {
-    let glyph = if busy {
-        "…"
-    } else if running == 0 {
-        "▶"
-    } else {
-        "■"
-    };
-    let name = if busy {
-        t!("toolbar-connecting")
-    } else if running == 0 {
-        t!("action-start-all")
-    } else {
-        t!("action-stop-all")
-    };
-    (glyph.to_string(), name)
-}
-
 /// K12/A5-1: the center segment names the engine state only; the endpoint
 /// count lives in the first segment.
-pub(crate) fn engine_status_text(engine: &EngineController) -> String {
+pub fn engine_status_text(engine: &EngineController) -> String {
     match engine.status() {
         EngineStatus::Stopped => t!("engine-status-stopped"),
         EngineStatus::Running => t!("engine-status-running"),
@@ -149,13 +141,10 @@ pub(crate) fn engine_status_text(engine: &EngineController) -> String {
 
 /// T-34: one session-sourced notice — the previous run left a running
 /// snapshot behind without reaching any clean-exit path.
-pub(crate) fn unclean_exit_notice_text() -> String {
+pub fn unclean_exit_notice_text() -> String {
     t!("unclean-exit-notice")
 }
-pub(crate) fn unclean_exit_notice(
-    previous_clean: bool,
-    last_snapshot: &[String],
-) -> Option<Notification> {
+pub fn unclean_exit_notice(previous_clean: bool, last_snapshot: &[String]) -> Option<Notification> {
     if previous_clean || last_snapshot.is_empty() {
         return None;
     }
@@ -165,7 +154,7 @@ pub(crate) fn unclean_exit_notice(
 /// nothing removed = error, partial = warning) — and the sentence the Undo
 /// toast carries. The blocking confirm the old copy described is gone
 /// (spec line 91); naming the rows stays.
-pub(crate) fn bulk_delete_note(removed: &[String], failed: &[String]) -> ToastSpec {
+pub fn bulk_delete_note(removed: &[String], failed: &[String]) -> ToastSpec {
     let text = bulk_delete_result_message(removed, failed);
     if failed.is_empty() {
         ToastSpec::success(text)
@@ -175,46 +164,30 @@ pub(crate) fn bulk_delete_note(removed: &[String], failed: &[String]) -> ToastSp
         ToastSpec::warning(text)
     }
 }
-pub(crate) fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> ServingTone {
-    let dead_evidence = crashed || health.map(str::trim) == Some("dead");
-    if is_running && dead_evidence {
-        ServingTone::Failed
-    } else if is_running {
-        ServingTone::Serving
-    } else {
-        ServingTone::Stopped
-    }
-}
-pub(crate) fn lamp_access_label(tone: ServingTone, name: &str) -> String {
-    match tone {
-        ServingTone::Failed => t!("lamp-failed", name = name),
-        ServingTone::Serving => t!("lamp-serving", name = name),
-        ServingTone::Stopped => t!("lamp-stopped", name = name),
-    }
-}
+
 /// T-33: the message a Settings field shows inline — the field's own sentence
 /// when the store named one, otherwise the error's display text.
-pub(crate) fn store_error_text(error: &StoreError) -> String {
+pub fn store_error_text(error: &StoreError) -> String {
     field_error_target(error)
         .map(|(_, message)| message)
         .unwrap_or_else(|| error.to_string())
 }
-pub(crate) fn settings_clear_traffic_text(total: usize) -> String {
+pub fn settings_clear_traffic_text(total: usize) -> String {
     t!("settings-clear-traffic-confirm", total = total)
 }
-pub(crate) fn settings_clear_health_text() -> String {
+pub fn settings_clear_health_text() -> String {
     t!("settings-clear-health-confirm")
 }
-pub(crate) fn settings_clear_snapshot_text() -> String {
+pub fn settings_clear_snapshot_text() -> String {
     t!("settings-clear-snapshot-confirm")
 }
-pub(crate) fn preset_summary_text(presets: Option<usize>) -> String {
+pub fn preset_summary_text(presets: Option<usize>) -> String {
     match presets {
         Some(count) => t!("preset-summary", count = count),
         None => t!("preset-summary-unavailable"),
     }
 }
-pub(crate) fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String {
+pub fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String {
     t!(
         "preset-delete-description",
         name = name,
@@ -222,7 +195,7 @@ pub(crate) fn preset_delete_confirm_description(name: &str, attached: &[String])
         names = attached.join(", ")
     )
 }
-pub(crate) fn preset_row_summary(preset: &store::RoutePreset, attached: &[String]) -> String {
+pub fn preset_row_summary(preset: &store::RoutePreset, attached: &[String]) -> String {
     let rules = match preset.rules() {
         Ok(rules) => t!("preset-row-rules", count = rules.len()),
         Err(_) => t!("preset-row-invalid-rules"),
@@ -240,7 +213,7 @@ pub(crate) fn preset_row_summary(preset: &store::RoutePreset, attached: &[String
         attached = attached
     )
 }
-pub(crate) fn update_all_confirm_text(included: usize, skipped: usize) -> String {
+pub fn update_all_confirm_text(included: usize, skipped: usize) -> String {
     if skipped == 0 {
         t!("subs-update-all-confirm", included = included)
     } else {
@@ -251,27 +224,23 @@ pub(crate) fn update_all_confirm_text(included: usize, skipped: usize) -> String
         )
     }
 }
-pub(crate) fn logs_overwrite_text(path: &std::path::Path) -> String {
+pub fn logs_overwrite_text(path: &std::path::Path) -> String {
     t!("logs-overwrite", path = path.display().to_string())
 }
-pub(crate) fn logs_save_path_text() -> String {
+pub fn logs_save_path_text() -> String {
     t!(
         "logs-save-path",
         path = Store::default_logs_path().display().to_string()
     )
 }
-pub(crate) fn group_delete_confirm_text(name: &str, count: usize) -> String {
+pub fn group_delete_confirm_text(name: &str, count: usize) -> String {
     if count == 0 {
         t!("group-delete-empty", name = name)
     } else {
         t!("group-delete-rows", name = name, count = count)
     }
 }
-pub(crate) fn group_delete_confirm_description(
-    name: &str,
-    count: usize,
-    subscriptions: usize,
-) -> String {
+pub fn group_delete_confirm_description(name: &str, count: usize, subscriptions: usize) -> String {
     if subscriptions == 0 {
         return group_delete_confirm_text(name, count);
     }
@@ -285,7 +254,7 @@ pub(crate) fn group_delete_confirm_description(
         subs = subscriptions
     )
 }
-pub(crate) fn stop_all_confirm_description(names: &[String]) -> String {
+pub fn stop_all_confirm_description(names: &[String]) -> String {
     let named = names
         .iter()
         .map(|name| format!("\"{name}\""))
@@ -293,7 +262,7 @@ pub(crate) fn stop_all_confirm_description(names: &[String]) -> String {
         .join(", ");
     t!("stop-all-confirm", count = names.len(), names = named)
 }
-pub(crate) fn close_confirm_description(running_names: &[String]) -> Option<String> {
+pub fn close_confirm_description(running_names: &[String]) -> Option<String> {
     if running_names.is_empty() {
         return None;
     }
@@ -308,14 +277,14 @@ pub(crate) fn close_confirm_description(running_names: &[String]) -> Option<Stri
         names = names
     ))
 }
-pub(crate) fn sidecar_presence_line(file_name: &str, found: bool) -> String {
+pub fn sidecar_presence_line(file_name: &str, found: bool) -> String {
     if found {
         t!("sidecar-found", file = file_name)
     } else {
         t!("sidecar-missing", file = file_name)
     }
 }
-pub(crate) fn about_body(
+pub fn about_body(
     version: &str,
     git_hash: &str,
     sidecars: &[String],
@@ -342,52 +311,48 @@ pub(crate) fn about_body(
         shortcuts = shortcuts
     )
 }
-pub(crate) fn export_count_fragment(total: usize, importable: usize) -> String {
+pub fn export_count_fragment(total: usize, importable: usize) -> String {
     if importable == total {
         t!("export-count-all", total = total)
     } else {
         t!("export-count-some", total = total, importable = importable)
     }
 }
-pub(crate) fn export_count_message(total: usize, importable: usize, path: &str) -> String {
+pub fn export_count_message(total: usize, importable: usize, path: &str) -> String {
     t!(
         "export-count-message",
         count = export_count_fragment(total, importable),
         path = path
     )
 }
-pub(crate) fn row_action_message(verb: &str, name: &str) -> String {
+pub fn row_action_message(verb: &str, name: &str) -> String {
     t!("row-action-message", verb = verb, name = name)
 }
-pub(crate) fn removed_message(name: &str, was_running: bool) -> String {
+pub fn removed_message(name: &str, was_running: bool) -> String {
     if was_running {
         t!("removed-message-running", name = name)
     } else {
         t!("removed-message", name = name)
     }
 }
-pub(crate) fn enabled_flag_message(name: &str, enabled: bool) -> String {
+pub fn enabled_flag_message(name: &str, enabled: bool) -> String {
     if enabled {
         t!("enabled-flag-on", name = name)
     } else {
         t!("enabled-flag-off", name = name)
     }
 }
-pub(crate) fn restore_done_message(outcome: &RestoreOutcome) -> String {
+pub fn restore_done_message(outcome: &RestoreOutcome) -> String {
     t!(
         "restore-done",
         configs = outcome.configs,
         subscriptions = outcome.subscriptions
     )
 }
-pub(crate) fn already_subscribed_message(label: &str) -> String {
+pub fn already_subscribed_message(label: &str) -> String {
     t!("already-subscribed", label = label)
 }
-pub(crate) fn subscription_interval_failure_message(
-    action: &str,
-    label: &str,
-    error: &str,
-) -> String {
+pub fn subscription_interval_failure_message(action: &str, label: &str, error: &str) -> String {
     t!(
         "subscription-interval-failure",
         action = action,
@@ -395,13 +360,13 @@ pub(crate) fn subscription_interval_failure_message(
         error = error
     )
 }
-pub(crate) fn preset_error_message(error: &crate::preset::PresetError) -> String {
+pub fn preset_error_message(error: &crate::preset::PresetError) -> String {
     t!("preset-error", error = error.to_string())
 }
-pub(crate) fn preset_imported_message(name: &str, count: usize) -> String {
+pub fn preset_imported_message(name: &str, count: usize) -> String {
     t!("preset-imported", name = name, count = count)
 }
-pub(crate) fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[String]) -> String {
+pub fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[String]) -> String {
     if kept.is_empty() {
         t!("auto-clear-toast", group = group, removed = removed)
     } else {
@@ -413,16 +378,17 @@ pub(crate) fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[Stri
         )
     }
 }
-pub(crate) fn inspector_tab_label(tab: InspectorTab) -> String {
-    match tab {
-        InspectorTab::Details => t!("inspector-tab-details"),
-        InspectorTab::Health => t!("inspector-tab-health"),
-        InspectorTab::Logs => t!("inspector-tab-logs"),
-        InspectorTab::Links => t!("inspector-tab-links"),
-        InspectorTab::Traffic => t!("inspector-tab-traffic"),
-    }
+/// Slice 6: a console log row's clock. Same `rem_euclid(86_400)` local-time
+/// convention as the settings check time — the app never claims a zone it
+/// does not know.
+pub fn format_clock_time(at: i64) -> String {
+    let seconds = at.rem_euclid(86_400);
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let secs = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
 }
-pub(crate) fn inspector_badge_text(
+pub fn inspector_badge_text(
     state: BadgeState,
     bind: &str,
     port: u16,
@@ -444,13 +410,13 @@ pub(crate) fn inspector_badge_text(
         _ => head,
     }
 }
-pub(crate) fn lan_confirm_title() -> String {
+pub fn lan_confirm_title() -> String {
     t!("lan-confirm-title")
 }
-pub(crate) fn lan_confirm_text(name: &str, bind: &str) -> String {
+pub fn lan_confirm_text(name: &str, bind: &str) -> String {
     t!("lan-confirm-text", name = name, bind = bind)
 }
-pub(crate) fn lan_confirm_description(entries: &[(String, String)]) -> String {
+pub fn lan_confirm_description(entries: &[(String, String)]) -> String {
     let mut lines: Vec<String> = entries
         .iter()
         .map(|(name, bind)| t!("lan-entry", name = name.as_str(), bind = bind.as_str()))
@@ -458,23 +424,23 @@ pub(crate) fn lan_confirm_description(entries: &[(String, String)]) -> String {
     lines.sort();
     t!("lan-confirm-description", entries = lines.join(", "))
 }
-pub(crate) fn lan_exposure_warning(name: &str, bind: &str) -> Option<String> {
+pub fn lan_exposure_warning(name: &str, bind: &str) -> Option<String> {
     if !requires_lan_confirm(bind) {
         None
     } else {
         Some(t!("lan-exposure-warning", name = name, bind = bind))
     }
 }
-pub(crate) fn lan_hint_for_bind(bind: &str) -> Option<String> {
+pub fn lan_hint_for_bind(bind: &str) -> Option<String> {
     if bind.trim().is_empty() || !requires_lan_confirm(bind) {
         return None;
     }
     Some(t!("lan-hint", bind = bind.trim()))
 }
-pub(crate) fn import_preview_message(valid: usize, invalid: usize) -> String {
+pub fn import_preview_message(valid: usize, invalid: usize) -> String {
     t!("import-preview", valid = valid, invalid = invalid)
 }
-pub(crate) fn import_files_label(
+pub fn import_files_label(
     file_hint: Option<&str>,
     multi_files: Option<&[(String, String)]>,
 ) -> Option<String> {
@@ -494,7 +460,7 @@ pub(crate) fn import_files_label(
         Some(t!("import-files-one", name = names.join(", ")))
     }
 }
-pub(crate) fn export_preview_description(
+pub fn export_preview_description(
     total: usize,
     importable: usize,
     path: &str,
@@ -507,7 +473,7 @@ pub(crate) fn export_preview_description(
         t!("export-preview", count = count, path = path)
     }
 }
-pub(crate) fn bind_port_collision_warning(
+pub fn bind_port_collision_warning(
     rows: &[ProxyConfig],
     exclude_id: Option<&str>,
     bind_raw: &str,
@@ -531,13 +497,13 @@ pub(crate) fn bind_port_collision_warning(
             )
         })
 }
-pub(crate) fn http_subscription_warning(url: &str) -> Option<String> {
+pub fn http_subscription_warning(url: &str) -> Option<String> {
     match subscription_fetch_policy(url) {
         SubscriptionFetchPolicy::Warn { .. } => Some(t!("sub-http-warning")),
         _ => None,
     }
 }
-pub(crate) fn format_interval_label(secs: i64) -> String {
+pub fn format_interval_label(secs: i64) -> String {
     if secs <= 0 {
         return t!("interval-always");
     }
@@ -552,7 +518,7 @@ pub(crate) fn format_interval_label(secs: i64) -> String {
     }
     t!("interval-days", days = secs / 86_400)
 }
-pub(crate) fn format_last_refresh_label(last_refresh_at: Option<i64>, now: i64) -> String {
+pub fn format_last_refresh_label(last_refresh_at: Option<i64>, now: i64) -> String {
     match last_refresh_at {
         None => t!("last-refresh-never"),
         Some(last) => {
@@ -569,7 +535,7 @@ pub(crate) fn format_last_refresh_label(last_refresh_at: Option<i64>, now: i64) 
         }
     }
 }
-pub(crate) fn format_expire_label(expire_at: i64, now: i64) -> String {
+pub fn format_expire_label(expire_at: i64, now: i64) -> String {
     let delta = expire_at.saturating_sub(now);
     if delta <= 0 {
         return t!("expire-expired");
@@ -582,6 +548,9 @@ pub(crate) fn format_expire_label(expire_at: i64, now: i64) -> String {
     }
     t!("expire-days", days = delta / 86_400)
 }
+// Crate-private on purpose: core::preset exports a same-named
+// `group_quota_line`, and a pub item here would make the root's two glob
+// imports ambiguous. Tests reach the core one through `crate::preset`.
 fn group_quota_line(subs: &[&ProxySubscription], now: i64) -> Option<String> {
     if subs.is_empty() {
         return None;
@@ -631,13 +600,13 @@ fn group_quota_line(subs: &[&ProxySubscription], now: i64) -> Option<String> {
     }
     Some(segments.join(" | "))
 }
-pub(crate) fn export_confirm_description() -> String {
+pub fn export_confirm_description() -> String {
     t!("export-warning")
 }
-pub(crate) fn export_overwrite_confirm_description(path: &str) -> String {
+pub fn export_overwrite_confirm_description(path: &str) -> String {
     t!("export-overwrite-description", path = path)
 }
-pub(crate) fn log_level_label(level: Option<LogLevel>) -> String {
+pub fn log_level_label(level: Option<LogLevel>) -> String {
     match level {
         None => t!("logs-level-all"),
         Some(LogLevel::Debug) => t!("logs-level-debug"),
@@ -646,17 +615,16 @@ pub(crate) fn log_level_label(level: Option<LogLevel>) -> String {
         Some(LogLevel::Error) => t!("logs-level-error"),
     }
 }
-pub(crate) fn log_level_tooltip(level: Option<LogLevel>) -> String {
+pub fn log_level_tooltip(level: Option<LogLevel>) -> String {
     match level {
         None => t!("logs-level-tooltip-all"),
         Some(level) => t!("logs-level-tooltip", label = log_level_label(Some(level))),
     }
 }
-pub(crate) fn prune_duplicates_confirm_text(
-    group: &str,
-    total: usize,
-    preview: &[String],
-) -> String {
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
+pub fn prune_duplicates_confirm_text(group: &str, total: usize, preview: &[String]) -> String {
     if preview.is_empty() {
         return t!("prune-duplicates-confirm", group = group, total = total);
     }
@@ -676,43 +644,28 @@ pub(crate) fn prune_duplicates_confirm_text(
         preview = preview.join(", ")
     )
 }
-pub(crate) fn prune_unavailable_confirm_text(group: &str, count: usize) -> String {
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
+pub fn prune_unavailable_confirm_text(group: &str, count: usize) -> String {
     t!("prune-unavailable-confirm", group = group, count = count)
 }
-pub(crate) fn prune_invalid_confirm_text(group: &str, count: usize) -> String {
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
+pub fn prune_invalid_confirm_text(group: &str, count: usize) -> String {
     t!("prune-invalid-confirm", group = group, count = count)
 }
-pub(crate) fn clear_group_tests_confirm_text(group: &str, count: usize) -> String {
+/// The retired Library menu's the prune family. Slice 7 re-homes it in the group
+/// and source manage sheet.
+#[allow(dead_code)]
+pub fn clear_group_tests_confirm_text(group: &str, count: usize) -> String {
     t!("prune-clear-tests-confirm", group = group, count = count)
 }
-pub(crate) fn auto_clear_opt_in_note(group: &str) -> String {
+pub fn auto_clear_opt_in_note(group: &str) -> String {
     t!("auto-clear-opt-in-note", group = group)
 }
-pub(crate) fn traffic_stats_summary_text(
-    period: store::TrafficPeriod,
-    exits: usize,
-    rx: u64,
-    tx: u64,
-) -> String {
-    t!(
-        "stats-summary",
-        period = period.label(),
-        exits = exits,
-        rx = format_bytes(rx),
-        tx = format_bytes(tx)
-    )
-}
-pub(crate) fn traffic_other_line(split: &TrafficExitSplit) -> Option<String> {
-    (split.other_exits > 0).then(|| {
-        t!(
-            "stats-other",
-            count = split.other_exits,
-            down = format_bytes(split.other_rx),
-            up = format_bytes(split.other_tx)
-        )
-    })
-}
-pub(crate) fn group_row_views(
+pub fn group_row_views(
     counts: &[(String, usize)],
     subs: &[ProxySubscription],
     skip: &dyn Fn(&str) -> bool,
@@ -766,7 +719,7 @@ pub(crate) fn group_row_views(
         })
         .collect()
 }
-pub(crate) fn subscription_failures_text(failures: &[ImportFailure]) -> String {
+pub fn subscription_failures_text(failures: &[ImportFailure]) -> String {
     if failures.is_empty() {
         return String::new();
     }
@@ -787,7 +740,7 @@ pub(crate) fn subscription_failures_text(failures: &[ImportFailure]) -> String {
         400,
     )
 }
-pub(crate) fn rule_set_summary(row: &RuleSetRow, used_by: &[String]) -> String {
+pub fn rule_set_summary(row: &RuleSetRow, used_by: &[String]) -> String {
     let mut parts = vec![
         redact_link(&row.url),
         format_bytes(row.bytes),
@@ -798,41 +751,48 @@ pub(crate) fn rule_set_summary(row: &RuleSetRow, used_by: &[String]) -> String {
     }
     parts.join(" · ")
 }
-pub(crate) fn shortcut_action_label(action: &str) -> String {
+pub fn shortcut_action_label(action: &str) -> String {
     match action {
-        "Add configuration" => t!("shortcut-add-configuration"),
-        "Import configurations" => t!("shortcut-import-configurations"),
+        "Add configuration" => t!("shortcut-add-config"),
+        "Import configurations" => t!("shortcut-import-configs"),
         "Paste clipboard into Import" => t!("shortcut-paste-clipboard"),
         "Start selected" => t!("shortcut-start-selected"),
         "Stop selected" => t!("shortcut-stop-selected"),
         "Test selected" => t!("shortcut-test-selected"),
         "Stop Testing" => t!("shortcut-stop-testing"),
-        "Edit selected" => t!("shortcut-edit-selected"),
+        "Edit endpoint" => t!("shortcut-edit-endpoint"),
+        "Edit config" => t!("shortcut-edit-config"),
         "Delete selected" => t!("shortcut-delete-selected"),
         "Extend selection up" => t!("shortcut-extend-up"),
         "Extend selection down" => t!("shortcut-extend-down"),
+        "Move focus up" => t!("shortcut-focus-up"),
+        "Move focus down" => t!("shortcut-focus-down"),
+        "Move focus to first row" => t!("shortcut-focus-first"),
+        "Move focus to last row" => t!("shortcut-focus-last"),
+        "Toggle focused row" => t!("shortcut-toggle-focused"),
         "Select all visible" => t!("shortcut-select-all"),
+        "Clear selection" => t!("shortcut-clear-selection"),
         "Focus search" => t!("shortcut-focus-search"),
         "Inspector details" => t!("shortcut-inspector-details"),
         "Inspector health" => t!("shortcut-inspector-health"),
         "Inspector logs" => t!("shortcut-inspector-logs"),
         "Inspector links" => t!("shortcut-inspector-links"),
         "Inspector traffic" => t!("shortcut-inspector-traffic"),
-        "Uncheck all" => t!("shortcut-uncheck-all"),
+        "Toggle inspector" => t!("shortcut-toggle-inspector"),
         "Copy URLs" => t!("shortcut-copy-urls"),
         "Command palette" => t!("shortcut-command-palette"),
         "Update the group in focus" => t!("shortcut-update-group"),
         other => other.to_string(),
     }
 }
-pub(crate) fn simple_rules_box_label(r#box: SimpleRulesBox) -> String {
+pub fn simple_rules_box_label(r#box: SimpleRulesBox) -> String {
     match r#box {
         SimpleRulesBox::Direct => t!("simple-box-direct"),
         SimpleRulesBox::Block => t!("simple-box-block"),
         SimpleRulesBox::Proxy => t!("simple-box-proxy"),
     }
 }
-pub(crate) fn settings_section_label(section: SettingsSection) -> String {
+pub fn settings_section_label(section: SettingsSection) -> String {
     match section {
         SettingsSection::General => t!("settings-section-general"),
         SettingsSection::Probing => t!("settings-section-probing"),
@@ -842,21 +802,29 @@ pub(crate) fn settings_section_label(section: SettingsSection) -> String {
         SettingsSection::Shortcuts => t!("settings-section-shortcuts"),
     }
 }
-pub(crate) fn appearance_choice_label(value: &str) -> String {
+pub fn appearance_choice_label(value: &str) -> String {
     match value {
         "dark" => t!("settings-appearance-dark"),
         "light" => t!("settings-appearance-light"),
         _ => t!("settings-appearance-system"),
     }
 }
-pub(crate) fn appearance_choice_tip(value: &str) -> String {
+
+/// R22: the density's name. The same words the palette command uses.
+pub fn density_label(density: Density) -> String {
+    match density {
+        Density::Comfortable => t!("density-comfortable"),
+        Density::Compact => t!("density-compact"),
+    }
+}
+pub fn appearance_choice_tip(value: &str) -> String {
     match value {
         "dark" => t!("settings-appearance-tip-dark"),
         "light" => t!("settings-appearance-tip-light"),
         _ => t!("settings-appearance-tip-system"),
     }
 }
-pub(crate) fn accent_label(accent: Accent) -> String {
+pub fn accent_label(accent: Accent) -> String {
     match accent {
         Accent::Blue => t!("accent-blue"),
         Accent::Indigo => t!("accent-indigo"),
@@ -867,22 +835,22 @@ pub(crate) fn accent_label(accent: Accent) -> String {
         Accent::Amber => t!("accent-amber"),
     }
 }
-pub(crate) fn text_size_label(size: TextSize) -> String {
+pub fn text_size_label(size: TextSize) -> String {
     t!("text-size-percent", percent = size.percent())
 }
-pub(crate) fn close_action_label(action: CloseAction) -> String {
+pub fn close_action_label(action: CloseAction) -> String {
     match action {
         CloseAction::Tray => t!("close-tray"),
         CloseAction::Quit => t!("close-quit"),
     }
 }
-pub(crate) fn close_action_explanation(action: CloseAction) -> String {
+pub fn close_action_explanation(action: CloseAction) -> String {
     match action {
         CloseAction::Tray => t!("close-tray-explanation"),
         CloseAction::Quit => t!("close-quit-explanation"),
     }
 }
-pub(crate) fn window_corners_label(corners: WindowCorners) -> String {
+pub fn window_corners_label(corners: WindowCorners) -> String {
     match corners {
         WindowCorners::Auto => t!("corners-auto"),
         WindowCorners::Rounded => t!("corners-rounded"),
@@ -890,7 +858,7 @@ pub(crate) fn window_corners_label(corners: WindowCorners) -> String {
         WindowCorners::Square => t!("corners-square"),
     }
 }
-pub(crate) fn window_corners_explanation(corners: WindowCorners) -> String {
+pub fn window_corners_explanation(corners: WindowCorners) -> String {
     match corners {
         WindowCorners::Auto => t!("corners-auto-explanation"),
         WindowCorners::Rounded => t!("corners-rounded-explanation"),
@@ -898,13 +866,13 @@ pub(crate) fn window_corners_explanation(corners: WindowCorners) -> String {
         WindowCorners::Square => t!("corners-square-explanation"),
     }
 }
-pub(crate) fn test_all_scope_label(scope: TestAllScope) -> String {
+pub fn test_all_scope_label(scope: TestAllScope) -> String {
     match scope {
         TestAllScope::Running => t!("test-scope-running"),
-        TestAllScope::Checked => t!("test-scope-checked"),
+        TestAllScope::Checked => t!("test-scope-selected"),
     }
 }
-pub(crate) fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
+pub fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
     let live = rows
         .iter()
         .filter(|row| row.caption != Some(ShardCaption::NotRunning))
@@ -926,24 +894,21 @@ pub(crate) fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
     }
     summary
 }
-pub(crate) fn skipped_dirty_message(names: &[String]) -> String {
-    t!("skipped-dirty", names = names.join(", "))
-}
-pub(crate) fn bulk_start_unreadable_message(ids: &[String]) -> String {
+pub fn bulk_start_unreadable_message(ids: &[String]) -> String {
     t!(
         "bulk-start-unreadable",
         count = ids.len(),
         names = ids.join(", ")
     )
 }
-pub(crate) fn bulk_start_enable_flag_failed_message(names: &[String]) -> String {
+pub fn bulk_start_enable_flag_failed_message(names: &[String]) -> String {
     t!(
         "bulk-start-flag-failed",
         count = names.len(),
         names = names.join(", ")
     )
 }
-pub(crate) fn bulk_start_failed_message(started: usize, failed: &[(String, String)]) -> String {
+pub fn bulk_start_failed_message(started: usize, failed: &[(String, String)]) -> String {
     let joined = failed
         .iter()
         .map(|(name, reason)| format!("{name}: {reason}"))
@@ -956,7 +921,7 @@ pub(crate) fn bulk_start_failed_message(started: usize, failed: &[(String, Strin
         joined = joined
     )
 }
-pub(crate) fn bulk_start_refused_message(
+pub fn bulk_start_refused_message(
     requested: usize,
     reason: &str,
     failed: &[(String, String)],
@@ -969,37 +934,16 @@ pub(crate) fn bulk_start_refused_message(
         detail = detail.join("; ")
     )
 }
-pub(crate) fn bulk_copy_proxies_message(copied: usize, skipped: usize) -> String {
-    if skipped == 0 {
-        t!("bulk-copy-proxies-toast", copied = copied)
-    } else {
-        t!(
-            "bulk-copy-proxies-skipped",
-            copied = copied,
-            skipped = skipped
-        )
-    }
-}
-pub(crate) fn bulk_copy_nothing_message(skipped: usize) -> String {
-    if skipped == 0 {
-        t!("bulk-copy-nothing")
-    } else {
-        t!("bulk-copy-nothing-skipped", skipped = skipped)
-    }
-}
-pub(crate) fn no_selection_message() -> String {
+pub fn no_selection_message() -> String {
     t!("no-selection")
 }
-pub(crate) fn start_busy_message() -> String {
+pub fn start_busy_message() -> String {
     t!("start-busy")
 }
-pub(crate) fn already_running_message(name: &str) -> String {
+pub fn already_running_message(name: &str) -> String {
     t!("already-running-toast", name = name)
 }
-pub(crate) fn dirty_endpoint_message(name: &str) -> String {
-    t!("dirty-endpoint-toast", name = name)
-}
-pub(crate) fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
+pub fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
     let failed = failed_names.len();
     if failed == 0 {
         return start_all_message(started);
@@ -1011,19 +955,19 @@ pub(crate) fn start_all_partial_message(started: usize, failed_names: &[String])
         names = failed_names.join(", ")
     )
 }
-pub(crate) fn addsub_error_message(error: &crate::import::ImportError) -> String {
+pub fn addsub_error_message(error: &crate::import::ImportError) -> String {
     t!("invalid-subscription-link", error = error.to_string())
 }
-pub(crate) fn db_list_error_message(error: &StoreError) -> String {
+pub fn db_list_error_message(error: &StoreError) -> String {
     t!("cannot-load-library", error = error.to_string())
 }
-pub(crate) fn crash_notification_text(detail: &str) -> String {
+pub fn crash_notification_text(detail: &str) -> String {
     t!("engine-crash-toast", detail = detail)
 }
-pub(crate) fn probe_start_toast(count: usize) -> String {
+pub fn probe_start_toast(count: usize) -> String {
     t!("probe-start-toast", count = count)
 }
-pub(crate) fn probe_batched_toast(count: usize, live: usize, dead: usize) -> String {
+pub fn probe_batched_toast(count: usize, live: usize, dead: usize) -> String {
     t!(
         "probe-batched-toast",
         count = count,
@@ -1031,7 +975,7 @@ pub(crate) fn probe_batched_toast(count: usize, live: usize, dead: usize) -> Str
         dead = dead
     )
 }
-pub(crate) fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) -> String {
+pub fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) -> String {
     let verb = if ping {
         t!("probe-verb-ping")
     } else {
@@ -1048,7 +992,7 @@ pub(crate) fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) 
         (None, None) => t!("probe-result-dead", verb = verb, name = name),
     }
 }
-pub(crate) fn group_test_summary_toast(
+pub fn group_test_summary_toast(
     group: &str,
     count: usize,
     live: usize,
@@ -1073,24 +1017,24 @@ pub(crate) fn group_test_summary_toast(
         )
     }
 }
-pub(crate) fn already_stopped_message(name: &str) -> String {
+pub fn already_stopped_message(name: &str) -> String {
     t!("already-stopped", name = name)
 }
-pub(crate) fn start_all_message(count: usize) -> String {
+pub fn start_all_message(count: usize) -> String {
     if count == 0 {
         t!("start-all-empty")
     } else {
         t!("start-all-started", count = count)
     }
 }
-pub(crate) fn stop_all_message(running: usize) -> String {
+pub fn stop_all_message(running: usize) -> String {
     if running == 0 {
         t!("stop-all-empty")
     } else {
         t!("stop-all-stopped", count = running)
     }
 }
-pub(crate) fn undo_restored_message(names: &[String], restored: usize) -> String {
+pub fn undo_restored_message(names: &[String], restored: usize) -> String {
     if restored == 1 {
         if let [single] = names {
             return t!("undo-restored-one", name = single);
@@ -1098,19 +1042,19 @@ pub(crate) fn undo_restored_message(names: &[String], restored: usize) -> String
     }
     t!("undo-restored-many", count = restored)
 }
-pub(crate) fn undo_failed_message(error: &StoreError) -> String {
+pub fn undo_failed_message(error: &StoreError) -> String {
     t!("restore-failed", error = error.to_string())
 }
-pub(crate) fn update_feed_failure_message() -> String {
+pub fn update_feed_failure_message() -> String {
     t!("update-feed-failure")
 }
-pub(crate) fn restart_to_apply_message(name: &str) -> String {
+pub fn restart_to_apply_message(name: &str) -> String {
     t!("restart-to-apply", name = name)
 }
-pub(crate) fn unreadable_drop_message(names: &[String]) -> String {
+pub fn unreadable_drop_message(names: &[String]) -> String {
     t!("unreadable-drop", names = names.join(", "))
 }
-pub(crate) fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> String {
+pub fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> String {
     const SHOWN: usize = 3;
     fn listed(names: &[String]) -> String {
         let shown = names
@@ -1149,7 +1093,7 @@ pub(crate) fn bulk_delete_result_message(removed: &[String], failed: &[String]) 
         names = listed(failed)
     )
 }
-pub(crate) fn chain_hop_rejection_message(rule: String) -> String {
+pub fn chain_hop_rejection_message(rule: String) -> String {
     match rule.as_str() {
         "chain hops cannot nest a chain (v1 chains are flat — pick a non-chain row)" => {
             t!("chain-reject-nested")
@@ -1166,7 +1110,7 @@ pub(crate) fn chain_hop_rejection_message(rule: String) -> String {
     }
 }
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn refresh_summary_text(
+pub fn refresh_summary_text(
     label: &str,
     added: usize,
     updated: usize,
@@ -1211,7 +1155,7 @@ pub(crate) fn refresh_summary_text(
     }
     (failures > 0 || conflicts > 0, summary)
 }
-fn localized_refresh_report_block(
+pub fn localized_refresh_report_block(
     added_names: &[String],
     updated_names: &[String],
     removed_names: &[String],

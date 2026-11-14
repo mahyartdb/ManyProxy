@@ -4,7 +4,7 @@ use crate::*;
 /// shortcuts, the palette and the inspector `…` menu pass the current
 /// selection. Handlers resolve the target at invocation — never at render.
 #[derive(Clone, Copy)]
-pub(crate) enum ActionTarget<'a> {
+pub enum ActionTarget<'a> {
     Row(&'a str),
     Selection,
 }
@@ -12,7 +12,7 @@ pub(crate) enum ActionTarget<'a> {
 /// How a handler addresses its row. `Row` handlers take the resolved id, so a
 /// context menu can act on a row that is not the selection. `Selected`
 /// handlers already work off the selection.
-pub(crate) enum Handler {
+pub enum Handler {
     Row(fn(&mut AppView, &str, &mut Window, &mut Context<AppView>)),
     Rows(fn(&mut AppView, &[String], &mut Window, &mut Context<AppView>)),
     Selected(fn(&mut AppView, &mut Window, &mut Context<AppView>)),
@@ -22,31 +22,31 @@ pub(crate) enum Handler {
 /// inspector menu, command palette, keymap) reads its label, keywords,
 /// shortcut and enabled state from here, and dispatches through
 /// [`run_action`], so a verb cannot drift between surfaces.
-pub(crate) struct ActionDef {
-    pub(crate) id: &'static str,
+pub struct ActionDef {
+    pub id: &'static str,
     /// Fluent key for the verb's label.
-    pub(crate) label_key: &'static str,
-    pub(crate) keywords: &'static [&'static str],
+    pub label_key: &'static str,
+    pub keywords: &'static [&'static str],
     /// Fluent key for the verb's tooltip, when it has one.
-    pub(crate) tooltip_key: Option<&'static str>,
+    pub tooltip_key: Option<&'static str>,
     /// (keystroke, chip) pairs. A slice because ctrl-1/ctrl-3 alias one id.
-    pub(crate) shortcuts: &'static [(&'static str, &'static str)],
-    pub(crate) enabled: fn(&AppView, ActionTarget<'_>, &App) -> bool,
-    pub(crate) run: Handler,
+    pub shortcuts: &'static [(&'static str, &'static str)],
+    pub enabled: fn(&AppView, ActionTarget<'_>, &App) -> bool,
+    pub run: Handler,
 }
 
 impl ActionDef {
-    pub(crate) fn label(&self) -> String {
+    pub fn label(&self) -> String {
         crate::i18n::translate(self.label_key, None)
     }
 
-    pub(crate) fn tooltip(&self) -> Option<String> {
+    pub fn tooltip(&self) -> Option<String> {
         self.tooltip_key
             .map(|key| crate::i18n::translate(key, None))
     }
 }
 
-pub(crate) const ACTIONS: &[ActionDef] = &[
+pub const ACTIONS: &[ActionDef] = &[
     selected(
         "add",
         "action-label-add",
@@ -90,19 +90,35 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         AppView::focus_library_search,
     ),
     selected(
-        "clear-checked",
-        "action-label-clear-checked",
-        &["clear", "uncheck", "escape"],
+        "clear-selection",
+        "action-label-clear-selection",
+        &["clear", "deselect", "escape"],
         &[("escape", "Esc")],
-        clear_checked,
+        clear_selection,
     ),
     selected(
-        "update-current-group",
-        "action-label-update-current-group",
-        &["update", "group"],
-        &[("ctrl-r", "Ctrl+R")],
-        AppView::update_current_group,
+        "density-comfortable",
+        "action-label-density-comfortable",
+        &["density", "comfortable", "rows", "spacing"],
+        &[],
+        AppView::set_comfortable_density,
     ),
+    selected(
+        "density-compact",
+        "action-label-density-compact",
+        &["density", "compact", "rows", "spacing"],
+        &[],
+        AppView::set_compact_density,
+    ),
+    ActionDef {
+        id: "update-current-group",
+        label_key: "action-label-update-current-scope",
+        keywords: &["update", "group", "source", "scope"],
+        tooltip_key: None,
+        shortcuts: &[("ctrl-r", "Ctrl+R")],
+        enabled: scope_has_update_target,
+        run: Handler::Selected(AppView::update_current_group),
+    },
     selected(
         "stop-testing",
         "action-label-stop-testing",
@@ -146,18 +162,11 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         AppView::open_presets_dialog,
     ),
     selected(
-        "groups",
-        "action-label-groups",
-        &["group", "move"],
-        &[],
-        AppView::open_groups_dialog,
-    ),
-    selected(
         "logs",
         "action-label-logs",
-        &["log", "output"],
+        &["log", "output", "console"],
         &[],
-        AppView::open_logs_dialog,
+        open_console_for_logs,
     ),
     selected(
         "settings",
@@ -174,25 +183,18 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         AppView::open_about_dialog,
     ),
     selected(
-        "runtime-stats",
-        "action-label-runtime-stats",
-        &["runtime", "stats", "health", "cpu", "memory"],
-        &[],
-        AppView::open_runtime_stats_dialog,
-    ),
-    selected(
-        "traffic-stats",
-        "action-label-traffic-stats",
-        &["traffic", "stats", "usage", "profile"],
-        &[],
-        AppView::open_traffic_stats_dialog,
-    ),
-    selected(
         "row-columns",
         "action-label-row-columns",
-        &["column", "columns", "rows", "display"],
+        &[
+            "column",
+            "columns",
+            "layout",
+            "width",
+            "order",
+            "visibility",
+        ],
         &[],
-        AppView::open_row_columns_dialog,
+        AppView::open_columns_sheet,
     ),
     selected(
         "text-size",
@@ -202,62 +204,6 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         text_size,
     ),
     selected(
-        "sort-latency",
-        "action-label-sort-latency",
-        &["sort", "latency", "ping", "health"],
-        &[],
-        sort_latency,
-    ),
-    selected(
-        "sort-download",
-        "action-label-sort-download",
-        &["sort", "download", "speed", "traffic"],
-        &[],
-        sort_download,
-    ),
-    selected(
-        "sort-upload",
-        "action-label-sort-upload",
-        &["sort", "upload", "speed", "traffic"],
-        &[],
-        sort_upload,
-    ),
-    selected(
-        "sort-out-ip",
-        "action-label-sort-out-ip",
-        &["sort", "out", "ip", "egress"],
-        &[],
-        sort_out_ip,
-    ),
-    selected(
-        "sort-type-security",
-        "action-label-sort-type-security",
-        &["sort", "type", "security", "protocol"],
-        &[],
-        sort_type_security,
-    ),
-    selected(
-        "sort-traffic-total",
-        "action-label-sort-traffic-total",
-        &["sort", "traffic", "total", "usage"],
-        &[],
-        sort_traffic_total,
-    ),
-    selected(
-        "sort-traffic-down",
-        "action-label-sort-traffic-down",
-        &["sort", "traffic", "download", "rx"],
-        &[],
-        sort_traffic_down,
-    ),
-    selected(
-        "sort-traffic-up",
-        "action-label-sort-traffic-up",
-        &["sort", "traffic", "upload", "tx"],
-        &[],
-        sort_traffic_up,
-    ),
-    selected(
         "sort-none",
         "action-label-sort-none",
         &["sort", "clear", "none", "library", "order"],
@@ -265,46 +211,18 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         sort_none,
     ),
     selected(
-        "sort-direction",
-        "action-label-sort-direction",
-        &["sort", "reverse", "direction", "ascending", "descending"],
-        &[],
-        sort_direction,
+        "inspector-toggle",
+        "action-label-inspector-toggle",
+        &["inspector", "panel", "toggle"],
+        &[("ctrl-i", "Ctrl+I")],
+        toggle_inspector,
     ),
     selected(
-        "inspector-details",
-        "action-label-inspector-details",
-        &["details", "tab"],
-        &[("ctrl-1", "Ctrl+1"), ("ctrl-3", "Ctrl+3")],
-        show_details,
-    ),
-    selected(
-        "inspector-health",
-        "action-label-inspector-health",
-        &["health", "tab"],
-        &[("ctrl-2", "Ctrl+2")],
-        show_health,
-    ),
-    selected(
-        "inspector-logs",
-        "action-label-inspector-logs",
-        &["log", "output", "tab"],
-        &[("ctrl-4", "Ctrl+4")],
-        show_logs,
-    ),
-    selected(
-        "inspector-links",
-        "action-label-inspector-links",
-        &["links", "connections", "tab"],
-        &[("ctrl-5", "Ctrl+5")],
-        show_links,
-    ),
-    selected(
-        "inspector-traffic",
-        "action-label-inspector-traffic",
-        &["traffic", "tab"],
-        &[("ctrl-6", "Ctrl+6")],
-        show_traffic,
+        "toggle-console",
+        "action-label-toggle-console",
+        &["console", "logs", "traffic", "connections", "toggle"],
+        &[("ctrl-`", "Ctrl+`")],
+        toggle_console,
     ),
     rows(
         "start",
@@ -347,10 +265,18 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         AppView::copy_selected_socks,
     ),
     row(
+        "edit-endpoint",
+        "action-label-edit-endpoint",
+        &["edit", "endpoint", "bind", "port"],
+        &[("ctrl-e", "Ctrl+E")],
+        "action-tip-edit-endpoint",
+        AppView::open_endpoint_for_row,
+    ),
+    row(
         "edit",
         "action-label-edit",
-        &["edit", "rename"],
-        &[("ctrl-e", "Ctrl+E")],
+        &["edit", "rename", "config"],
+        &[("ctrl-shift-e", "Ctrl+Shift+E")],
         "action-tip-edit",
         AppView::open_edit_for_row,
     ),
@@ -377,6 +303,14 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
         &[],
         "action-tip-share",
         AppView::open_share_for_row,
+    ),
+    row(
+        "assign-preset",
+        "action-label-assign-preset",
+        &["preset", "assign", "attach", "routing"],
+        &[],
+        "action-tip-assign-preset",
+        AppView::open_preset_attach_for_row,
     ),
     row(
         "duplicate",
@@ -420,25 +354,49 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
     ),
 ];
 
-fn always(_view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
+pub fn always(_view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
     true
+}
+
+/// R20: `Ctrl+R` updates the scope, so it refuses under `All configs` rather
+/// than guessing a group from the selected row.
+pub fn scope_has_update_target(view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
+    !matches!(view.scope, LibraryScope::All)
 }
 
 /// A row verb only runs when there is a row. A `Row` target is always one;
 /// a selection target can be empty, and that refusal is the only place the
 /// palette, the menus and the shortcuts say "select a row first".
-fn needs_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> bool {
+pub fn needs_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> bool {
     target_row(view, target, cx).is_some() || !target_rows(view, target, cx).is_empty()
 }
 
-fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String> {
+pub fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String> {
     match target {
         ActionTarget::Row(id) => vec![id.to_string()],
-        ActionTarget::Selection => view.libraries.read(cx).delegate().selected_ids(),
+        ActionTarget::Selection => {
+            let libraries = view.libraries.read(cx);
+            let delegate = libraries.delegate();
+            let mut ids: Vec<String> = view
+                .visible_row_ids(cx)
+                .into_iter()
+                .filter(|id| view.is_selected(id))
+                .collect();
+            // A selected row a filter hides still counts: the selection is not
+            // a visible-row set.
+            let mut hidden: Vec<String> = delegate
+                .row_ids()
+                .into_iter()
+                .filter(|id| view.is_selected(id))
+                .filter(|id| !ids.contains(id))
+                .collect();
+            ids.append(&mut hidden);
+            ids
+        }
     }
 }
 
-const fn selected(
+pub const fn selected(
     id: &'static str,
     label_key: &'static str,
     keywords: &'static [&'static str],
@@ -456,7 +414,7 @@ const fn selected(
     }
 }
 
-const fn row(
+pub const fn row(
     id: &'static str,
     label_key: &'static str,
     keywords: &'static [&'static str],
@@ -475,7 +433,7 @@ const fn row(
     }
 }
 
-const fn rows(
+pub const fn rows(
     id: &'static str,
     label_key: &'static str,
     keywords: &'static [&'static str],
@@ -495,7 +453,7 @@ const fn rows(
 }
 
 /// The palette's groups, in render order. Ids, not copies of the verbs.
-pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
+pub const PALETTE_GROUPS: &[(&str, &[&str])] = &[
     (
         "Library",
         &[
@@ -505,12 +463,11 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "stop",
             "test",
             "copy-urls",
+            "edit-endpoint",
             "edit",
             "delete",
             "focus-search",
-            "clear-checked",
-            "inspector-details",
-            "inspector-health",
+            "clear-selection",
             "paste-import",
             "export-library",
             "move",
@@ -522,37 +479,24 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
         &[
             "subscriptions",
             "presets",
-            "groups",
             "logs",
             "settings",
             "about",
+            "inspector-toggle",
+            "toggle-console",
             "start-all",
             "stop-all",
             "test-all",
-            "runtime-stats",
-            "traffic-stats",
             "row-columns",
             "text-size",
+            "density-comfortable",
+            "density-compact",
         ],
     ),
-    (
-        "Sort",
-        &[
-            "sort-latency",
-            "sort-download",
-            "sort-upload",
-            "sort-out-ip",
-            "sort-type-security",
-            "sort-traffic-total",
-            "sort-traffic-down",
-            "sort-traffic-up",
-            "sort-direction",
-            "sort-none",
-        ],
-    ),
+    ("Sort", &["sort-none"]),
 ];
 
-pub(crate) fn action(id: &str) -> &'static ActionDef {
+pub fn action(id: &str) -> &'static ActionDef {
     ACTIONS
         .iter()
         .find(|def| def.id == id)
@@ -561,14 +505,14 @@ pub(crate) fn action(id: &str) -> &'static ActionDef {
 
 /// The row an action will run on, resolved now. A `Row` target is trusted as
 /// given — the row ops already report a vanished row ("Already removed").
-fn target_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Option<String> {
+pub fn target_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Option<String> {
     match target {
         ActionTarget::Row(id) => Some(id.to_string()),
         ActionTarget::Selection => view.selected_config(cx).map(|config| config.id),
     }
 }
 
-pub(crate) fn run_action(
+pub fn run_action(
     view: &mut AppView,
     id: &'static str,
     target: ActionTarget<'_>,
@@ -577,7 +521,14 @@ pub(crate) fn run_action(
 ) {
     let def = action(id);
     if !(def.enabled)(view, target, cx) {
-        window.push_notification(Notification::info(no_selection_message()), cx);
+        // R20 carries its own reason: the action is refused because the scope
+        // has no update target, not because no row is selected.
+        let message = if id == "update-current-group" {
+            t!("scope-update-disabled")
+        } else {
+            no_selection_message()
+        };
+        window.push_notification(Notification::info(message), cx);
         return;
     }
     match def.run {
@@ -602,7 +553,7 @@ pub(crate) fn run_action(
 
 /// A keybinding's way in: the overlay owns the keyboard, so a shortcut fired
 /// under a dialog is refused rather than acting on the screen underneath.
-pub(crate) fn shortcut_action(
+pub fn shortcut_action(
     view: &mut AppView,
     id: &'static str,
     window: &mut Window,
@@ -615,83 +566,42 @@ pub(crate) fn shortcut_action(
     run_action(view, id, ActionTarget::Selection, window, cx);
 }
 
-pub(crate) fn palette_action_at(index: IndexPath) -> Option<&'static str> {
+pub fn palette_action_at(index: IndexPath) -> Option<&'static str> {
     PALETTE_GROUPS.get(index.section)?.1.get(index.row).copied()
 }
 
-fn clear_checked(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.clear_checked_unless_dialog(window, cx);
+pub fn clear_selection(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+    view.clear_selection_unless_dialog(window, cx);
 }
 
-fn open_import(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn open_import(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
 }
 
-fn test_all(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn test_all(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.test_all_health(window, cx);
 }
 
-fn show_details(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.toggle_inspector(InspectorTab::Details);
+pub fn toggle_inspector(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
+    view.toggle_inspector();
 }
 
-fn show_health(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Health);
+/// R9: the palette's `Logs` verb opens the console scoped to the selection;
+/// the full log sheet survives only behind the console's `Filters…`.
+pub fn open_console_for_logs(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
+    view.open_console_scoped_to_selection(false, cx);
 }
 
-fn show_logs(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Logs);
+/// Ctrl-` toggles the dock; the engine-bar button lands in the same method.
+pub fn toggle_console(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+    view.toggle_console(window, cx);
 }
 
-fn show_links(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Links);
-}
-
-fn show_traffic(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
-    view.set_inspector_tab(InspectorTab::Traffic);
-}
-
-fn sort_latency(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::Latency, window, cx);
-}
-
-fn sort_download(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::Download, window, cx);
-}
-
-fn sort_upload(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::Upload, window, cx);
-}
-
-fn sort_out_ip(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::OutIp, window, cx);
-}
-
-fn sort_type_security(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TypeSecurity, window, cx);
-}
-
-fn sort_traffic_total(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TrafficTotal, window, cx);
-}
-
-fn sort_traffic_down(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TrafficDown, window, cx);
-}
-
-fn sort_traffic_up(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.set_library_sort(LibrarySortKey::TrafficUp, window, cx);
-}
-
-fn sort_none(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn sort_none(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.set_library_sort(LibrarySortKey::None, window, cx);
 }
 
-fn sort_direction(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    view.toggle_library_sort_direction(window, cx);
-}
-
-fn text_size(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn text_size(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     // Task 13: the palette keeps its one-step toggle; "large" is the slider's
     // 125% stop, and any custom stop toggles back to the stock 100%.
     let next = if view.store.text_size() == TextSize::LARGE {

@@ -1,6 +1,6 @@
 use crate::*;
 
-pub(crate) fn preset_row(
+pub fn preset_row(
     view: Entity<AppView>,
     preset: store::RoutePreset,
     attached: Vec<String>,
@@ -104,7 +104,7 @@ pub(crate) fn preset_row(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PresetRulesOp {
+pub enum PresetRulesOp {
     CycleAction(usize),
     Remove(usize),
     Add,
@@ -112,7 +112,7 @@ pub(crate) enum PresetRulesOp {
 
 /// T-09 attribute fold keys, rendered per rule as JSON-shape fields. The
 /// rules JSON box stays the single editing surface; no per-key input state.
-pub(crate) const PRESET_FOLD_KEYS: &[&str] = &[
+pub const PRESET_FOLD_KEYS: &[&str] = &[
     "source_ip_cidr",
     "source_ip_is_private",
     "source_port",
@@ -122,7 +122,7 @@ pub(crate) const PRESET_FOLD_KEYS: &[&str] = &[
     "process_path_regex",
 ];
 
-fn preset_fold_label(key: &str) -> String {
+pub fn preset_fold_label(key: &str) -> String {
     match key {
         "source_ip_cidr" => t!("preset-fold-source-cidr"),
         "source_ip_is_private" => t!("preset-fold-source-private"),
@@ -135,7 +135,7 @@ fn preset_fold_label(key: &str) -> String {
     }
 }
 
-pub(crate) fn preset_rule_attribute_folds(
+pub fn preset_rule_attribute_folds(
     preset_id: &str,
     index: usize,
     rule: &serde_json::Value,
@@ -160,7 +160,7 @@ pub(crate) fn preset_rule_attribute_folds(
         .collect()
 }
 
-pub(crate) fn preset_advanced_section(
+pub fn preset_advanced_section(
     view: Entity<AppView>,
     preset: &store::RoutePreset,
     form: Option<PresetForm>,

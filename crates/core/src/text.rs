@@ -868,8 +868,9 @@ pub fn traffic_stats_summary_text(
     tx: u64,
 ) -> String {
     format!(
-        "{} (all-time totals) · {exits} exit(s) · ↓{} ↑{}",
+        "{} (all-time totals) · {exits} {} · ↓{} ↑{}",
         period.label(),
+        if exits == 1 { "exit" } else { "exits" },
         format_bytes(rx),
         format_bytes(tx),
     )

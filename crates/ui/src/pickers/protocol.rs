@@ -1,11 +1,11 @@
 use crate::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProtocolChoice {
-    id: String,
-    title: String,
-    display: String,
-    pub(crate) value: String,
+pub struct ProtocolChoice {
+    pub id: String,
+    pub title: String,
+    pub display: String,
+    pub value: String,
 }
 
 impl SearchableListItem for ProtocolChoice {
@@ -24,7 +24,7 @@ impl SearchableListItem for ProtocolChoice {
     }
 }
 
-pub(crate) fn protocol_choices() -> Vec<ProtocolChoice> {
+pub fn protocol_choices() -> Vec<ProtocolChoice> {
     VALID_PROTOCOLS
         .iter()
         .map(|protocol| ProtocolChoice {

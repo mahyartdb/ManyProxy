@@ -3,7 +3,7 @@ use crate::*;
 use std::path::Path;
 
 impl AppView {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         match Store::open_file(&Store::default_path()) {
             Ok(store) => Self::with_store(window, cx, store),
             Err(error) => Self::fell_back_to_memory(window, cx, error, &Store::default_path()),
@@ -16,7 +16,7 @@ impl AppView {
     /// so the open failure itself is the banner's cause. The one-time warning
     /// still names the reason; the banner stands for as long as the session
     /// cannot save.
-    pub(crate) fn fell_back_to_memory(
+    pub fn fell_back_to_memory(
         window: &mut Window,
         cx: &mut Context<Self>,
         error: StoreError,
@@ -43,11 +43,11 @@ impl AppView {
     /// T-08: a deliberate in-memory store (tests, any explicit no-persist
     /// path) passes no fallback and stays silent: only an open failure can
     /// claim the folder refused this session.
-    pub(crate) fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
+    pub fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
         Self::with_store_inner(window, cx, store, None)
     }
 
-    pub(crate) fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.notify_engine_crash(window, cx);
         // `has_active_dialog` / `has_active_sheet` / `close_sheet` all read the
         // Root layer, which the window only adopts after the boot closure
@@ -85,7 +85,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // Task 14: the setting owns the icon. With it off, closing has no tray
         // to hide to, and `close_route` falls through to Quit.
         if !self.store.show_tray_icon() {
@@ -109,7 +109,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn restore_on_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn restore_on_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.store.restore_running() {
             return;
         }
@@ -137,7 +137,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_restore_subset(
+    pub fn commit_restore_subset(
         &mut self,
         rows: &[ProxyConfig],
         window: &mut Window,
@@ -181,7 +181,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_restore_lan_confirm(
+    pub fn open_restore_lan_confirm(
         &mut self,
         rows: Vec<ProxyConfig>,
         window: &mut Window,
@@ -216,7 +216,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn handle_launch_intake(
+    pub fn handle_launch_intake(
         &mut self,
         intake: OpenWithKind,
         window: &mut Window,

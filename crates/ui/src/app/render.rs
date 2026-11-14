@@ -1,19 +1,21 @@
 use crate::*;
 
+use super::console::render_console_slot;
+
 /// F2: the one owner of the inspector's geometry. The column headers, the
 /// rows, the facet bar and the drawer all read these two numbers, so the
 /// table can never lay itself out under the drawer.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct InspectorLayout {
-    pub(crate) drawer_w: f32,
-    pub(crate) table_w: f32,
+pub struct InspectorLayout {
+    pub drawer_w: f32,
+    pub table_w: f32,
 }
 
 impl InspectorLayout {
     /// F19: a hidden inspector costs the table nothing in either presentation,
     /// so the list takes the whole viewport. A visible drawer is clamped so the
     /// table never drops under its floor.
-    pub(crate) fn compute(viewport: f32, inspector_w: f32, docked: bool, visible: bool) -> Self {
+    pub fn compute(viewport: f32, inspector_w: f32, docked: bool, visible: bool) -> Self {
         if !visible {
             return Self {
                 drawer_w: 0.,
@@ -37,7 +39,7 @@ impl InspectorLayout {
 impl AppView {
     /// F18: the empty canvas names the two intake actions and calls the same
     /// AppView methods the toolbar buttons use.
-    pub(crate) fn render_empty_ctas(app: Entity<Self>) -> impl IntoElement {
+    pub fn render_empty_ctas(app: Entity<Self>) -> impl IntoElement {
         let add_view = app.clone();
         let import_view = app;
         div()
@@ -74,24 +76,27 @@ impl AppView {
     /// T-03: the window width decides the inspector's shape. At or above the
     /// breakpoint the inspector docks to the right and takes its share; below
     /// it the inspector becomes a slide-over drawer beside the table.
-    pub(crate) fn inspector_docked(&self, window: &Window) -> bool {
+    pub fn inspector_docked(&self, window: &Window) -> bool {
         window.viewport_size().width.as_f32() >= INSPECTOR_DRAWER_BREAKPOINT
     }
 
-    /// T-03: the inspector's live width. The split's own state carries it, so
-    /// the table's column budget follows a drag. The width is session-only.
-    pub(crate) fn inspector_width(&self, cx: &App) -> f32 {
+    /// T-03/R12: the inspector's live width. The split's own state carries it
+    /// after a drag, so the table's column budget follows; before the first
+    /// drag (and on the first frame, when `sizes()` is empty) the persisted
+    /// store width is authoritative.
+    pub fn inspector_width(&self, cx: &App) -> f32 {
         let sizes = self.split_state.read(cx).sizes();
         sizes
             .get(1)
             .map(|size| size.as_f32())
             .filter(|width| *width >= INSPECTOR_WIDTH_MIN && *width <= INSPECTOR_WIDTH_MAX)
-            .unwrap_or(INSPECTOR_WIDTH)
+            .unwrap_or_else(|| self.store.inspector_width())
     }
 }
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.consume_endpoint_intent(window, cx);
         // Task 12: restore-from-maximize is the one frame where DWM may have
         // forgotten the corner style. Re-apply only on that transition.
         let maximized = window.is_maximized();
@@ -102,17 +107,25 @@ impl Render for AppView {
 
         let app_entity = cx.entity();
         // T-03/F2: one geometry spec, computed once per frame and handed to
-        // the header strip, the rows and the list pane's drawer reserve.
+        // the header strip, the rows and the list pane's drawer reserve. The
+        // table lives beside the nav, so the budget it is measured against is
+        // the column's width, not the window's.
         let show_detail = self.config_count(cx) != 0;
         let docked = self.inspector_docked(window);
         let inspector_width = self.inspector_width(cx);
         let inspector_visible = show_detail && self.inspector_visible;
-        let layout = InspectorLayout::compute(
-            window.viewport_size().width.as_f32(),
-            inspector_width,
-            docked,
-            inspector_visible,
-        );
+        let nav_width = self.nav_width(window);
+        let column_width = (window.viewport_size().width.as_f32() - nav_width).max(0.);
+        let layout =
+            InspectorLayout::compute(column_width, inspector_width, docked, inspector_visible);
+        // R11: one layout resolved once per frame. Every visible column keeps
+        // its width; the table scrolls when the sum is wider than the pane.
+        let metrics = RowMetrics::for_table_width(layout.table_w, self.column_layout);
+        let content_width = self.column_layout.content_width(layout.table_w);
+        // The one draft beams down to the table as a plain frame; the row that
+        // owns it paints the popover, every other row ignores it.
+        self.prune_endpoint_draft(cx);
+        let endpoint_frame = self.endpoint_frame(cx);
         self.libraries.update(cx, |state, cx| {
             let list_focus = state.focus_handle(cx);
             let delegate = state.delegate_mut();
@@ -120,9 +133,8 @@ impl Render for AppView {
                 delegate.app_view = Some(app_entity);
                 cx.notify();
             }
-            let metrics =
-                RowMetrics::for_table_width(layout.table_w, delegate.row_columns, delegate.layout);
             delegate.set_row_metrics(metrics);
+            delegate.set_endpoint_frame(endpoint_frame);
             // T-06: the row cards paint the kit focus ring while the list holds
             // the keyboard; the handle lives on the ListState, the app owns the
             // cards, so the frame hands it across once.
@@ -132,9 +144,41 @@ impl Render for AppView {
         // T-26: the titlebar label carries the same `· N running` text the OS
         // title gets, both composed from the one shared helper.
         let current_title = window_title_text(self.engine.running_count());
-        let facet_bar = self.render_facet_bar(window, cx);
-        let bulk_bar = self.render_bulk_bar(cx);
+        let nav = self.render_nav(window, cx);
+        let action_bar = self.render_action_bar(cx);
+        let filter_slot = self.render_filter_slot(window, cx);
+        let engine_bar = self.render_engine_bar(cx);
+        let console_slot = render_console_slot(self, window, cx);
         let column_headers = self.render_library_column_headers(window, cx);
+        // R11: the header and the rows live in one horizontally scrolled
+        // column, so they can never drift apart and a narrow pane scrolls
+        // instead of hiding a column.
+        let table = div()
+            .id("library-table")
+            .test_support()
+            .w(px(content_width))
+            .min_w(px(content_width))
+            .h_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .child(column_headers)
+            // The blank area below the rows belongs to the table, not to a
+            // row: a plain click there clears the selection. Rows stop their
+            // own clicks so selecting one never reaches this.
+            .child(
+                div()
+                    .id("library-scroll")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if view.selection_count() > 0 {
+                            view.clear_selection(window, cx);
+                        }
+                    }))
+                    .child(List::new(&self.libraries).size_full()),
+            );
         let mut list_pane = div()
             .id("config-list")
             .test_support()
@@ -142,10 +186,26 @@ impl Render for AppView {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(facet_bar)
-            .child(bulk_bar)
-            .child(column_headers)
-            .child(List::new(&self.libraries).flex_1());
+            // The bar above the table carries labels that cannot shrink; the
+            // pane must not grow to fit them, or the table would slide out of
+            // the window at a large text size.
+            .min_w_0()
+            .child(action_bar)
+            .children(self.render_scope_strip(cx))
+            .child(filter_slot)
+            .children(self.render_writable_banner(cx))
+            .child(
+                div()
+                    .id("library-hscroll")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .track_scroll(&self.table_scroll)
+                    .overflow_x_scroll()
+                    .horizontal_scrollbar(&self.table_scroll)
+                    .child(table),
+            );
         if !docked && inspector_visible {
             list_pane = list_pane.pr(px(layout.drawer_w));
         }
@@ -155,8 +215,25 @@ impl Render for AppView {
             // the whole viewport instead of an empty split half.
             list_pane.into_any_element()
         } else if docked {
+            // R12: `on_resize` fires after the mouse-up, so this is one store
+            // write per drag — never one per frame.
+            let weak_view = cx.entity().downgrade();
             h_resizable("main-split")
                 .with_state(&self.split_state)
+                .on_resize(move |state, window, cx| {
+                    let Some(view) = weak_view.upgrade() else {
+                        return;
+                    };
+                    let width = state
+                        .read(cx)
+                        .sizes()
+                        .get(1)
+                        .map(|size| size.as_f32())
+                        .unwrap_or(store::Store::INSPECTOR_WIDTH_DEFAULT);
+                    view.update(cx, |view, cx| {
+                        view.persist_inspector_width(width, window, cx);
+                    });
+                })
                 .child(
                     resizable_panel()
                         .size_range(px(RowMetrics::TABLE_MIN)..px(10000.))
@@ -188,20 +265,46 @@ impl Render for AppView {
 
         self.render_shell(cx)
             .child(self.render_titlebar(current_title, window, cx))
-            .child(self.render_toolbar(cx))
-            .children(self.render_writable_banner(cx))
             .child(
                 div()
-                    .id("main-content")
+                    .id("body")
                     .test_support()
-                    .relative()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
                     .min_h_0()
-                    .child(split),
+                    .child(nav)
+                    .child(
+                        div()
+                            .id("main-column")
+                            .test_support()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(
+                                div()
+                                    .id("main-content")
+                                    .test_support()
+                                    .relative()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(split),
+                            )
+                            // Slice 6: the console dock is a child of main,
+                            // under the rows and above the engine bar. It
+                            // spans the table and the inspector; the nav is
+                            // never under it.
+                            .children(console_slot)
+                            // The engine bar is a sibling of the content row,
+                            // not a child of the split: it spans the table and
+                            // the inspector, and the nav is never under it.
+                            .child(engine_bar),
+                    ),
             )
-            .child(self.render_status_bar(cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))

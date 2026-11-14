@@ -4,8 +4,8 @@
 use crate::*;
 
 impl AppView {
-    #[cfg(test)]
-    pub(crate) fn commit_add(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_add(
         &mut self,
         input: NewConfig,
         window: &mut Window,
@@ -29,7 +29,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_add_with_focus(
+    pub fn commit_add_with_focus(
         &mut self,
         form: &ConfigForm,
         form_error: &Rc<RefCell<Option<(String, String)>>>,
@@ -75,10 +75,9 @@ impl AppView {
                 self.reload(window, cx);
                 // F12: the new row is the confirmation. A filter that hides
                 // it leaves the previous selection alone.
-                self.libraries.update(cx, |list_state, list_cx| {
-                    select_first_visible(list_state, &[created_id], window, list_cx);
-                    list_cx.notify();
-                });
+                if self.visible_row_ids(cx).iter().any(|id| id == &created_id) {
+                    self.select_row(&created_id, cx);
+                }
                 window.push_notification(Notification::success(message), cx);
                 true
             }
@@ -98,7 +97,10 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_edit(
+    /// The tests' direct store-edit path. Production edit actions go through
+    /// `commit_edit_with_focus`, which owns the form error and focus.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_edit(
         &mut self,
         id: &str,
         patch: ConfigPatch,
@@ -148,71 +150,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_row_endpoint(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let (bind_raw, port_raw, stored) = self.libraries.read_with(cx, |list, cx| {
-            let delegate = list.delegate();
-            let drafts = delegate.endpoint_draft_texts(id, cx).unwrap_or_default();
-            let stored = delegate
-                .rows
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| (row.name.clone(), row.bind_ip.clone(), row.port.to_string()));
-            (drafts.0, drafts.1, stored)
-        });
-        let Some((name, bind_stored, port_stored)) = stored else {
-            window.push_notification(Notification::warning(t!("already-removed")), cx);
-            return true;
-        };
-        if bind_raw.trim() == bind_stored && port_raw.trim() == port_stored {
-            self.libraries.update(cx, |list, _| {
-                if let Some(inputs) = list.delegate_mut().endpoint_inputs.get_mut(id) {
-                    inputs.clean_bind = bind_raw.clone();
-                    inputs.clean_port = port_raw.clone();
-                }
-            });
-            return true;
-        }
-        if let Err(reason) = save_listen_gate(&name, &bind_raw, &port_raw) {
-            window.push_notification(Notification::error(reason), cx);
-            return false;
-        }
-        let patch = ConfigPatch {
-            bind_ip: Some(bind_raw),
-            port: Some(port_raw),
-            ..Default::default()
-        };
-        let ok = self.commit_edit(id, patch, window, cx);
-        if ok {
-            if let Ok(Some(fresh)) = self.store.get(id) {
-                let bind_fresh = fresh.bind_ip.clone();
-                let port_fresh = fresh.port.to_string();
-                self.libraries.update(cx, |list, cx| {
-                    let delegate = list.delegate_mut();
-                    delegate
-                        .pending_endpoint_commits
-                        .retain(|pending| pending != id);
-                    if let Some(inputs) = delegate.endpoint_inputs.get_mut(id) {
-                        inputs.bind.update(cx, |state, cx| {
-                            state.set_value(bind_fresh.clone(), window, cx);
-                        });
-                        inputs.port.update(cx, |state, cx| {
-                            state.set_value(port_fresh.clone(), window, cx);
-                        });
-                        inputs.clean_bind = bind_fresh;
-                        inputs.clean_port = port_fresh;
-                    }
-                });
-            }
-        }
-        ok
-    }
-
-    pub(crate) fn commit_edit_with_focus(
+    pub fn commit_edit_with_focus(
         &mut self,
         id: &str,
         patch: ConfigPatch,
@@ -303,7 +241,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // K5: the whole row is captured BEFORE removal — the undo toast keeps
         // it in memory for its lifetime, so expiry means the row is simply
         // gone, and Undo re-adds it with its group assignment.
@@ -355,12 +293,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_duplicate(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let source = match self.store.get(id) {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -405,7 +338,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_test_url(
+    pub fn commit_test_url(
         &mut self,
         raw: &str,
         window: &mut Window,
@@ -452,7 +385,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_update_feed_url(
+    pub fn commit_update_feed_url(
         &mut self,
         raw: &str,
         window: &mut Window,
@@ -515,7 +448,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_row_test_url(
+    pub fn commit_row_test_url(
         &mut self,
         id: &str,
         raw: &str,
@@ -579,7 +512,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_edit_with_test_url(
+    pub fn commit_edit_with_test_url(
         &mut self,
         id: &str,
         patch: ConfigPatch,
@@ -605,12 +538,7 @@ impl AppView {
 
     /// The row's auto-start flag flipped to its current opposite. Read now, at
     /// invocation, so the menu never acts on a stale render.
-    pub(crate) fn toggle_row_enabled(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toggle_row_enabled(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -618,7 +546,7 @@ impl AppView {
         self.commit_enabled_flag(&config.id, !config.enabled, window, cx);
     }
 
-    pub(crate) fn commit_enabled_flag(
+    pub fn commit_enabled_flag(
         &mut self,
         id: &str,
         enabled: bool,
@@ -650,16 +578,16 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_prune(
+    /// The group manage sheet's prune family. The sheet names its group; no
+    /// selected row is required.
+    pub fn commit_prune(
         &mut self,
         kind: GroupPruneKind,
+        group: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(group) = self.current_group(cx) else {
-            window.push_notification(Notification::info(t!("no-group-focus")), cx);
-            return;
-        };
+        let group = group.to_string();
 
         let targets: Vec<ProxyConfig> = match kind {
             GroupPruneKind::Duplicates => self
@@ -775,7 +703,7 @@ impl AppView {
 
     /// T-19: only this confirm's ACK enables the flag — the note is
     /// auto-clear's own, and the store rejects any enable without note_seen.
-    pub(crate) fn commit_auto_clear_opt_in(
+    pub fn commit_auto_clear_opt_in(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -803,7 +731,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_auto_clear_off(
+    pub fn commit_auto_clear_off(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -835,7 +763,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_library_sort(
+    pub fn commit_library_sort(
         &mut self,
         sort: LibrarySort,
         window: &mut Window,
@@ -845,6 +773,7 @@ impl AppView {
             state.delegate_mut().set_sort(sort);
             list_cx.notify();
         });
+        self.apply_query(cx);
         if let Err(error) = self.store.set_library_sort(sort) {
             window.push_notification(
                 Notification::error(t!("cannot-save-sort", error = error.to_string())),
@@ -866,7 +795,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn commit_save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_logs_path();
         match self.write_visible_logs_to(&path, cx) {
             Ok(()) => window.push_notification(
@@ -881,12 +810,7 @@ impl AppView {
     /// The rebuild preserves nothing: changing the cap mid-session truncates
     /// every present record for the fresh ring (no partial-growth state), which
     /// the Settings note beside the field states.
-    pub(crate) fn commit_log_cap(
-        &mut self,
-        window: &mut Window,
-        raw: &str,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_log_cap(&mut self, window: &mut Window, raw: &str, cx: &mut Context<Self>) {
         let Some(cap) = parse_log_cap(raw) else {
             window.push_notification(
                 Notification::warning(t!("log-cap-invalid", cap = self.logs.store.cap())),
@@ -919,7 +843,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn commit_export_dialog(
+    pub fn commit_export_dialog(
         &mut self,
         path: String,
         window: &mut Window,
@@ -961,7 +885,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn commit_export_write_to(
+    pub fn commit_export_write_to(
         &mut self,
         path: &str,
         window: &mut Window,
@@ -997,7 +921,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_library_restore(
+    pub fn commit_library_restore(
         &mut self,
         payload: &str,
         window: &mut Window,
@@ -1083,12 +1007,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_usage_reset(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_usage_reset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.reset_traffic_counters(id) {
             Ok(()) => {
                 self.reload(window, cx);
@@ -1106,7 +1025,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_bare_url_subscription(
+    pub fn commit_bare_url_subscription(
         &mut self,
         url: String,
         window: &mut Window,
@@ -1126,8 +1045,8 @@ impl AppView {
         );
     }
 
-    #[cfg(test)]
-    pub(crate) fn commit_import(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_import(
         &mut self,
         text: String,
         group: String,
@@ -1138,9 +1057,9 @@ impl AppView {
         self.commit_import_with_context(text, group, file_hint, None, None, window, cx)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_import_with_context(
+    pub fn commit_import_with_context(
         &mut self,
         text: String,
         group: String,
@@ -1166,7 +1085,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_import_dialog(
+    pub fn commit_import_dialog(
         &mut self,
         text: String,
         group: String,
@@ -1228,7 +1147,7 @@ impl AppView {
         false
     }
 
-    pub(crate) fn commit_addsub_request_with_group(
+    pub fn commit_addsub_request_with_group(
         &mut self,
         request: AddSubRequest,
         dialog_group: &str,
@@ -1248,7 +1167,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_subscription_add(
+    pub fn commit_subscription_add(
         &mut self,
         label: String,
         url: String,
@@ -1300,7 +1219,7 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_subscription_edit(
+    pub fn commit_subscription_edit(
         &mut self,
         id: &str,
         label: String,
@@ -1349,7 +1268,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_subscription_auto(
+    pub fn commit_subscription_auto(
         &mut self,
         sub_id: &str,
         window: &mut Window,
@@ -1389,7 +1308,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_create_with_boxes(
+    pub fn commit_preset_create_with_boxes(
         &mut self,
         name: String,
         rules_text: String,
@@ -1468,8 +1387,8 @@ impl AppView {
 
     /// Compat entry for contract tests that only exercise the rules JSON
     /// layer (empty boxes expand to nothing).
-    #[cfg(test)]
-    pub(crate) fn commit_preset_edit(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_preset_edit(
         &mut self,
         id: &str,
         name: String,
@@ -1487,7 +1406,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn commit_preset_edit_with_boxes(
+    pub fn commit_preset_edit_with_boxes(
         &mut self,
         id: &str,
         name: String,
@@ -1543,7 +1462,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_preset_export_link(
+    pub fn commit_preset_export_link(
         &mut self,
         preset: &store::RoutePreset,
         window: &mut Window,
@@ -1578,7 +1497,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_preset_duplicate(
+    pub fn commit_preset_duplicate(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1626,7 +1545,7 @@ impl AppView {
     /// T-10 prevent-modifications lock. The toggle is the owner's positive
     /// action (no confirm dialog); it protects the rules, never the attach
     /// relationship.
-    pub(crate) fn commit_preset_lock(
+    pub fn commit_preset_lock(
         &mut self,
         id: &str,
         locked: bool,
@@ -1653,12 +1572,7 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_remove(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_preset_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_preset(id) {
             Ok(true) => {
                 self.reload(window, cx);
@@ -1695,7 +1609,7 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_detach_delete(
+    pub fn commit_preset_detach_delete(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1722,45 +1636,52 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub(crate) fn commit_preset_attach(
+    /// The selection's attach: the same preset, applied to every selected
+    /// config. One message names the count.
+    pub fn commit_preset_attach_ids(
         &mut self,
-        config_id: &str,
+        config_ids: &[String],
         preset_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self
-            .store
-            .set_config_preset(config_id, preset_id.as_deref())
-        {
-            Ok(row) => {
-                self.reload(window, cx);
-                let message = match preset_id {
-                    Some(_) => {
-                        let name = self
-                            .preset_name_for(row.preset_id.as_deref())
-                            .unwrap_or_else(|| "preset".to_string());
-                        t!(
-                            "preset-attached-toast",
-                            row = row.name.as_str(),
-                            name = name.as_str()
-                        )
-                    }
-                    None => t!("preset-detached-toast", row = row.name.as_str()),
-                };
-                window.push_notification(Notification::success(message), cx);
-                window.close_all_dialogs(cx);
-                reclaim_shell_focus(window, cx);
-            }
-            Err(error) => {
-                self.report_save_error(error, window, cx);
+        let mut failed: Vec<String> = Vec::new();
+        for id in config_ids {
+            if self
+                .store
+                .set_config_preset(id, preset_id.as_deref())
+                .is_err()
+            {
+                failed.push(id.clone());
             }
         }
+        self.reload(window, cx);
+        if failed.is_empty() {
+            let name = preset_id
+                .as_deref()
+                .and_then(|id| self.preset_name_for(Some(id)))
+                .unwrap_or_else(|| "preset".to_string());
+            window.push_notification(
+                Notification::success(t!(
+                    "preset-attached-toast-many",
+                    count = config_ids.len(),
+                    name = name
+                )),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::warning(t!("preset-attach-failed", count = failed.len())),
+                cx,
+            );
+        }
+        window.close_all_dialogs(cx);
+        reclaim_shell_focus(window, cx);
     }
 
     /// Remove: blocked while any preset references the set (loud inline), the
     /// file delete lands right after the row so no orphan cache bytes survive.
-    pub(crate) fn commit_rule_set_remove(
+    pub fn commit_rule_set_remove(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1806,7 +1727,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_subscription_remove(
+    pub fn commit_subscription_remove(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -1832,7 +1753,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    pub(crate) fn commit_subs_global_auto(
+    pub fn commit_subs_global_auto(
         &mut self,
         on: bool,
         window: &mut Window,
@@ -1851,7 +1772,7 @@ impl AppView {
 /// K3: the `Add remote ruleset…` row only carries a URL, so the staging name
 /// falls back to the URL's last path segment with the extension stripped. The
 /// store still validates the final name and reports why it refused.
-fn rule_set_name_from_url(url: &str) -> String {
+pub fn rule_set_name_from_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches(['/', '\\']);
     let segment = trimmed
         .split(['/', '?', '#'])

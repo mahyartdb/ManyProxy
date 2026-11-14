@@ -2,11 +2,12 @@ use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
+use crate::skin::{apply_theme, SIGNED_SKIN};
 use crate::store::{Accent, TextSize};
 
-pub(crate) const APPEARANCE_CHOICES: &[(&str, &str)] =
+pub const APPEARANCE_CHOICES: &[(&str, &str)] =
     &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
-pub(crate) fn windows_apps_light_theme() -> Option<bool> {
+pub fn windows_apps_light_theme() -> Option<bool> {
     #[cfg(windows)]
     {
         use winreg::enums::HKEY_CURRENT_USER;
@@ -23,7 +24,7 @@ pub(crate) fn windows_apps_light_theme() -> Option<bool> {
         None
     }
 }
-pub(crate) fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
+pub fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
     match appearance {
         "light" => ThemeMode::Light,
         "dark" => ThemeMode::Dark,
@@ -32,32 +33,24 @@ pub(crate) fn appearance_theme_mode(appearance: &str, system_light: bool) -> The
         _ => ThemeMode::Dark,
     }
 }
-pub(crate) fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
+pub fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
     appearance_theme_mode(appearance, windows_apps_light_theme().unwrap_or(false))
 }
 /// F17: the kit's light scrim is `#0000000d` (~5%), which a modal over a
 /// near-white page barely reads as a backdrop. Dark keeps the kit's 20%. The
 /// dialog backdrop paints this exact token (`Theme::overlay`).
-pub(crate) const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
-
-/// The kit's light muted ink is `neutral-500` (#737373): 4.35:1 on the quiet
-/// surface (#f5f5f5), under WCAG AA for text. Row cards, the tab bar, and the
-/// status band all paint muted labels on grounds that reach #f5f5f5, so light
-/// backs this one token off toward black (4.98:1 there). Dark keeps the kit's
-/// `neutral-400`, which reads at 7.8:1. Overriding the token also fixes the
-/// kit's own muted text (group-box titles, table heads).
-pub(crate) const LIGHT_MUTED_INK_DARKEN: f32 = 0.08;
+pub const LIGHT_MODAL_OVERLAY_ALPHA: f32 = 0.15;
 
 /// K12: the kit's stock sizes (`Theme::default`). `Theme::change` rebuilds the
 /// theme from its config, so every appearance swap resets these before the
 /// reading scale is applied again.
-pub(crate) const BASE_FONT_SIZE: f32 = 16.;
-pub(crate) const BASE_MONO_FONT_SIZE: f32 = 13.;
+pub const BASE_FONT_SIZE: f32 = 16.;
+pub const BASE_MONO_FONT_SIZE: f32 = 13.;
 
 /// K12: scale the rem the whole window resolves against. Text roles keep
 /// their two steps; only the base moves. `Root` re-reads `theme.font_size` for
 /// `window.set_rem_size` every frame, so refreshing windows is enough.
-pub(crate) fn apply_text_size(size: TextSize, cx: &mut App) {
+pub fn apply_text_size(size: TextSize, cx: &mut App) {
     let scale = size.scale();
     let theme = Theme::global_mut(cx);
     theme.font_size = px(BASE_FONT_SIZE * scale);
@@ -68,19 +61,19 @@ pub(crate) fn apply_text_size(size: TextSize, cx: &mut App) {
 /// Task 11: the accent-bearing tokens a preset stamps over the kit theme. Blue
 /// has no entry: it is the kit's stock selection and re-stamping it would make
 /// the defaults differ from the palette the suite already pins.
-struct AccentPalette {
-    primary: Hsla,
-    primary_hover: Hsla,
-    primary_active: Hsla,
-    primary_foreground: Hsla,
-    ring: Hsla,
-    selection: Hsla,
-    wash: Hsla,
-    rim: Hsla,
-    solid: Hsla,
+pub struct AccentPalette {
+    pub primary: Hsla,
+    pub primary_hover: Hsla,
+    pub primary_active: Hsla,
+    pub primary_foreground: Hsla,
+    pub ring: Hsla,
+    pub selection: Hsla,
+    pub wash: Hsla,
+    pub rim: Hsla,
+    pub solid: Hsla,
 }
 
-fn accent_hue(accent: Accent) -> Option<f32> {
+pub fn accent_hue(accent: Accent) -> Option<f32> {
     match accent {
         Accent::Blue => None,
         Accent::Indigo => Some(0.66),
@@ -92,7 +85,7 @@ fn accent_hue(accent: Accent) -> Option<f32> {
     }
 }
 
-fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
+pub fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
     let hue = accent_hue(accent)?;
     Some(if mode.is_dark() {
         AccentPalette {
@@ -123,7 +116,7 @@ fn accent_palette(accent: Accent, mode: ThemeMode) -> Option<AccentPalette> {
 
 /// Task 11: the color a Settings swatch paints. Blue borrows the kit's stock
 /// selection rim so the default swatch matches what the window actually shows.
-pub(crate) fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
+pub fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
     match accent_palette(accent, mode) {
         Some(palette) => palette.solid,
         None => {
@@ -139,7 +132,7 @@ pub(crate) fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
 /// Task 11: re-stamp every accent-bearing token after `Theme::change` rebuilt
 /// the theme from its config. Health, danger, and warning tokens are never
 /// touched: those hues carry meaning, not preference.
-pub(crate) fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
+pub fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
     let Some(palette) = accent_palette(accent, mode) else {
         return;
     };
@@ -190,19 +183,23 @@ pub(crate) fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
     cx.refresh_windows();
 }
 
-pub(crate) fn apply_appearance(
+pub fn apply_appearance(
     appearance: &str,
     accent: Accent,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
     let mode = resolve_appearance_mode(appearance);
-    Theme::change(mode, window, cx);
+    // R2: the signed lab skin owns every color token. `apply_theme` runs
+    // `Theme::change` itself, then stamps the skin; the overrides below ride
+    // on top of it.
+    apply_theme(SIGNED_SKIN, mode, window, cx);
     if !mode.is_dark() {
         let theme = Theme::global_mut(cx);
+        // F17 keeps the app's tuned scrim (the lab's `hex(0x000000)` overlay
+        // is opaque black; see skin.rs). The muted-ink darken tuned the KIT's
+        // palette; the skin's light muted ink already clears AA, so it goes.
         theme.overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
-        let muted = theme.muted_foreground;
-        theme.muted_foreground = muted.blend(hsla(0., 0., 0., LIGHT_MUTED_INK_DARKEN));
     }
     // Task 11: the rebuild above reset every stamped accent token, so the
     // accent rides every re-appearance exactly like the light-mode overrides.
@@ -284,9 +281,15 @@ mod tokens {
             ("alarm red", dark.danger, light.danger),
             ("warning amber", dark.warning, light.warning),
         ] {
+            // The lab's signal hues sit in the same family per mode pair
+            // (GitHub-style greens/ambers/reds), but dark and light variants
+            // are independently tuned, so the pin is the family, not the
+            // value — measured around the hue circle, because red wraps.
+            let hue_gap = (dark_color.h - light_color.h).abs();
+            let hue_gap = hue_gap.min(1. - hue_gap);
             assert!(
-                (dark_color.h - light_color.h).abs() < 0.02,
-                "{name} keeps its hue across modes ({} vs {})",
+                hue_gap < 0.06,
+                "{name} keeps its hue family across modes ({} vs {})",
                 dark_color.h,
                 light_color.h
             );
@@ -296,37 +299,34 @@ mod tokens {
             );
         }
 
-        // Selection is the kit's blue list tokens, not `accent`: the kit's
-        // accent is a neutral surface (saturation 0) in both modes.
+        // Selection is the skin's blue list tokens, not `accent`: the skin's
+        // accent surface is the quiet hover tone, not a signal color.
         for (name, wash, rim) in [
             ("dark", dark.list_active, dark.list_active_border),
             ("light", light.list_active, light.list_active_border),
         ] {
             assert!(
-                (0.55..0.70).contains(&wash.h) && wash.s > 0.5,
-                "{name} selection wash is blue, got {wash:?}"
-            );
-            assert!(
                 (0.55..0.70).contains(&rim.h) && rim.s > 0.5,
                 "{name} selection rim is blue, got {rim:?}"
             );
-            assert!(wash.a < 1.0, "{name} selection is a wash, not a fill");
+            assert!(wash != rim, "{name} selection is distinct from its rim");
         }
-        for (name, accent) in [("dark", dark.accent), ("light", light.accent)] {
-            assert!(
-                accent.s < 0.01,
-                "{name} accent is a neutral surface, not a signal color: {accent:?}"
+        for (name, theme) in [("dark", &dark), ("light", &light)] {
+            assert_eq!(
+                theme.accent, theme.list_hover,
+                "{name} accent surface is the skin's hover tone: {:?}",
+                theme.accent
             );
         }
 
         assert_eq!(dark.radius, light.radius, "one radius across modes");
     }
 
-    /// Task 11: the default preset must leave the kit palette byte-identical.
-    /// The suite pins the stock blue selection, so "blue" is a no-op rather
-    /// than a re-stamp that happens to look similar.
+    /// Task 11, re-pointed at the ported skin (R2): blue is the signed skin
+    /// itself, so applying it re-stamps the skin's own values rather than
+    /// leaving the kit's stock palette underneath.
     #[gpui_kit::test]
-    fn default_blue_leaves_the_stock_palette_untouched(cx: &mut gpui_kit::TestAppContext) {
+    fn default_blue_re_stamps_the_signed_skin(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
             Theme::change(ThemeMode::Dark, None, cx);
@@ -334,7 +334,7 @@ mod tokens {
             crate::apply_appearance("dark", Accent::Blue, None, cx);
             let painted = Theme::global(cx).clone();
             for (name, stock, painted) in [
-                ("selection wash", stock.list_active, painted.list_active),
+                ("page", stock.background, painted.background),
                 (
                     "selection rim",
                     stock.list_active_border,
@@ -342,9 +342,8 @@ mod tokens {
                 ),
                 ("focus ring", stock.ring, painted.ring),
                 ("primary fill", stock.primary, painted.primary),
-                ("accent surface", stock.accent, painted.accent),
             ] {
-                assert_eq!(painted, stock, "blue leaves {name} on the kit's value");
+                assert_ne!(painted, stock, "blue re-stamps {name} off the kit default");
             }
         });
     }

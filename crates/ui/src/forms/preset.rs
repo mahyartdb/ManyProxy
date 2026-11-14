@@ -7,19 +7,19 @@ use crate::*;
 /// so the grammar lives in each box's placeholder and tooltip only. The
 /// `rules` state stays in the form because the commit and reopen paths read
 /// whatever a restored preset already carried.
-pub(crate) struct PresetForm {
-    pub(crate) name: Entity<InputState>,
-    pub(crate) rules: Entity<TextareaState>,
-    pub(crate) simple_direct: Entity<TextareaState>,
-    pub(crate) simple_block: Entity<TextareaState>,
-    pub(crate) simple_proxy: Entity<TextareaState>,
+pub struct PresetForm {
+    pub name: Entity<InputState>,
+    pub rules: Entity<TextareaState>,
+    pub simple_direct: Entity<TextareaState>,
+    pub simple_block: Entity<TextareaState>,
+    pub simple_proxy: Entity<TextareaState>,
     /// K3: the single `Add remote ruleset…` URL row — the one creation path
     /// replaces the old `Add by URL` / `New Remote` doors.
-    pub(crate) remote_url: Entity<InputState>,
+    pub remote_url: Entity<InputState>,
 }
 
 impl PresetForm {
-    pub(crate) fn restored(
+    pub fn restored(
         window: &mut Window,
         cx: &mut Context<AppView>,
         name: &str,
@@ -28,7 +28,7 @@ impl PresetForm {
         Self::restored_with_boxes(window, cx, name, rules, &SimpleRuleBoxes::default())
     }
 
-    pub(crate) fn restored_with_boxes(
+    pub fn restored_with_boxes(
         window: &mut Window,
         cx: &mut Context<AppView>,
         name: &str,
@@ -63,7 +63,7 @@ impl PresetForm {
         }
     }
 
-    pub(crate) fn element(self, cx: &App) -> impl IntoElement {
+    pub fn element(self, cx: &App) -> impl IntoElement {
         use crate::preset::SimpleRulesBox;
         let example = |r#box: SimpleRulesBox| match r#box {
             SimpleRulesBox::Direct => t!("preset-simple-example-direct"),

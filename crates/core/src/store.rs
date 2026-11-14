@@ -1,7 +1,7 @@
 //! The SQLite store: schema, queries, DPAPI-sealed secrets and the data dir.
 //! Belongs: every row/subscription/settings read and write plus their error types.
 //! Not here: UI state, engine processes, dialog strings.
-use crate::library::{LatencyFacet, LibraryColumns};
+use crate::library::{ColumnLayout, Density, LatencyFacet};
 use crate::secret::Secret;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -307,7 +307,7 @@ pub enum TestAllScope {
     /// Every running endpoint — the behaviour the app shipped with.
     #[default]
     Running,
-    /// Only the endpoints whose rows are checked.
+    /// Only the endpoints whose rows are selected.
     Checked,
 }
 
@@ -330,7 +330,7 @@ impl TestAllScope {
     pub fn label(self) -> &'static str {
         match self {
             TestAllScope::Running => "Every running endpoint",
-            TestAllScope::Checked => "Checked endpoints only",
+            TestAllScope::Checked => "Selected endpoints only",
         }
     }
 }
@@ -1126,6 +1126,11 @@ pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Orde
 pub enum LibrarySortKey {
     #[default]
     None,
+    Name,
+    Group,
+    Protocol,
+    Upstream,
+    Endpoint,
     Latency,
     Download,
     Upload,
@@ -1137,10 +1142,15 @@ pub enum LibrarySortKey {
 }
 
 impl LibrarySortKey {
-    /// Every key, in the order the pickers list them. The traffic keys live at
-    /// the end because only the traffic header menu offers them.
-    pub const ALL: [LibrarySortKey; 9] = [
+    /// Every key the library can rank by. The text keys back the seven column
+    /// headers; the traffic keys keep their place for persisted values.
+    pub const ALL: [LibrarySortKey; 14] = [
         LibrarySortKey::None,
+        LibrarySortKey::Name,
+        LibrarySortKey::Group,
+        LibrarySortKey::Protocol,
+        LibrarySortKey::Upstream,
+        LibrarySortKey::Endpoint,
         LibrarySortKey::Latency,
         LibrarySortKey::Download,
         LibrarySortKey::Upload,
@@ -1155,6 +1165,11 @@ impl LibrarySortKey {
     pub fn token(self) -> &'static str {
         match self {
             LibrarySortKey::None => "none",
+            LibrarySortKey::Name => "name",
+            LibrarySortKey::Group => "group",
+            LibrarySortKey::Protocol => "protocol",
+            LibrarySortKey::Upstream => "upstream",
+            LibrarySortKey::Endpoint => "endpoint",
             LibrarySortKey::Latency => "latency",
             LibrarySortKey::Download => "download",
             LibrarySortKey::Upload => "upload",
@@ -1173,6 +1188,11 @@ impl LibrarySortKey {
     pub fn label(self) -> &'static str {
         match self {
             LibrarySortKey::None => "None (library order)",
+            LibrarySortKey::Name => "Name (text)",
+            LibrarySortKey::Group => "Group (text)",
+            LibrarySortKey::Protocol => "Protocol (text)",
+            LibrarySortKey::Upstream => "Upstream (text)",
+            LibrarySortKey::Endpoint => "Endpoint (bind, then port)",
             LibrarySortKey::Latency => "Latency (latest URL test)",
             LibrarySortKey::Download => "Download (current session)",
             LibrarySortKey::Upload => "Upload (current session)",
@@ -4218,8 +4238,10 @@ pub struct WindowGeometry {
 impl WindowGeometry {
     /// T-32: the same minimums `app_window_options` hands the window, kept
     /// here so a restored rectangle can never seed a window below them.
-    pub const MIN_WIDTH: f32 = 880.;
-    pub const MIN_HEIGHT: f32 = 620.;
+    /// The redesign's shell (nav + table + inspector + engine bar) needs the
+    /// wider floor: 880×620 cannot hold the nav beside the table.
+    pub const MIN_WIDTH: f32 = 1100.;
+    pub const MIN_HEIGHT: f32 = 640.;
 
     /// T-32: the sane position box — anything further out is clamped rather
     /// than dropped, so even a hand-edited row lands somewhere visible.
@@ -8493,18 +8515,11 @@ impl Store {
 
     pub const META_LIBRARY_COLUMNS: &str = "library_columns";
 
+    /// Read-only: the retired visibility token list, kept so a profile written
+    /// before the layout existed can seed its first migration. Nothing writes
+    /// this key anymore.
     pub fn library_columns_raw(&self) -> Option<String> {
         self.get_meta(Self::META_LIBRARY_COLUMNS).ok().flatten()
-    }
-
-    pub fn set_library_columns(&mut self, value: &str) -> Result<(), StoreError> {
-        if value.trim().is_empty() {
-            return Err(StoreError::Invalid(vec![FieldError::new(
-                "library_columns",
-                "library_columns must list visible columns",
-            )]));
-        }
-        self.set_meta(Self::META_LIBRARY_COLUMNS, value.trim())
     }
 
     /// T-27: the persisted library sort, additive beside `library_columns`. A
@@ -8523,19 +8538,17 @@ impl Store {
         self.set_meta(Self::META_LIBRARY_SORT, &sort.to_json())
     }
 
-    /// T-03: the user's column widths and order, stored apart from
-    /// `library_columns` so a corrupt payload can only reset geometry, never
-    /// hide a column. Missing reads as the default geometry.
+    /// T-03/R11: the user's column order, visibility and widths. One layout is
+    /// authoritative; a corrupt payload reads as defaults and can never hide
+    /// Name or Endpoint. `ColumnLayout::from_store` owns the one-time legacy
+    /// visibility seed, so every reader agrees on the migration.
     pub const META_LIBRARY_COLUMN_LAYOUT: &str = "library_column_layout";
 
-    pub fn library_column_layout(&self) -> LibraryColumns {
-        match self.get_meta(Self::META_LIBRARY_COLUMN_LAYOUT) {
-            Ok(Some(raw)) => LibraryColumns::from_json(&raw),
-            _ => LibraryColumns::default(),
-        }
+    pub fn library_column_layout(&self) -> ColumnLayout {
+        ColumnLayout::from_store(self)
     }
 
-    pub fn set_library_column_layout(&mut self, layout: LibraryColumns) -> Result<(), StoreError> {
+    pub fn set_library_column_layout(&mut self, layout: ColumnLayout) -> Result<(), StoreError> {
         self.set_meta(Self::META_LIBRARY_COLUMN_LAYOUT, &layout.to_json())
     }
 
@@ -8554,32 +8567,44 @@ impl Store {
         self.set_meta(Self::META_LATENCY_FACET, &facet.to_json())
     }
 
-    pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";
+    /// The row density. A missing or unknown value reads as comfortable, so a
+    /// corrupt payload can only reset the pitch, never hide the table.
+    pub const META_ROW_DENSITY: &str = "row_density";
 
-    /// T-23: the library search query string of the previous session. A missing
-    /// or whitespace-only value reads as "no remembered filter".
-    pub fn library_last_query(&self) -> Option<String> {
-        match self.get_meta(Self::META_LIBRARY_LAST_QUERY) {
-            Ok(Some(value)) if !value.trim().is_empty() => Some(value),
-            _ => None,
+    pub fn row_density(&self) -> Density {
+        match self.get_meta(Self::META_ROW_DENSITY) {
+            Ok(Some(raw)) => Density::from_token(&raw).unwrap_or_default(),
+            _ => Density::default(),
         }
     }
 
-    /// T-23: remembering an empty query clears the key instead of storing a
-    /// blank one, so an untouched search field never writes a meta row.
-    pub fn set_library_last_query(&mut self, value: &str) -> Result<(), StoreError> {
-        if value.trim().is_empty() {
-            return self.clear_library_last_query();
-        }
-        self.set_meta(Self::META_LIBRARY_LAST_QUERY, value.trim())
+    pub fn set_row_density(&mut self, density: Density) -> Result<(), StoreError> {
+        self.set_meta(Self::META_ROW_DENSITY, density.token())
     }
 
-    pub fn clear_library_last_query(&mut self) -> Result<(), StoreError> {
-        self.conn.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![Self::META_LIBRARY_LAST_QUERY],
-        )?;
-        Ok(())
+    /// R12: the inspector's persisted width. Absent, unparsable, or
+    /// out-of-range values read as the 300px default — the pre-feature shape —
+    /// and in-window values clamp to `240..=360`.
+    pub const META_INSPECTOR_WIDTH: &str = "inspector_width";
+
+    pub const INSPECTOR_WIDTH_DEFAULT: f32 = 300.;
+    pub const INSPECTOR_WIDTH_MIN: f32 = 240.;
+    pub const INSPECTOR_WIDTH_MAX: f32 = 360.;
+
+    pub fn inspector_width(&self) -> f32 {
+        match self.get_meta(Self::META_INSPECTOR_WIDTH) {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<f32>()
+                .map(|width| width.clamp(Self::INSPECTOR_WIDTH_MIN, Self::INSPECTOR_WIDTH_MAX))
+                .unwrap_or(Self::INSPECTOR_WIDTH_DEFAULT),
+            _ => Self::INSPECTOR_WIDTH_DEFAULT,
+        }
+    }
+
+    pub fn set_inspector_width(&mut self, width: f32) -> Result<(), StoreError> {
+        let clamped = width.clamp(Self::INSPECTOR_WIDTH_MIN, Self::INSPECTOR_WIDTH_MAX);
+        self.set_meta(Self::META_INSPECTOR_WIDTH, &clamped.to_string())
     }
 
     /// T-31: the kept-log ring cap, additive beside the other meta keys.
@@ -8956,7 +8981,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library::{LatencyBucket, LatencyFacet, LibraryColumn};
+    use crate::library::{ColumnId, LatencyBucket, LatencyFacet};
 
     fn valid_input(name: &str) -> NewConfig {
         NewConfig {
@@ -15671,21 +15696,21 @@ mod tests {
     }
 
     #[test]
-    fn library_columns_absent_and_round_trips() {
+    fn library_columns_legacy_key_is_read_only() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         assert_eq!(store.library_columns_raw(), None, "default absent");
         store
-            .set_library_columns("upstream,health")
-            .expect("valid set writes");
+            .set_meta(Store::META_LIBRARY_COLUMNS, "upstream,health")
+            .expect("raw write");
         assert_eq!(
             store.library_columns_raw().as_deref(),
             Some("upstream,health"),
-            "round-trips verbatim"
+            "the retired key still reads for the one migration"
         );
-        assert!(
-            store.set_library_columns("  ").is_err(),
-            "blank fails loudly"
-        );
+        let layout = store.library_column_layout();
+        assert!(layout.is_visible(ColumnId::Upstream));
+        assert!(layout.is_visible(ColumnId::Health));
+        assert!(!layout.is_visible(ColumnId::Group));
     }
 
     #[test]
@@ -15693,12 +15718,12 @@ mod tests {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         assert_eq!(
             store.library_column_layout(),
-            LibraryColumns::default(),
+            ColumnLayout::default(),
             "an absent layout is the computed default"
         );
-        let mut layout = LibraryColumns::default();
-        layout.set_width(LibraryColumn::Endpoint, 176.);
-        layout.move_column(LibraryColumn::Traffic, LibraryColumn::Group, false);
+        let mut layout = ColumnLayout::default();
+        layout.set_width(ColumnId::Endpoint, 176.);
+        layout.move_column(ColumnId::Traffic, ColumnId::Group, false);
         store
             .set_library_column_layout(layout)
             .expect("layout writes");
@@ -15708,8 +15733,8 @@ mod tests {
             .expect("raw write");
         assert_eq!(
             store.library_column_layout(),
-            LibraryColumns::default(),
-            "a corrupt payload resets geometry, never visibility"
+            ColumnLayout::default(),
+            "a corrupt payload resets the layout, never hides a locked column"
         );
     }
 
@@ -17805,6 +17830,47 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// R12: the inspector's width persists beside the other meta keys and
+    /// clamps hard, so a corrupt or wild value can only ever reshape the
+    /// panel, never break the layout.
+    #[test]
+    fn inspector_width_round_trips_and_clamps_to_240_360() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.inspector_width(),
+            Store::INSPECTOR_WIDTH_DEFAULT,
+            "absent meta reads as 300"
+        );
+        assert_eq!(
+            store
+                .get_meta(Store::META_INSPECTOR_WIDTH)
+                .expect("meta read"),
+            None,
+            "the default writes no meta row"
+        );
+
+        for width in [260.0f32, 300.0, 340.0] {
+            store.set_inspector_width(width).expect("width writes");
+            assert_eq!(store.inspector_width(), width, "{width} round-trips");
+        }
+
+        store.set_inspector_width(100.0).expect("low width writes");
+        assert_eq!(store.inspector_width(), 240.0, "low widths clamp to 240");
+        store
+            .set_inspector_width(1_000.0)
+            .expect("high width writes");
+        assert_eq!(store.inspector_width(), 360.0, "high widths clamp to 360");
+
+        store
+            .set_meta(Store::META_INSPECTOR_WIDTH, "not-a-number")
+            .expect("junk writes");
+        assert_eq!(
+            store.inspector_width(),
+            Store::INSPECTOR_WIDTH_DEFAULT,
+            "junk reads as the default"
+        );
     }
 
     /// T-32: the window rectangle rides the meta family as

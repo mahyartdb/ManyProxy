@@ -1,303 +1,17 @@
-use crate::app::columns::WidthAction;
 use crate::*;
 
 impl AppView {
-    /// T-23: keep the last-filter memory in step with the query. `set_value`
-    /// never emits `InputEvent::Change`, so the clear paths call this directly.
-    /// A blank query clears the key rather than storing one, and a write hiccup
-    /// only costs the memory — the live filter is unaffected.
-    pub(crate) fn remember_library_query(&mut self, query: &str) {
-        let _ = if query.trim().is_empty() {
-            self.store.clear_library_last_query()
-        } else {
-            self.store.set_library_last_query(query)
-        };
-    }
-
-    pub(crate) fn sort_menu_item(
-        column: &'static str,
-        id_suffix: &'static str,
-        label: String,
-        tip: String,
-        checked: bool,
-        action: SortMenuAction,
-        view: &Entity<AppView>,
-    ) -> PopupMenuItem {
-        let id = format!("sort-header-{column}-{id_suffix}");
-        let view = view.clone();
-        PopupMenuItem::element(move |_, _| {
-            let text = label.clone();
-            let tip = tip.clone();
-            // The check mark is the menu's own state, not a glyph in the label:
-            // the visual row gets the check slot and screen readers hear the
-            // same fact as words.
-            let aria = if checked {
-                t!("sort-current-aria", label = &text)
-            } else {
-                text.clone()
-            };
-            div()
-                .id(id.clone())
-                .test_support()
-                .role(Role::MenuItem)
-                .aria_label(aria)
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                .child(text)
-        })
-        .checked(checked)
-        .on_click(move |_, window, cx| {
-            view.update(cx, |view, cx| match action {
-                SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
-                SortMenuAction::Direction => view.toggle_library_sort_direction(window, cx),
-            });
-        })
-    }
-
-    pub(crate) fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.focus_handle(cx).focus(window, cx);
     }
 
-    pub(crate) fn sync_search_box(
-        view: &Entity<Self>,
-        text: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        view.update(cx, |view, cx| {
-            view.remember_library_query(text);
-            view.search_input.update(cx, |input, cx| {
-                input.set_value(text.to_string(), window, cx);
-            });
-        });
-    }
-
-    pub(crate) fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remember_library_query("");
-        self.search_input.update(cx, |input, cx| {
-            input.set_value(String::new(), window, cx);
-        });
-        self.libraries.update(cx, |state, list_cx| {
-            state.set_query("", window, list_cx);
-        });
-        cx.notify();
-    }
-
-    pub(crate) fn sync_facet_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // K11/A2-1: one facet menu; the enabled/disabled axis rides inside it.
-        let (choices, current) = FacetMenu::Group.choices(self.libraries.read(cx).delegate());
-        Self::sync_facet_picker(&mut self.facet_group, choices, current, window, cx);
-        let (choices, current) = FacetMenu::Latency.choices(self.libraries.read(cx).delegate());
-        Self::sync_facet_picker(&mut self.facet_latency, choices, current, window, cx);
-    }
-
-    /// T-05: one writer for the latency facet, shared by the picker and the
-    /// unprobed switch. The live filter is the important part; a failed meta
-    /// write only costs the remembered choice, so it does not interrupt the
-    /// user (the remembered query takes the same trade).
-    pub(crate) fn set_latency_facet(&mut self, facet: LatencyFacet, cx: &mut Context<Self>) {
-        self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_latency_facet(facet);
-            list_cx.notify();
-        });
-        let _ = self.store.set_latency_facet(facet);
-        cx.notify();
-    }
-
-    pub(crate) fn sync_facet_picker(
-        picker: &mut FacetPicker,
-        choices: Vec<FacetChoice>,
-        current: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<AppView>,
-    ) {
-        if picker.synced != choices {
-            picker.synced = choices.clone();
-            picker.state.update(cx, |state, cx| {
-                state.set_items(FacetChoiceList(choices.clone()), window, cx);
-                state.set_selected_value(&current, window, cx);
-            });
-            return;
-        }
-        let selected = picker.state.read(cx).selected_value().cloned().flatten();
-        if selected != current {
-            picker.state.update(cx, |state, cx| {
-                state.set_selected_value(&current, window, cx);
-            });
-        }
-    }
-
-    pub(crate) fn render_facet_bar(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        self.sync_facet_pickers(window, cx);
-        let right_pad = 8.;
-        let has_facets = self.libraries.read(cx).delegate().facets_active();
-        let latency_now = self.libraries.read(cx).delegate().latency_facet;
-        // T-19: the facet area carries the same per-group opt-in switch for
-        // the focused group; has no group to protect by design.
-        let facet_group_now = self.libraries.read(cx).delegate().facet_group.clone();
-        let facet_auto_clear = facet_group_now
-            .as_deref()
-            .map(|group| self.store.auto_clear_enabled(group))
-            .unwrap_or(false);
-        let facet_auto_view = cx.entity();
-
-        let group_tip = {
-            let libraries = self.libraries.read(cx);
-            let delegate = libraries.delegate();
-            let (visible, total, _) = delegate.delegate_counts_for_search();
-            facet_tip_text(
-                &t!("facet-group-dimension"),
-                &FacetMenu::Group.current_display(delegate),
-                visible,
-                total,
-            )
-        };
-        div()
-            .id("facet-bar")
-            .test_support()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .pl_2()
-            .pr(px(right_pad))
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            // T-23 / F-32: filters lead the row. A `flex_1` search used to
-            // claim the whole width and shove Protocol/Status under the
-            // inspector drawer at 880–1000px. The search keeps the remaining
-            // stretch but stops at 320px, so the drawer can only ever cover
-            // its right edge — never the filter values.
-            .child(
-                div()
-                    .id("facet-group-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(group_tip.clone())).into())
-                    .child(
-                        Select::new(&self.facet_group.state)
-                            .id("facet-group")
-                            .small()
-                            .accessibility_label(t!("facet-group-aria")),
-                    ),
-            )
-            .child(
-                div()
-                    .id("facet-latency-tip")
-                    .test_support()
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(t!("facet-latency-tip"))).into())
-                    .child(
-                        Select::new(&self.facet_latency.state)
-                            .id("facet-latency")
-                            .small()
-                            .accessibility_label(t!("facet-latency-aria")),
-                    ),
-            )
-            .child(
-                div().id("facet-latency-unprobed").test_support().child(
-                    Switch::new("facet-latency-unprobed-switch")
-                        .checked(latency_now.include_unprobed)
-                        .label(t!("facet-include-unprobed"))
-                        .tooltip(t!("facet-include-unprobed-tip"))
-                        .accessibility_label(t!("facet-include-unprobed-aria"))
-                        .on_change(cx.listener(|view, next: &bool, _, cx| {
-                            let bucket = view.libraries.read(cx).delegate().latency_facet.bucket;
-                            view.set_latency_facet(
-                                LatencyFacet {
-                                    bucket,
-                                    include_unprobed: *next,
-                                },
-                                cx,
-                            );
-                        })),
-                ),
-            )
-            .child(
-                div()
-                    .id("library-search")
-                    .test_support()
-                    .flex_1()
-                    .min_w(px(140.))
-                    .max_w(px(320.))
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(search_hint())).into())
-                    .child(
-                        Input::new(&self.search_input)
-                            .small()
-                            .aria_label(t!("search-placeholder")),
-                    ),
-            )
-            .child(self.render_search_count(cx))
-            .child(match facet_group_now {
-                Some(group) => {
-                    let slug = slugify_group_id(&group);
-                    div()
-                        .id(format!("facet-auto-clear-{slug}"))
-                        .test_support()
-                        .child(
-                            Switch::new(format!("facet-auto-clear-switch-{slug}"))
-                                .checked(facet_auto_clear)
-                                .label(t!("facet-auto-clear"))
-                                .tooltip(t!("facet-auto-clear-tip"))
-                                .accessibility_label(t!(
-                                    "facet-auto-clear-aria",
-                                    group = group.clone()
-                                ))
-                                .on_change({
-                                    let facet_auto_view = facet_auto_view.clone();
-                                    move |next: &bool, window, cx| {
-                                        let view = facet_auto_view.clone();
-                                        if *next {
-                                            view.update(cx, |view, cx| {
-                                                view.open_auto_clear_opt_in_confirm(
-                                                    &group, false, window, cx,
-                                                )
-                                            });
-                                        } else {
-                                            view.update(cx, |view, cx| {
-                                                view.commit_auto_clear_off(&group, window, cx)
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                        .into_any_element()
-                }
-                None => div()
-                    .id("facet-auto-clear-idle")
-                    .test_support()
-                    .into_any_element(),
-            })
-            .child(if has_facets {
-                Button::new("clear-facets")
-                    .small()
-                    .label(t!("facet-clear"))
-                    .tooltip(t!("facet-clear-tip"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.clear_facets(window, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                div().id("facets-idle").test_support().into_any_element()
-            })
-            .into_any_element()
-    }
-
-    /// T-27: the library list's column header strip. The visible columns come
-    /// from `library_columns`; the health and traffic cells are sortable and
-    /// carry the picker menu, the rest are labels that keep the strip lined up.
+    /// R7/R11: the library list's column header strip. Every visible column in
+    /// the layout's order paints one sortable header; the lead and the trailing
+    /// reserve are explicit spacers, never columns.
     ///
     /// T-03: the strip reads the same `RowMetrics` the row reads, so every
-    /// label sits at its column's first character instead of at a second,
-    /// disagreeing set of widths.
-    pub(crate) fn render_library_column_headers(
+    /// label sits at its column's first character.
+    pub fn render_library_column_headers(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -309,6 +23,7 @@ impl AppView {
         let has_rows = !delegate.rows.is_empty();
         let view = cx.entity();
         let column_drop = self.column_drop;
+        let clear_view = view.clone();
         if !has_rows {
             // An empty library keeps today's empty-state clean: a header strip
             // over nothing is noise.
@@ -317,175 +32,180 @@ impl AppView {
                 .test_support()
                 .into_any_element();
         }
-        let mut strip = div()
-            .id("library-column-headers")
-            .test_support()
-            .relative()
-            .flex()
-            .flex_row()
-            .flex_nowrap()
-            .items_center()
-            .gap_2()
-            // A drag move outside any movable header must clear the indicator;
-            // parent listeners register before child listeners, so the headers
-            // below can put it back when the pointer is over one of them.
-            .on_drag_move(
-                cx.listener(move |view, _: &DragMoveEvent<ColumnDrag>, _, cx| {
-                    view.clear_column_drop(cx);
-                }),
-            )
-            // The row's content starts after the list item's 4px inset and
-            // the card's 8px padding — the strip starts at the same place.
-            .px_3()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            // The gutter the row cards spend on the serving lamp and checkbox.
-            .child(
-                div()
-                    .id("header-lamp-check")
-                    .test_support()
-                    .w(px(metrics.lamp_check))
-                    .flex_shrink_0(),
-            )
-            // The numeral check chip's reserved slot.
-            .child(
-                div()
-                    .id("header-check-slot")
-                    .test_support()
-                    .w(px(metrics.check_slot))
-                    .flex_shrink_0(),
-            )
-            .child(
-                div()
-                    .id("header-name")
-                    .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("column-name")),
-            );
+        let mut headers: Vec<AnyElement> = Vec::new();
         for column in *metrics.layout.order() {
             if !metrics.column_visible(column) {
                 continue;
             }
             let drop_side =
                 column_drop.and_then(|(target, side)| (target == column).then_some(side));
-            let width = metrics.column_width(column);
-            strip = strip.child(match column {
-                LibraryColumn::Group
-                | LibraryColumn::Protocol
-                | LibraryColumn::Upstream
-                | LibraryColumn::Endpoint => {
-                    column_header_label(column, width, drop_side, view.clone(), cx)
-                }
-                LibraryColumn::Health | LibraryColumn::Traffic => {
-                    sort_header_cell(column, sort, width, drop_side, view.clone(), window, cx)
-                }
-            });
+            headers.push(column_header_cell(
+                column,
+                sort,
+                metrics,
+                drop_side,
+                view.clone(),
+                window,
+                cx,
+            ));
         }
-        // The row's trailing cell holds the copy action; the strip keeps the
-        // same width so the columns stay lined up.
-        strip = strip.child(
-            div()
-                .id("header-copy")
-                .test_support()
-                .w(px(metrics.copy))
-                .flex_shrink_0(),
-        );
-        strip = strip.child(column_drag_canvas(view));
+        let strip = div()
+            .id("library-column-headers")
+            .test_support()
+            .relative()
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_nowrap()
+            .items_center()
+            // A drag move outside any header must clear the indicator; parent
+            // listeners register before child listeners, so the headers below
+            // can put it back when the pointer is over one of them.
+            .on_drag_move(
+                cx.listener(move |view, _: &DragMoveEvent<ColumnDrag>, _, cx| {
+                    view.clear_column_drop(cx);
+                }),
+            )
+            // A plain click on the header is a click outside the rows: the
+            // selection goes. Header controls that act (sort, menus, resize)
+            // keep their own handlers; this only adds the clearing.
+            .on_click(move |_, window, cx| {
+                clear_view.update(cx, |view, cx| {
+                    if view.selection_count() > 0 {
+                        view.clear_selection(window, cx);
+                    }
+                });
+            })
+            .h(px(self.density.header_height()))
+            .border_b_1()
+            .border_color(cx.theme().border)
+            // The lead gutter the row spends on its state glyph.
+            .child(
+                div()
+                    .id("header-lead")
+                    .test_support()
+                    .w(px(metrics.lead))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .id("header-columns")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(RowMetrics::GAP))
+                    .flex_shrink_0()
+                    .children(headers),
+            )
+            // The row's trailing reserve holds the hover actions; the strip
+            // keeps the same width so the columns line up.
+            .child(
+                div()
+                    .id("header-actions")
+                    .test_support()
+                    .w(px(metrics.actions))
+                    .flex_shrink_0(),
+            )
+            .child(column_drag_canvas(view));
         strip.into_any_element()
     }
 
-    /// T-27: the header picker — the key list for this column plus the direction
-    /// toggle, with the live choice marked. Item ids are pinned
-    /// (`sort-header-{column}-{key|direction}`) for the UI test.
-    pub(crate) fn sort_header_menu(
-        menu: PopupMenu,
-        column: &'static str,
-        sort: LibrarySort,
-        view: &Entity<AppView>,
-    ) -> PopupMenu {
-        let mut menu = menu;
-        for key in sort_header_keys(column) {
-            let current = *key == sort.key;
-            let label = library_sort_key_label(*key);
-            menu = menu.item(Self::sort_menu_item(
-                column,
-                key.token(),
-                label.clone(),
-                t!("sort-by", label = label),
-                current,
-                SortMenuAction::Key(*key),
-                view,
-            ));
-        }
-        let next = sort.direction.toggled();
-        menu = menu.item(Self::sort_menu_item(
-            column,
-            "direction",
-            t!(
-                "sort-direction",
-                from = sort_direction_label(sort.direction),
-                to = sort_direction_label(next)
-            ),
-            t!("sort-direction-tip"),
-            false,
-            SortMenuAction::Direction,
-            view,
-        ));
-        match LibraryColumn::from_id(column) {
-            Some(column) => Self::width_menu_items(menu.separator(), column, view),
-            None => menu,
-        }
-    }
-
-    /// T-03: the same three verbs every header exposes, minus the sort half for
-    /// the columns that have no sort key.
-    pub(crate) fn width_header_menu(
-        menu: PopupMenu,
-        column: LibraryColumn,
-        view: &Entity<AppView>,
-    ) -> PopupMenu {
-        Self::width_menu_items(menu, column, view)
-    }
-
-    fn width_menu_items(
+    /// R11: the one Explorer-style menu every header opens. The same items and
+    /// the same ids on every column; only the fit target differs.
+    pub fn column_header_menu(
         mut menu: PopupMenu,
-        column: LibraryColumn,
+        column: ColumnId,
+        layout: ColumnLayout,
         view: &Entity<AppView>,
     ) -> PopupMenu {
-        for action in WidthAction::ALL {
-            menu = menu.item(Self::width_menu_item(column, action, view));
+        menu = menu.item(Self::column_menu_action(
+            "columns-menu-size-this",
+            t!("columns-size-this"),
+            view.clone(),
+            move |view, window, cx| view.fit_column_to_content(column, window, cx),
+        ));
+        menu = menu.item(Self::column_menu_action(
+            "columns-menu-size-all",
+            t!("columns-size-all"),
+            view.clone(),
+            |view, window, cx| view.fit_all_columns_to_content(window, cx),
+        ));
+        menu = menu.separator();
+        // The menu lists the signed default order; only the sheet follows the
+        // live order, so the two surfaces stay distinguishable.
+        for column in ColumnId::ALL {
+            menu = menu.item(Self::column_visibility_item(column, layout, view));
         }
-        menu
+        menu = menu.separator();
+        menu.item(Self::column_menu_action(
+            "columns-menu-more",
+            t!("columns-more"),
+            view.clone(),
+            |view, window, cx| view.open_columns_sheet(window, cx),
+        ))
     }
 
-    fn width_menu_item(
-        column: LibraryColumn,
-        action: WidthAction,
-        view: &Entity<AppView>,
+    pub fn column_menu_action(
+        id: &'static str,
+        label: String,
+        view: Entity<AppView>,
+        act: impl Fn(&mut AppView, &mut Window, &mut Context<AppView>) + 'static,
     ) -> PopupMenuItem {
-        let id = format!("column-menu-{}-{}", column.id(), action.id_suffix());
-        let label = action.label();
-        let aria = t!(
-            "column-width-aria",
-            action = label.clone(),
-            column = library_column_label(column)
-        );
-        let view = view.clone();
         PopupMenuItem::element(move |_, _| {
             div()
-                .id(id.clone())
+                .id(id)
                 .test_support()
                 .role(Role::MenuItem)
-                .aria_label(aria.clone())
+                .aria_label(label.clone())
                 .child(label.clone())
         })
         .on_click(move |_, window, cx| {
-            action.apply(&view, column, window, cx);
+            view.update(cx, |view, cx| act(view, window, cx));
+        })
+    }
+
+    pub fn column_visibility_item(
+        column: ColumnId,
+        layout: ColumnLayout,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let label = library_column_label(column);
+        let checked = layout.is_visible(column);
+        let locked = column.locked();
+        let hint = locked.then(|| t!("columns-always-visible"));
+        let aria = hint
+            .as_ref()
+            .map_or_else(|| label.clone(), |hint| format!("{label}, {hint}"));
+        let item_label = label.clone();
+        let view = view.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let mut row = div()
+                .id(format!("columns-menu-{}", column.id()))
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(aria.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(item_label.clone());
+            if let Some(hint) = hint.clone() {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
+                );
+            }
+            row
+        })
+        .checked(checked)
+        .disabled(locked)
+        .on_click(move |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_column_visible(column, !checked, window, cx);
+            });
         })
     }
 }
@@ -494,7 +214,7 @@ impl AppView {
 /// `on_mouse_move` stops at the cell edge, but the user may drag higher or
 /// lower than the 30px strip; the window listener follows until mouse-up. It
 /// has to be registered during paint, hence the zero-visual canvas.
-fn column_drag_canvas(view: Entity<AppView>) -> AnyElement {
+pub fn column_drag_canvas(view: Entity<AppView>) -> AnyElement {
     canvas(
         |_, _, _| (),
         move |_, _, window, _| {
