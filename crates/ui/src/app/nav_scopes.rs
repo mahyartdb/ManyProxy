@@ -10,14 +10,14 @@ use std::collections::BTreeSet;
 /// The payload a row drag carries. Only the dragged row moves; a selection is
 /// never dragged along.
 #[derive(Clone)]
-pub(crate) struct RowDrag {
-    pub(crate) id: String,
+pub struct RowDrag {
+    pub id: String,
 }
 
 /// The chip under the pointer while a row is dragged. It names the row so the
 /// drop result is obvious before release.
-pub(crate) struct RowDragPreview {
-    pub(crate) label: String,
+pub struct RowDragPreview {
+    pub label: String,
 }
 
 impl Render for RowDragPreview {
@@ -38,28 +38,28 @@ impl Render for RowDragPreview {
 /// What a drag can land on. `All` has no group to move a row into; it refuses
 /// with copy instead of inventing a "no group" state.
 #[derive(Clone)]
-enum RowDrop {
+pub enum RowDrop {
     All,
     Group(String),
 }
 
-struct ScopeEntrySpec {
-    id: String,
-    scope: LibraryScope,
-    letter: String,
-    label: String,
-    tip: String,
-    count: Option<usize>,
-    dot: Option<SourceStatus>,
-    drop: RowDrop,
-    context_group: Option<String>,
+pub struct ScopeEntrySpec {
+    pub id: String,
+    pub scope: LibraryScope,
+    pub letter: String,
+    pub label: String,
+    pub tip: String,
+    pub count: Option<usize>,
+    pub dot: Option<SourceStatus>,
+    pub drop: RowDrop,
+    pub context_group: Option<String>,
 }
 
 impl AppView {
     /// Rebuild the group, source and scope-count snapshot. This is the only
     /// writer of the nav's counts; a repaint never touches the store or walks
     /// the library. A scope whose bucket disappeared falls back to `All`.
-    pub(crate) fn refresh_scope_index(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_scope_index(&mut self, cx: &mut Context<Self>) {
         let subs = self.store.list_subscriptions().unwrap_or_default();
         let now = now_unix();
         let (counts, groups, sources) = {
@@ -169,7 +169,7 @@ impl AppView {
         self.scope_enabled = enabled;
     }
 
-    pub(crate) fn scope_count(&self, scope: &LibraryScope) -> usize {
+    pub fn scope_count(&self, scope: &LibraryScope) -> usize {
         self.scope_counts
             .iter()
             .find(|(candidate, _)| candidate == scope)
@@ -178,7 +178,7 @@ impl AppView {
     }
 
     /// The action bar's name for the current scope.
-    pub(crate) fn scope_label(&self) -> String {
+    pub fn scope_label(&self) -> String {
         match &self.scope {
             LibraryScope::All => t!("nav-all-configs"),
             LibraryScope::Group(name) => name.clone(),
@@ -195,12 +195,7 @@ impl AppView {
     /// A scope change is a navigation move. It clears the selection, the
     /// anchor and the focus, then recomputes the table inside the new scope;
     /// the query (search, status, protocol) stays exactly as it was.
-    pub(crate) fn set_scope(
-        &mut self,
-        scope: LibraryScope,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_scope(&mut self, scope: LibraryScope, window: &mut Window, cx: &mut Context<Self>) {
         if self.scope == scope {
             return;
         }
@@ -212,20 +207,20 @@ impl AppView {
         cx.notify();
     }
 
-    pub(crate) fn hover_row_drop(&mut self, group: &str, cx: &mut Context<Self>) {
+    pub fn hover_row_drop(&mut self, group: &str, cx: &mut Context<Self>) {
         if self.row_drop_target.as_deref() != Some(group) {
             self.row_drop_target = Some(group.to_string());
             cx.notify();
         }
     }
 
-    pub(crate) fn clear_row_drop(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_row_drop(&mut self, cx: &mut Context<Self>) {
         if self.row_drop_target.take().is_some() {
             cx.notify();
         }
     }
 
-    fn group_drop_label(group: &str) -> String {
+    pub fn group_drop_label(group: &str) -> String {
         if group == DEFAULT_GROUP {
             t!("nav-ungrouped")
         } else {
@@ -233,7 +228,7 @@ impl AppView {
         }
     }
 
-    fn source_tone(&self, status: SourceStatus, cx: &App) -> Hsla {
+    pub fn source_tone(&self, status: SourceStatus, cx: &App) -> Hsla {
         match status {
             SourceStatus::Fresh => cx.theme().success,
             SourceStatus::Stale | SourceStatus::Never => cx.theme().warning,
@@ -241,7 +236,7 @@ impl AppView {
         }
     }
 
-    fn source_status_label(status: SourceStatus) -> String {
+    pub fn source_status_label(status: SourceStatus) -> String {
         match status {
             SourceStatus::Fresh => t!("source-strip-fresh"),
             SourceStatus::Stale => t!("source-strip-stale"),
@@ -250,7 +245,7 @@ impl AppView {
         }
     }
 
-    fn nav_dot(&self, status: SourceStatus, cx: &App) -> AnyElement {
+    pub fn nav_dot(&self, status: SourceStatus, cx: &App) -> AnyElement {
         div()
             .flex_shrink_0()
             .size(px(6.))
@@ -262,7 +257,7 @@ impl AppView {
     /// `All configs`, pinned above the scrolling sections. It is the one
     /// scope that is also a drop target that refuses: there is no ungrouped
     /// state to move a row into.
-    pub(crate) fn render_all_configs_entry(
+    pub fn render_all_configs_entry(
         &self,
         total: usize,
         collapsed: bool,
@@ -287,11 +282,7 @@ impl AppView {
 
     /// The `Groups` section. The header carries the `+`; the collapsed nav
     /// keeps the same action as its own hairline row.
-    pub(crate) fn render_group_section(
-        &self,
-        collapsed: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub fn render_group_section(&self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
         let mut section = div().id("nav-groups-section").flex().flex_col();
         if collapsed {
             section = section
@@ -377,7 +368,7 @@ impl AppView {
         section.into_any_element()
     }
 
-    fn new_group_row(
+    pub fn new_group_row(
         &self,
         label: &'static str,
         compact: bool,
@@ -407,11 +398,7 @@ impl AppView {
 
     /// The `Sources` section. `Manage…` opens the existing sources sheet; each
     /// entry carries its freshness dot, count and one-source refresh.
-    pub(crate) fn render_source_section(
-        &self,
-        collapsed: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub fn render_source_section(&self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
         let mut section = div().id("nav-sources-section").flex().flex_col();
         if collapsed {
             section = section
@@ -447,7 +434,7 @@ impl AppView {
         section.into_any_element()
     }
 
-    fn manage_sources_row(
+    pub fn manage_sources_row(
         &self,
         label: impl Into<SharedString>,
         compact: bool,
@@ -475,7 +462,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_source_entry(
+    pub fn render_source_entry(
         &self,
         source: &SourceEntry,
         collapsed: bool,
@@ -581,7 +568,7 @@ impl AppView {
 
     /// One nav scope entry: the label or its letter, the count, the active rim
     /// and fill, the tooltip, and the row drop target for a group.
-    fn render_scope_entry(
+    pub fn render_scope_entry(
         &self,
         spec: ScopeEntrySpec,
         collapsed: bool,
@@ -720,7 +707,7 @@ impl AppView {
         row.into_any_element()
     }
 
-    fn group_context_menu(menu: PopupMenu, group: &str, view: &Entity<AppView>) -> PopupMenu {
+    pub fn group_context_menu(menu: PopupMenu, group: &str, view: &Entity<AppView>) -> PopupMenu {
         let slug = slugify_group_id(group);
         let manage_slug = slug.clone();
         let manage_view = view.clone();
@@ -761,7 +748,7 @@ impl AppView {
 
     /// The source strip, inside the main column above the filter row. `None`
     /// outside a source scope.
-    pub(crate) fn render_scope_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_scope_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let LibraryScope::Source(id) = &self.scope else {
             return None;
         };
@@ -922,7 +909,7 @@ impl AppView {
 
     /// A row dropped on a group entry moves only that row. `None` is the
     /// `All configs` entry: the store has no "no group" state to move into.
-    pub(crate) fn drop_row_on_group(
+    pub fn drop_row_on_group(
         &mut self,
         row_id: &str,
         group: Option<&str>,
@@ -975,14 +962,14 @@ impl AppView {
     }
 }
 
-fn group_letter(name: &str) -> String {
+pub fn group_letter(name: &str) -> String {
     name.chars()
         .next()
         .map(|letter| letter.to_uppercase().to_string())
         .unwrap_or_else(|| "?".to_string())
 }
 
-fn section_hairline(id: &'static str, cx: &App) -> AnyElement {
+pub fn section_hairline(id: &'static str, cx: &App) -> AnyElement {
     div()
         .id(id)
         .test_support()
@@ -992,7 +979,7 @@ fn section_hairline(id: &'static str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn source_quota_text(quota: SourceQuotaLine, now: i64) -> Option<String> {
+pub fn source_quota_text(quota: SourceQuotaLine, now: i64) -> Option<String> {
     let mut segments = Vec::new();
     match (quota.used, quota.total) {
         (Some(used), Some(total)) => segments.push(t!(

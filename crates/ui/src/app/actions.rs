@@ -4,7 +4,7 @@ use crate::*;
 /// shortcuts, the palette and the inspector `…` menu pass the current
 /// selection. Handlers resolve the target at invocation — never at render.
 #[derive(Clone, Copy)]
-pub(crate) enum ActionTarget<'a> {
+pub enum ActionTarget<'a> {
     Row(&'a str),
     Selection,
 }
@@ -12,7 +12,7 @@ pub(crate) enum ActionTarget<'a> {
 /// How a handler addresses its row. `Row` handlers take the resolved id, so a
 /// context menu can act on a row that is not the selection. `Selected`
 /// handlers already work off the selection.
-pub(crate) enum Handler {
+pub enum Handler {
     Row(fn(&mut AppView, &str, &mut Window, &mut Context<AppView>)),
     Rows(fn(&mut AppView, &[String], &mut Window, &mut Context<AppView>)),
     Selected(fn(&mut AppView, &mut Window, &mut Context<AppView>)),
@@ -22,31 +22,31 @@ pub(crate) enum Handler {
 /// inspector menu, command palette, keymap) reads its label, keywords,
 /// shortcut and enabled state from here, and dispatches through
 /// [`run_action`], so a verb cannot drift between surfaces.
-pub(crate) struct ActionDef {
-    pub(crate) id: &'static str,
+pub struct ActionDef {
+    pub id: &'static str,
     /// Fluent key for the verb's label.
-    pub(crate) label_key: &'static str,
-    pub(crate) keywords: &'static [&'static str],
+    pub label_key: &'static str,
+    pub keywords: &'static [&'static str],
     /// Fluent key for the verb's tooltip, when it has one.
-    pub(crate) tooltip_key: Option<&'static str>,
+    pub tooltip_key: Option<&'static str>,
     /// (keystroke, chip) pairs. A slice because ctrl-1/ctrl-3 alias one id.
-    pub(crate) shortcuts: &'static [(&'static str, &'static str)],
-    pub(crate) enabled: fn(&AppView, ActionTarget<'_>, &App) -> bool,
-    pub(crate) run: Handler,
+    pub shortcuts: &'static [(&'static str, &'static str)],
+    pub enabled: fn(&AppView, ActionTarget<'_>, &App) -> bool,
+    pub run: Handler,
 }
 
 impl ActionDef {
-    pub(crate) fn label(&self) -> String {
+    pub fn label(&self) -> String {
         crate::i18n::translate(self.label_key, None)
     }
 
-    pub(crate) fn tooltip(&self) -> Option<String> {
+    pub fn tooltip(&self) -> Option<String> {
         self.tooltip_key
             .map(|key| crate::i18n::translate(key, None))
     }
 }
 
-pub(crate) const ACTIONS: &[ActionDef] = &[
+pub const ACTIONS: &[ActionDef] = &[
     selected(
         "add",
         "action-label-add",
@@ -354,24 +354,24 @@ pub(crate) const ACTIONS: &[ActionDef] = &[
     ),
 ];
 
-fn always(_view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
+pub fn always(_view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
     true
 }
 
 /// R20: `Ctrl+R` updates the scope, so it refuses under `All configs` rather
 /// than guessing a group from the selected row.
-fn scope_has_update_target(view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
+pub fn scope_has_update_target(view: &AppView, _target: ActionTarget<'_>, _cx: &App) -> bool {
     !matches!(view.scope, LibraryScope::All)
 }
 
 /// A row verb only runs when there is a row. A `Row` target is always one;
 /// a selection target can be empty, and that refusal is the only place the
 /// palette, the menus and the shortcuts say "select a row first".
-fn needs_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> bool {
+pub fn needs_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> bool {
     target_row(view, target, cx).is_some() || !target_rows(view, target, cx).is_empty()
 }
 
-fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String> {
+pub fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String> {
     match target {
         ActionTarget::Row(id) => vec![id.to_string()],
         ActionTarget::Selection => {
@@ -396,7 +396,7 @@ fn target_rows(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Vec<String
     }
 }
 
-const fn selected(
+pub const fn selected(
     id: &'static str,
     label_key: &'static str,
     keywords: &'static [&'static str],
@@ -414,7 +414,7 @@ const fn selected(
     }
 }
 
-const fn row(
+pub const fn row(
     id: &'static str,
     label_key: &'static str,
     keywords: &'static [&'static str],
@@ -433,7 +433,7 @@ const fn row(
     }
 }
 
-const fn rows(
+pub const fn rows(
     id: &'static str,
     label_key: &'static str,
     keywords: &'static [&'static str],
@@ -453,7 +453,7 @@ const fn rows(
 }
 
 /// The palette's groups, in render order. Ids, not copies of the verbs.
-pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
+pub const PALETTE_GROUPS: &[(&str, &[&str])] = &[
     (
         "Library",
         &[
@@ -496,7 +496,7 @@ pub(crate) const PALETTE_GROUPS: &[(&str, &[&str])] = &[
     ("Sort", &["sort-none"]),
 ];
 
-pub(crate) fn action(id: &str) -> &'static ActionDef {
+pub fn action(id: &str) -> &'static ActionDef {
     ACTIONS
         .iter()
         .find(|def| def.id == id)
@@ -505,14 +505,14 @@ pub(crate) fn action(id: &str) -> &'static ActionDef {
 
 /// The row an action will run on, resolved now. A `Row` target is trusted as
 /// given — the row ops already report a vanished row ("Already removed").
-fn target_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Option<String> {
+pub fn target_row(view: &AppView, target: ActionTarget<'_>, cx: &App) -> Option<String> {
     match target {
         ActionTarget::Row(id) => Some(id.to_string()),
         ActionTarget::Selection => view.selected_config(cx).map(|config| config.id),
     }
 }
 
-pub(crate) fn run_action(
+pub fn run_action(
     view: &mut AppView,
     id: &'static str,
     target: ActionTarget<'_>,
@@ -553,7 +553,7 @@ pub(crate) fn run_action(
 
 /// A keybinding's way in: the overlay owns the keyboard, so a shortcut fired
 /// under a dialog is refused rather than acting on the screen underneath.
-pub(crate) fn shortcut_action(
+pub fn shortcut_action(
     view: &mut AppView,
     id: &'static str,
     window: &mut Window,
@@ -566,42 +566,42 @@ pub(crate) fn shortcut_action(
     run_action(view, id, ActionTarget::Selection, window, cx);
 }
 
-pub(crate) fn palette_action_at(index: IndexPath) -> Option<&'static str> {
+pub fn palette_action_at(index: IndexPath) -> Option<&'static str> {
     PALETTE_GROUPS.get(index.section)?.1.get(index.row).copied()
 }
 
-fn clear_selection(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn clear_selection(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.clear_selection_unless_dialog(window, cx);
 }
 
-fn open_import(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn open_import(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
 }
 
-fn test_all(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn test_all(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.test_all_health(window, cx);
 }
 
-fn toggle_inspector(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
+pub fn toggle_inspector(view: &mut AppView, _window: &mut Window, _cx: &mut Context<AppView>) {
     view.toggle_inspector();
 }
 
 /// R9: the palette's `Logs` verb opens the console scoped to the selection;
 /// the full log sheet survives only behind the console's `Filters…`.
-fn open_console_for_logs(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
+pub fn open_console_for_logs(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
     view.open_console_scoped_to_selection(false, cx);
 }
 
 /// Ctrl-` toggles the dock; the engine-bar button lands in the same method.
-fn toggle_console(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn toggle_console(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.toggle_console(window, cx);
 }
 
-fn sort_none(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn sort_none(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     view.set_library_sort(LibrarySortKey::None, window, cx);
 }
 
-fn text_size(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
+pub fn text_size(view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
     // Task 13: the palette keeps its one-step toggle; "large" is the slider's
     // 125% stop, and any custom stop toggles back to the stock 100%.
     let next = if view.store.text_size() == TextSize::LARGE {

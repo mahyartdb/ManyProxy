@@ -6,23 +6,23 @@ use crate::*;
 use gpui_kit::component::list::ListState;
 use gpui_kit::component::ThemeStyled as _;
 
-mod columns;
-mod shard;
-mod tone;
+pub mod columns;
+pub mod shard;
+pub mod tone;
 
-pub(crate) use columns::*;
-pub(crate) use shard::*;
-pub(crate) use tone::*;
+pub use columns::*;
+pub use shard::*;
+pub use tone::*;
 
 /// R17: the type scale is fixed at 14 / 13 / 12. The values are rems, so the
 /// user's text-size setting still scales the table.
-pub(crate) const ROW_NAME_REMS: f32 = 0.875;
-pub(crate) const ROW_CELL_REMS: f32 = 0.8125;
-pub(crate) const ROW_GROUP_REMS: f32 = 0.75;
+pub const ROW_NAME_REMS: f32 = 0.875;
+pub const ROW_CELL_REMS: f32 = 0.8125;
+pub const ROW_GROUP_REMS: f32 = 0.75;
 
 /// One entry of the endpoint chip's chevron menu: a copy format and the row
 /// it belongs to.
-fn endpoint_copy_item(
+pub fn endpoint_copy_item(
     id: String,
     label: String,
     view: Option<Entity<AppView>>,
@@ -49,85 +49,91 @@ fn endpoint_copy_item(
 /// the first real row does not appear from nowhere — and a failed one names the
 /// reason and carries the way back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum LibraryLoad {
+pub enum LibraryLoad {
     #[default]
     Ready,
     Loading(String),
     Failed(String),
 }
 
-pub(crate) struct LibraryDelegate {
+pub struct LibraryDelegate {
     /// B16: pushed by every refresh origin; the list never reads the app's
     /// in-flight set itself, because a frame is already borrowing that entity.
-    pub(crate) load: LibraryLoad,
-    pub(crate) rows: Vec<ProxyConfig>,
-    pub(crate) search_index: Vec<RowSearchIndex>,
-    pub(crate) upstream_cache: HashMap<String, String>,
+    pub load: LibraryLoad,
+    pub rows: Vec<ProxyConfig>,
+    pub search_index: Vec<RowSearchIndex>,
+    pub upstream_cache: HashMap<String, String>,
 
     /// T-06: the list's own focus handle, handed in by the frame that owns the
     /// `ListState`. The selected row wears the kit focus ring while this handle
     /// is focused - the row card is the app's custom control, but the keyboard
     /// lands on the list.
-    pub(crate) list_focus: Option<FocusHandle>,
+    pub list_focus: Option<FocusHandle>,
 
-    pub(crate) health: HashMap<String, String>,
+    pub health: HashMap<String, String>,
 
     /// The probe's last failure cause per row. The health cell folds it into
     /// the two words it knows: `timeout` and `refused`.
-    pub(crate) health_errors: HashMap<String, String>,
+    pub health_errors: HashMap<String, String>,
 
-    pub(crate) health_tone: HashMap<String, LatencyTone>,
+    pub health_tone: HashMap<String, LatencyTone>,
 
-    pub(crate) running: HashSet<String>,
+    pub running: HashSet<String>,
 
-    pub(crate) crashed: HashSet<String>,
+    pub crashed: HashSet<String>,
 
-    pub(crate) traffic: HashMap<String, (u64, u64)>,
+    pub traffic: HashMap<String, (u64, u64)>,
 
-    pub(crate) sub_labels: HashMap<String, String>,
-    pub(crate) preset_names: HashMap<String, String>,
+    pub sub_labels: HashMap<String, String>,
+    pub preset_names: HashMap<String, String>,
 
-    pub(crate) show_security: bool,
+    pub show_security: bool,
 
     /// T-27: the one sort concept — a key plus a direction, persisted in the
     /// `library_sort` meta key. Replaces the retired `type_security_sort` bool.
-    pub(crate) sort: LibrarySort,
+    pub sort: LibrarySort,
 
     /// T-27 mirrors the sort keys read on render. All three are pushed from
     /// state the app already holds (health store samples, session traffic
     /// mirror, out-IP resolutions) — the sort never polls.
-    pub(crate) latency: HashMap<String, u64>,
+    pub latency: HashMap<String, u64>,
 
-    pub(crate) data_traffic: HashMap<String, (u64, u64)>,
+    pub data_traffic: HashMap<String, (u64, u64)>,
 
-    pub(crate) out_ips: HashMap<String, String>,
+    pub out_ips: HashMap<String, String>,
 
     /// T-03/R11: the geometry the header strip and the row both read. The
     /// owner resolves the app's one layout against the table width once per
     /// frame and hands the same snapshot to both readers.
-    pub(crate) row_metrics: RowMetrics,
+    pub row_metrics: RowMetrics,
 
     /// R22: the density. It owns the row pitch and every chrome height, so
     /// the row, the header strip and the bars cannot disagree.
-    pub(crate) density: Density,
+    pub density: Density,
 
-    pub(crate) app_view: Option<Entity<AppView>>,
+    pub app_view: Option<Entity<AppView>>,
 
     /// One frame of the open endpoint draft, handed over by `AppView` before
     /// the list renders. Only the owning row paints it, so no per-row editor
     /// state survives the frame.
-    pub(crate) endpoint_frame: Option<EndpointFrame>,
+    pub endpoint_frame: Option<EndpointFrame>,
 
     /// B18: the one row whose engine state just settled, with a nonce that
     /// makes a second settle run the accent again instead of reusing the
     /// finished one. Only a single-id change sets it — bulk ops and the boot
     /// restore move several rows at once and stay still.
-    pub(crate) settled: Option<(String, u64)>,
-    settle_seq: u64,
+    pub settled: Option<(String, u64)>,
+    pub settle_seq: u64,
+}
+
+impl Default for LibraryDelegate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LibraryDelegate {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             load: LibraryLoad::Ready,
             rows: Vec::new(),
@@ -158,7 +164,7 @@ impl LibraryDelegate {
 
     /// B16: returns whether the state actually changed, so a caller can skip a
     /// notify when nothing on screen moves.
-    pub(crate) fn set_load(&mut self, load: LibraryLoad) -> bool {
+    pub fn set_load(&mut self, load: LibraryLoad) -> bool {
         if self.load == load {
             return false;
         }
@@ -166,7 +172,7 @@ impl LibraryDelegate {
         true
     }
 
-    pub(crate) fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
+    pub fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
         self.search_index = rows.iter().map(RowSearchIndex::of).collect();
         self.upstream_cache = rows
             .iter()
@@ -182,56 +188,56 @@ impl LibraryDelegate {
         self.refresh_search_words();
     }
 
-    pub(crate) fn set_endpoint_frame(&mut self, frame: Option<EndpointFrame>) {
+    pub fn set_endpoint_frame(&mut self, frame: Option<EndpointFrame>) {
         self.endpoint_frame = frame;
     }
 
     /// R22: the density owns the row pitch and every chrome height.
-    pub(crate) fn set_density(&mut self, density: Density) {
+    pub fn set_density(&mut self, density: Density) {
         self.density = density;
     }
 
     /// Every row's id, in library order.
-    pub(crate) fn row_ids(&self) -> Vec<String> {
+    pub fn row_ids(&self) -> Vec<String> {
         self.rows.iter().map(|row| row.id.clone()).collect()
     }
 
-    pub(crate) fn upstream_for(&self, id: &str) -> Option<&str> {
+    pub fn upstream_for(&self, id: &str) -> Option<&str> {
         self.upstream_cache.get(id).map(String::as_str)
     }
 
     /// T-03/R11: the owner hands both readers the same geometry.
-    pub(crate) fn set_row_metrics(&mut self, metrics: RowMetrics) {
+    pub fn set_row_metrics(&mut self, metrics: RowMetrics) {
         self.row_metrics = metrics;
     }
 
-    pub(crate) fn set_show_security(&mut self, show: bool) {
+    pub fn set_show_security(&mut self, show: bool) {
         self.show_security = show;
     }
 
     /// T-27: swap the whole sort model (key + direction) and re-rank what the
     /// filters kept. The setter never persists — the owner (AppView) writes the
     /// meta row, matching how the column toggles work.
-    pub(crate) fn set_sort(&mut self, sort: LibrarySort) {
+    pub fn set_sort(&mut self, sort: LibrarySort) {
         self.sort = sort;
     }
 
-    pub(crate) fn set_latency(&mut self, latency: HashMap<String, u64>) {
+    pub fn set_latency(&mut self, latency: HashMap<String, u64>) {
         self.latency = latency;
     }
 
-    pub(crate) fn set_data_traffic(&mut self, data_traffic: HashMap<String, (u64, u64)>) {
+    pub fn set_data_traffic(&mut self, data_traffic: HashMap<String, (u64, u64)>) {
         self.data_traffic = data_traffic;
     }
 
-    pub(crate) fn set_out_ips(&mut self, out_ips: HashMap<String, String>) {
+    pub fn set_out_ips(&mut self, out_ips: HashMap<String, String>) {
         self.out_ips = out_ips;
     }
 
     /// Borrowed row for per-frame rendering: `render_item` copies only the
     /// fields it needs instead of cloning a whole config every frame. The
     /// visible order is the app's; the delegate only paints it.
-    pub(crate) fn row_ref(&self, index: IndexPath, cx: &App) -> Option<&ProxyConfig> {
+    pub fn row_ref(&self, index: IndexPath, cx: &App) -> Option<&ProxyConfig> {
         let row = {
             let app = self.app_view.as_ref()?.read(cx);
             *app.visible.get(index.row)?
@@ -240,20 +246,20 @@ impl LibraryDelegate {
     }
 
     /// One row by id, borrowed.
-    pub(crate) fn row_by_id(&self, id: &str) -> Option<&ProxyConfig> {
+    pub fn row_by_id(&self, id: &str) -> Option<&ProxyConfig> {
         self.rows.iter().find(|row| row.id == id)
     }
 
-    pub(crate) fn set_health(&mut self, health: HashMap<String, String>) {
+    pub fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
         self.refresh_search_words();
     }
 
-    pub(crate) fn set_health_tone(&mut self, health_tone: HashMap<String, LatencyTone>) {
+    pub fn set_health_tone(&mut self, health_tone: HashMap<String, LatencyTone>) {
         self.health_tone = health_tone;
     }
 
-    pub(crate) fn set_running(&mut self, ids: Vec<String>) {
+    pub fn set_running(&mut self, ids: Vec<String>) {
         let next: HashSet<String> = ids.into_iter().collect();
         // B18: one id gained or lost is a single-row start or stop — the row
         // the user just acted on, and the only row the accent marks. Any other
@@ -275,7 +281,7 @@ impl LibraryDelegate {
     /// the same 3px leading edge the checked set uses, so it costs the row no
     /// geometry at all. `None` for every other row, and for every row under
     /// reduced motion.
-    fn row_accent(&self, row_id: &str, cx: &App) -> Option<impl IntoElement> {
+    pub fn row_accent(&self, row_id: &str, cx: &App) -> Option<impl IntoElement> {
         let (_, seq) = self.settled.as_ref().filter(|(id, _)| id == row_id)?;
         AppView::motion_accent(
             div()
@@ -292,15 +298,15 @@ impl LibraryDelegate {
         )
     }
 
-    pub(crate) fn set_crashed(&mut self, ids: Vec<String>) {
+    pub fn set_crashed(&mut self, ids: Vec<String>) {
         self.crashed = ids.into_iter().collect();
     }
 
-    pub(crate) fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
+    pub fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
         self.traffic = traffic;
     }
 
-    pub(crate) fn set_search_context(
+    pub fn set_search_context(
         &mut self,
         sub_labels: HashMap<String, String>,
         preset_names: HashMap<String, String>,
@@ -310,7 +316,7 @@ impl LibraryDelegate {
         self.refresh_search_words();
     }
 
-    pub(crate) fn refresh_search_words(&mut self) {
+    pub fn refresh_search_words(&mut self) {
         for (row, entry) in self.rows.iter().zip(self.search_index.iter_mut()) {
             entry.enrich(
                 row,
@@ -322,7 +328,7 @@ impl LibraryDelegate {
         }
     }
 
-    pub(crate) fn counts(&self) -> (usize, usize) {
+    pub fn counts(&self) -> (usize, usize) {
         (
             self.rows.len(),
             self.rows.iter().filter(|row| row.enabled).count(),
@@ -332,7 +338,7 @@ impl LibraryDelegate {
 
 /// Group names become stable ids by keeping ASCII alphanumerics and folding
 /// every other run into one dash. Empty input still needs a usable id.
-pub(crate) fn slugify_group_id(group: &str) -> String {
+pub fn slugify_group_id(group: &str) -> String {
     let mut slug = String::with_capacity(group.len());
     for ch in group.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -351,8 +357,8 @@ pub(crate) fn slugify_group_id(group: &str) -> String {
     }
 }
 
-pub(crate) struct LogLinesDelegate {
-    pub(crate) lines: Vec<String>,
+pub struct LogLinesDelegate {
+    pub lines: Vec<String>,
 }
 
 impl ListDelegate for LogLinesDelegate {

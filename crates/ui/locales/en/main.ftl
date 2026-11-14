@@ -19,8 +19,8 @@ titlebar-close = Close the window
 nav-all-configs = All configs
 nav-all-tip =
     { $count } { $count ->
-        [one] configuration
-       *[other] configurations
+        [one] config
+       *[other] configs
     } in the library
 nav-groups = Groups
 nav-sources = Sources
@@ -33,8 +33,8 @@ nav-group-tip =
     } in { $name }
 nav-source-tip =
     { $name } · { $count } { $count ->
-        [one] configuration
-       *[other] configurations
+        [one] config
+       *[other] configs
     } · { $group }
 nav-new-group = New group
 nav-new-group-tip = Create a group
@@ -81,9 +81,9 @@ tray-quit = Quit
 action-start-all = Start all
 action-stop-all = Stop all
 action-import = Import
-action-add-config = + Add configuration
-action-add-config-accessible = Add configuration
-action-add-config-tip = Add a proxy configuration (Ctrl-N)
+action-add-config = + Add config
+action-add-config-accessible = Add config
+action-add-config-tip = Add a proxy config (Ctrl-N)
 action-settings = Settings
 action-command-palette = Command palette
 toolbar-program = Program
@@ -96,7 +96,7 @@ toolbar-settings-tip = Settings
 toolbar-open-settings-tip = Open Settings
 toolbar-tools = Tools
 toolbar-tools-tip = Selection, diagnostics, and commands
-toolbar-start-all-tip = Start every configuration
+toolbar-start-all-tip = Start every config
 toolbar-stop-all-tip = Stop every endpoint
 toolbar-test-all = Test all
 toolbar-test-all-tip = Test every running endpoint
@@ -120,8 +120,8 @@ status-palette-hint = Command palette (Ctrl+K)
 status-update-hint = Update available — choose Check for updates… from the action bar's overflow menu
 status-count =
     { $total } { $total ->
-        [one] configuration
-       *[other] configurations
+        [one] config
+       *[other] configs
     } · { $enabled } set for launch
 search-count = { $visible } of { $total }
 engine-status-stopped = engine stopped
@@ -146,7 +146,7 @@ column-width-narrower = Narrower
 column-width-reset = Reset
 column-width-aria = { $action } { $column } column
 column-restored = { $column } column restored to default
-columns-reset = Columns reset to defaults
+columns-reset = Column widths and order reset
 column-layout-save-failed = Could not save column layout: { $error }
 
 # Sort headers and menus
@@ -215,7 +215,7 @@ latency-1000 = ≤1000 ms
 # Library rows and empty states
 library-loading = Loading…
 library-loading-subscriptions = Fetching subscriptions…
-library-load-failed = Could not load configurations
+library-load-failed = Could not load configs
 library-retry = Retry
 library-retry-tip = Fetch the subscriptions again
 library-no-matches = No configs match
@@ -224,13 +224,13 @@ library-empty-text = Add or import a config
 library-no-upstream = no upstream
 
 # Row context menus
-rowctx-multi-start = Start { $count } configurations
-rowctx-multi-stop = Stop { $count } configurations
-rowctx-multi-test = Test { $count } configurations
+rowctx-multi-start = Start { $count } configs
+rowctx-multi-stop = Stop { $count } configs
+rowctx-multi-test = Test { $count } configs
 rowctx-multi-copy-urls = Copy { $count } URLs
 rowctx-multi-copy-proxy = Copy { $count } SOCKS URLs
-rowctx-multi-move = Move { $count } configurations to group
-rowctx-multi-delete = Delete { $count } configurations
+rowctx-multi-move = Move { $count } configs to group
+rowctx-multi-delete = Delete { $count } configs
 rowctx-reset = Reset…
 rowctx-more = More ▾
 row-kebab-on = On
@@ -257,9 +257,9 @@ dialog-export = Export
 dialog-move = Move
 dialog-rename = Rename
 dialog-copy-link = Copy link
-add-dialog-title = Add proxy configuration
+add-dialog-title = Add proxy config
 edit-dialog-title = Edit { $name }
-import-dialog-title = Import proxy configurations
+import-dialog-title = Import proxy configs
 secret-not-set = Not Set
 secret-already-set = Already Set
 
@@ -350,26 +350,62 @@ logs-clear-filter = Clear filter
 logs-clear-filter-tip = Clear the log text filter and level
 
 # Prune and auto-clear confirmations
-prune-duplicates-title = Remove { $total } duplicate(s) in group "{ $group }"?
-prune-duplicates-confirm = Remove { $total } duplicate(s) in group "{ $group }"? The first copy of each configuration is kept. This cannot be undone.
-prune-duplicates-confirm-preview = Remove { $total } duplicate(s) in group "{ $group }"? The first copy of each configuration is kept. This cannot be undone. Duplicates: { $preview }.
-prune-duplicates-confirm-more = Remove { $total } duplicate(s) in group "{ $group }"? The first copy of each configuration is kept. This cannot be undone. Duplicates: { $preview } (+{ $more } more).
-prune-unavailable-title = Remove { $count } unavailable row(s) in group "{ $group }"?
-prune-unavailable-confirm = Remove { $count } unavailable row(s) in group "{ $group }"? Rows whose last test failed are deleted. This cannot be undone.
-prune-invalid-title = Remove { $count } invalid row(s) in group "{ $group }"?
-prune-invalid-confirm = Remove { $count } invalid row(s) in group "{ $group }"? Rows failing validation are deleted. This cannot be undone.
-prune-clear-tests-title = Clear { $count } test result(s) in group "{ $group }"?
-prune-clear-tests-confirm = Clear { $count } test result(s) in group "{ $group }"? Rows are kept and read untested until the next probe. This cannot be undone.
+prune-duplicates-title = Remove { $total } { $total ->
+       [one] duplicate
+      *[other] duplicates
+     } in group "{ $group }"?
+prune-duplicates-confirm = Remove { $total } { $total ->
+       [one] duplicate
+      *[other] duplicates
+     } in group "{ $group }"? The first config is kept. This cannot be undone.
+prune-duplicates-confirm-preview = Remove { $total } { $total ->
+       [one] duplicate
+      *[other] duplicates
+     } in group "{ $group }"? The first config is kept. This cannot be undone. Duplicates: { $preview }.
+prune-duplicates-confirm-more = Remove { $total } { $total ->
+       [one] duplicate
+      *[other] duplicates
+     } in group "{ $group }"? The first config is kept. This cannot be undone. Duplicates: { $preview } (+{ $more } more).
+prune-unavailable-title = Remove { $count } { $count ->
+       [one] unavailable config
+      *[other] unavailable configs
+     } in group "{ $group }"?
+prune-unavailable-confirm = Remove { $count } { $count ->
+       [one] unavailable config
+      *[other] unavailable configs
+     } in group "{ $group }"? Configs whose last test failed are deleted. This cannot be undone.
+prune-invalid-title = Remove { $count } { $count ->
+       [one] invalid config
+      *[other] invalid configs
+     } in group "{ $group }"?
+prune-invalid-confirm = Remove { $count } { $count ->
+       [one] invalid config
+      *[other] invalid configs
+     } in group "{ $group }"? Configs failing validation are deleted. This cannot be undone.
+prune-clear-tests-title = Clear { $count } { $count ->
+       [one] test result
+      *[other] test results
+     } in group "{ $group }"?
+prune-clear-tests-confirm = Clear { $count } { $count ->
+       [one] test result
+      *[other] test results
+     } in group "{ $group }"? Configs are kept and read untested until the next probe. This cannot be undone.
 prune-remove = Remove
-prune-enable = Enable
+prune-enable = Enable auto-clear
 auto-clear-opt-in-title = Enable auto-clear in group "{ $group }"?
 auto-clear-opt-in-note = Unavailable rows in "{ $group }" will be removed automatically after group tests pass with dead rows. Running rows and the row being edited are never removed.
 
 # Runtime and traffic stats
 stats-usage-unavailable = usage unavailable
 stats-unknown = unknown
-stats-subs-due = { $count } subscription(s), { $due } due
-stats-subs-due-off = { $count } subscription(s), { $due } due (auto-refresh off)
+stats-subs-due = { $count } { $count ->
+       [one] subscription
+      *[other] subscriptions
+     }, { $due } due
+stats-subs-due-off = { $count } { $count ->
+       [one] subscription
+      *[other] subscriptions
+     }, { $due } due (auto-refresh off)
 stats-selected-no-probes = { $name } (no probes this session)
 stats-selected-health = { $name } ({ $health })
 stats-none-selected = none selected
@@ -390,7 +426,10 @@ stats-period-tip = Cycle 24h → 7d → 30d → 90d (all-time totals throughout)
 stats-empty = No traffic recorded yet — start an exit and pass data.
 stats-exit-row = { $bar } { $name } · { $bind } ↓{ $down } ↑{ $up }
 stats-other = Other ({ $count } more · ↓{ $down } ↑{ $up })
-stats-summary = { $period } (all-time totals) · { $exits } exit(s) · ↓{ $rx } ↑{ $tx }
+stats-summary = { $period } (all-time totals) · { $exits } { $exits ->
+    [one] exit
+   *[other] exits
+  } · { $rx } { $tx }
 stats-traffic-title = Traffic stats
 
 # About, updates and cores
@@ -463,8 +502,8 @@ group-manage-action = Manage group.
 group-manage-title = Manage group "{ $group }"
 group-manage-count =
     { $count } { $count ->
-        [one] configuration
-       *[other] configurations
+        [one] config
+       *[other] configs
     }
 group-manage-refresh = Refresh subscriptions
 group-manage-refresh-tip = Refresh every subscription feeding this group
@@ -490,7 +529,7 @@ group-rename = Rename
 group-edit = Edit
 group-edit-tip = Rename + auto-refresh skip for this group
 group-update = Update
-group-update-tip = Refresh this group's subscription(s) now (manual — runs even when auto-skipped)
+group-update-tip = Refresh this group's subscriptions now (manual — runs even when auto-skipped)
 group-delete = Delete
 group-delete-action = Delete group.
 group-delete-title = Delete group
@@ -504,7 +543,10 @@ group-name = Group name
 group-skip-refresh = Skip automatic refresh
 group-skip-refresh-tip = Skip this group's subscriptions on ticks and Update-all. Manual Update still works.
 group-skip-refresh-aria = Skip automatic refresh of this group's subscriptions. Manual Update still works.
-bulk-move-title = Move { $count } configuration(s) to group
+bulk-move-title = Move { $count } { $count ->
+       [one] config
+      *[other] configs
+     } to group
 bulk-move-one-title = Move "{ $name }" to group
 
 # Subscription manager
@@ -563,8 +605,14 @@ sub-remove-title = Remove subscription
 sub-remove-description = Remove "{ $label }"? Its configs stay in the library.
 subs-update-all-title = Update all subscriptions?
 subs-update-all-ok = Update all
-subs-update-all-confirm = Update all { $included } subscription(s)?
-subs-update-all-confirm-skipped = Update { $included } subscription(s)? { $skipped } skipped (auto-refresh off for their group).
+subs-update-all-confirm = Update all { $included } { $included ->
+       [one] subscription
+      *[other] subscriptions
+     }?
+subs-update-all-confirm-skipped = Update { $included } { $included ->
+       [one] subscription
+      *[other] subscriptions
+     }? { $skipped } skipped (auto-refresh off for their group).
 
 # LAN exposure
 lan-confirm-title = Expose proxy on the local network?
@@ -587,7 +635,10 @@ preset-edit-title = Edit preset { $name }
 preset-locked-hint = Locked — import a copy to modify
 preset-locked-name = Name: { $name }
 preset-delete-title = Delete routing preset
-preset-delete-description = Delete routing preset "{ $name }"? It is still attached to { $count } row(s): { $names }. Deleting detaches every listed row first; unattached rows are unaffected.
+preset-delete-description = Delete routing preset "{ $name }"? It is still attached to { $count } { $count ->
+       [one] config
+      *[other] configs
+     }: { $names }. Deleting detaches every listed config first; unattached ones are unaffected.
 preset-delete-ok = Delete
 preset-manager-title = Routing presets
 preset-manager-empty = No routing presets yet — paste a throne://route link in Import, or create one below
@@ -632,18 +683,33 @@ simple-box-block = Block
 simple-box-proxy = Proxy
 
 # Export dialog
-export-count-all = { $total } config(s)
-export-count-some = { $total } config(s) ({ $importable } importable)
+export-count-all = { $total } { $total ->
+       [one] config
+      *[other] configs
+     }
+export-count-some = { $total } { $total ->
+       [one] config
+      *[other] configs
+     } ({ $importable } importable)
 export-preview = { $count } → { $path }
 export-preview-overwrite = { $count } → { $path } — { $path } already exists and will be overwritten
 
 # Confirm dialogs
-settings-clear-traffic-confirm = Clear traffic counters for all { $total } configuration(s)? This cannot be undone.
+settings-clear-traffic-confirm = Clear traffic counters for all { $total } { $total ->
+       [one] config
+      *[other] configs
+     }? This cannot be undone.
 settings-clear-health-confirm = Clear every persisted health snapshot? Rows read untested until the next probe. This cannot be undone.
 settings-clear-snapshot-confirm = Forget the running snapshot? The next launch starts with nothing running. The live engine is untouched. This cannot be undone.
-preset-summary = { $count } routing preset(s) stored
+preset-summary = { $count } { $count ->
+       [one] routing preset
+      *[other] routing presets
+     } stored
 preset-summary-unavailable = Preset inventory unavailable
-preset-row-rules = { $count } rule(s)
+preset-row-rules = { $count } { $count ->
+       [one] rule
+      *[other] rules
+     }
 preset-row-invalid-rules = invalid rules
 preset-row-unattached = unattached
 preset-row-attached = attached to { $names }
@@ -653,15 +719,44 @@ logs-overwrite-title = Overwrite saved logs?
 dialog-overwrite = Overwrite
 logs-save-path = Save writes to { $path } (set MANYPROXY_LOGS to override the location)
 group-delete-empty = Delete empty group "{ $name }"? No rows move (none use it). This cannot be undone.
-group-delete-rows = Delete group "{ $name }" ({ $count } row(s))? Groups with rows refuse — move the rows out first. This cannot be undone.
-group-delete-subs-only = Delete group "{ $name }" ({ $subs } subscription(s))? Groups feeding subscriptions refuse — remove or regroup them first. This cannot be undone.
-group-delete-mixed = Delete group "{ $name }" ({ $count } row(s) and { $subs } subscription(s))? Groups with rows or subscriptions refuse — move the rows out and remove or regroup the subscriptions first. This cannot be undone.
-close-confirm = Closing now stops { $count } running endpoint(s): { $names }. Stop all and close?
+group-delete-rows = Delete group "{ $name }" ({ $count } { $count ->
+    [one] config
+   *[other] configs
+  })? Groups with configs refuse — move them out first. This cannot be undone.
+group-delete-subs-only = Delete group "{ $name }" ({ $subs } { $subs ->
+    [one] subscription
+   *[other] subscriptions
+  })? Groups feeding subscriptions refuse — remove or regroup them first. This cannot be undone.
+group-delete-mixed = Delete group "{ $name }" ({ $count } { $count ->
+    [one] config
+   *[other] configs
+  } and { $subs } { $subs ->
+    [one] subscription
+   *[other] subscriptions
+  })? Groups with configs or subscriptions refuse — move the configs out and remove or regroup the subscriptions first. This cannot be undone.
+close-confirm = Closing now stops { $count } running { $count ->
+       [one] endpoint
+      *[other] endpoints
+     }: { $names }. Stop all and close?
 
 # About and sidecars
 sidecar-found = { $file }: found (app dir)
 sidecar-missing = { $file }: missing (place it next to the app exe)
-about-body = ManyProxy v{ $version } (git { $hash })\n\nSidecars (app dir only):\n{ $sidecars }\n\nData:\n  library: { $db }\n  export default: { $export }\n\nOpt-in only: autostart (HKCU Run entry) and session restore live in Settings, both default off; no auto-update.\n\nShortcuts:\n{ $shortcuts }\n
+about-body =
+    ManyProxy v{ $version } (git { $hash })
+
+    Sidecars (app dir only):
+    { $sidecars }
+
+    Data:
+      library: { $db }
+      export default: { $export }
+
+    Opt-in only: autostart (HKCU Run entry) and session restore live in Settings, both default off; no auto-update.
+
+    Shortcuts:
+    { $shortcuts }
+
 
 # Config form validation
 params-invalid-json = params are not valid JSON: { $error }
@@ -976,11 +1071,20 @@ removed-message = Removed "{ $name }"
 removed-message-running = Removed "{ $name }" (endpoint stopped first)
 enabled-flag-on = "{ $name }" will restore on launch (Start serves it now)
 enabled-flag-off = "{ $name }" will not restore on launch (Stop closes the endpoint now)
-restore-done = Restored { $configs } config(s), { $subscriptions } subscription(s)
+restore-done = Restored { $configs } { $configs ->
+       [one] config
+      *[other] configs
+     }, { $subscriptions } { $subscriptions ->
+       [one] subscription
+      *[other] subscriptions
+     }
 already-subscribed = Already subscribed as "{ $label }" — no duplicate added
 subscription-interval-failure = Subscription "{ $label }" { $action } — could not set refresh interval: { $error }
 preset-error = Invalid routing preset: { $error }
-preset-imported = Routing preset "{ $name }" imported ({ $count } rule(s))
+preset-imported = Routing preset "{ $name }" imported ({ $count } { $count ->
+       [one] rule
+      *[other] rules
+     })
 auto-clear-toast = Auto-cleared { $removed } unavailable rows in "{ $group }"
 auto-clear-toast-kept = Auto-cleared { $removed } unavailable rows in "{ $group }" (kept: { $kept })
 badge-stopped = Stopped · { $endpoint }
@@ -1017,7 +1121,7 @@ settings-handle-links = Handle manyproxy:// links
 settings-handle-links-on = Registered for this exe — manyproxy:// links open in ManyProxy.
 settings-handle-links-off = Not registered — apps have no handler for manyproxy:// links.
 settings-restore = Restore on launch
-settings-restore-help = Relauch the rows that were running when ManyProxy last exited.
+settings-restore-help = Relaunch the configs that were running when ManyProxy last exited.
 settings-window-behaviour = Window behaviour
 settings-window-behaviour-no-tray = Show tray icon is off, so closing quits. The saved choice returns when the icon is back.
 settings-show-tray = Show tray icon
@@ -1038,9 +1142,9 @@ settings-update-feed = Update feed URL
 settings-update-feed-help = A JSON feed of releases; checking only reads it. Default: { $default }
 settings-passive-update-check = Check for updates weekly
 settings-passive-update-check-help = Reads the update feed at launch, at most once every seven days, and shows a status-bar hint when a newer version is available. Nothing downloads.
-settings-last-checked = Last checked
-settings-last-checked-at = Last checked at { $time }.
-settings-never-checked = Never checked.
+settings-last-update-check = Last update check
+settings-last-update-check-at = Last update check at { $time }.
+settings-no-update-check = No update check yet.
 settings-check-now = Check now
 settings-check-now-tip = Read the update feed now
 settings-check-time = { $time } UTC
@@ -1079,8 +1183,8 @@ settings-clear-snapshot = Reset running snapshot
 settings-reset-library = Reset library
 settings-maintenance-filter = Clear traffic counters, clear health snapshots, clear sessions, reset library
 settings-shortcuts-note = Every key bound in ManyProxy.
-shortcut-add-configuration = Add configuration
-shortcut-import-configurations = Import configurations
+shortcut-add-config = Add config
+shortcut-import-configs = Import configs
 shortcut-paste-clipboard = Paste clipboard into Import
 shortcut-start-selected = Start selected
 shortcut-stop-selected = Stop selected
@@ -1114,7 +1218,10 @@ settings-save-tooltip = Save the text fields and close
 settings-cancel-tooltip = Close without saving (Esc)
 settings-reset-title = Reset the library?
 settings-reset-ok = Reset library
-settings-reset-description = This deletes all { $count } configuration(s) from the ManyProxy library. It cannot be undone.
+settings-reset-description = This deletes all { $count } { $count ->
+       [one] config
+      *[other] configs
+     } from the ManyProxy library. It cannot be undone.
 
 # Settings enum labels
 close-tray = Close to tray
@@ -1137,7 +1244,7 @@ corners-rounded-explanation = Round the window's outer corners.
 corners-small-explanation = Use the smaller Windows 11 corner radius.
 corners-square-explanation = Square off the window's outer corners.
 test-scope-running = Every running endpoint
-test-scope-checked = Selected endpoints only
+test-scope-selected = Selected endpoints only
 
 # Inspector
 detail-start-tip = Start the selected endpoint (F5)
@@ -1145,7 +1252,7 @@ detail-stop-tip = Stop the selected endpoint (Shift-F5)
 detail-test-tip = Test the selected endpoint (Ctrl-T)
 detail-close = Close inspector
 detail-close-tip = Close the inspector drawer (Esc)
-detail-empty-title = Select a configuration to inspect its endpoint, health, and usage
+detail-empty-title = Select a config to inspect its endpoint, health, and usage
 detail-empty-description = Pick a row in the library — its endpoints and controls appear here.
 detail-log-filter-include = include "{ $value }"
 detail-log-filter-exclude = exclude "{ $value }"
@@ -1265,11 +1372,17 @@ cannot-save-inspector-width = Could not save inspector width: { $error }
 detail-history-unavailable = history unavailable
 detail-history-one = 1 probe recorded — no trend yet ({ $latency })
 detail-history-none = no health history yet — press Test to record a probe
-detail-history-samples = { $count } samples · latest { $ms }ms
+detail-history-samples = { $count } samples · latest { $latest }ms
 unclean-exit-notice = Previous run carried running endpoints and did not exit cleanly.
 shard-stats-none = no sidecar running
-shard-stats-summary = { $live } live shard(s), { $sampled } charted
-shard-stats-summary-sampling = { $live } live shard(s), { $sampled } charted, sampling unavailable
+shard-stats-summary = { $live } live { $live ->
+       [one] shard
+      *[other] shards
+     }, { $sampled } charted
+shard-stats-summary-sampling = { $live } live { $live ->
+       [one] shard
+      *[other] shards
+     }, { $sampled } charted, sampling unavailable
 
 # Toast copy
 already-removed = Already removed
@@ -1327,9 +1440,15 @@ feed-url-http-warning = Feed URL set over plaintext http — prefer https: { $ur
 feed-url-set = Feed URL set — updates check { $url }
 row-test-url-cleared = Test URL for "{ $name }" cleared — uses the global
 row-test-url-set = Test URL for "{ $name }" set — probes use { $url }
-cleared-tests = Cleared { $count } test result(s) in group "{ $group }"
+cleared-tests = Cleared { $count } { $count ->
+       [one] test result
+      *[other] test results
+     } in group "{ $group }"
 prune-nothing-changed = { $kind } in group "{ $group }": nothing removed — rows changed
-prune-nothing-stopped = { $kind } in group "{ $group }": nothing removed — { $count } row(s) could not be stopped ({ $names })
+prune-nothing-stopped = { $kind } in group "{ $group }": nothing removed — { $count } { $count ->
+    [one] config
+   *[other] configs
+  } could not be stopped ({ $names })
 prune-removed = { $kind } in group "{ $group }": { $count } removed ({ $names })
 prune-removed-more = { $kind } in group "{ $group }": { $count } removed ({ $names }) (+{ $more } more)
 prune-removed-skipped = { $text } — { $count } could not be stopped ({ $names })
@@ -1343,7 +1462,10 @@ restore-with-backup = { $message } (backup { $backup })
 subscription-added = Subscription "{ $label }" added — refreshing
 subscription-updated = Updated "{ $label }"
 preset-needs-name = Invalid routing preset: preset needs a name
-preset-updated = Preset "{ $name }" updated ({ $count } rule(s))
+preset-updated = Preset "{ $name }" updated ({ $count } { $count ->
+       [one] rule
+      *[other] rules
+     })
 preset-link-copied = Copied preset link for "{ $name }"
 preset-locked-toast = Routing preset locked — import a copy to modify
 preset-unlocked-toast = Routing preset unlocked
@@ -1372,21 +1494,42 @@ probe-verb-test = Test
 probe-result-live = { $verb } "{ $name }": live, { $ms }ms
 probe-result-dead-cause = { $verb } "{ $name }": dead — { $cause }
 probe-result-dead = { $verb } "{ $name }": dead
-group-test-summary = Tested { $count } endpoint(s) in group "{ $group }": { $live } live · { $dead } dead
-group-test-summary-stopped = Tested { $count } endpoint(s) in group "{ $group }": { $live } live · { $dead } dead (stopped early)
+group-test-summary = Tested { $count } { $count ->
+       [one] endpoint
+      *[other] endpoints
+     } in group "{ $group }": { $live } live · { $dead } dead
+group-test-summary-stopped = Tested { $count } { $count ->
+       [one] endpoint
+      *[other] endpoints
+     } in group "{ $group }": { $live } live · { $dead } dead (stopped early)
 already-stopped = "{ $name }" is already stopped
 start-all-empty = Nothing to start — the library is empty
-start-all-started = Started { $count } endpoint(s)
+start-all-started = Started { $count } { $count ->
+       [one] endpoint
+      *[other] endpoints
+     }
 stop-all-empty = Nothing to stop — no endpoints are running
-stop-all-stopped = Stopped { $count } endpoint(s)
+stop-all-stopped = Stopped { $count } { $count ->
+       [one] endpoint
+      *[other] endpoints
+     }
 undo-restored-one = Restored "{ $name }" to its group
-undo-restored-many = Restored { $count } configuration(s) in their groups
+undo-restored-many = Restored { $count } { $count ->
+       [one] config
+      *[other] configs
+     } in their groups
 update-feed-failure = Couldn't reach the update feed
 restart-to-apply = Updated "{ $name }" — restart it to apply (still serving the previous config)
-unreadable-drop = Skipped unreadable file(s): { $names }
-bulk-delete-none = Deleted 0 configuration(s)
-bulk-delete-removed = Deleted { $count } configuration(s): { $names }
-bulk-delete-failed = Delete failed for { $count } configuration(s): { $names }
+unreadable-drop = Skipped unreadable files: { $names }
+bulk-delete-none = Deleted 0 configs
+bulk-delete-removed = Deleted { $count } { $count ->
+       [one] config
+      *[other] configs
+     }: { $names }
+bulk-delete-failed = Delete failed for { $count } { $count ->
+       [one] config
+      *[other] configs
+     }: { $names }
 bulk-delete-partial = Deleted { $removed } · { $failed } failed: { $names }
 names-more = { $shown } +{ $count } more
 refresh-summary = { $label }: [+]Added { $added } / [~]Updated { $updated } / [-]Deleted { $removed }
@@ -1394,7 +1537,10 @@ refresh-summary-in-use = { " " }/ [=] Still in use { $count }
 refresh-summary-skipped = { " " }· { $count } skipped
 refresh-summary-duplicates = { " " }· { $count } duplicates
 refresh-summary-failed = { " " }· { $count } failed
-refresh-summary-conflicts = { " " }· { $count } conflict(s) — your edits kept
+refresh-summary-conflicts = { " " }· { $count } { $count ->
+    [one] conflict
+   *[other] conflicts
+  } — your edits kept
 refresh-report-added = Added
 refresh-report-updated = Updated
 refresh-report-deleted = Deleted
@@ -1483,7 +1629,7 @@ probe-timeout-invalid = The probe timeout must be a whole number of seconds ({ $
 probe-timeout-set = Probe timeout set to { $secs } seconds
 probe-timeout-failed = Probe timeout change failed: { $error }
 test-all-scope-running-toast = Test all covers every running endpoint
-test-all-scope-checked-toast = Test all covers the selected endpoints only
+test-all-scope-selected-toast = Test all covers the selected endpoints only
 test-all-scope-failed = Test-all scope change failed: { $error }
 bind-host-added = Added { $host }
 bind-host-removed = Removed { $host }
@@ -1491,33 +1637,66 @@ data-folder-opened = Opened { $path }
 data-folder-failed = Cannot open the data folder: { $error }
 library-already-empty = The library is already empty — nothing to reset
 reset-remove-failed = Cannot remove "{ $name }": { $error }
-library-reset-done = Library reset — { $count } configuration(s) removed
+library-reset-done = Library reset — { $count } { $count ->
+    [one] config
+   *[other] configs
+  } removed
 tray-hint = Still running in the tray — right-click the icon to quit.
 shell-refused-folder = the shell refused to open the folder ({ $instance })
 folder-open-unsupported = opening the data folder is not supported on this platform
-bulk-start-unreadable = { $count } configuration(s) not started (could not read): { $names }
+bulk-start-unreadable = { $count } { $count ->
+       [one] config
+      *[other] configs
+     } not started (could not read): { $names }
 bulk-start-flag-failed = { $count } started but the enabled flag could not be saved: { $names }
 bulk-start-failed = Started { $started }, { $count } failed: { $joined }
-bulk-start-refused = Could not start { $requested } configuration(s): { $detail } (nothing new started)
-no-selection = Select a configuration first
+bulk-start-refused = Could not start { $requested } { $requested ->
+       [one] config
+      *[other] configs
+     }: { $detail } (nothing new started)
+no-selection = Select a config first
 start-busy = Starting… already in progress
-start-bulk-started = Started { $count } configuration(s)
+start-bulk-started = Started { $count } { $count ->
+       [one] config
+      *[other] configs
+     }
 stop-bulk-empty = Nothing to stop - no selected endpoints are running
-stop-bulk-stopped = Stopped { $count } configuration(s)
-stop-bulk-failed = Stop failed for { $count } configuration(s): { $names }
+stop-bulk-stopped = Stopped { $count } { $count ->
+       [one] config
+      *[other] configs
+     }
+stop-bulk-failed = Stop failed for { $count } { $count ->
+       [one] config
+      *[other] configs
+     }: { $names }
 stop-bulk-partial = Stopped { $stopped }, { $failed } failed: { $names }
-moved-to-group = Moved { $count } configuration(s) to "{ $group }"
+moved-to-group = Moved { $count } { $count ->
+       [one] config
+      *[other] configs
+     } to "{ $group }"
 group-updated = Updated group "{ $name }"
 group-holds-no-rows = Group "{ $name }" holds no rows
 group-renamed = Renamed "{ $old }" to "{ $new }" ({ $moved })
-group-rows-count = { $count } row(s)
-group-subs-count = { $count } subscription(s)
+group-rows-count = { $count } { $count ->
+       [one] config
+      *[other] configs
+     }
+group-subs-count = { $count } { $count ->
+       [one] subscription
+      *[other] subscriptions
+     }
 group-deleted-empty = Deleted empty group "{ $name }"
 reset-traffic-toast = Reset traffic for "{ $name }"
 cannot-reset-traffic = Cannot reset traffic: { $error }
-cleared-traffic-toast = Cleared traffic for { $count } row(s)
+cleared-traffic-toast = Cleared traffic for { $count } { $count ->
+       [one] config
+      *[other] configs
+     }
 cannot-clear-traffic = Cannot clear traffic: { $error }
-cleared-health-toast = Cleared { $count } health snapshot(s)
+cleared-health-toast = Cleared { $count } { $count ->
+       [one] health snapshot
+      *[other] health snapshots
+     }
 cannot-clear-health = Cannot clear health: { $error }
 snapshot-cleared-toast = Running snapshot cleared — next launch starts clean
 cannot-clear-snapshot = Cannot clear snapshot: { $error }
@@ -1525,12 +1704,27 @@ started-row-toast = Started "{ $name }"
 started-flag-failed = Started "{ $name }" but could not save its flag: { $error }
 cannot-bind-endpoint = Cannot bind the endpoint
 cannot-bind-an-endpoint = Cannot bind an endpoint
-all-already-running = All { $count } endpoint(s) already running
-start-flag-failed = Started { $count } endpoint(s) but { $errors } flag(s) failed to save: { $error }
+all-already-running = All { $count } { $count ->
+       [one] endpoint
+      *[other] endpoints
+     } already running
+start-flag-failed = Started { $count } { $count ->
+       [one] endpoint
+      *[other] endpoints
+     } but { $errors } { $errors ->
+       [one] flag
+      *[other] flags
+     } failed to save: { $error }
 stop-all-failed = Stop-all failed: { $error }
-stop-all-flag-failed = Stopped all endpoints but { $errors } flag(s) failed to save: { $error }
+stop-all-flag-failed = Stopped all endpoints but { $errors } { $errors ->
+       [one] flag
+      *[other] flags
+     } failed to save: { $error }
 already-running-toast = "{ $name }" already running (restarted)
-start-all-partial = Started { $started } endpoint(s), { $failed } failed: { $names }
+start-all-partial = Started { $started } { $started ->
+       [one] endpoint
+      *[other] endpoints
+     }, { $failed } failed: { $names }
 no-crashed-to-restart = No crashed endpoints to restart
 restarted-crashed = Restarted { $names }
 restart-failed = Restart failed: { $error }
@@ -1556,11 +1750,23 @@ enter-subscription-url = Enter a subscription URL
 no-subs-to-update-skipped = No subscriptions to update — { $count } skipped (auto-refresh off for their group)
 copied-socks-url = Copied SOCKS URL
 copied-proxy-urls = Copied proxy URLs
-copied-urls-count = Copied URLs for { $count } configuration(s)
-copied-socks-urls-count = Copied SOCKS URLs for { $count } configuration(s)
+copied-urls-count = Copied URLs for { $count } { $count ->
+       [one] config
+      *[other] configs
+     }
+copied-socks-urls-count = Copied SOCKS URLs for { $count } { $count ->
+       [one] config
+      *[other] configs
+     }
 copied-config-folder = Copied config folder path ({ $folder })
-copied-log-lines = Copied { $count } log line(s)
-subscription-refresh-failed-count-body = { $failed } route(s) could not be refreshed. Open Subscriptions for details.
+copied-log-lines = Copied { $count } { $count ->
+       [one] log line
+      *[other] log lines
+     }
+subscription-refresh-failed-count-body = { $failed } { $failed ->
+       [one] route
+      *[other] routes
+     } could not be refreshed. Open Subscriptions for details.
 cannot-save-logs = Cannot save logs: { $error }
 rule-set-cannot-create = cannot create { $path }: { $error }
 rule-set-cannot-write = cannot write { $path }: { $error }
@@ -1569,14 +1775,20 @@ picked-extra-core = Picked extra-core executable { $stored }
 import-failed = Import failed: { $error }
 refresh-label-error = { $label }: { $error }
 refresh-label-failed = { $label }: refresh failed ({ $error })
-routing-preset-refreshed = Routing preset "{ $name }" refreshed ({ $count } rule(s))
+routing-preset-refreshed = Routing preset "{ $name }" refreshed ({ $count } { $count ->
+       [one] rule
+      *[other] rules
+     })
 cannot-download-rule-set = Cannot download rule set "{ $name }" ({ $url }): { $reason }
 rule-set-staged = Rule set "{ $name }" staged ({ $bytes } bytes) — { $path }
 cannot-stage-rule-set = Cannot stage rule set "{ $name }" ({ $url }): { $error }
 running-without-persistence = Running without persistence: { $error }
 tray-unavailable = Tray unavailable ({ $error }) — closing still confirms
 cannot-restore = Cannot restore: { $reason }
-restored-endpoints = Restored { $started } endpoint(s)
+restored-endpoints = Restored { $started } { $started ->
+       [one] endpoint
+      *[other] endpoints
+     }
 overlay-refusal-note = Close the open dialog first
 generated-new-uuid = Generated a new UUID
 generated-new-wg-key = Generated a new WireGuard private key
@@ -1614,8 +1826,8 @@ cannot-load-rule-sets-lower = cannot load rule sets: { $error }
 copied-sub-url-redacted = Copied subscription URL (redacted)
 
 # Action table
-action-label-add = Add configuration
-action-label-import = Import configurations
+action-label-add = Add config
+action-label-import = Import configs
 action-label-paste-import = Import from clipboard
 action-label-export-library = Export library
 action-label-open-palette = Command palette
@@ -1659,7 +1871,7 @@ action-tip-test = URL-test this row or every selected row
 action-tip-copy-urls = Copy bind endpoints (no secrets)
 action-tip-copy-proxy = Copy the SOCKS proxy URL for this row or the selection
 action-tip-edit-endpoint = Edit this row's bind and port
-action-tip-edit = Edit the full configuration
+action-tip-edit = Edit the full config
 action-tip-delete = Delete this row or every selected row
 action-tip-move = Move this row or the selection to a group
 action-tip-share = Copy this row's share link (carries credentials)

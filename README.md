@@ -100,8 +100,8 @@ Start all / Stop all / Show / Quit.
 
 | Action | Keys |
 | --- | --- |
-| Add configuration | `Ctrl-N` |
-| Import configurations | `Ctrl-O` |
+| Add config | `Ctrl-N` |
+| Import configs | `Ctrl-O` |
 | Paste clipboard into Import | `Ctrl-V` |
 | Start selected | `F5` |
 | Stop selected | `Shift-F5` |
@@ -110,20 +110,22 @@ Start all / Stop all / Show / Quit.
 | Edit endpoint | `Ctrl-E` |
 | Edit config | `Ctrl-Shift-E` |
 | Delete selected | `Delete` |
+| Extend selection up / down | `Shift-Up` / `Shift-Down` |
+| Move focus up / down | `Up` / `Down` |
+| Move focus to first / last row | `Home` / `End` |
+| Toggle focused row | `Space` |
+| Select all visible | `Ctrl-A` |
 | Focus search | `Ctrl-F` |
-| Inspector details | `Ctrl-1` |
-| Inspector health | `Ctrl-2` |
-| Inspector details | `Ctrl-3` |
-| Inspector logs | `Ctrl-4` |
-| Inspector links | `Ctrl-5` |
-| Inspector traffic | `Ctrl-6` |
-| Uncheck all | `Esc` |
+| Toggle inspector | `Ctrl-I` |
+| Toggle console | `` Ctrl-` `` |
+| Clear selection | `Esc` |
 | Copy URLs | `Ctrl-U` |
 | Command palette | `Ctrl-K` |
-| Update the group in focus | `Ctrl-R` |
+| Update the current scope | `Ctrl-R` |
 
 The same list appears in the About dialog and Settings → Shortcuts, and these
-key-bound actions also have toolbar or menu entries and `Ctrl-K` palette twins.
+key-bound actions also have action-bar or nav entries and `Ctrl-K` palette
+twins.
 
 ## What ManyProxy does not do
 

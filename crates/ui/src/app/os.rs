@@ -8,7 +8,7 @@ impl AppView {
     /// Called once, after the window exists. A test harness has no Win32
     /// window, so `hwnd_from_window` returns `None` and every later OS call
     /// stays a no-op.
-    pub(crate) fn install_os(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn install_os(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(hwnd) = crate::tray::hwnd_from_window(window) else {
             return;
         };
@@ -20,7 +20,7 @@ impl AppView {
     /// Runs on the existing tray pump. A taskbar button click is a user action
     /// with no entity callback, so the pump drains the queue and dispatches it
     /// through the same methods the toolbar calls.
-    pub(crate) fn poll_os_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn poll_os_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_taskbar_buttons(cx);
         for event in crate::os::taskbar::drain_events() {
             match event {
@@ -67,12 +67,7 @@ impl AppView {
     /// One balloon, subject to the same visibility/setting/dedup rules the
     /// policy unit tests pin. The caller supplies the event text the in-app
     /// toast would have shown.
-    pub(crate) fn os_notify(
-        &mut self,
-        kind: crate::os::notify::NoticeKind,
-        title: &str,
-        body: &str,
-    ) {
+    pub fn os_notify(&mut self, kind: crate::os::notify::NoticeKind, title: &str, body: &str) {
         let enabled = self.notify_from_tray_enabled();
         let Some(notifier) = self.os_notifier.as_ref() else {
             return;
@@ -92,7 +87,7 @@ impl AppView {
     /// The deferred Phase 3 balloon: a passive check found a newer release
     /// while the window is out of sight. A visible window gets the status-bar
     /// hint alone, and the policy still owns dedup and flood.
-    pub(crate) fn os_notify_update(&mut self, release: &FetchedRelease) {
+    pub fn os_notify_update(&mut self, release: &FetchedRelease) {
         let Some(notifier) = self.os_notifier.as_ref() else {
             return;
         };
@@ -109,20 +104,20 @@ impl AppView {
         self.os_notify(crate::os::notify::NoticeKind::UpdateFound, &title, &body);
     }
 
-    pub(crate) fn set_taskbar_progress(&mut self, done: usize, total: usize, failed: usize) {
+    pub fn set_taskbar_progress(&mut self, done: usize, total: usize, failed: usize) {
         let progress = crate::os::taskbar::Progress::from_counts(done, total, failed);
         if let Some(taskbar) = &mut self.os_taskbar {
             taskbar.set_progress(progress);
         }
     }
 
-    pub(crate) fn clear_taskbar_progress(&mut self) {
+    pub fn clear_taskbar_progress(&mut self) {
         if let Some(taskbar) = &mut self.os_taskbar {
             taskbar.set_progress(None);
         }
     }
 
-    fn taskbar_button_states(&self, cx: &App) -> crate::os::taskbar::ButtonStates {
+    pub fn taskbar_button_states(&self, cx: &App) -> crate::os::taskbar::ButtonStates {
         crate::os::taskbar::button_states(
             self.engine.running_count(),
             self.config_count(cx),
@@ -131,7 +126,7 @@ impl AppView {
         )
     }
 
-    fn sync_taskbar_buttons(&mut self, cx: &App) {
+    pub fn sync_taskbar_buttons(&mut self, cx: &App) {
         let states = self.taskbar_button_states(cx);
         if let Some(taskbar) = &mut self.os_taskbar {
             taskbar.sync_buttons(states);

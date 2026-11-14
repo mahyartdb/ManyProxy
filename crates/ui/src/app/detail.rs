@@ -10,13 +10,13 @@ use super::console::console_height;
 /// T-02: a key never rides inside a label or an accessible name. The operate
 /// row announces the action alone and keeps the key in its tooltip, so the
 /// key-bearing tooltip text is named here and pinned by the test suite.
-pub(crate) fn operate_start_tooltip() -> String {
+pub fn operate_start_tooltip() -> String {
     t!("detail-start-tip")
 }
-pub(crate) fn operate_stop_tooltip() -> String {
+pub fn operate_stop_tooltip() -> String {
     t!("detail-stop-tip")
 }
-pub(crate) fn operate_test_tooltip() -> String {
+pub fn operate_test_tooltip() -> String {
     t!("detail-test-tip")
 }
 
@@ -24,20 +24,20 @@ pub(crate) fn operate_test_tooltip() -> String {
 /// subtree. Uniform row heights keep the size cache exact: a declared height
 /// that is too small clips a row, so each row is pinned to one line (log and
 /// traffic text truncates, the link card is a fixed two-line block).
-pub(crate) const PANE_LOG_ROW_H: f32 = 20.;
-pub(crate) const PANE_LINK_ROW_H: f32 = 48.;
+pub const PANE_LOG_ROW_H: f32 = 20.;
+pub const PANE_LINK_ROW_H: f32 = 48.;
 /// A row list never eats the whole pane: the console body caps the list to a
 /// share of what it can show and scrolls itself past it. A short list keeps
 /// its natural height.
-const PANE_LIST_SHARE: f32 = 0.6;
+pub const PANE_LIST_SHARE: f32 = 0.6;
 /// The panel's own height is only known after the first layout; until then the
 /// list falls back to this so the pane is never blank on its first frame.
-const PANE_LIST_FALLBACK_H: f32 = 320.;
+pub const PANE_LIST_FALLBACK_H: f32 = 320.;
 
 /// B3 acceptance probe: counts the rows a console pane actually builds.
 /// Debug-only — release builds compile the counter away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConsoleRows {
+pub enum ConsoleRows {
     Logs = 0,
     Links = 1,
 }
@@ -49,7 +49,7 @@ thread_local! {
     static CONSOLE_ROWS_BUILT: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
-pub(crate) fn note_console_row(pane: ConsoleRows) {
+pub fn note_console_row(pane: ConsoleRows) {
     #[cfg(any(debug_assertions, test))]
     CONSOLE_ROWS_BUILT.with(|built| {
         let mut counts = built.get();
@@ -60,20 +60,20 @@ pub(crate) fn note_console_row(pane: ConsoleRows) {
     let _ = pane;
 }
 
-#[cfg(test)]
-pub(crate) fn console_rows_built(pane: ConsoleRows) -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn console_rows_built(pane: ConsoleRows) -> usize {
     CONSOLE_ROWS_BUILT.with(|built| built.get()[pane as usize])
 }
 
-#[cfg(test)]
-pub(crate) fn reset_console_rows_built() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_console_rows_built() {
     CONSOLE_ROWS_BUILT.with(|built| built.set([0; 2]));
 }
 
 /// B3: the pane's row area. The list is handed the visible range only, so rows
 /// outside the window are never built; the paired handle remembers the offset
 /// and the scrollbar makes the extra scroll range visible in a narrow panel.
-pub(crate) fn pane_rows(
+pub fn pane_rows(
     cx: &mut Context<AppView>,
     pane: &mut PaneWindow,
     id: &'static str,
@@ -122,7 +122,7 @@ impl AppView {
     /// drawer. It is an overlay: the table keeps its own pane beside it, so
     /// the list is never squeezed under its floor. The root occludes input,
     /// or a blank click reaches the rows behind it and retargets the inspector.
-    pub(crate) fn render_inspector_drawer(
+    pub fn render_inspector_drawer(
         &mut self,
         width: f32,
         window: &mut Window,
@@ -175,7 +175,7 @@ impl AppView {
 
     /// F19: picking a row opens the inspector again — it is the only way back
     /// to the row's controls once Esc closed it.
-    pub(crate) fn open_inspector(&mut self) {
+    pub fn open_inspector(&mut self) {
         self.inspector_visible = true;
     }
 
@@ -183,7 +183,7 @@ impl AppView {
     /// and hand focus back to the list. It reports whether it closed
     /// anything, so the caller can leave the selection alone - one overlay
     /// layer per Esc.
-    pub(crate) fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn close_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.inspector_visible {
             return false;
         }
@@ -193,7 +193,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn render_detail(
+    pub fn render_detail(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -221,7 +221,7 @@ impl AppView {
 
     /// T-03: rows but no selection. The Add and Import calls to action belong
     /// to an EMPTY library only — here the inspector just asks for a row.
-    pub(crate) fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("config-detail")
             .test_support()
@@ -245,7 +245,7 @@ impl AppView {
             .into_any_element()
     }
 
-    pub(crate) fn render_detail_selected(
+    pub fn render_detail_selected(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -303,7 +303,7 @@ impl AppView {
     /// The dock's height is fixed (240/220), so the share of it a list may
     /// paint is a constant, not a measurement — one less layout read per
     /// frame, and the dock never resizes anyway.
-    pub(crate) fn console_list_height(&self, rows: usize, row_h: f32) -> f32 {
+    pub fn console_list_height(&self, rows: usize, row_h: f32) -> f32 {
         if rows == 0 {
             return 0.;
         }
@@ -316,7 +316,7 @@ impl AppView {
         (rows as f32 * row_h).min((viewport * PANE_LIST_SHARE).max(row_h * 3.))
     }
 
-    pub(crate) fn render_detail_header(
+    pub fn render_detail_header(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -394,7 +394,7 @@ impl AppView {
     /// selected row's editable bind/port strip share one frame, one draft
     /// warning, and ONE copy action (was three per-row copies plus a strip
     /// pinned below the pane body).
-    pub(crate) fn render_detail_endpoints(
+    pub fn render_detail_endpoints(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -512,7 +512,7 @@ impl AppView {
     /// One read-only contact row. T-03: the value takes the leftover width and
     /// truncates at the 260px default; the full text stays in its tooltip.
     /// K1/A4-4: the per-row Copy left — the block carries the single action.
-    pub(crate) fn endpoint_row(
+    pub fn endpoint_row(
         cx: &mut Context<Self>,
         label: String,
         value: String,
@@ -549,7 +549,7 @@ impl AppView {
     /// K1/A4-5: red ONLY for a failing state — live numbers ride dim mono and
     /// the probe wording drops `(s)` plus the `probe:`/byte jargon. The full
     /// detail line keeps its job inside the failed ALERT, where red is earned.
-    pub(crate) fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+    pub fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         let status = self.health_store.status(&config.id);
         let mono_number = |text: String| {
             div()
@@ -645,7 +645,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn render_detail_usage(
+    pub fn render_detail_usage(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -676,7 +676,7 @@ impl AppView {
     /// one-or-two-point "trend" is noise, so the block says how many probes
     /// it has instead. The real trend (caption + chart) still comes from
     /// `history_line` once the row has enough history to draw honestly.
-    pub(crate) fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+    pub fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         // Same 90-day window the sparkline reads, so the count matches the
         // samples `history_line` would chart.
         let since = now_unix().saturating_sub(90 * 86_400);
@@ -708,7 +708,7 @@ impl AppView {
         )
     }
 
-    pub(crate) fn render_detail_actions(
+    pub fn render_detail_actions(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -810,7 +810,7 @@ impl AppView {
 
     /// A context-menu row for one table action. The target row travels by id
     /// and is resolved when the handler runs, never at render.
-    fn context_menu_item(
+    pub fn context_menu_item(
         id: &'static str,
         row_id: &str,
         view: &Entity<AppView>,
@@ -819,7 +819,7 @@ impl AppView {
         Self::context_menu_item_with_label(id, row_id, view, multi, None)
     }
 
-    fn context_menu_item_with_label(
+    pub fn context_menu_item_with_label(
         id: &'static str,
         row_id: &str,
         view: &Entity<AppView>,
@@ -861,7 +861,7 @@ impl AppView {
 
     /// The row verbs that widen to the whole set, and the copy they wear when
     /// they do. Edit / Share / Duplicate stay row-scoped by nature.
-    fn multi_row_label(id: &str, count: usize) -> Option<String> {
+    pub fn multi_row_label(id: &str, count: usize) -> Option<String> {
         if count <= 1 {
             return None;
         }
@@ -877,7 +877,7 @@ impl AppView {
         }
     }
 
-    fn row_context_item(
+    pub fn row_context_item(
         id: &'static str,
         row_id: &str,
         view: &Entity<AppView>,
@@ -898,7 +898,7 @@ impl AppView {
     ///
     /// The menu acts on the row it was opened on, unless that row is part of a
     /// multi-selection — then the verb that widens to the set widens.
-    pub(crate) fn row_more_menu(
+    pub fn row_more_menu(
         menu: PopupMenu,
         row_id: &str,
         view: &Entity<AppView>,
@@ -967,7 +967,7 @@ impl AppView {
     /// flag only), Ping, Logs, Copy URLs, Copy SOCKS. Row management (Edit /
     /// Delete / Duplicate / Reset) lives in the row's context menu — this
     /// button used to duplicate half of it above itself.
-    pub(crate) fn render_row_menu(
+    pub fn render_row_menu(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -997,7 +997,7 @@ impl AppView {
 
     /// An inspector-menu row for one table action against the selection. Only
     /// the auto-start row carries a state suffix; the label is the table's.
-    fn selection_menu_item(
+    pub fn selection_menu_item(
         id: &'static str,
         note: Option<String>,
         view: &Entity<AppView>,
@@ -1032,7 +1032,7 @@ impl AppView {
         })
     }
 
-    pub(crate) fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {
+    pub fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {
         struct SparkPoint {
             x: String,
             y: f64,
@@ -1059,7 +1059,7 @@ impl AppView {
     /// Slice 6, Identity section: the old Details content — name (tooltip
     /// carries the whole name), Protocol, Group, Source (`Manual` when the
     /// row has no subscription), Upstream, and Preset when one is attached.
-    pub(crate) fn render_inspector_identity(
+    pub fn render_inspector_identity(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -1097,7 +1097,7 @@ impl AppView {
 
     /// Slice 6, Endpoint section: the same values the old endpoints block
     /// read, still hosting slice 5's one inline draft. No second editor.
-    pub(crate) fn render_inspector_endpoint(
+    pub fn render_inspector_endpoint(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1109,7 +1109,7 @@ impl AppView {
     /// Slice 6, Health section: state, latency probes, the failure reason,
     /// the probe/usage block and the honest history line. `Test` rides the
     /// actions section; this section only reports.
-    pub(crate) fn render_inspector_health_section(
+    pub fn render_inspector_health_section(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -1140,7 +1140,7 @@ impl AppView {
     /// Slice 6, Actions section: Start/Stop (Start is primary while stopped),
     /// Test, and the row's `More` kebab — the same menu the row uses, not a
     /// second one. The F5/Shift+F5/Ctrl+T hints stay pinned.
-    pub(crate) fn render_inspector_actions(
+    pub fn render_inspector_actions(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
@@ -1153,7 +1153,7 @@ impl AppView {
 
     /// The inspector's one console entry: `Open in console →` opens the dock
     /// on Logs with scope `Selected` and an empty console filter.
-    pub(crate) fn render_inspector_console_link(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_inspector_console_link(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         div()
             .id("inspector-console-link")
@@ -1178,7 +1178,7 @@ impl AppView {
     /// R6: the 2+ selection aggregate. Counts only — no action buttons, no
     /// endpoint editor, no second batch panel. `{N} hidden` clears filters,
     /// exactly as the batch bar's hidden count does.
-    pub(crate) fn render_inspector_aggregate(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_inspector_aggregate(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.selection_count();
         let (running, failed, stopped) = {
             let mut counts = (0usize, 0usize, 0usize);

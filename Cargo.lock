@@ -4352,6 +4352,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "manyproxy-core",
+ "manyproxy-ui",
  "png 0.18.1",
  "qrcodegen",
  "raw-window-handle",

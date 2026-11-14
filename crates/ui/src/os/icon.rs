@@ -3,7 +3,7 @@
 //! mask/XOR packing lives in one place.
 
 #[cfg(windows)]
-pub(crate) fn hicon_from_rgba(
+pub fn hicon_from_rgba(
     rgba: &[u8],
     width: usize,
     height: usize,

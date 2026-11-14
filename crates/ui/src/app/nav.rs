@@ -5,28 +5,28 @@
 use crate::*;
 
 /// The nav's expanded width. A scope entry needs its label.
-pub(crate) const NAV_WIDTH: f32 = 220.;
+pub const NAV_WIDTH: f32 = 220.;
 /// The nav's collapsed width: one letter per entry, with the tooltip naming it.
-pub(crate) const NAV_COLLAPSED_WIDTH: f32 = 56.;
+pub const NAV_COLLAPSED_WIDTH: f32 = 56.;
 /// Below this viewport width the nav collapses to its letters.
-pub(crate) const NAV_BREAKPOINT: f32 = 1200.;
+pub const NAV_BREAKPOINT: f32 = 1200.;
 
 /// One nav row's height.
-pub(crate) const NAV_ENTRY_HEIGHT: f32 = 32.;
+pub const NAV_ENTRY_HEIGHT: f32 = 32.;
 
 /// One utility row: the label, or its letter when the nav is collapsed. The
 /// two utilities are the only fixed entries below the scroll area.
-struct NavEntry {
-    id: &'static str,
-    letter: &'static str,
-    label: String,
-    action: fn(&mut AppView, &mut Window, &mut Context<AppView>),
+pub struct NavEntry {
+    pub id: &'static str,
+    pub letter: &'static str,
+    pub label: String,
+    pub action: fn(&mut AppView, &mut Window, &mut Context<AppView>),
 }
 
 impl AppView {
     /// The nav's width for this frame. The viewport is read every frame, so a
     /// resize or a DPI change can never leave a stale width behind.
-    pub(crate) fn nav_width(&self, window: &Window) -> f32 {
+    pub fn nav_width(&self, window: &Window) -> f32 {
         if window.viewport_size().width.as_f32() >= NAV_BREAKPOINT {
             NAV_WIDTH
         } else {
@@ -37,7 +37,7 @@ impl AppView {
     /// The left nav. `All configs` stays pinned; the group and source scopes
     /// scroll between it and the two utilities, so a long group list never
     /// pushes Routing presets or Settings out of reach.
-    pub(crate) fn render_nav(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_nav(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let width = self.nav_width(window);
         let collapsed = width < NAV_WIDTH;
         let total = self.config_count(cx);
@@ -103,7 +103,7 @@ impl AppView {
 
 /// One utility row: the label, or its letter when the nav is collapsed. The
 /// tooltip names the dialog it opens.
-fn nav_entry(entry: NavEntry, collapsed: bool, cx: &mut Context<AppView>) -> AnyElement {
+pub fn nav_entry(entry: NavEntry, collapsed: bool, cx: &mut Context<AppView>) -> AnyElement {
     let NavEntry {
         id,
         letter,

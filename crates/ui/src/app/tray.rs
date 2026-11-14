@@ -1,7 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn poll_tray_once(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn poll_tray_once(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.tray.is_none() {
             return false;
         }
@@ -33,7 +33,7 @@ impl AppView {
         false
     }
 
-    pub(crate) fn handle_tray_action(
+    pub fn handle_tray_action(
         &mut self,
         action: crate::tray::TrayAction,
         window: &mut Window,

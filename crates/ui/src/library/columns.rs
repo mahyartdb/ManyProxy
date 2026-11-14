@@ -6,7 +6,7 @@ use gpui_kit::component::ThemeStyled as _;
 /// T-03/T-04: one header cell. The wrapper owns the column width so the edge
 /// handle can sit on the boundary; it is also the drag source and the drop
 /// target. Every visible column uses this shape, Name included.
-fn resizable_header(
+pub fn resizable_header(
     column: ColumnId,
     width: f32,
     drop_side: Option<DropSide>,
@@ -67,7 +67,7 @@ fn resizable_header(
         .into_any_element()
 }
 
-fn column_resize_handle(
+pub fn column_resize_handle(
     handle_id: String,
     column: ColumnId,
     width: f32,
@@ -103,7 +103,7 @@ fn column_resize_handle(
 /// T-27/R7: one sortable header. Every visible column sorts on click, a second
 /// click reverses the direction, and the label carries the direction word. The
 /// right-click menu is the same Explorer menu for every column.
-pub(crate) fn column_header_cell(
+pub fn column_header_cell(
     column: ColumnId,
     sort: LibrarySort,
     metrics: RowMetrics,

@@ -1,11 +1,11 @@
 use crate::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PanelChoice {
-    id: String,
-    title: String,
-    display: String,
-    pub(crate) value: String,
+pub struct PanelChoice {
+    pub id: String,
+    pub title: String,
+    pub display: String,
+    pub value: String,
 }
 
 impl SearchableListItem for PanelChoice {
@@ -25,7 +25,7 @@ impl SearchableListItem for PanelChoice {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PanelChoiceList(pub(crate) Vec<PanelChoice>);
+pub struct PanelChoiceList(pub Vec<PanelChoice>);
 
 impl SearchableListDelegate for PanelChoiceList {
     type Item = PanelChoice;
@@ -67,7 +67,7 @@ impl SearchableListDelegate for PanelChoiceList {
     }
 }
 
-pub(crate) fn panel_choices(prefix: &str, items: &[(&str, &str)]) -> Vec<PanelChoice> {
+pub fn panel_choices(prefix: &str, items: &[(&str, &str)]) -> Vec<PanelChoice> {
     items
         .iter()
         .map(|(value, title)| {

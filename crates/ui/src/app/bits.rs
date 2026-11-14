@@ -1,6 +1,6 @@
 use crate::*;
 
-pub(crate) fn topbar_menu_row(
+pub fn topbar_menu_row(
     id: &'static str,
     label: impl Into<SharedString>,
     accessible: impl Into<SharedString>,
@@ -49,32 +49,32 @@ pub(crate) fn topbar_menu_row(
     }
 }
 
-pub(crate) fn search_placeholder() -> String {
+pub fn search_placeholder() -> String {
     t!("filter-search-placeholder")
 }
 
 /// T-23: the one hint that the `port=` grammar exists — a tooltip on the search
 /// box, because the pinned placeholder is too narrow to carry it.
-pub(crate) fn search_hint() -> String {
+pub fn search_hint() -> String {
     t!("search-hint")
 }
 
 /// Store meta key for "Automatically restart crashed cores"; a missing or corrupt
 /// value reads as enabled, matching the engine's default.
-pub(crate) const META_AUTO_RESTART: &str = "auto_restart_enabled";
+pub const META_AUTO_RESTART: &str = "auto_restart_enabled";
 
 /// Store meta key for "Notify from the tray"; a missing or corrupt value reads
 /// as enabled, because the notifications exist precisely for a hidden window.
-pub(crate) const META_NOTIFY_FROM_TRAY: &str = "notify_from_tray_enabled";
+pub const META_NOTIFY_FROM_TRAY: &str = "notify_from_tray_enabled";
 
 /// Store meta key for "Check for updates weekly"; a missing or corrupt value
 /// reads as enabled because the passive check ships on (plan decision 6).
-pub(crate) const META_PASSIVE_UPDATE_CHECK: &str = "passive_update_check_enabled";
+pub const META_PASSIVE_UPDATE_CHECK: &str = "passive_update_check_enabled";
 
 /// Bind failures are the ones where "start" did nothing because the endpoint's
 /// address was taken or unusable; the user needs the log even when the window
 /// is hidden.
-pub(crate) fn is_port_bind_error(error: &EngineError) -> bool {
+pub fn is_port_bind_error(error: &EngineError) -> bool {
     matches!(
         error,
         EngineError::PortConflict { .. }
@@ -85,11 +85,11 @@ pub(crate) fn is_port_bind_error(error: &EngineError) -> bool {
     )
 }
 
-pub(crate) fn is_row_local_start_error(error: &EngineError) -> bool {
+pub fn is_row_local_start_error(error: &EngineError) -> bool {
     crate::engine::is_row_local_error(error)
 }
 
-pub(crate) fn normalize_test_url(raw: &str) -> Result<String, String> {
+pub fn normalize_test_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(t!("test-url-empty"));
@@ -105,7 +105,7 @@ pub(crate) fn normalize_test_url(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-pub(crate) fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> String {
+pub fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> String {
     row_override
         .filter(|url| !url.trim().is_empty())
         .or_else(|| global.filter(|url| !url.trim().is_empty()))
@@ -113,14 +113,14 @@ pub(crate) fn effective_probe_url(row_override: Option<&str>, global: Option<&st
         .unwrap_or_else(|| DEFAULT_TEST_URL.to_string())
 }
 
-pub(crate) fn format_params_json(text: &str) -> Result<String, String> {
+pub fn format_params_json(text: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| t!("params-invalid-json", error = error.to_string()))?;
     serde_json::to_string_pretty(&value)
         .map_err(|error| t!("params-format-failed", error = error.to_string()))
 }
 
-pub(crate) fn validate_params_json(text: &str) -> Result<(), String> {
+pub fn validate_params_json(text: &str) -> Result<(), String> {
     if text.trim().is_empty() {
         return Ok(());
     }
@@ -129,14 +129,14 @@ pub(crate) fn validate_params_json(text: &str) -> Result<(), String> {
         .map_err(|error| t!("params-invalid-json", error = error.to_string()))
 }
 
-pub(crate) fn guided_identity_label(protocol_raw: &str) -> String {
+pub fn guided_identity_label(protocol_raw: &str) -> String {
     match guided_identity_fields(protocol_raw).and_then(|guided| guided.key) {
         Some(key) => t!("guided-identity-key", key = key),
         None => t!("guided-identity"),
     }
 }
 
-pub(crate) fn guided_hint_line(protocol_raw: &str) -> Option<String> {
+pub fn guided_hint_line(protocol_raw: &str) -> Option<String> {
     let name = protocol_raw.trim();
     let guided = guided_identity_fields(protocol_raw)?;
     if name.is_empty() {
@@ -149,7 +149,7 @@ pub(crate) fn guided_hint_line(protocol_raw: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn block_owns_identity(protocol_raw: &str) -> bool {
+pub fn block_owns_identity(protocol_raw: &str) -> bool {
     matches!(
         protocol_raw.trim(),
         "vless"
@@ -169,7 +169,7 @@ pub(crate) fn block_owns_identity(protocol_raw: &str) -> bool {
     )
 }
 
-pub(crate) fn tls_panel_plan(protocol_raw: &str) -> Option<bool> {
+pub fn tls_panel_plan(protocol_raw: &str) -> Option<bool> {
     match protocol_raw.trim() {
         "vless" | "vmess" | "trojan" | "http" | "https" => Some(false),
         "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls" => Some(true),
@@ -177,11 +177,11 @@ pub(crate) fn tls_panel_plan(protocol_raw: &str) -> Option<bool> {
     }
 }
 
-pub(crate) fn has_network_panel(protocol_raw: &str) -> bool {
+pub fn has_network_panel(protocol_raw: &str) -> bool {
     matches!(protocol_raw.trim(), "vless" | "vmess" | "trojan")
 }
 
-pub(crate) fn has_dial_panel(protocol_raw: &str) -> bool {
+pub fn has_dial_panel(protocol_raw: &str) -> bool {
     matches!(
         protocol_raw.trim(),
         "vless"
@@ -204,7 +204,7 @@ pub(crate) fn has_dial_panel(protocol_raw: &str) -> bool {
     )
 }
 
-pub(crate) fn has_advanced_dialog(protocol_raw: &str) -> bool {
+pub fn has_advanced_dialog(protocol_raw: &str) -> bool {
     has_dial_panel(protocol_raw) || tls_panel_plan(protocol_raw).is_some()
 }
 
@@ -227,7 +227,7 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
     ))
 }
 
-pub(crate) fn interval_picker_row(
+pub fn interval_picker_row(
     id_prefix: &str,
     interval_secs: Rc<RefCell<i64>>,
     repaint: DialogRepaint,
@@ -270,7 +270,7 @@ pub(crate) fn interval_picker_row(
         )
 }
 
-pub(crate) fn spawn_tick(
+pub fn spawn_tick(
     cx: &mut Context<AppView>,
     secs: u64,
     tick: impl Fn(&mut AppView, &mut Context<AppView>) + 'static,

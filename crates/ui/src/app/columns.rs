@@ -7,14 +7,14 @@ use gpui_kit::component::Disableable as _;
 /// R17: fit measures the name style at its default 14px, independent of the
 /// current text scale and of virtualization — it reads the delegate's rows,
 /// not the painted viewport.
-const FIT_TEXT_PX: f32 = 14.;
+pub const FIT_TEXT_PX: f32 = 14.;
 
 /// The breathing room a fitted column keeps beyond its widest text: cell
 /// padding plus the header's sort affordance.
-const FIT_CHROME: f32 = 24.;
+pub const FIT_CHROME: f32 = 24.;
 
 impl AppView {
-    pub(crate) fn begin_column_resize(
+    pub fn begin_column_resize(
         &mut self,
         column: ColumnId,
         start_x: f32,
@@ -33,7 +33,7 @@ impl AppView {
     /// reflow together; the store waits for mouse-up. A Name with no explicit
     /// width is handed its current effective width, which is the moment it
     /// stops flexing.
-    pub(crate) fn drag_column_resize(&mut self, x: f32, cx: &mut Context<Self>) {
+    pub fn drag_column_resize(&mut self, x: f32, cx: &mut Context<Self>) {
         let Some(resize) = self.column_resize else {
             return;
         };
@@ -42,7 +42,7 @@ impl AppView {
         self.notify_table(cx);
     }
 
-    pub(crate) fn finish_column_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn finish_column_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.column_resize.take().is_none() {
             return;
         }
@@ -50,7 +50,7 @@ impl AppView {
         self.persist_column_layout(layout, window, cx);
     }
 
-    pub(crate) fn reset_column_width(
+    pub fn reset_column_width(
         &mut self,
         column: ColumnId,
         window: &mut Window,
@@ -67,35 +67,35 @@ impl AppView {
 
     /// The four reset verbs the columns sheet exposes. Each changes only the
     /// dimension it names; `reset_all_columns` restores every default.
-    pub(crate) fn reset_column_widths(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reset_column_widths(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset_widths();
         self.commit_column_layout(layout, window, cx);
         window.push_notification(Notification::info(t!("columns-reset")), cx);
     }
 
-    pub(crate) fn reset_column_order(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reset_column_order(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset_order();
         self.commit_column_layout(layout, window, cx);
         window.push_notification(Notification::info(t!("columns-reset")), cx);
     }
 
-    pub(crate) fn reset_column_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reset_column_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset_visibility();
         self.commit_column_layout(layout, window, cx);
         window.push_notification(Notification::info(t!("columns-reset")), cx);
     }
 
-    pub(crate) fn reset_all_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reset_all_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset();
         self.commit_column_layout(layout, window, cx);
         window.push_notification(Notification::info(t!("columns-reset")), cx);
     }
 
-    pub(crate) fn commit_column_layout(
+    pub fn commit_column_layout(
         &mut self,
         layout: ColumnLayout,
         window: &mut Window,
@@ -109,12 +109,12 @@ impl AppView {
 
     /// The layout is the only state the table needs to repaint; the delegate
     /// reads it through the per-frame metrics.
-    fn notify_table(&mut self, cx: &mut Context<Self>) {
+    pub fn notify_table(&mut self, cx: &mut Context<Self>) {
         self.libraries.update(cx, |_, list_cx| list_cx.notify());
         cx.notify();
     }
 
-    fn persist_column_layout(
+    pub fn persist_column_layout(
         &mut self,
         layout: ColumnLayout,
         window: &mut Window,
@@ -131,7 +131,7 @@ impl AppView {
     /// R17: size one column to its widest row text (or its header, with the
     /// sort marker) plus the cell chrome. The explicit width stops Name
     /// flexing, which is the signed behaviour.
-    pub(crate) fn fit_column_to_content(
+    pub fn fit_column_to_content(
         &mut self,
         column: ColumnId,
         window: &mut Window,
@@ -143,11 +143,7 @@ impl AppView {
         self.commit_column_layout(layout, window, cx);
     }
 
-    pub(crate) fn fit_all_columns_to_content(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn fit_all_columns_to_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let measured = self.measured_column_widths(window, cx);
         let mut layout = self.column_layout;
         layout.fit_all(|column| measured[column.index()]);
@@ -157,7 +153,7 @@ impl AppView {
     /// One measurement pass for every column. Header labels include the
     /// longest direction marker so an active header never truncates its own
     /// name; the rows come from the delegate, so off-screen rows count too.
-    fn measured_column_widths(&self, window: &mut Window, cx: &App) -> [f32; 7] {
+    pub fn measured_column_widths(&self, window: &mut Window, cx: &App) -> [f32; 7] {
         let libraries = self.libraries.read(cx);
         let delegate = libraries.delegate();
         let inputs = RowViewInputs {
@@ -209,7 +205,7 @@ impl AppView {
 
     /// Move one column one slot in the sheet's list. Locked columns move like
     /// every other column; only hiding is locked.
-    pub(crate) fn move_column_step(
+    pub fn move_column_step(
         &mut self,
         column: ColumnId,
         up: bool,
@@ -234,7 +230,7 @@ impl AppView {
     }
 }
 
-fn measure_fit_text(text: &str, window: &mut Window) -> f32 {
+pub fn measure_fit_text(text: &str, window: &mut Window) -> f32 {
     if text.is_empty() {
         return 0.;
     }
@@ -258,8 +254,8 @@ fn measure_fit_text(text: &str, window: &mut Window) -> f32 {
 
 /// T-04: the chip under the pointer while a header is dragged. It names the
 /// column being moved so the drop result is obvious before release.
-pub(crate) struct ColumnDragPreview {
-    pub(crate) label: String,
+pub struct ColumnDragPreview {
+    pub label: String,
 }
 
 impl Render for ColumnDragPreview {
@@ -278,25 +274,20 @@ impl Render for ColumnDragPreview {
 }
 
 impl AppView {
-    pub(crate) fn hover_column_drop(
-        &mut self,
-        column: ColumnId,
-        side: DropSide,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn hover_column_drop(&mut self, column: ColumnId, side: DropSide, cx: &mut Context<Self>) {
         if self.column_drop != Some((column, side)) {
             self.column_drop = Some((column, side));
             cx.notify();
         }
     }
 
-    pub(crate) fn clear_column_drop(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_column_drop(&mut self, cx: &mut Context<Self>) {
         if self.column_drop.take().is_some() {
             cx.notify();
         }
     }
 
-    pub(crate) fn drop_column(
+    pub fn drop_column(
         &mut self,
         drag: ColumnDrag,
         target: ColumnId,
@@ -321,13 +312,13 @@ impl AppView {
 /// R11: the Columns sheet's live body. It observes the app so a visibility,
 /// order or width change repaints here without closing and reopening the
 /// sheet; the sheet's chrome is built once by the root.
-pub(crate) struct ColumnsSheetBody {
-    app: Entity<AppView>,
-    _app_subscription: Subscription,
+pub struct ColumnsSheetBody {
+    pub app: Entity<AppView>,
+    pub _app_subscription: Subscription,
 }
 
 impl ColumnsSheetBody {
-    pub(crate) fn new(app: Entity<AppView>, cx: &mut Context<Self>) -> Self {
+    pub fn new(app: Entity<AppView>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&app, |_, _, cx| cx.notify());
         Self {
             app,

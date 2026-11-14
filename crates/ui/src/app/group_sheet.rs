@@ -7,7 +7,7 @@
 use crate::*;
 
 impl AppView {
-    pub(crate) fn open_new_group_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_new_group_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name_state = cx.new(|cx| InputState::new(window, cx));
         let view = cx.entity();
         let reader = name_state.clone();
@@ -43,7 +43,7 @@ impl AppView {
     /// A created group is session-only; it needs no store row to exist. The
     /// reserved default name belongs to the `Ungrouped` bucket, and an existing
     /// group is never duplicated in the nav.
-    pub(crate) fn create_group(
+    pub fn create_group(
         &mut self,
         name: &str,
         window: &mut Window,
@@ -75,7 +75,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn rename_group_scope(
+    pub fn rename_group_scope(
         &mut self,
         old: &str,
         new: &str,
@@ -85,16 +85,11 @@ impl AppView {
         self.commit_rename_group(old, new, window, cx)
     }
 
-    pub(crate) fn delete_group_scope(
-        &mut self,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn delete_group_scope(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_delete_group(name, window, cx);
     }
 
-    pub(crate) fn open_group_manage_sheet(
+    pub fn open_group_manage_sheet(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -284,7 +279,7 @@ impl AppView {
     }
 }
 
-fn prune_label(kind: GroupPruneKind) -> String {
+pub fn prune_label(kind: GroupPruneKind) -> String {
     match kind {
         GroupPruneKind::Duplicates => t!("prune-duplicates"),
         GroupPruneKind::Unavailable => t!("prune-unavailable"),

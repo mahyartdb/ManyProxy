@@ -6,7 +6,7 @@ use crate::*;
 /// One menu row for the batch bar's overflow. The row carries its own stable
 /// id so the menu contents are provable in the completed frame; Delete is the
 /// only danger row.
-fn batch_menu_item(
+pub fn batch_menu_item(
     id: &'static str,
     label: String,
     danger: bool,
@@ -41,7 +41,7 @@ impl AppView {
     ///
     /// Left to right: `×`, the count, the running count, the batch's own
     /// result, `Show failures`, the hidden count, then the verbs.
-    pub(crate) fn render_batch_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_batch_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.selection_count();
         if selected == 0 {
             return div().id("batch-bar").test_support().into_any_element();
@@ -216,7 +216,7 @@ impl AppView {
     }
 
     /// The batch bar's overflow. It is a popover, never a second bar.
-    fn render_batch_more(&self, view: Entity<AppView>) -> AnyElement {
+    pub fn render_batch_more(&self, view: Entity<AppView>) -> AnyElement {
         let enabled = self
             .selection
             .iter()
@@ -298,7 +298,7 @@ impl AppView {
     }
 
     /// Whether a batch is still running. The bar's own verbs wait for it.
-    pub(crate) fn batch_running(&self) -> bool {
+    pub fn batch_running(&self) -> bool {
         self.batch
             .as_ref()
             .is_some_and(|batch| batch.done < batch.total())
@@ -307,7 +307,7 @@ impl AppView {
     /// Settle a Start batch from the engine's applied set. An id the snapshot
     /// holds but the engine did not apply counts as failed — dirty, unreadable,
     /// refused or skipped, the row is not serving.
-    pub(crate) fn settle_batch_start(&mut self, applied: &[String]) {
+    pub fn settle_batch_start(&mut self, applied: &[String]) {
         let Some(batch) = self.batch.as_mut() else {
             return;
         };
@@ -326,7 +326,7 @@ impl AppView {
 
     /// Settle a Stop batch from the engine: every snapshotted row that is no
     /// longer serving counts as stopped, whether it was running or not.
-    pub(crate) fn settle_batch_stop(&mut self) {
+    pub fn settle_batch_stop(&mut self) {
         let Some(batch) = self.batch.as_ref() else {
             return;
         };
@@ -348,7 +348,7 @@ impl AppView {
 
     /// Settle a Test batch from the probe's outcomes. A snapshotted row the
     /// probe never sampled counts as failed: it was not tested.
-    pub(crate) fn settle_batch_test(&mut self, outcomes: &[TestOutcome]) {
+    pub fn settle_batch_test(&mut self, outcomes: &[TestOutcome]) {
         let Some(batch) = self.batch.as_ref() else {
             return;
         };
@@ -374,7 +374,7 @@ impl AppView {
 
     /// The batch bar's `Start with ManyProxy` / `Don't start with ManyProxy`:
     /// the enabled flag flips for every selected config.
-    pub(crate) fn toggle_selection_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_selection_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -389,11 +389,7 @@ impl AppView {
     }
 
     /// The batch bar's `Reset → Traffic`: every selected config's counters.
-    pub(crate) fn reset_traffic_for_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn reset_traffic_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -405,11 +401,7 @@ impl AppView {
     }
 
     /// The batch bar's `Reset → Usage`: every selected config's counters.
-    pub(crate) fn reset_usage_for_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn reset_usage_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -422,7 +414,7 @@ impl AppView {
 
     /// R29: the table narrows to the ids the last batch failed on. The
     /// ordinary filter controls take it away again.
-    pub(crate) fn show_batch_failures(
+    pub fn show_batch_failures(
         &mut self,
         failed: &[String],
         window: &mut Window,
@@ -435,7 +427,7 @@ impl AppView {
 
     /// The hidden count's button: the filter goes away and the first hidden
     /// selected row comes into view. The selection does not change.
-    pub(crate) fn reveal_hidden_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reveal_hidden_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible = self.visible_row_ids(cx);
         let hidden = {
             let delegate = self.libraries.read(cx);
@@ -463,7 +455,7 @@ impl AppView {
     }
 
     /// Escape: the top layer goes first, then the selection.
-    pub(crate) fn clear_selection_unless_dialog(
+    pub fn clear_selection_unless_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -505,7 +497,7 @@ impl AppView {
 
     /// Shift+Up/Down: the focus moves one row and the range from the anchor
     /// to the new focus replaces the set.
-    pub(crate) fn extend_selection_by(
+    pub fn extend_selection_by(
         &mut self,
         delta: isize,
         window: &mut Window,
@@ -515,13 +507,13 @@ impl AppView {
     }
 
     /// Ctrl+A: select every row the filters keep, without moving the focus.
-    pub(crate) fn select_all_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_all_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.select_all_visible_rows(cx);
     }
     /// The batch bar's Start: the selection is snapshotted, and the snapshot
     /// is what runs. Changing the selection mid-flight never changes the
     /// batch.
-    pub(crate) fn start_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -533,7 +525,7 @@ impl AppView {
     }
 
     /// The batch bar's Stop: the same snapshot rule.
-    pub(crate) fn stop_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -545,7 +537,7 @@ impl AppView {
     }
 
     /// The batch bar's Test: the same snapshot rule.
-    pub(crate) fn test_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn test_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -556,7 +548,7 @@ impl AppView {
         self.test_selected_rows(&ids, window, cx);
     }
 
-    pub(crate) fn start_rows(
+    pub fn start_rows(
         &mut self,
         rows: Vec<ProxyConfig>,
         window: &mut Window,
@@ -602,7 +594,7 @@ impl AppView {
             return;
         }
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-        if cfg!(test) {
+        if cfg!(any(test, feature = "test-support")) {
             self.commit_bulk_start_ids(&ids, window, cx);
         } else {
             self.spawn_commit_bulk_start_ids(ids, window, cx);
@@ -612,7 +604,7 @@ impl AppView {
     /// The Start action for a row menu and for the selection shortcuts. One
     /// row keeps the single-row path (and its own toasts); several rows share
     /// the batch apply the bulk bar already uses.
-    pub(crate) fn start_selected_rows(
+    pub fn start_selected_rows(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -626,7 +618,7 @@ impl AppView {
         self.start_rows(rows, window, cx);
     }
 
-    pub(crate) fn commit_bulk_start_ids(
+    pub fn commit_bulk_start_ids(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -726,7 +718,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn spawn_commit_start_selected(
+    pub fn spawn_commit_start_selected(
         &mut self,
         id: String,
         window: &Window,
@@ -747,7 +739,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn spawn_commit_start_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub fn spawn_commit_start_all(&mut self, window: &Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
         let view = cx.entity().clone();
         cx.spawn(async move |_, cx| {
@@ -761,7 +753,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn spawn_commit_bulk_start_ids(
+    pub fn spawn_commit_bulk_start_ids(
         &mut self,
         ids: Vec<String>,
         window: &Window,
@@ -782,7 +774,7 @@ impl AppView {
         .detach();
     }
 
-    pub(crate) fn stop_selected_rows(
+    pub fn stop_selected_rows(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -795,7 +787,7 @@ impl AppView {
         self.stop_ids(ids, window, cx);
     }
 
-    pub(crate) fn stop_ids(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_ids(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -862,7 +854,7 @@ impl AppView {
     /// The signed delete split: one row goes at once, two or more confirm
     /// first. A row a filter hides still counts — the selection is not a
     /// visible-row set.
-    pub(crate) fn delete_selected_rows(
+    pub fn delete_selected_rows(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -882,13 +874,13 @@ impl AppView {
     }
 
     /// The batch bar's Delete: the same split, on the selection.
-    pub(crate) fn delete_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_selected_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         self.delete_selected_rows(&ids, window, cx);
     }
 
     /// One row deletes at once; the Undo toast is the safety net.
-    pub(crate) fn delete_row_immediately(
+    pub fn delete_row_immediately(
         &mut self,
         id: &str,
         window: &mut Window,
@@ -900,7 +892,7 @@ impl AppView {
 
     /// Two or more: one confirm that names the rows, the running count and
     /// the subscription count.
-    pub(crate) fn open_bulk_delete_confirm(
+    pub fn open_bulk_delete_confirm(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -960,7 +952,7 @@ impl AppView {
     }
 
     /// The confirmed delete: every row goes, and one Undo toast covers them.
-    pub(crate) fn commit_bulk_delete_ids(
+    pub fn commit_bulk_delete_ids(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -974,7 +966,7 @@ impl AppView {
         self.commit_bulk_delete(&targets, window, cx);
     }
 
-    pub(crate) fn commit_bulk_delete(
+    pub fn commit_bulk_delete(
         &mut self,
         targets: &[(String, String)],
         window: &mut Window,
@@ -1022,12 +1014,12 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_bulk_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_bulk_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         self.open_move_ids_dialog(ids, window, cx);
     }
 
-    pub(crate) fn move_selected_rows(
+    pub fn move_selected_rows(
         &mut self,
         ids: &[String],
         window: &mut Window,
@@ -1040,7 +1032,7 @@ impl AppView {
         self.open_move_ids_dialog(ids.to_vec(), window, cx);
     }
 
-    fn open_move_ids_dialog(
+    pub fn open_move_ids_dialog(
         &mut self,
         ids: Vec<String>,
         window: &mut Window,
@@ -1089,12 +1081,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_row_move_dialog(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_row_move_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -1138,7 +1125,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn commit_bulk_move(
+    pub fn commit_bulk_move(
         &mut self,
         ids: &[String],
         group: &str,
@@ -1169,7 +1156,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_group_rename_dialog(
+    pub fn open_group_rename_dialog(
         &mut self,
         old: &str,
         window: &mut Window,
@@ -1211,7 +1198,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn open_group_edit_dialog(
+    pub fn open_group_edit_dialog(
         &mut self,
         group: &str,
         window: &mut Window,
@@ -1279,7 +1266,7 @@ impl AppView {
         });
     }
 
-    pub(crate) fn commit_edit_group(
+    pub fn commit_edit_group(
         &mut self,
         old: &str,
         new: &str,
@@ -1329,7 +1316,7 @@ impl AppView {
         true
     }
 
-    pub(crate) fn commit_rename_group(
+    pub fn commit_rename_group(
         &mut self,
         old: &str,
         new: &str,
@@ -1407,12 +1394,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn commit_delete_group(
-        &mut self,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_delete_group(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_group(name) {
             Ok(()) => {
                 self.created_groups.retain(|group| group != name);
@@ -1434,7 +1416,7 @@ impl AppView {
         }
     }
 
-    pub(crate) fn open_group_delete_confirm(
+    pub fn open_group_delete_confirm(
         &mut self,
         name: &str,
         window: &mut Window,

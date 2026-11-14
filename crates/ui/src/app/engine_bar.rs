@@ -12,7 +12,7 @@ impl AppView {
     /// The engine's last error rides here: the retired status strip was the
     /// one surface that kept a crashed engine's cause on screen, and this bar
     /// is its replacement.
-    pub(crate) fn render_engine_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_engine_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let engine_text = engine_status_text(&self.engine);
         let running = self.engine.running_count();
         let usage_text = summed_traffic_text(&self.store);
@@ -126,7 +126,7 @@ impl AppView {
     /// Slice 6: the engine bar's `Console` toggle. It shows its active state
     /// and swaps its tooltip between Show/Hide; the shortcut lives on
     /// `toggle-console` (`Ctrl+\``).
-    fn render_console_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_console_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
         let open = self.console.open;
         let label = if open {
             t!("console-hide")
@@ -154,7 +154,7 @@ impl AppView {
     /// The engine bar's `⋯`: the verbs that act on the pool rather than on
     /// one row. `Stop testing` is only live while a probe batch runs;
     /// `Clear test results…` is only live while health samples exist.
-    pub(crate) fn render_engine_menu(&self, view: Entity<AppView>, testing: bool) -> AnyElement {
+    pub fn render_engine_menu(&self, view: Entity<AppView>, testing: bool) -> AnyElement {
         let has_samples = self.health_store.has_samples();
         Button::new("engine-bar-overflow")
             .small()

@@ -10,10 +10,10 @@ use crate::*;
 /// this delegate. Item ids stay `protocol-option-{protocol}` so the UIA
 /// fixtures and option clicks keep their stable anchors.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DialogProtocolChoice {
-    id: String,
-    title: String,
-    pub(crate) value: String,
+pub struct DialogProtocolChoice {
+    pub id: String,
+    pub title: String,
+    pub value: String,
 }
 
 impl SearchableListItem for DialogProtocolChoice {
@@ -29,7 +29,7 @@ impl SearchableListItem for DialogProtocolChoice {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DialogProtocolChoiceList(pub(crate) Vec<DialogProtocolChoice>);
+pub struct DialogProtocolChoiceList(pub Vec<DialogProtocolChoice>);
 
 impl SearchableListDelegate for DialogProtocolChoiceList {
     type Item = DialogProtocolChoice;
@@ -71,7 +71,7 @@ impl SearchableListDelegate for DialogProtocolChoiceList {
     }
 }
 
-pub(crate) fn dialog_protocol_choices() -> Vec<DialogProtocolChoice> {
+pub fn dialog_protocol_choices() -> Vec<DialogProtocolChoice> {
     protocol_choices()
         .into_iter()
         .map(|choice| DialogProtocolChoice {
@@ -82,7 +82,7 @@ pub(crate) fn dialog_protocol_choices() -> Vec<DialogProtocolChoice> {
         .collect()
 }
 
-pub(crate) fn password_row(
+pub fn password_row(
     label: impl Into<String>,
     id: &'static str,
     secret: &Entity<InputState>,
@@ -106,7 +106,7 @@ pub(crate) fn password_row(
     )
 }
 
-pub(crate) fn panel_toggle_button(
+pub fn panel_toggle_button(
     id: &'static str,
     label: impl Into<SharedString>,
     view: &Entity<AppView>,
@@ -127,7 +127,7 @@ pub(crate) fn panel_toggle_button(
 }
 
 /// F5: a guided field's error belongs beside that field, not at the form foot.
-fn local_field_error(
+pub fn local_field_error(
     id: &'static str,
     form_error: Option<&(String, String)>,
     field: &str,
@@ -146,216 +146,216 @@ fn local_field_error(
 }
 
 #[derive(Clone)]
-pub(crate) struct ConfigForm {
-    pub(crate) name: Entity<InputState>,
+pub struct ConfigForm {
+    pub name: Entity<InputState>,
 
-    pub(crate) protocol_select: Entity<SelectState<DialogProtocolChoiceList>>,
+    pub protocol_select: Entity<SelectState<DialogProtocolChoiceList>>,
 
-    pub(crate) last_protocol: Rc<RefCell<String>>,
+    pub last_protocol: Rc<RefCell<String>>,
 
-    pub(crate) protocol_locked: bool,
+    pub protocol_locked: bool,
 
-    pub(crate) locked_protocol: String,
+    pub locked_protocol: String,
 
-    pub(crate) vless_uuid: Entity<InputState>,
-    pub(crate) vless_flow: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) vless_packet_encoding: Entity<SelectState<PanelChoiceList>>,
+    pub vless_uuid: Entity<InputState>,
+    pub vless_flow: Entity<SelectState<PanelChoiceList>>,
+    pub vless_packet_encoding: Entity<SelectState<PanelChoiceList>>,
 
-    pub(crate) s1_network: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) s1_path: Entity<InputState>,
-    pub(crate) s1_host: Entity<InputState>,
-    pub(crate) s1_method: Entity<InputState>,
-    pub(crate) s1_service_name: Entity<InputState>,
-    pub(crate) s1_open: Rc<RefCell<bool>>,
+    pub s1_network: Entity<SelectState<PanelChoiceList>>,
+    pub s1_path: Entity<InputState>,
+    pub s1_host: Entity<InputState>,
+    pub s1_method: Entity<InputState>,
+    pub s1_service_name: Entity<InputState>,
+    pub s1_open: Rc<RefCell<bool>>,
 
-    pub(crate) s2_enable: Rc<RefCell<bool>>,
-    pub(crate) s2_sni: Entity<InputState>,
-    pub(crate) s2_alpn: Entity<InputState>,
-    pub(crate) s2_fp: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) s2_insecure: Rc<RefCell<bool>>,
-    pub(crate) s2_pbk: Entity<InputState>,
-    pub(crate) s2_sid: Entity<InputState>,
-    pub(crate) s2_open: Rc<RefCell<bool>>,
+    pub s2_enable: Rc<RefCell<bool>>,
+    pub s2_sni: Entity<InputState>,
+    pub s2_alpn: Entity<InputState>,
+    pub s2_fp: Entity<SelectState<PanelChoiceList>>,
+    pub s2_insecure: Rc<RefCell<bool>>,
+    pub s2_pbk: Entity<InputState>,
+    pub s2_sid: Entity<InputState>,
+    pub s2_open: Rc<RefCell<bool>>,
 
-    pub(crate) s3_mode: Rc<RefCell<String>>,
-    pub(crate) s3_brutal: Rc<RefCell<bool>>,
-    pub(crate) s3_up: Entity<InputState>,
-    pub(crate) s3_down: Entity<InputState>,
-    pub(crate) s3_open: Rc<RefCell<bool>>,
+    pub s3_mode: Rc<RefCell<String>>,
+    pub s3_brutal: Rc<RefCell<bool>>,
+    pub s3_up: Entity<InputState>,
+    pub s3_down: Entity<InputState>,
+    pub s3_open: Rc<RefCell<bool>>,
 
-    pub(crate) s4_reuse: Rc<RefCell<bool>>,
-    pub(crate) s4_fastopen: Rc<RefCell<bool>>,
-    pub(crate) s4_fragment: Rc<RefCell<bool>>,
-    pub(crate) s4_multipath: Rc<RefCell<bool>>,
-    pub(crate) s4_timeout: Entity<InputState>,
-    pub(crate) s4_bind: Entity<InputState>,
-    pub(crate) s4_inet4: Entity<InputState>,
-    pub(crate) s4_inet6: Entity<InputState>,
+    pub s4_reuse: Rc<RefCell<bool>>,
+    pub s4_fastopen: Rc<RefCell<bool>>,
+    pub s4_fragment: Rc<RefCell<bool>>,
+    pub s4_multipath: Rc<RefCell<bool>>,
+    pub s4_timeout: Entity<InputState>,
+    pub s4_bind: Entity<InputState>,
+    pub s4_inet4: Entity<InputState>,
+    pub s4_inet6: Entity<InputState>,
 
-    pub(crate) vmess_uuid: Entity<InputState>,
-    pub(crate) vmess_aid: Entity<InputState>,
-    pub(crate) vmess_security: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) vmess_packet_encoding: Entity<SelectState<PanelChoiceList>>,
+    pub vmess_uuid: Entity<InputState>,
+    pub vmess_aid: Entity<InputState>,
+    pub vmess_security: Entity<SelectState<PanelChoiceList>>,
+    pub vmess_packet_encoding: Entity<SelectState<PanelChoiceList>>,
 
-    pub(crate) trojan_password: Entity<InputState>,
+    pub trojan_password: Entity<InputState>,
 
-    pub(crate) ss_method: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) ss_password: Entity<InputState>,
-    pub(crate) ss_plugin: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) ss_plugin_opts: Entity<InputState>,
-    pub(crate) ss_uot: Rc<RefCell<bool>>,
+    pub ss_method: Entity<SelectState<PanelChoiceList>>,
+    pub ss_password: Entity<InputState>,
+    pub ss_plugin: Entity<SelectState<PanelChoiceList>>,
+    pub ss_plugin_opts: Entity<InputState>,
+    pub ss_uot: Rc<RefCell<bool>>,
 
-    pub(crate) wg_private: Entity<InputState>,
-    pub(crate) wg_public: Entity<InputState>,
-    pub(crate) wg_preshared: Entity<InputState>,
-    pub(crate) wg_reserved: Entity<InputState>,
-    pub(crate) wg_keepalive: Entity<InputState>,
-    pub(crate) wg_local_addr: Entity<InputState>,
-    pub(crate) wg_dns: Entity<InputState>,
-    pub(crate) wg_mtu: Entity<InputState>,
-    pub(crate) wg_workers: Entity<InputState>,
-    pub(crate) wg_sys_ifc: Rc<RefCell<bool>>,
+    pub wg_private: Entity<InputState>,
+    pub wg_public: Entity<InputState>,
+    pub wg_preshared: Entity<InputState>,
+    pub wg_reserved: Entity<InputState>,
+    pub wg_keepalive: Entity<InputState>,
+    pub wg_local_addr: Entity<InputState>,
+    pub wg_dns: Entity<InputState>,
+    pub wg_mtu: Entity<InputState>,
+    pub wg_workers: Entity<InputState>,
+    pub wg_sys_ifc: Rc<RefCell<bool>>,
 
-    pub(crate) awg_private: Entity<InputState>,
-    pub(crate) awg_public: Entity<InputState>,
-    pub(crate) awg_preshared: Entity<InputState>,
-    pub(crate) awg_reserved: Entity<InputState>,
-    pub(crate) awg_keepalive: Entity<InputState>,
-    pub(crate) awg_local_addr: Entity<InputState>,
-    pub(crate) awg_dns: Entity<InputState>,
-    pub(crate) awg_mtu: Entity<InputState>,
-    pub(crate) awg_workers: Entity<InputState>,
-    pub(crate) awg_sys_ifc: Rc<RefCell<bool>>,
-    pub(crate) awg_version: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) awg_enable: Rc<RefCell<bool>>,
-    pub(crate) awg_jc: Entity<InputState>,
-    pub(crate) awg_jmin: Entity<InputState>,
-    pub(crate) awg_jmax: Entity<InputState>,
-    pub(crate) awg_s1: Entity<InputState>,
-    pub(crate) awg_s2: Entity<InputState>,
-    pub(crate) awg_s3: Entity<InputState>,
-    pub(crate) awg_s4: Entity<InputState>,
-    pub(crate) awg_h1: Entity<InputState>,
-    pub(crate) awg_h2: Entity<InputState>,
-    pub(crate) awg_h3: Entity<InputState>,
-    pub(crate) awg_h4: Entity<InputState>,
-    pub(crate) awg_i1: Entity<InputState>,
-    pub(crate) awg_i2: Entity<InputState>,
-    pub(crate) awg_i3: Entity<InputState>,
-    pub(crate) awg_i4: Entity<InputState>,
-    pub(crate) awg_i5: Entity<InputState>,
-    pub(crate) awg_hpk: Entity<InputState>,
-    pub(crate) awg_pad: Entity<InputState>,
-    pub(crate) awg_rekey_after: Entity<InputState>,
-    pub(crate) awg_rekey_timeout: Entity<InputState>,
-    pub(crate) awg_reject_after: Entity<InputState>,
-    pub(crate) awg_keepalive_timeout: Entity<InputState>,
-    pub(crate) awg_max_handshake: Entity<InputState>,
-    pub(crate) awg_trailers: Rc<RefCell<bool>>,
-    pub(crate) awg_cookies: Rc<RefCell<bool>>,
+    pub awg_private: Entity<InputState>,
+    pub awg_public: Entity<InputState>,
+    pub awg_preshared: Entity<InputState>,
+    pub awg_reserved: Entity<InputState>,
+    pub awg_keepalive: Entity<InputState>,
+    pub awg_local_addr: Entity<InputState>,
+    pub awg_dns: Entity<InputState>,
+    pub awg_mtu: Entity<InputState>,
+    pub awg_workers: Entity<InputState>,
+    pub awg_sys_ifc: Rc<RefCell<bool>>,
+    pub awg_version: Entity<SelectState<PanelChoiceList>>,
+    pub awg_enable: Rc<RefCell<bool>>,
+    pub awg_jc: Entity<InputState>,
+    pub awg_jmin: Entity<InputState>,
+    pub awg_jmax: Entity<InputState>,
+    pub awg_s1: Entity<InputState>,
+    pub awg_s2: Entity<InputState>,
+    pub awg_s3: Entity<InputState>,
+    pub awg_s4: Entity<InputState>,
+    pub awg_h1: Entity<InputState>,
+    pub awg_h2: Entity<InputState>,
+    pub awg_h3: Entity<InputState>,
+    pub awg_h4: Entity<InputState>,
+    pub awg_i1: Entity<InputState>,
+    pub awg_i2: Entity<InputState>,
+    pub awg_i3: Entity<InputState>,
+    pub awg_i4: Entity<InputState>,
+    pub awg_i5: Entity<InputState>,
+    pub awg_hpk: Entity<InputState>,
+    pub awg_pad: Entity<InputState>,
+    pub awg_rekey_after: Entity<InputState>,
+    pub awg_rekey_timeout: Entity<InputState>,
+    pub awg_reject_after: Entity<InputState>,
+    pub awg_keepalive_timeout: Entity<InputState>,
+    pub awg_max_handshake: Entity<InputState>,
+    pub awg_trailers: Rc<RefCell<bool>>,
+    pub awg_cookies: Rc<RefCell<bool>>,
 
-    pub(crate) hy_server_ports: Entity<InputState>,
-    pub(crate) hy_hop_interval: Entity<InputState>,
-    pub(crate) hy_up: Entity<InputState>,
-    pub(crate) hy_down: Entity<InputState>,
-    pub(crate) hy_obfs: Entity<InputState>,
-    pub(crate) hy_auth_type: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) hy_auth: Entity<InputState>,
-    pub(crate) hy_recv_conn: Entity<InputState>,
-    pub(crate) hy_recv: Entity<InputState>,
-    pub(crate) hy_mtu: Rc<RefCell<bool>>,
-    pub(crate) hy_password: Entity<InputState>,
+    pub hy_server_ports: Entity<InputState>,
+    pub hy_hop_interval: Entity<InputState>,
+    pub hy_up: Entity<InputState>,
+    pub hy_down: Entity<InputState>,
+    pub hy_obfs: Entity<InputState>,
+    pub hy_auth_type: Entity<SelectState<PanelChoiceList>>,
+    pub hy_auth: Entity<InputState>,
+    pub hy_recv_conn: Entity<InputState>,
+    pub hy_recv: Entity<InputState>,
+    pub hy_mtu: Rc<RefCell<bool>>,
+    pub hy_password: Entity<InputState>,
 
-    pub(crate) tuic_uuid: Entity<InputState>,
-    pub(crate) tuic_password: Entity<InputState>,
-    pub(crate) tuic_cc: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) tuic_relay: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) tuic_uot: Rc<RefCell<bool>>,
-    pub(crate) tuic_zero_rtt: Rc<RefCell<bool>>,
-    pub(crate) tuic_heartbeat: Entity<InputState>,
+    pub tuic_uuid: Entity<InputState>,
+    pub tuic_password: Entity<InputState>,
+    pub tuic_cc: Entity<SelectState<PanelChoiceList>>,
+    pub tuic_relay: Entity<SelectState<PanelChoiceList>>,
+    pub tuic_uot: Rc<RefCell<bool>>,
+    pub tuic_zero_rtt: Rc<RefCell<bool>>,
+    pub tuic_heartbeat: Entity<InputState>,
 
-    pub(crate) socks_version: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) socks_username: Entity<InputState>,
-    pub(crate) socks_password: Entity<InputState>,
-    pub(crate) socks_network: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) socks_uot: Rc<RefCell<bool>>,
+    pub socks_version: Entity<SelectState<PanelChoiceList>>,
+    pub socks_username: Entity<InputState>,
+    pub socks_password: Entity<InputState>,
+    pub socks_network: Entity<SelectState<PanelChoiceList>>,
+    pub socks_uot: Rc<RefCell<bool>>,
 
-    pub(crate) http_username: Entity<InputState>,
-    pub(crate) http_password: Entity<InputState>,
-    pub(crate) http_path: Entity<InputState>,
-    pub(crate) http_headers: Entity<InputState>,
+    pub http_username: Entity<InputState>,
+    pub http_password: Entity<InputState>,
+    pub http_path: Entity<InputState>,
+    pub http_headers: Entity<InputState>,
 
-    pub(crate) anytls_password: Entity<InputState>,
-    pub(crate) anytls_interval: Entity<InputState>,
-    pub(crate) anytls_timeout: Entity<InputState>,
-    pub(crate) anytls_min: Entity<InputState>,
+    pub anytls_password: Entity<InputState>,
+    pub anytls_interval: Entity<InputState>,
+    pub anytls_timeout: Entity<InputState>,
+    pub anytls_min: Entity<InputState>,
 
-    pub(crate) naive_username: Entity<InputState>,
-    pub(crate) naive_password: Entity<InputState>,
-    pub(crate) naive_uot: Rc<RefCell<bool>>,
-    pub(crate) naive_quic: Rc<RefCell<bool>>,
-    pub(crate) naive_cc: Entity<SelectState<PanelChoiceList>>,
+    pub naive_username: Entity<InputState>,
+    pub naive_password: Entity<InputState>,
+    pub naive_uot: Rc<RefCell<bool>>,
+    pub naive_quic: Rc<RefCell<bool>>,
+    pub naive_cc: Entity<SelectState<PanelChoiceList>>,
 
-    pub(crate) ssh_user: Entity<InputState>,
-    pub(crate) ssh_password: Entity<InputState>,
-    pub(crate) ssh_private_key: Entity<TextareaState>,
-    pub(crate) ssh_key_path: Entity<InputState>,
-    pub(crate) ssh_key_pass: Entity<InputState>,
-    pub(crate) ssh_host_key: Entity<InputState>,
-    pub(crate) ssh_host_key_algs: Entity<InputState>,
-    pub(crate) ssh_client_version: Entity<InputState>,
+    pub ssh_user: Entity<InputState>,
+    pub ssh_password: Entity<InputState>,
+    pub ssh_private_key: Entity<TextareaState>,
+    pub ssh_key_path: Entity<InputState>,
+    pub ssh_key_pass: Entity<InputState>,
+    pub ssh_host_key: Entity<InputState>,
+    pub ssh_host_key_algs: Entity<InputState>,
+    pub ssh_client_version: Entity<InputState>,
 
-    pub(crate) snell_psk: Entity<InputState>,
-    pub(crate) snell_version: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) snell_obfs_mode: Entity<InputState>,
-    pub(crate) snell_obfs_host: Entity<InputState>,
-    pub(crate) snell_userkey: Entity<InputState>,
-    pub(crate) snell_reuse: Rc<RefCell<bool>>,
-    pub(crate) snell_network: Entity<InputState>,
-    pub(crate) snell_mode: Entity<InputState>,
+    pub snell_psk: Entity<InputState>,
+    pub snell_version: Entity<SelectState<PanelChoiceList>>,
+    pub snell_obfs_mode: Entity<InputState>,
+    pub snell_obfs_host: Entity<InputState>,
+    pub snell_userkey: Entity<InputState>,
+    pub snell_reuse: Rc<RefCell<bool>>,
+    pub snell_network: Entity<InputState>,
+    pub snell_mode: Entity<InputState>,
 
-    pub(crate) shadowtls_version: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) shadowtls_password: Entity<InputState>,
+    pub shadowtls_version: Entity<SelectState<PanelChoiceList>>,
+    pub shadowtls_password: Entity<InputState>,
 
-    pub(crate) xray_uuid: Entity<InputState>,
-    pub(crate) xray_enc: Entity<InputState>,
-    pub(crate) xray_flow: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) xray_sni: Entity<InputState>,
-    pub(crate) xray_fp: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) xray_alpn: Entity<InputState>,
-    pub(crate) xray_pbk: Entity<InputState>,
-    pub(crate) xray_sid: Entity<InputState>,
-    pub(crate) xray_spiderx: Entity<InputState>,
-    pub(crate) xray_network: Entity<SelectState<PanelChoiceList>>,
-    pub(crate) xray_mode: Entity<InputState>,
-    pub(crate) xray_mux: Entity<SelectState<PanelChoiceList>>,
+    pub xray_uuid: Entity<InputState>,
+    pub xray_enc: Entity<InputState>,
+    pub xray_flow: Entity<SelectState<PanelChoiceList>>,
+    pub xray_sni: Entity<InputState>,
+    pub xray_fp: Entity<SelectState<PanelChoiceList>>,
+    pub xray_alpn: Entity<InputState>,
+    pub xray_pbk: Entity<InputState>,
+    pub xray_sid: Entity<InputState>,
+    pub xray_spiderx: Entity<InputState>,
+    pub xray_network: Entity<SelectState<PanelChoiceList>>,
+    pub xray_mode: Entity<InputState>,
+    pub xray_mux: Entity<SelectState<PanelChoiceList>>,
 
-    pub(crate) chain_hops: Rc<RefCell<Vec<serde_json::Value>>>,
+    pub chain_hops: Rc<RefCell<Vec<serde_json::Value>>>,
 
-    pub(crate) chain_pick: Entity<SelectState<PanelChoiceList>>,
+    pub chain_pick: Entity<SelectState<PanelChoiceList>>,
 
-    pub(crate) chain_library: Rc<RefCell<Vec<ChainLibraryEntry>>>,
+    pub chain_library: Rc<RefCell<Vec<ChainLibraryEntry>>>,
 
-    pub(crate) extra_exe: Entity<InputState>,
-    pub(crate) extra_args: Entity<InputState>,
-    pub(crate) extra_config: Entity<TextareaState>,
+    pub extra_exe: Entity<InputState>,
+    pub extra_args: Entity<InputState>,
+    pub extra_config: Entity<TextareaState>,
 
-    pub(crate) params: Entity<TextareaState>,
-    pub(crate) group: Entity<InputState>,
-    pub(crate) bind: Entity<InputState>,
-    pub(crate) port: Entity<InputState>,
+    pub params: Entity<TextareaState>,
+    pub group: Entity<InputState>,
+    pub bind: Entity<InputState>,
+    pub port: Entity<InputState>,
 
-    pub(crate) test_url: Entity<InputState>,
+    pub test_url: Entity<InputState>,
 
-    pub(crate) guided_server: Entity<InputState>,
-    pub(crate) guided_port: Entity<InputState>,
-    pub(crate) guided_identity: Entity<InputState>,
+    pub guided_server: Entity<InputState>,
+    pub guided_port: Entity<InputState>,
+    pub guided_identity: Entity<InputState>,
 
-    pub(crate) advanced: Rc<RefCell<bool>>,
+    pub advanced: Rc<RefCell<bool>>,
 }
 
 impl ConfigForm {
-    pub(crate) fn field(
+    pub fn field(
         window: &mut Window,
         cx: &mut Context<AppView>,
         placeholder: impl Into<String>,
@@ -371,7 +371,7 @@ impl ConfigForm {
         })
     }
 
-    pub(crate) fn secret_field(
+    pub fn secret_field(
         window: &mut Window,
         cx: &mut Context<AppView>,
         placeholder: impl Into<String>,
@@ -389,7 +389,7 @@ impl ConfigForm {
         })
     }
 
-    pub(crate) fn panel_select(
+    pub fn panel_select(
         window: &mut Window,
         cx: &mut Context<AppView>,
         choices: Vec<PanelChoice>,
@@ -402,7 +402,7 @@ impl ConfigForm {
         cx.new(|cx| SelectState::new(PanelChoiceList(choices), selected, window, cx))
     }
 
-    pub(crate) fn area(
+    pub fn area(
         window: &mut Window,
         cx: &mut Context<AppView>,
         placeholder: impl Into<String>,
@@ -418,7 +418,7 @@ impl ConfigForm {
         })
     }
 
-    pub(crate) fn protocol_text(&self, cx: &App) -> String {
+    pub fn protocol_text(&self, cx: &App) -> String {
         if self.protocol_locked {
             return self.locked_protocol.clone();
         }
@@ -429,7 +429,7 @@ impl ConfigForm {
             .unwrap_or_else(|| self.last_protocol.borrow().clone())
     }
 
-    pub(crate) fn sync_protocol_template(&self, window: &mut Window, cx: &mut App) {
+    pub fn sync_protocol_template(&self, window: &mut Window, cx: &mut App) {
         if self.protocol_locked {
             return;
         }
@@ -455,7 +455,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+    pub fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
         let template = protocol_params_template(DEFAULT_PROTOCOL);
         let selected = dialog_protocol_choices()
             .iter()
@@ -650,7 +650,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn prefilled(
+    pub fn prefilled(
         window: &mut Window,
         cx: &mut Context<AppView>,
         config: &ProxyConfig,
@@ -1651,7 +1651,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn port_budget_text(rows: &[ProxyConfig]) -> String {
+    pub fn port_budget_text(rows: &[ProxyConfig]) -> String {
         use crate::store::{
             AUTO_PORT_END, AUTO_PORT_SPILL_END, AUTO_PORT_SPILL_START, AUTO_PORT_START,
         };
@@ -1664,7 +1664,7 @@ impl ConfigForm {
         t!("config-port-budget", used = used, total = total)
     }
 
-    pub(crate) fn uuid_row(
+    pub fn uuid_row(
         &self,
         view: &Entity<AppView>,
         secret: &Entity<InputState>,
@@ -1724,7 +1724,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn panel_select_row(
+    pub fn panel_select_row(
         label: impl Into<String>,
         tip_id: &'static str,
         tip: impl Into<String>,
@@ -1757,7 +1757,7 @@ impl ConfigForm {
     /// and the TLS / network / mux panels — one `Advanced Settings` disclosure
     /// instead of four competing doors. `None` when the protocol has nothing
     /// advanced to show.
-    pub(crate) fn advanced_sections(
+    pub fn advanced_sections(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -1800,7 +1800,7 @@ impl ConfigForm {
         shown.then(|| body.into_any_element())
     }
 
-    pub(crate) fn s1_network_section(&self, view: &Entity<AppView>, _cx: &App) -> impl IntoElement {
+    pub fn s1_network_section(&self, view: &Entity<AppView>, _cx: &App) -> impl IntoElement {
         let network_select = self.s1_network.clone();
         let picker = field().label(t!("config-network").to_string()).child(
             div()
@@ -1851,7 +1851,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn s1_camouflage_section(&self, cx: &App) -> Option<AnyElement> {
+    pub fn s1_camouflage_section(&self, cx: &App) -> Option<AnyElement> {
         let network = Self::panel_value(&self.s1_network, cx, "tcp");
         let conditional = |id: &'static str, label: String, state: &Entity<InputState>| {
             field()
@@ -1913,7 +1913,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn s2_tls_section(
+    pub fn s2_tls_section(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -1989,7 +1989,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn s2_security_section(&self, cx: &App) -> impl IntoElement {
+    pub fn s2_security_section(&self, cx: &App) -> impl IntoElement {
         let _ = cx;
         let fp_select = self.s2_fp.clone();
         let body = div()
@@ -2048,7 +2048,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn s2_extras_section(&self, repaint: &DialogRepaint) -> impl IntoElement {
+    pub fn s2_extras_section(&self, repaint: &DialogRepaint) -> impl IntoElement {
         let s2_insecure = self.s2_insecure.clone();
         let s2_repaint_insecure = repaint.clone();
         let body = div()
@@ -2105,7 +2105,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn s3_section(
+    pub fn s3_section(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2239,7 +2239,7 @@ impl ConfigForm {
             .into_any_element()
     }
 
-    pub(crate) fn s4_section(
+    pub fn s4_section(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2349,7 +2349,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn vmess_block(
+    pub fn vmess_block(
         &self,
         view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -2386,7 +2386,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn trojan_block(
+    pub fn trojan_block(
         &self,
         _view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -2403,7 +2403,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn shadowsocks_block(
+    pub fn shadowsocks_block(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2477,7 +2477,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn wg_peer_block(
+    pub fn wg_peer_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2604,7 +2604,7 @@ impl ConfigForm {
             )
     }
 
-    pub(crate) fn wireguard_block(
+    pub fn wireguard_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2641,7 +2641,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn amneziawg_block(
+    pub fn amneziawg_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2818,7 +2818,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn hysteria_block(
+    pub fn hysteria_block(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -2975,7 +2975,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn tuic_block(
+    pub fn tuic_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3065,7 +3065,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn socks_block(
+    pub fn socks_block(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3132,7 +3132,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn http_block(
+    pub fn http_block(
         &self,
         _view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -3182,7 +3182,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn anytls_block(
+    pub fn anytls_block(
         &self,
         _view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -3238,7 +3238,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn naive_block(
+    pub fn naive_block(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3321,7 +3321,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn ssh_block(
+    pub fn ssh_block(
         &self,
         view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -3437,7 +3437,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn snell_block(
+    pub fn snell_block(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3535,7 +3535,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn shadowtls_block(
+    pub fn shadowtls_block(
         &self,
         _view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -3569,7 +3569,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn xray_block(
+    pub fn xray_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3684,7 +3684,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn chain_block(
+    pub fn chain_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3834,7 +3834,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn extra_block(
+    pub fn extra_block(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
@@ -3902,7 +3902,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn vless_block(
+    pub fn vless_block(
         &self,
         view: &Entity<AppView>,
         _repaint: &DialogRepaint,
@@ -3962,7 +3962,7 @@ impl ConfigForm {
         block
     }
 
-    pub(crate) fn element(
+    pub fn element(
         self,
         view: Entity<AppView>,
         cx: &App,
@@ -4432,7 +4432,7 @@ impl ConfigForm {
         form
     }
 
-    pub(crate) fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
+    pub fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
         if field == "protocol" {
             if !self.protocol_locked {
                 self.protocol_select.update(cx, |state, cx| {
@@ -4465,7 +4465,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn as_new(&self, cx: &App) -> NewConfig {
+    pub fn as_new(&self, cx: &App) -> NewConfig {
         NewConfig {
             name: self.name.read(cx).value().to_string(),
             protocol: self.protocol_text(cx),
@@ -4476,7 +4476,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn effective_params(&self, cx: &App) -> String {
+    pub fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
@@ -4597,7 +4597,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn panel_value(
+    pub fn panel_value(
         select: &Entity<SelectState<PanelChoiceList>>,
         cx: &App,
         default: &str,
@@ -4609,7 +4609,7 @@ impl ConfigForm {
             .unwrap_or_else(|| default.to_string())
     }
 
-    pub(crate) fn vless_inner_values(&self, cx: &App) -> (String, String, String) {
+    pub fn vless_inner_values(&self, cx: &App) -> (String, String, String) {
         (
             self.vless_uuid.read(cx).value().to_string(),
             Self::panel_value(&self.vless_flow, cx, ""),
@@ -4617,7 +4617,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn vmess_inner_values(&self, cx: &App) -> (String, String, String, String) {
+    pub fn vmess_inner_values(&self, cx: &App) -> (String, String, String, String) {
         (
             self.vmess_uuid.read(cx).value().to_string(),
             self.vmess_aid.read(cx).value().to_string(),
@@ -4626,7 +4626,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn ss_inner_values(&self, cx: &App) -> (String, String, String, String, bool) {
+    pub fn ss_inner_values(&self, cx: &App) -> (String, String, String, String, bool) {
         (
             Self::panel_value(&self.ss_method, cx, ""),
             self.ss_password.read(cx).value().to_string(),
@@ -4636,7 +4636,7 @@ impl ConfigForm {
         )
     }
 
-    pub(crate) fn wireguard_fold(&self, cx: &App, page: &str) -> WireguardFold {
+    pub fn wireguard_fold(&self, cx: &App, page: &str) -> WireguardFold {
         let awg = page == "amneziawg";
         WireguardFold {
             private_key: if awg {
@@ -4692,7 +4692,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn amnezia_fold(&self, cx: &App) -> AmneziaFold {
+    pub fn amnezia_fold(&self, cx: &App) -> AmneziaFold {
         AmneziaFold {
             enable_amnezia: *self.awg_enable.borrow(),
             version: Self::panel_value(&self.awg_version, cx, ""),
@@ -4724,7 +4724,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn hysteria_fold(&self, cx: &App) -> HysteriaFold {
+    pub fn hysteria_fold(&self, cx: &App) -> HysteriaFold {
         HysteriaFold {
             server_ports: self.hy_server_ports.read(cx).value().to_string(),
             hop_interval: self.hy_hop_interval.read(cx).value().to_string(),
@@ -4740,7 +4740,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn tuic_fold(&self, cx: &App) -> TuicFold {
+    pub fn tuic_fold(&self, cx: &App) -> TuicFold {
         TuicFold {
             uuid: self.tuic_uuid.read(cx).value().to_string(),
             password: self.tuic_password.read(cx).value().to_string(),
@@ -4752,7 +4752,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn socks_fold(&self, cx: &App) -> SocksFold {
+    pub fn socks_fold(&self, cx: &App) -> SocksFold {
         SocksFold {
             version: Self::panel_value(&self.socks_version, cx, ""),
             username: self.socks_username.read(cx).value().to_string(),
@@ -4762,7 +4762,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn http_fold(&self, cx: &App) -> HttpFold {
+    pub fn http_fold(&self, cx: &App) -> HttpFold {
         HttpFold {
             username: self.http_username.read(cx).value().to_string(),
             password: self.http_password.read(cx).value().to_string(),
@@ -4771,7 +4771,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn anytls_fold(&self, cx: &App) -> AnytlsFold {
+    pub fn anytls_fold(&self, cx: &App) -> AnytlsFold {
         AnytlsFold {
             password: self.anytls_password.read(cx).value().to_string(),
             interval: self.anytls_interval.read(cx).value().to_string(),
@@ -4780,7 +4780,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn naive_fold(&self, cx: &App) -> NaiveFold {
+    pub fn naive_fold(&self, cx: &App) -> NaiveFold {
         NaiveFold {
             username: self.naive_username.read(cx).value().to_string(),
             password: self.naive_password.read(cx).value().to_string(),
@@ -4790,7 +4790,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn ssh_fold(&self, cx: &App) -> SshFold {
+    pub fn ssh_fold(&self, cx: &App) -> SshFold {
         SshFold {
             user: self.ssh_user.read(cx).value().to_string(),
             password: self.ssh_password.read(cx).value().to_string(),
@@ -4803,7 +4803,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn snell_fold(&self, cx: &App) -> SnellFold {
+    pub fn snell_fold(&self, cx: &App) -> SnellFold {
         SnellFold {
             psk: self.snell_psk.read(cx).value().to_string(),
             version: Self::panel_value(&self.snell_version, cx, ""),
@@ -4816,14 +4816,14 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn shadowtls_fold(&self, cx: &App) -> ShadowTlsFold {
+    pub fn shadowtls_fold(&self, cx: &App) -> ShadowTlsFold {
         ShadowTlsFold {
             version: Self::panel_value(&self.shadowtls_version, cx, ""),
             password: self.shadowtls_password.read(cx).value().to_string(),
         }
     }
 
-    pub(crate) fn xray_fold(&self, cx: &App) -> XrayFold {
+    pub fn xray_fold(&self, cx: &App) -> XrayFold {
         XrayFold {
             uuid: self.xray_uuid.read(cx).value().to_string(),
             encryption: self.xray_enc.read(cx).value().to_string(),
@@ -4840,7 +4840,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn extra_fold(&self, cx: &App) -> ExtraFold {
+    pub fn extra_fold(&self, cx: &App) -> ExtraFold {
         ExtraFold {
             exe: self.extra_exe.read(cx).value().to_string(),
             args: self.extra_args.read(cx).value().to_string(),
@@ -4848,7 +4848,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn tls_forced_fold(&self, cx: &App) -> TlsForcedFold {
+    pub fn tls_forced_fold(&self, cx: &App) -> TlsForcedFold {
         TlsForcedFold {
             sni: self.s2_sni.read(cx).value().to_string(),
             alpn: self.s2_alpn.read(cx).value().to_string(),
@@ -4859,7 +4859,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn transport_fold(&self, cx: &App) -> TransportFold {
+    pub fn transport_fold(&self, cx: &App) -> TransportFold {
         TransportFold {
             network: Self::panel_value(&self.s1_network, cx, "tcp"),
             path: self.s1_path.read(cx).value().to_string(),
@@ -4869,7 +4869,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn tls_optional_fold(&self, cx: &App) -> TlsOptionalFold {
+    pub fn tls_optional_fold(&self, cx: &App) -> TlsOptionalFold {
         TlsOptionalFold {
             enable: *self.s2_enable.borrow(),
             sni: self.s2_sni.read(cx).value().to_string(),
@@ -4881,7 +4881,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn s3_effective_mode(&self) -> String {
+    pub fn s3_effective_mode(&self) -> String {
         if *self.s3_brutal.borrow() {
             "on".to_string()
         } else {
@@ -4889,7 +4889,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn mux_fold(&self, cx: &App) -> MuxFold {
+    pub fn mux_fold(&self, cx: &App) -> MuxFold {
         MuxFold {
             mode: self.s3_effective_mode(),
             brutal_enable: *self.s3_brutal.borrow(),
@@ -4898,7 +4898,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn dial_fold(&self, cx: &App) -> DialFold {
+    pub fn dial_fold(&self, cx: &App) -> DialFold {
         DialFold {
             reuse_addr: *self.s4_reuse.borrow(),
             tcp_fast_open: *self.s4_fastopen.borrow(),
@@ -4911,7 +4911,7 @@ impl ConfigForm {
         }
     }
 
-    pub(crate) fn as_patch_vs(&self, cx: &App, baseline: &ProxyConfig) -> ConfigPatch {
+    pub fn as_patch_vs(&self, cx: &App, baseline: &ProxyConfig) -> ConfigPatch {
         fn changed(current: String, baseline: &str) -> Option<String> {
             if current == baseline {
                 None

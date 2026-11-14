@@ -3,16 +3,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 /// K12/A1-1: the custom chrome's height, matching the kit title bar the app
 /// replaced so the toolbar and status strip keep their vertical budget.
-pub(crate) const TITLEBAR_HEIGHT: f32 = 34.;
+pub const TITLEBAR_HEIGHT: f32 = 34.;
 /// K12/A1-1: one flat control cell. Square-ish, like the platform's own
 /// caption buttons, with a hairline between cells.
-pub(crate) const TITLEBAR_CONTROL_WIDTH: f32 = 46.;
+pub const TITLEBAR_CONTROL_WIDTH: f32 = 46.;
 
 /// K12/A1-1: the three caption controls drawn in the custom chrome. The ids
 /// are pinned for the UI test; the label/action tables keep the visible
 /// affordance and the platform call from drifting apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TitlebarControl {
+pub enum TitlebarControl {
     Minimize,
     Maximize,
     Close,
@@ -22,14 +22,14 @@ pub(crate) enum TitlebarControl {
 /// window to do. Kept as data so the mapping is testable without a platform
 /// window; `apply_titlebar_action` is the only place that touches the OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TitlebarAction {
+pub enum TitlebarAction {
     Minimize,
     ToggleMaximize,
     Close,
 }
 
 impl TitlebarControl {
-    pub(crate) fn id(self) -> &'static str {
+    pub fn id(self) -> &'static str {
         match self {
             TitlebarControl::Minimize => "titlebar-minimize",
             TitlebarControl::Maximize => "titlebar-maximize",
@@ -39,7 +39,7 @@ impl TitlebarControl {
 
     /// The maximize cell turns into a restore affordance while maximized, but
     /// keeps its stable id so tests and the platform hit-test never chase it.
-    pub(crate) fn label(self, maximized: bool) -> String {
+    pub fn label(self, maximized: bool) -> String {
         match self {
             TitlebarControl::Minimize => t!("titlebar-minimize"),
             TitlebarControl::Maximize if maximized => t!("titlebar-restore"),
@@ -48,7 +48,7 @@ impl TitlebarControl {
         }
     }
 
-    pub(crate) fn area(self) -> WindowControlArea {
+    pub fn area(self) -> WindowControlArea {
         match self {
             TitlebarControl::Minimize => WindowControlArea::Min,
             TitlebarControl::Maximize => WindowControlArea::Max,
@@ -57,7 +57,7 @@ impl TitlebarControl {
     }
 }
 
-pub(crate) fn titlebar_control_action(control: TitlebarControl) -> TitlebarAction {
+pub fn titlebar_control_action(control: TitlebarControl) -> TitlebarAction {
     match control {
         TitlebarControl::Minimize => TitlebarAction::Minimize,
         TitlebarControl::Maximize => TitlebarAction::ToggleMaximize,
@@ -67,24 +67,27 @@ pub(crate) fn titlebar_control_action(control: TitlebarControl) -> TitlebarActio
 
 /// K12/A1-1: double-clicking the title area toggles maximize (restore when
 /// already maximized).
-pub(crate) fn titlebar_double_click_action() -> TitlebarAction {
+pub fn titlebar_double_click_action() -> TitlebarAction {
     TitlebarAction::ToggleMaximize
 }
 
 /// K12/A1-1: hermetic tests exercise the wiring without a platform window —
 /// the test platform's `minimize`/`zoom` are unimplemented. The counter is the
 /// observable proof that an id reached its action.
-#[cfg(test)]
-pub(crate) static TITLEBAR_ACTION_CALLS: std::sync::atomic::AtomicUsize =
+#[cfg(any(test, feature = "test-support"))]
+pub static TITLEBAR_ACTION_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-pub(crate) fn apply_titlebar_action(action: TitlebarAction, window: &mut Window) {
-    #[cfg(test)]
+pub fn apply_titlebar_action(action: TitlebarAction, window: &mut Window) {
+    #[cfg(any(test, feature = "test-support"))]
     {
-        let _ = (action, window);
+        // Borrow, don't move: the production match below still compiles under
+        // the test feature, and `window` must survive for it.
+        let _ = &action;
+        let _ = &*window;
         TITLEBAR_ACTION_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     match action {
         TitlebarAction::Minimize => window.minimize_window(),
         TitlebarAction::ToggleMaximize => window.zoom_window(),
@@ -95,7 +98,7 @@ pub(crate) fn apply_titlebar_action(action: TitlebarAction, window: &mut Window)
 /// K12/A1-1: flat hairline caption buttons per DESIGN — no shadows, no icon
 /// font (the kit's icon set is not initialized here and rendered blank), a
 /// quiet hover wash for minimize/maximize and the alarm wash for close.
-fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> AnyElement {
+pub fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> AnyElement {
     let close = control == TitlebarControl::Close;
     let theme = cx.theme();
     let hover_bg = if close {
@@ -121,7 +124,7 @@ fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> AnyE
     // On Windows the NC hit-test area performs the native action; a click
     // listener on top of it would act twice. Tests (and non-Windows builds)
     // take the explicit path so the id → action wiring stays observable.
-    let clickable = cfg!(test) || !cfg!(windows);
+    let clickable = cfg!(any(test, feature = "test-support")) || !cfg!(windows);
     div()
         .id(control.id())
         .test_support()
@@ -152,7 +155,7 @@ fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> AnyE
 /// Drawn glyphs, not icon-font codepoints: the small-glyph family (A5-1) is
 /// exactly what fails when a font falls back. A line, a square outline, two
 /// offset squares, and a multiplication sign read at any scale.
-fn titlebar_control_glyph(
+pub fn titlebar_control_glyph(
     control: TitlebarControl,
     maximized: bool,
     color: Hsla,
@@ -201,7 +204,7 @@ impl AppView {
     /// because its caption glyphs come from an icon font this app never loads
     /// (they painted blank). The drag region is the whole title area; the
     /// three cells at the trailing end are real window controls.
-    pub(crate) fn render_titlebar(&self, title: String, window: &Window, cx: &App) -> AnyElement {
+    pub fn render_titlebar(&self, title: String, window: &Window, cx: &App) -> AnyElement {
         let maximized = window.is_maximized();
         let drag = div()
             .id("titlebar-drag-region")
@@ -219,7 +222,9 @@ impl AppView {
                 // Windows handles HTCAPTION double clicks natively; the
                 // explicit path covers non-Windows and the hermetic wiring
                 // test. `apply_titlebar_action` is inert on the test platform.
-                if event.click_count() == 2 && (cfg!(test) || !cfg!(windows)) {
+                if event.click_count() == 2
+                    && (cfg!(any(test, feature = "test-support")) || !cfg!(windows))
+                {
                     apply_titlebar_action(titlebar_double_click_action(), window);
                 }
             })
@@ -269,7 +274,7 @@ impl AppView {
 ///
 /// The width is the nav's own breakpoint: at 1200 the nav opens expanded, so
 /// the first frame shows the shell the user is meant to learn.
-pub(crate) fn startup_window_bounds(
+pub fn startup_window_bounds(
     geometry: Option<WindowGeometry>,
     visible_bounds: Option<Bounds<Pixels>>,
 ) -> WindowBounds {
@@ -296,7 +301,7 @@ pub(crate) fn startup_window_bounds(
 /// leaves roughly 540 points of usable height, well under the 620-point
 /// design floor. A minimum taller than the screen pins the status strip below
 /// the desktop and leaves no drag edge to recover it, so the display wins.
-pub(crate) fn window_min_size(visible_bounds: Option<Bounds<Pixels>>) -> Size<Pixels> {
+pub fn window_min_size(visible_bounds: Option<Bounds<Pixels>>) -> Size<Pixels> {
     let design = size(
         px(WindowGeometry::MIN_WIDTH),
         px(WindowGeometry::MIN_HEIGHT),
@@ -304,7 +309,7 @@ pub(crate) fn window_min_size(visible_bounds: Option<Bounds<Pixels>>) -> Size<Pi
     visible_bounds.map_or(design, |visible| design.min(&visible.size))
 }
 
-pub(crate) fn app_window_options(
+pub fn app_window_options(
     bounds: WindowBounds,
     visible_bounds: Option<Bounds<Pixels>>,
 ) -> WindowOptions {
@@ -321,7 +326,7 @@ pub(crate) fn app_window_options(
 /// point the startup bounds can seed from. A missing file, an unreadable
 /// store, or an absent/corrupt key all read as `None`, so the first run
 /// centers instead of landing in the old upper-left corner.
-pub(crate) fn stored_window_geometry() -> Option<WindowGeometry> {
+pub fn stored_window_geometry() -> Option<WindowGeometry> {
     Store::peek_meta_readonly(&Store::default_path(), Store::META_GEOMETRY)
         .as_deref()
         .and_then(WindowGeometry::from_json)
