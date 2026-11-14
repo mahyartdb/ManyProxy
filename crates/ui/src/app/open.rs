@@ -69,12 +69,7 @@ impl AppView {
         });
     }
 
-    pub fn open_edit_for_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_edit_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -183,11 +178,7 @@ impl AppView {
         });
     }
 
-    pub fn open_clear_traffic_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_clear_traffic_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description =
             settings_clear_traffic_text(self.libraries.read(cx).delegate().counts().0);
@@ -211,11 +202,7 @@ impl AppView {
         });
     }
 
-    pub fn open_clear_health_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_clear_health_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_health_text();
         open_app_alert_dialog(window, cx, move |alert, _, _| {
@@ -238,11 +225,7 @@ impl AppView {
         });
     }
 
-    pub fn open_clear_snapshot_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_clear_snapshot_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_snapshot_text();
         open_app_alert_dialog(window, cx, move |alert, _, _| {
@@ -265,12 +248,7 @@ impl AppView {
         });
     }
 
-    pub fn open_share_for_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_share_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -484,11 +462,7 @@ impl AppView {
     /// The status hint and the tray balloon both land here: show the release
     /// the passive check stored, and clear the hint as it becomes the dialog.
     /// A missing release means a later check already took over.
-    pub fn open_available_update(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn open_available_update(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(release) = self.update_available.take() else {
             return false;
         };
@@ -1575,11 +1549,7 @@ impl AppView {
         });
     }
 
-    pub fn open_import_from_clipboard(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // K5: the clipboard paste imports directly into the current group;
         // ambiguous grammar keeps its dialog inside import_text_direct.
         self.import_from_clipboard_direct(window, cx);
@@ -1663,11 +1633,7 @@ impl AppView {
         }
     }
 
-    pub fn reopen_subscriptions_if_open(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn reopen_subscriptions_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
             self.subs_form = None;
             return;
@@ -2385,11 +2351,7 @@ impl AppView {
         });
     }
 
-    pub fn open_subscriptions_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_subscriptions_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_subscriptions_dialog_restored(
             "",
             "",

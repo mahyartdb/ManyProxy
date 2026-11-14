@@ -274,7 +274,12 @@ impl SettingsState {
 
     /// B17: a row that is not built by `settings_row` still has to be counted
     /// and hidden, or its section would vanish under a filter that matches it.
-    pub fn filtered(&self, id: &str, label: &str, element: impl Styled + IntoElement) -> AnyElement {
+    pub fn filtered(
+        &self,
+        id: &str,
+        label: &str,
+        element: impl Styled + IntoElement,
+    ) -> AnyElement {
         let shown = self.note_row(id, label);
         // Hiding the row itself, not a wrapper around it: the wrapper was one
         // more element in a column GPUI lays out again on every frame.
@@ -954,7 +959,10 @@ impl SettingsState {
         ));
 
         let last = match *self.last_check.borrow() {
-            Some(at) => t!("settings-last-update-check-at", time = format_check_time(at)),
+            Some(at) => t!(
+                "settings-last-update-check-at",
+                time = format_check_time(at)
+            ),
             None => t!("settings-no-update-check"),
         };
         // K9: `Check now` is a row action, not a commit. It rides beside the
@@ -2095,11 +2103,7 @@ impl AppView {
 
     /// T-04: the naming confirm for the library reset. The dialog names the
     /// library and the number of configurations it would delete.
-    pub fn open_reset_library_confirm(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_reset_library_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.store.list().map(|rows| rows.len()).unwrap_or(0);
         if count == 0 {
             window.push_notification(Notification::info(t!("library-already-empty")), cx);
@@ -2175,11 +2179,7 @@ impl AppView {
 
     /// T-04: the one-time "still running in the tray" hint. It shows exactly
     /// once per library: the flag is written before the toast goes out.
-    pub fn show_tray_hint_once(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn show_tray_hint_once(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.store.seen_tray_hint() {
             return false;
         }
@@ -2193,12 +2193,7 @@ impl AppView {
 
     /// R22: the density owns every chrome height and the row pitch. The
     /// choice is written on every change, so the next launch reads it back.
-    pub fn set_density(
-        &mut self,
-        density: Density,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_density(&mut self, density: Density, window: &mut Window, cx: &mut Context<Self>) {
         self.density = density;
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_density(density);

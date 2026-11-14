@@ -195,12 +195,7 @@ impl AppView {
     /// A scope change is a navigation move. It clears the selection, the
     /// anchor and the focus, then recomputes the table inside the new scope;
     /// the query (search, status, protocol) stays exactly as it was.
-    pub fn set_scope(
-        &mut self,
-        scope: LibraryScope,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_scope(&mut self, scope: LibraryScope, window: &mut Window, cx: &mut Context<Self>) {
         if self.scope == scope {
             return;
         }
@@ -287,11 +282,7 @@ impl AppView {
 
     /// The `Groups` section. The header carries the `+`; the collapsed nav
     /// keeps the same action as its own hairline row.
-    pub fn render_group_section(
-        &self,
-        collapsed: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub fn render_group_section(&self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
         let mut section = div().id("nav-groups-section").flex().flex_col();
         if collapsed {
             section = section
@@ -407,11 +398,7 @@ impl AppView {
 
     /// The `Sources` section. `Manage…` opens the existing sources sheet; each
     /// entry carries its freshness dot, count and one-source refresh.
-    pub fn render_source_section(
-        &self,
-        collapsed: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub fn render_source_section(&self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
         let mut section = div().id("nav-sources-section").flex().flex_col();
         if collapsed {
             section = section

@@ -335,7 +335,11 @@ mod tokens {
             let painted = Theme::global(cx).clone();
             for (name, stock, painted) in [
                 ("page", stock.background, painted.background),
-                ("selection rim", stock.list_active_border, painted.list_active_border),
+                (
+                    "selection rim",
+                    stock.list_active_border,
+                    painted.list_active_border,
+                ),
                 ("focus ring", stock.ring, painted.ring),
                 ("primary fill", stock.primary, painted.primary),
             ] {

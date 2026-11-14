@@ -1,12 +1,7 @@
 use crate::*;
 
 impl AppView {
-    pub fn commit_reset_traffic(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_reset_traffic(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .store
             .get(id)
@@ -91,12 +86,7 @@ impl AppView {
         }
     }
 
-    pub fn commit_start_selected(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;

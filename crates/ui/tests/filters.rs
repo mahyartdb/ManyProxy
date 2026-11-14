@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -833,8 +842,8 @@ fn already_subscribed_message_names_existing_label() {
 
 #[gpui_kit::test]
 fn add_commit_invalid_stays_open_and_focuses_field(cx: &mut TestAppContext) {
-    use manyproxy_ui::ConfigForm;
     use gpui_kit::component::input::AnyInputState;
+    use manyproxy_ui::ConfigForm;
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
@@ -868,8 +877,8 @@ fn add_commit_invalid_stays_open_and_focuses_field(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t06_add_blank_name_and_bad_params_names_first_field(cx: &mut TestAppContext) {
-    use manyproxy_ui::ConfigForm;
     use gpui_kit::component::input::AnyInputState;
+    use manyproxy_ui::ConfigForm;
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
@@ -1047,7 +1056,9 @@ fn edit_subscription_persists_and_refreshes(cx: &mut TestAppContext) {
 #[test]
 fn preset_copy_names_reasons_never_content() {
     use manyproxy_ui::store::RoutePreset;
-    use manyproxy_ui::{preset_delete_confirm_description, preset_error_message, preset_row_summary};
+    use manyproxy_ui::{
+        preset_delete_confirm_description, preset_error_message, preset_row_summary,
+    };
     let error = manyproxy_ui::preset::decode_route_link("throne://route/!!!").expect_err("fails");
     let text = preset_error_message(&error);
     assert!(text.contains("Invalid routing preset"), "{text}");
@@ -1309,8 +1320,8 @@ fn presets_dialog_opens_with_footer(cx: &mut TestAppContext) {
 
 #[test]
 fn appearance_mapping_and_summaries() {
-    use manyproxy_ui::{appearance_theme_mode, preset_summary_text};
     use gpui_kit::component::ThemeMode;
+    use manyproxy_ui::{appearance_theme_mode, preset_summary_text};
     assert_eq!(appearance_theme_mode("dark", true), ThemeMode::Dark);
     assert_eq!(appearance_theme_mode("dark", false), ThemeMode::Dark);
     assert_eq!(appearance_theme_mode("light", false), ThemeMode::Light);
@@ -1930,8 +1941,8 @@ fn appearance_choice_persists_and_paints_live(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn accent_choice_persists_paints_live_and_survives_a_theme_swap(cx: &mut TestAppContext) {
-    use manyproxy_ui::store::Accent;
     use gpui_kit::component::ActiveTheme as _;
+    use manyproxy_ui::store::Accent;
 
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -2303,7 +2314,12 @@ fn t10_advanced_rule_ops_rewrite_rules_box(cx: &mut TestAppContext) {
     let text = cx.update(|window, cx| {
         view.update(cx, |_view, cx| {
             let form = manyproxy_ui::PresetForm::restored(window, cx, "office", &text);
-            manyproxy_ui::AppView::rewrite_preset_rules_box(&form, &manyproxy_ui::PresetRulesOp::Add, window, cx);
+            manyproxy_ui::AppView::rewrite_preset_rules_box(
+                &form,
+                &manyproxy_ui::PresetRulesOp::Add,
+                window,
+                cx,
+            );
             form.rules.read(cx).value().to_string()
         })
     });
@@ -2886,9 +2902,12 @@ fn t64_no_switching_behavior_added(cx: &mut TestAppContext) {
                 .filter(|row| row.group == group)
                 .cloned()
                 .collect::<Vec<_>>();
-            let monitor =
-                manyproxy_ui::health::best_rows_monitor_lines(&group, &filtered, &view.health_store)
-                    .expect("monitor lines");
+            let monitor = manyproxy_ui::health::best_rows_monitor_lines(
+                &group,
+                &filtered,
+                &view.health_store,
+            )
+            .expect("monitor lines");
             let attached = view
                 .row_config(&live.id)
                 .and_then(|row| row.preset_id.clone())
@@ -3346,7 +3365,11 @@ fn t10_tray_select_and_config_copy(cx: &mut TestAppContext) {
             .unwrap_or_default()
             .to_string()
     });
-    assert_eq!(clip, manyproxy_ui::tray::config_folder(), "config folder copies");
+    assert_eq!(
+        clip,
+        manyproxy_ui::tray::config_folder(),
+        "config folder copies"
+    );
     assert!(!clip.is_empty(), "folder never empty");
     assert_eq!(
         std::path::Path::new(&clip)
@@ -4451,8 +4474,8 @@ fn t48_tray_dispatch_every_menu_id_runs_its_handler(cx: &mut TestAppContext) {
 
 #[test]
 fn t48_resolve_fetch_redirect_table() {
-    use manyproxy_ui::{is_fetch_redirect, resolve_fetch_redirect};
     use gpui_kit::http_client::http::StatusCode;
+    use manyproxy_ui::{is_fetch_redirect, resolve_fetch_redirect};
     for code in [301u16, 302, 303, 307, 308] {
         assert!(
             is_fetch_redirect(StatusCode::from_u16(code).expect("status builds")),
@@ -4501,36 +4524,48 @@ fn t48_resolve_fetch_redirect_table() {
 
 #[test]
 fn t41_save_listen_gate_passthrough_and_refusal() {
-    assert_eq!(manyproxy_ui::save_listen_gate("Row", "127.0.0.1", ""), Ok(()));
-    assert_eq!(manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "   "), Ok(()));
+    assert_eq!(
+        manyproxy_ui::save_listen_gate("Row", "127.0.0.1", ""),
+        Ok(())
+    );
+    assert_eq!(
+        manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "   "),
+        Ok(())
+    );
     assert_eq!(
         manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "not-a-port"),
         Ok(())
     );
-    assert_eq!(manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "0"), Ok(()));
-    assert_eq!(manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "10801"), Ok(()));
+    assert_eq!(
+        manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "0"),
+        Ok(())
+    );
+    assert_eq!(
+        manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "10801"),
+        Ok(())
+    );
     assert_eq!(manyproxy_ui::save_listen_gate("Row", "", "10801"), Ok(()));
-    let err =
-        manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "18501").expect_err("clash range refused");
+    let err = manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "18501")
+        .expect_err("clash range refused");
     assert!(
         err.contains("clash-controller range 18501-18999"),
         "names range, got {err}"
     );
-    let err =
-        manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "11801").expect_err("bridge range refused");
+    let err = manyproxy_ui::save_listen_gate("Row", "127.0.0.1", "11801")
+        .expect_err("bridge range refused");
     assert!(
         err.contains("xray-bridge range 11801-11999"),
         "names range, got {err}"
     );
-    let err =
-        manyproxy_ui::save_listen_gate("Row", "999.999.0.1", "10801").expect_err("garbage bind refused");
+    let err = manyproxy_ui::save_listen_gate("Row", "999.999.0.1", "10801")
+        .expect_err("garbage bind refused");
     assert!(err.contains("bad bind address"), "names bind, got {err}");
 }
 
 #[test]
 fn t48_resolve_fetch_redirect_edges() {
-    use manyproxy_ui::{is_fetch_redirect, resolve_fetch_redirect};
     use gpui_kit::http_client::http::StatusCode;
+    use manyproxy_ui::{is_fetch_redirect, resolve_fetch_redirect};
     assert_eq!(
         resolve_fetch_redirect("https://example.com/a/sub.txt", "  /b/sub.txt  "),
         Some("https://example.com/b/sub.txt".to_string())
@@ -5274,7 +5309,8 @@ fn t56_prerelease_visibility_follows_app_channel() {
     // prerelease-only feed with a stable running version is up-to-date
     let only_prerelease = r#"[{"tag_name":"v0.0.3-beta.1","prerelease":true,"html_url":"https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.3-beta.1"}]"#;
     assert_eq!(
-        manyproxy_ui::parse_release_feed(only_prerelease, true, manyproxy_ui::APP_VERSION).expect("parses"),
+        manyproxy_ui::parse_release_feed(only_prerelease, true, manyproxy_ui::APP_VERSION)
+            .expect("parses"),
         None,
         "nothing eligible means up-to-date, never an alarm"
     );
@@ -5298,7 +5334,11 @@ fn t56_dialog_reports_new_version_with_browser_link(cx: &mut TestAppContext) {
     };
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.open_update_check_dialog(manyproxy_ui::UpdateCheckOutcome::Newer(release), window, cx);
+            view.open_update_check_dialog(
+                manyproxy_ui::UpdateCheckOutcome::Newer(release),
+                window,
+                cx,
+            );
         });
     });
     paint_dialog_open(cx);
@@ -5318,7 +5358,8 @@ fn t56_dialog_reports_new_version_with_browser_link(cx: &mut TestAppContext) {
         release_name: None,
     })))
     .expect("newer tag compares");
-    let (id, message, name, url) = manyproxy_ui::update_check_presentation(&outcome, manyproxy_ui::APP_VERSION);
+    let (id, message, name, url) =
+        manyproxy_ui::update_check_presentation(&outcome, manyproxy_ui::APP_VERSION);
     assert_eq!(id, "update-new-version");
     assert_eq!(
         message,
@@ -5334,8 +5375,10 @@ fn t56_dialog_reports_new_version_with_browser_link(cx: &mut TestAppContext) {
     assert_eq!(url, None, "a missing page never buys the browser button");
 
     // up-to-date renders its own fixed copy, without any link button
-    let (id, message, name, url) =
-        manyproxy_ui::update_check_presentation(&manyproxy_ui::UpdateCheckOutcome::UpToDate, manyproxy_ui::APP_VERSION);
+    let (id, message, name, url) = manyproxy_ui::update_check_presentation(
+        &manyproxy_ui::UpdateCheckOutcome::UpToDate,
+        manyproxy_ui::APP_VERSION,
+    );
     assert_eq!(id, "update-up-to-date");
     assert_eq!(
         message,
@@ -6231,7 +6274,8 @@ fn k12_engine_bar_counts_stay_honest(cx: &mut TestAppContext) {
 #[test]
 fn k12_sort_header_reads_as_words() {
     use manyproxy_ui::store::{LibrarySort, LibrarySortKey, SortDirection};
-    let marker = |key, direction| manyproxy_ui::sort_header_marker(LibrarySort::new(key, direction));
+    let marker =
+        |key, direction| manyproxy_ui::sort_header_marker(LibrarySort::new(key, direction));
     assert_eq!(
         marker(LibrarySortKey::None, SortDirection::Ascending),
         "",
@@ -7251,7 +7295,8 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     let upstream = manyproxy_ui::upstream_host_port(&row).expect("upstream reads");
     assert_eq!(upstream, "198.51.100.9:443");
     assert_no_canaries(&upstream, "upstream");
-    let cells = manyproxy_ui::library_row_cells(&row, &upstream, Some("87ms"), true, false, None, false);
+    let cells =
+        manyproxy_ui::library_row_cells(&row, &upstream, Some("87ms"), true, false, None, false);
     let route = manyproxy_ui::library_row_full_route(&row, &upstream);
     assert!(
         route.contains("127.0.0.1:10982"),
@@ -7395,10 +7440,12 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
             export_warning_text()
         );
     }
-    let preview = manyproxy_ui::export_preview_description(1, 1, "/tmp/manyproxy-t08-export.json", false);
+    let preview =
+        manyproxy_ui::export_preview_description(1, 1, "/tmp/manyproxy-t08-export.json", false);
     assert!(preview.contains('1'), "preview counts: {preview}");
     assert_no_canaries(&preview, "export preview");
-    let overwrite = manyproxy_ui::export_overwrite_confirm_description("/tmp/manyproxy-t08-export.json");
+    let overwrite =
+        manyproxy_ui::export_overwrite_confirm_description("/tmp/manyproxy-t08-export.json");
     assert!(
         overwrite.contains("/tmp/manyproxy-t08-export.json"),
         "overwrite names the path: {overwrite}"
@@ -8070,10 +8117,10 @@ fn t62_rule_set_fetch_policy_parity_internal_blocked() {
 
 #[gpui_kit::test]
 fn t65_failed_tone_distinct_from_unknown_in_row_text(cx: &mut TestAppContext) {
+    use gpui_kit::component::ActiveTheme as _;
     use manyproxy_ui::health::{HealthKind, HealthSample, LatencyTone, TestOutcome};
     use manyproxy_ui::health_tone_color;
     use manyproxy_ui::store::now_unix;
-    use gpui_kit::component::ActiveTheme as _;
 
     cx.update(gpui_kit::init);
     let (view, cx, failed, untested, gamma) =
@@ -9226,7 +9273,9 @@ fn t80_sampler_delta_calculations() {
 
 #[test]
 fn t80_ring_evicts_dead_shards() {
-    use manyproxy_ui::{fold_shard_samples, push_shard_sample, SampleRead, ShardRing, SHARD_SAMPLE_RING};
+    use manyproxy_ui::{
+        fold_shard_samples, push_shard_sample, SampleRead, ShardRing, SHARD_SAMPLE_RING,
+    };
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
@@ -9723,12 +9772,18 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
     assert_eq!(rows[0].cpu, vec![4.5, 6.0], "series follow the shard label");
     assert_eq!(rows[0].ram, vec![31.0, 33.5]);
     assert_eq!(rows[0].caption, None, "samples mean charts");
-    assert_eq!(rows[1].caption, Some(manyproxy_ui::ShardCaption::NotRunning));
+    assert_eq!(
+        rows[1].caption,
+        Some(manyproxy_ui::ShardCaption::NotRunning)
+    );
     assert_eq!(
         rows[2].caption,
         Some(manyproxy_ui::ShardCaption::SamplingUnavailable)
     );
-    assert_eq!(rows[3].caption, Some(manyproxy_ui::ShardCaption::Collecting));
+    assert_eq!(
+        rows[3].caption,
+        Some(manyproxy_ui::ShardCaption::Collecting)
+    );
     assert_eq!(
         manyproxy_ui::shard_stats_summary(&rows),
         "3 live shards, 1 charted, sampling unavailable"

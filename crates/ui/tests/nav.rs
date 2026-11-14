@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -194,7 +203,11 @@ fn nav_counts_are_scope_totals_and_ignore_the_filter(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Group("Home".to_string()), window, cx)
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Group("Home".to_string()),
+                window,
+                cx,
+            )
         });
     });
     paint_frame_at(cx, 1440., 900.);
@@ -254,7 +267,11 @@ fn switching_scope_clears_the_selection(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Group("Work".to_string()), window, cx)
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Group("Work".to_string()),
+                window,
+                cx,
+            )
         });
     });
     cx.run_until_parked();
@@ -293,7 +310,11 @@ fn scope_change_keeps_search_status_and_protocol(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Group("Work".to_string()), window, cx)
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Group("Work".to_string()),
+                window,
+                cx,
+            )
         });
     });
     view.read_with(cx, |view, _| {
@@ -327,7 +348,11 @@ fn filter_row_counts_inside_the_scope(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Group("Home".to_string()), window, cx)
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Group("Home".to_string()),
+                window,
+                cx,
+            )
         });
     });
     paint_frame_at(cx, 1440., 900.);
@@ -412,7 +437,11 @@ fn group_manage_sheet_renames_and_deletes(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Group("Home".to_string()), window, cx);
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Group("Home".to_string()),
+                window,
+                cx,
+            );
             view.rename_group_scope("Home", "Office", window, cx);
         });
     });
@@ -646,7 +675,11 @@ fn source_strip_shows_freshness_counts_quota_and_traffic(cx: &mut TestAppContext
     });
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Source(sub_id.clone()), window, cx)
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Source(sub_id.clone()),
+                window,
+                cx,
+            )
         });
     });
     paint_frame_at(cx, 1440., 900.);
@@ -820,7 +853,11 @@ fn update_current_scope_refreshes_the_scoped_source_or_group(cx: &mut TestAppCon
     });
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Group("Work".to_string()), window, cx);
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Group("Work".to_string()),
+                window,
+                cx,
+            );
             manyproxy_ui::run_action(
                 view,
                 "update-current-group",
@@ -843,7 +880,11 @@ fn update_current_scope_refreshes_the_scoped_source_or_group(cx: &mut TestAppCon
     });
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Source(home.id.clone()), window, cx);
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Source(home.id.clone()),
+                window,
+                cx,
+            );
             manyproxy_ui::run_action(
                 view,
                 "update-current-group",

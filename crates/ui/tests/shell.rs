@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())

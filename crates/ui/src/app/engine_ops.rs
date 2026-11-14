@@ -15,10 +15,7 @@ impl AppView {
         self.reload_inner_impl(cx, true)
     }
 
-    pub fn reload_inner_no_poll(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Result<(), StoreError> {
+    pub fn reload_inner_no_poll(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
         self.reload_inner_impl(cx, false)
     }
 
@@ -592,12 +589,7 @@ impl AppView {
         true
     }
 
-    pub fn toggle_sub_expanded(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toggle_sub_expanded(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.expanded_subs.remove(id) {
             self.expanded_subs.insert(id.to_string());
         }

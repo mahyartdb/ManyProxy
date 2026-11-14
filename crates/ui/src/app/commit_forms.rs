@@ -293,12 +293,7 @@ impl AppView {
         }
     }
 
-    pub fn commit_duplicate(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let source = match self.store.get(id) {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -543,12 +538,7 @@ impl AppView {
 
     /// The row's auto-start flag flipped to its current opposite. Read now, at
     /// invocation, so the menu never acts on a stale render.
-    pub fn toggle_row_enabled(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toggle_row_enabled(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -820,12 +810,7 @@ impl AppView {
     /// The rebuild preserves nothing: changing the cap mid-session truncates
     /// every present record for the fresh ring (no partial-growth state), which
     /// the Settings note beside the field states.
-    pub fn commit_log_cap(
-        &mut self,
-        window: &mut Window,
-        raw: &str,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_log_cap(&mut self, window: &mut Window, raw: &str, cx: &mut Context<Self>) {
         let Some(cap) = parse_log_cap(raw) else {
             window.push_notification(
                 Notification::warning(t!("log-cap-invalid", cap = self.logs.store.cap())),
@@ -1022,12 +1007,7 @@ impl AppView {
         }
     }
 
-    pub fn commit_usage_reset(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_usage_reset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.reset_traffic_counters(id) {
             Ok(()) => {
                 self.reload(window, cx);
@@ -1592,12 +1572,7 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    pub fn commit_preset_remove(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_preset_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_preset(id) {
             Ok(true) => {
                 self.reload(window, cx);

@@ -9,6 +9,13 @@
 pub use std::cell::RefCell;
 pub use std::rc::Rc;
 
+pub use gpui_kit::component::dialog::Dialog;
+pub use gpui_kit::component::{IndexPath, Root, WindowExt};
+pub use gpui_kit::test::TestWindowExt;
+pub use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+pub use manyproxy_core::Secret;
 pub use manyproxy_ui::engine::AutoRestartConfig;
 pub use manyproxy_ui::import::OpenWithKind;
 pub use manyproxy_ui::overlay_open;
@@ -20,13 +27,6 @@ pub use manyproxy_ui::ColumnId;
 pub use manyproxy_ui::ColumnLayout;
 pub use manyproxy_ui::ConfigForm;
 pub use manyproxy_ui::ExitTraffic;
-pub use gpui_kit::component::dialog::Dialog;
-pub use gpui_kit::component::{IndexPath, Root, WindowExt};
-pub use gpui_kit::test::TestWindowExt;
-pub use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-pub use manyproxy_core::Secret;
 
 pub fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -50,7 +50,10 @@ pub fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::Que
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-pub fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+pub fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -61,7 +64,10 @@ pub fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-pub fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+pub fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -89,13 +95,15 @@ pub fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_u
     visible
 }
 
-pub fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+pub fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
         .collect()
 }
-
 
 /// WCAG 2.1 relative luminance of `color` composited over `background`.
 pub fn relative_luminance(color: Hsla, background: Hsla) -> f32 {
@@ -127,7 +135,6 @@ pub fn contrast_ratio(color: Hsla, background: Hsla) -> f32 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
-
 pub fn paint_tall_dialog(cx: &mut VisualTestContext) {
     cx.simulate_resize(size(px(1000.), px(1800.)));
     cx.update(|window, cx| {
@@ -135,7 +142,6 @@ pub fn paint_tall_dialog(cx: &mut VisualTestContext) {
         window.render_frame(cx);
     });
 }
-
 
 pub fn t07_open_add_on(view: &Entity<AppView>, cx: &mut VisualTestContext, protocol: &str) {
     use manyproxy_ui::store::VALID_PROTOCOLS;
@@ -180,7 +186,6 @@ pub fn t07_open_add_on(view: &Entity<AppView>, cx: &mut VisualTestContext, proto
     paint_tall_dialog(cx);
 }
 
-
 pub fn tick12_seed(name: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -195,7 +200,6 @@ pub fn tick12_seed(name: &str, port: &str) -> NewConfig {
         port: port.to_string(),
     }
 }
-
 
 pub fn stub_clash_server(bodies: Vec<String>, secret: &str) -> (u16, std::thread::JoinHandle<()>) {
     use std::io::{Read as _, Write as _};
@@ -283,7 +287,6 @@ pub fn bug18_probe_body(row: &str, gstatic: Option<(u64, u64)>, custom: (u64, u6
         .to_string()
 }
 
-
 pub fn traffic_body_multi(flows: &[(&str, u64, u64)]) -> String {
     let mut connections: Vec<serde_json::Value> = flows
         .iter()
@@ -313,7 +316,6 @@ pub fn traffic_body_multi(flows: &[(&str, u64, u64)]) -> String {
     })
     .to_string()
 }
-
 
 /// Tall enough that the seeded Connections row lands inside the detail
 /// viewport (the default 1000x700 frame clips it below the fold).
@@ -382,7 +384,6 @@ pub fn t74_conn_setup<'a>(
     (view, cx, endpoint)
 }
 
-
 pub fn seed_lan_input(name: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -393,7 +394,6 @@ pub fn seed_lan_input(name: &str) -> NewConfig {
         port: String::new(),
     }
 }
-
 
 pub use gpui_kit::VisualTestContext;
 
@@ -414,7 +414,10 @@ pub fn guided_add_form(name: &str, window: &mut Window, cx: &mut Context<AppView
     form
 }
 
-pub fn mount_view(store: Store, cx: &mut TestAppContext) -> (Entity<AppView>, &mut VisualTestContext) {
+pub fn mount_view(
+    store: Store,
+    cx: &mut TestAppContext,
+) -> (Entity<AppView>, &mut VisualTestContext) {
     let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
     let stash_for_window = stash.clone();
     let (_, cx) = cx.add_window_view(move |window, cx| {
@@ -454,13 +457,13 @@ pub fn mount_fallback_view(
 /// on drop, before the folder is removed.
 #[cfg(windows)]
 pub struct T08TempFolder {
-pub     dir: std::path::PathBuf,
-pub     denied: bool,
+    pub dir: std::path::PathBuf,
+    pub denied: bool,
 }
 
 #[cfg(windows)]
 impl T08TempFolder {
-pub     fn new(tag: &str) -> Self {
+    pub fn new(tag: &str) -> Self {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -473,11 +476,11 @@ pub     fn new(tag: &str) -> Self {
         Self { dir, denied: false }
     }
 
-pub     fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &std::path::Path {
         &self.dir
     }
 
-pub     fn deny_write(&mut self) {
+    pub fn deny_write(&mut self) {
         if self.denied {
             return;
         }
@@ -489,7 +492,7 @@ pub     fn deny_write(&mut self) {
         self.denied = true;
     }
 
-pub     fn allow_write(&mut self) {
+    pub fn allow_write(&mut self) {
         if !self.denied {
             return;
         }
@@ -498,7 +501,7 @@ pub     fn allow_write(&mut self) {
         self.denied = false;
     }
 
-pub     fn icacls(dir: &std::path::Path, flag: &str, principal: &str) {
+    pub fn icacls(dir: &std::path::Path, flag: &str, principal: &str) {
         let output = std::process::Command::new("icacls")
             .arg(dir)
             .arg(flag)
@@ -558,7 +561,6 @@ pub fn open_inspector(view: &Entity<AppView>, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
-
 pub fn ticket43_seed(name: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -573,7 +575,6 @@ pub fn ticket43_seed(name: &str, port: &str) -> NewConfig {
         port: port.to_string(),
     }
 }
-
 
 pub fn t73_port_row(
     id: &str,
@@ -597,7 +598,10 @@ pub fn t73_port_row(
     }
 }
 
-pub fn t73_visible_ports(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<u16> {
+pub fn t73_visible_ports(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<u16> {
     test_visible(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].port)
@@ -624,12 +628,10 @@ pub fn t73_rows() -> Vec<manyproxy_ui::store::ProxyConfig> {
     ]
 }
 
-
 /// T-05: `Copy proxies` yields one TAB-separated line per running checked
 /// row — two spreadsheet columns, the name and the URL.
 ///
 /// T-05: the copy toast is honest about what it skipped.
-
 
 pub fn paint_dialog_open(cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
@@ -642,7 +644,6 @@ pub fn paint_dialog_open(cx: &mut VisualTestContext) {
         window.render_frame(cx);
     });
 }
-
 
 pub fn paint_frame(cx: &mut VisualTestContext) {
     cx.simulate_resize(size(px(1000.), px(700.)));
@@ -699,7 +700,6 @@ pub fn row19_seed(name: &str, host: &str, port: &str) -> NewConfig {
     }
 }
 
-
 pub fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -715,7 +715,6 @@ pub fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewCon
     }
 }
 
-
 pub fn t26_engine_seed(name: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -730,7 +729,6 @@ pub fn t26_engine_seed(name: &str, port: &str) -> NewConfig {
         port: port.to_string(),
     }
 }
-
 
 /// Paint the frame at an explicit size. The repo's `paint_frame` pins the
 /// 1000x700 frame; the geometry pins need the wide frame and the minimum.
@@ -750,7 +748,6 @@ pub fn paint_frame_at(cx: &mut VisualTestContext, width: f32, height: f32) {
     });
 }
 
-
 pub fn t30_engine_seed(name: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -766,17 +763,14 @@ pub fn t30_engine_seed(name: &str, port: &str) -> NewConfig {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Slice 3 — the filter row
 // ---------------------------------------------------------------------------
-
 
 // K20/D1: the inspector switcher sizes to its five labels instead of five
 // fixed slots, at one fixed text size — `Details · Health · Logs · Links ·
 // Traffic` fit whole, so nothing scales them. Checked at the default drawer
 // width, on the wide side panel, and at the 240px panel floor.
-
 
 pub fn t37_route_link(name: &str) -> String {
     use base64::Engine as _;
@@ -786,12 +780,11 @@ pub fn t37_route_link(name: &str) -> String {
     format!("throne://route/{payload}")
 }
 
-
 /// B17: the one settings column is taller than the dialog, so a section below
 /// the fold has to be scrolled to before it can be painted or clicked. Rewind,
 /// then walk down until the target's top sits inside the body.
 pub fn scroll_settings_into_view(cx: &mut VisualTestContext, id: &str) {
-pub     fn wheel(cx: &mut VisualTestContext, delta: f32) {
+    pub fn wheel(cx: &mut VisualTestContext, delta: f32) {
         cx.update(|window, cx| {
             window.scroll(
                 "settings-body",
@@ -882,7 +875,6 @@ pub fn settings_spine_walk(cx: &mut VisualTestContext) -> Vec<Vec<&'static str>>
     steps
 }
 
-
 pub fn t64_seed_in_group(name: &str, group: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -898,7 +890,6 @@ pub fn t64_seed_in_group(name: &str, group: &str, port: &str) -> NewConfig {
     }
 }
 
-
 pub fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -913,7 +904,6 @@ pub fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
         port: port.to_string(),
     }
 }
-
 
 /// Functions that run inside `cx.open_window`'s closure, before the window
 /// adopts its `Root` layer, so none of them may reach an overlay directly:
@@ -948,7 +938,6 @@ pub const OVERLAY_CALLS: [&str; 3] = [
     ".open_alert_dialog(",
 ];
 
-
 /// Direct overlay calls inside `markers`, ignoring literals and comments.
 /// Empty means every listed function defers. Each marker must name exactly
 /// one function, so a rename cannot silently leave the scan on a body it
@@ -981,7 +970,7 @@ pub fn direct_overlay_calls(source: &str, markers: &[&str]) -> Vec<String> {
 /// lines still match and the brace count sees only real code. `'` lifetimes
 /// (`'a`, `'static`) stay: only a closed `'x'` / `'\n'` is a char literal.
 pub fn strip_literals_and_comments(source: &str) -> String {
-pub     fn blanked(ch: char) -> char {
+    pub fn blanked(ch: char) -> char {
         if ch == '\n' {
             '\n'
         } else {
@@ -1137,7 +1126,6 @@ pub fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
     panic!("unbalanced body: {marker}");
 }
 
-
 pub fn t48_recording_client(
     handler: impl Fn(String) -> gpui_kit::http_client::http::Response<gpui_kit::http_client::AsyncBody>
         + Send
@@ -1189,7 +1177,6 @@ pub fn t48_internal_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, Strin
 pub fn t48_dead_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
     Err("no such host".to_string())
 }
-
 
 pub type T56HeaderLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
 
@@ -1258,7 +1245,6 @@ pub fn t56_no_hwid_header(log: &[Vec<(String, String)>]) -> bool {
         .all(|(name, _)| !name.to_ascii_lowercase().contains("hwid"))
 }
 
-
 // T-07: the outbound fetch layer identifies itself as exactly
 // `ManyProxy/<version>` on every request of every hop, and never sends
 // any device-identification header (Throne's x-hwid / x-device-*
@@ -1307,7 +1293,6 @@ pub fn t57_assert_no_device_identifier_headers(log: &[Vec<(String, String)>]) {
     }
 }
 
-
 pub fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
     let bounds = cx
         .update(|window, _| window.try_find(id.to_owned()))
@@ -1326,7 +1311,6 @@ pub fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
         "{id} ends inside the frame height: {bounds:?}"
     );
 }
-
 
 pub fn paint_frame_min(cx: &mut VisualTestContext) {
     cx.simulate_resize(size(px(1100.), px(640.)));
@@ -1355,7 +1339,6 @@ pub fn assert_within_frame_min(cx: &mut VisualTestContext, id: &str) {
     );
 }
 
-
 pub fn t19_auto_clear_seed(name: &str, port: &str, group: &str) -> NewConfig {
     NewConfig {
         name: name.to_string(),
@@ -1380,7 +1363,6 @@ pub fn t19_dead_snapshot(id: &str, error: &str) -> HealthSnapshot {
         error: Some(error.to_string()),
     }
 }
-
 
 /// Every key the app binds in its own contexts, in the canonical form
 /// `KeyBinding::unparse` writes: lower-case modifiers, then the key. One key
@@ -1425,9 +1407,7 @@ pub fn canonical_shortcut(display: &str) -> String {
     }
 }
 
-
 pub const BUG16_LINK: &str = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one";
-
 
 /// Serializes the one test that stages real rule-set files: locks the
 /// process-global `MANYPROXY_RULE_SETS_DIR` override to a test staging
@@ -1440,7 +1420,7 @@ pub fn t62_rule_sets_env(dir: &std::path::Path) -> T62RuleSetsEnvGuard {
 }
 
 pub struct T62RuleSetsEnvGuard {
-pub     _lease: std::sync::MutexGuard<'static, ()>,
+    pub _lease: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for T62RuleSetsEnvGuard {
@@ -1460,7 +1440,12 @@ pub fn t62_staged_rows(
 
 /// Runs the Add-by-URL commit (the add dialog's only meaningful action)
 /// and reports whether the gate let the flow through to the confirm.
-pub fn t62_begin(view: &Entity<AppView>, cx: &mut VisualTestContext, name: &str, url: &str) -> bool {
+pub fn t62_begin(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+    name: &str,
+    url: &str,
+) -> bool {
     let outcome = Rc::new(RefCell::new(false));
     let recorded = outcome.clone();
     cx.update(|window, cx| {
@@ -1476,7 +1461,6 @@ pub fn t62_begin(view: &Entity<AppView>, cx: &mut VisualTestContext, name: &str,
     let value = *outcome.borrow();
     value
 }
-
 
 pub fn t65_seed(name: &str, port: &str) -> NewConfig {
     NewConfig {
@@ -1547,7 +1531,6 @@ pub fn t65_mount_with_failed_probe<'a>(
     (view, cx, failed.id, untested.id, gamma)
 }
 
-
 // ---- T-27: header sort pickers -------------------------------------
 
 pub use manyproxy_ui::store::ProxyConfig;
@@ -1606,7 +1589,6 @@ pub fn t77_sort(key: LibrarySortKey, direction: SortDirection) -> manyproxy_ui::
     manyproxy_ui::store::LibrarySort::new(key, direction)
 }
 
-
 // ---- T-28: share-dialog QR ------------------------------------------
 
 pub const T78_KNOWN_PAYLOAD: &str = "socks5://127.0.0.1:10801";
@@ -1636,13 +1618,11 @@ pub fn t78_new(bind_ip: &str, port: &str) -> NewConfig {
     }
 }
 
-
 pub fn socks_qr_side() -> usize {
     manyproxy_ui::qr_grid(T78_KNOWN_PAYLOAD)
         .expect("known payload encodes")
         .side
 }
-
 
 // ---- T-29: top-9 exits + Other --------------------------------------
 
@@ -1655,7 +1635,6 @@ pub fn t79_exit(id: &str, name: &str, rx: u64, tx: u64) -> ExitTraffic {
         tx_bytes: tx,
     }
 }
-
 
 // --- T-30: shard CPU/RAM sampler (pure math, ring, render) ---------------
 
@@ -1677,7 +1656,6 @@ pub fn sampled(cpu_100ns: u64, ram_bytes: u64) -> impl Fn(u32) -> manyproxy_ui::
 pub fn t83_bind_hosts_of(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
     cx.update(|_, cx| view.update(cx, |view, _| view.store.bind_hosts()))
 }
-
 
 // ---------------------------------------------------------------------------
 // Slice 5 - one endpoint draft, two hosts, one apply path.
@@ -1744,7 +1722,10 @@ pub fn endpoint_error(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Opt
     })
 }
 
-pub fn endpoint_failed_reason(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Option<String> {
+pub fn endpoint_failed_reason(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+) -> Option<String> {
     view.read_with(cx, |view, _| {
         match view.endpoint_draft.as_ref().map(|draft| &draft.phase) {
             Some(manyproxy_ui::app::endpoint_editor::EndpointPhase::Failed(reason)) => {
@@ -1761,7 +1742,11 @@ pub fn endpoint_apply_clicked(cx: &mut VisualTestContext) {
     paint_frame(cx);
 }
 
-pub fn endpoint_saved(view: &Entity<AppView>, cx: &mut VisualTestContext, id: &str) -> (String, u16) {
+pub fn endpoint_saved(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+    id: &str,
+) -> (String, u16) {
     view.read_with(cx, |view, _| {
         let row = view
             .store
@@ -1813,11 +1798,9 @@ pub fn endpoint_press(view: &Entity<AppView>, cx: &mut VisualTestContext, key: &
     paint_frame(cx);
 }
 
-
 // ---------------------------------------------------------------------------
 // K5 — toasts + non-blocking import/delete
 // ---------------------------------------------------------------------------
-
 
 /// A click on a library row with modifiers held. The kit's own test helpers
 /// click with an empty modifier set, so multi-select needs its own dispatch.
@@ -2072,7 +2055,6 @@ pub fn row_aria_selected(cx: &mut VisualTestContext, id: &str) -> bool {
     })
 }
 
-
 pub fn press_key(cx: &mut VisualTestContext, key: &str) {
     let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
     cx.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
@@ -2086,11 +2068,9 @@ pub fn focus_library(view: &Entity<AppView>, cx: &mut VisualTestContext) {
     cx.update(|window, cx| window.focus(&handle, cx));
 }
 
-
 // ---------------------------------------------------------------------------
 // Slice 1 — the workbench shell
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Slice 2 — one selection model, flat rows and the batch bar
@@ -2104,7 +2084,6 @@ pub fn clipboard_text(cx: &mut VisualTestContext) -> String {
             .to_string()
     })
 }
-
 
 /// A click near the bottom of the table, below the rows.
 pub fn click_blank_table(cx: &mut VisualTestContext) {
@@ -2144,11 +2123,9 @@ pub fn click_blank_table(cx: &mut VisualTestContext) {
     });
 }
 
-
 // ---------------------------------------------------------------------------
 // Slice 6 — the stacked inspector and the console dock
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Slice 7: the nav scopes.
@@ -2164,5 +2141,3 @@ pub fn nav_y(id: &str, cx: &mut VisualTestContext) -> gpui_kit::Pixels {
             .y
     })
 }
-
-

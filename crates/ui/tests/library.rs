@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -521,8 +530,8 @@ fn r04_columns_sheet_toggles_and_persists(cx: &mut TestAppContext) {
 /// R11: the retired `row-columns` palette id now opens the Columns sheet.
 #[gpui_kit::test]
 fn columns_palette_action_opens_the_sheet(cx: &mut TestAppContext) {
-    use manyproxy_ui::app::actions::{palette_action_at, PALETTE_GROUPS};
     use gpui_kit::component::IndexPath;
+    use manyproxy_ui::app::actions::{palette_action_at, PALETTE_GROUPS};
 
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -1258,9 +1267,9 @@ fn t44_ui_facets_filter_and_clear(cx: &mut TestAppContext) {
 
 #[test]
 fn w1_search_never_matches_credentials() {
+    use manyproxy_core::{library_row_matches, library_row_matches_full, MatchContext};
     use manyproxy_ui::store::ProxyConfig;
     use manyproxy_ui::LibraryDelegate;
-    use manyproxy_core::{library_row_matches, library_row_matches_full, MatchContext};
     let row = ProxyConfig {
             id: "1".to_string(),
             name: "Work".to_string(),
@@ -1364,9 +1373,9 @@ fn w1_row_phase_precedence_and_start_copy() {
 
 #[test]
 fn t47_delegate_caches_survive_params_poison() {
+    use manyproxy_core::{library_row_matches, upstream_host_port};
     use manyproxy_ui::store::ProxyConfig;
     use manyproxy_ui::LibraryDelegate;
-    use manyproxy_core::{library_row_matches, upstream_host_port};
     let row = ProxyConfig {
         id: "1".to_string(),
         name: "Alpha".to_string(),
@@ -2687,8 +2696,8 @@ fn f12_add_under_excluding_filter_keeps_selection(cx: &mut TestAppContext) {
 /// can point at the UUID input instead of opening the raw JSON textarea.
 #[gpui_kit::test]
 fn f5_guided_blank_uuid_names_the_field_and_focuses_it(cx: &mut TestAppContext) {
-    use manyproxy_ui::ConfigForm;
     use gpui_kit::Focusable as _;
+    use manyproxy_ui::ConfigForm;
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
@@ -2728,8 +2737,8 @@ fn f5_guided_blank_uuid_names_the_field_and_focuses_it(cx: &mut TestAppContext) 
 /// F5: the guided error paints under its own row, not at the form foot.
 #[gpui_kit::test]
 fn f5_guided_error_renders_beside_the_uuid_row(cx: &mut TestAppContext) {
-    use manyproxy_ui::ConfigForm;
     use gpui_kit::ParentElement as _;
+    use manyproxy_ui::ConfigForm;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -2871,7 +2880,9 @@ fn f5_scrollbar_mode_stays_visible(cx: &mut TestAppContext) {
 fn f17_light_modal_scrim_alpha(cx: &mut TestAppContext) {
     use gpui_kit::component::Theme;
     cx.update(gpui_kit::init);
-    cx.update(|cx| manyproxy_ui::apply_appearance("light", manyproxy_ui::store::Accent::Blue, None, cx));
+    cx.update(|cx| {
+        manyproxy_ui::apply_appearance("light", manyproxy_ui::store::Accent::Blue, None, cx)
+    });
     cx.update(|cx| {
         let overlay = Theme::global(cx).overlay;
         assert_eq!(
@@ -2884,7 +2895,9 @@ fn f17_light_modal_scrim_alpha(cx: &mut TestAppContext) {
             "scrim stays black, got {overlay:?}"
         );
     });
-    cx.update(|cx| manyproxy_ui::apply_appearance("dark", manyproxy_ui::store::Accent::Blue, None, cx));
+    cx.update(|cx| {
+        manyproxy_ui::apply_appearance("dark", manyproxy_ui::store::Accent::Blue, None, cx)
+    });
     cx.update(|cx| {
         let alpha = Theme::global(cx).overlay.a;
         assert!(
@@ -3666,8 +3679,8 @@ fn laneb_stacked_inspector_shares_detail_header(cx: &mut TestAppContext) {
 /// and rows past a group's end resolve to nothing.
 #[test]
 fn action_table_is_the_single_source() {
-    use manyproxy_ui::app::actions::{action, palette_action_at, ACTIONS, PALETTE_GROUPS};
     use gpui_kit::component::IndexPath;
+    use manyproxy_ui::app::actions::{action, palette_action_at, ACTIONS, PALETTE_GROUPS};
     use std::collections::HashMap;
 
     let mut ids = std::collections::HashSet::new();
@@ -3721,8 +3734,8 @@ fn action_table_is_the_single_source() {
 /// carries — so "Copy URLs" is one verb with one label and one enabled state.
 #[gpui_kit::test]
 fn f16_palette_menus_and_keys_share_one_action(cx: &mut TestAppContext) {
-    use manyproxy_ui::app::actions::{action, palette_action_at, ActionTarget, PALETTE_GROUPS};
     use gpui_kit::component::IndexPath;
+    use manyproxy_ui::app::actions::{action, palette_action_at, ActionTarget, PALETTE_GROUPS};
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -4111,8 +4124,8 @@ fn f13_sheet_header_close_paints_and_closes(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
-    use manyproxy_ui::app::actions::PALETTE_GROUPS;
     use gpui_kit::component::IndexPath;
+    use manyproxy_ui::app::actions::PALETTE_GROUPS;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -6096,8 +6109,8 @@ fn library_health_tick_repaints_rows(cx: &mut TestAppContext) {
 
 #[test]
 fn library_row_lines_show_complete_content() {
-    use manyproxy_ui::store::ProxyConfig;
     use manyproxy_core::library_row_lines;
+    use manyproxy_ui::store::ProxyConfig;
     fn row(enabled: bool, params: &str) -> ProxyConfig {
         ProxyConfig {
             id: "7".to_string(),
@@ -6755,11 +6768,13 @@ fn t08_group_rows_kind_quota_skip() {
     store
         .set_subscription_quota(
             &fed.id,
-            manyproxy_ui::store::parse_subscription_userinfo("upload=2048; download=0; total=1048576")
-                .map(|mut quota| {
-                    quota.expire = Some(now + 259_200);
-                    quota
-                }),
+            manyproxy_ui::store::parse_subscription_userinfo(
+                "upload=2048; download=0; total=1048576",
+            )
+            .map(|mut quota| {
+                quota.expire = Some(now + 259_200);
+                quota
+            }),
         )
         .expect("quota works");
     store
@@ -6847,10 +6862,7 @@ fn t08_update_targets_partition_and_confirm() {
         update_all_confirm_text(2, 1),
         "Update 2 subscriptions? 1 skipped (auto-refresh off for their group)."
     );
-    assert_eq!(
-        update_all_confirm_text(2, 0),
-        "Update all 2 subscriptions?"
-    );
+    assert_eq!(update_all_confirm_text(2, 0), "Update all 2 subscriptions?");
 }
 
 #[gpui_kit::test]
@@ -7174,8 +7186,8 @@ fn t07_read_import_file_guards() {
 
 #[gpui_kit::test]
 fn t07_drop_names_refused_files_with_reasons(cx: &mut TestAppContext) {
-    use manyproxy_ui::import::MAX_IMPORT_FILE_BYTES;
     use gpui_kit::ExternalPaths;
+    use manyproxy_ui::import::MAX_IMPORT_FILE_BYTES;
     cx.update(gpui_kit::init);
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
@@ -7939,8 +7951,8 @@ fn inspector_badge_copy() {
 
 #[test]
 fn t01_status_text_equivalents() {
-    use manyproxy_ui::store::ProxyConfig;
     use manyproxy_core::{library_row_lines, serving_badge};
+    use manyproxy_ui::store::ProxyConfig;
     let row = ProxyConfig {
         id: "1".to_string(),
         name: "paris".to_string(),
@@ -7967,8 +7979,8 @@ fn t01_status_text_equivalents() {
 
 #[test]
 fn row_lines_badge_follows_serving_not_flag() {
-    use manyproxy_ui::store::ProxyConfig;
     use manyproxy_core::{library_row_lines, serving_badge};
+    use manyproxy_ui::store::ProxyConfig;
     fn row() -> ProxyConfig {
         ProxyConfig {
             id: "7".to_string(),
@@ -10654,10 +10666,7 @@ fn thousand_rows_keep_the_row_pitch(cx: &mut TestAppContext) {
             *height, pitch,
             "row {index} fills the density pitch at 1,000 rows"
         );
-        if let Some((prev_y, _)) = index
-            .checked_sub(1)
-            .and_then(|prev| pitches.get(prev))
-        {
+        if let Some((prev_y, _)) = index.checked_sub(1).and_then(|prev| pitches.get(prev)) {
             assert_eq!(
                 y - prev_y,
                 pitch,
@@ -10708,9 +10717,7 @@ fn no_secret_reaches_the_rendered_tree_at_scale(cx: &mut TestAppContext) {
 
     // Searching for the secret never matches a row.
     cx.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            view.apply_search_now(MARKER.to_string(), cx)
-        });
+        view.update(cx, |view, cx| view.apply_search_now(MARKER.to_string(), cx));
     });
     paint_frame(cx);
     assert_eq!(
@@ -10739,6 +10746,9 @@ fn no_secret_reaches_the_rendered_tree_at_scale(cx: &mut TestAppContext) {
         }
         found
     });
-    assert!(leaked.is_empty(), "no row label carries the secret: {leaked:?}");
+    assert!(
+        leaked.is_empty(),
+        "no row label carries the secret: {leaked:?}"
+    );
     let _ = Secret::default();
 }

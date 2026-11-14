@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -102,7 +111,8 @@ fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::Fi
 
 #[test]
 fn window_options_carry_app_title() {
-    let options = manyproxy_ui::app_window_options(manyproxy_ui::startup_window_bounds(None, None), None);
+    let options =
+        manyproxy_ui::app_window_options(manyproxy_ui::startup_window_bounds(None, None), None);
     let title = options
         .titlebar
         .expect("titlebar options")
@@ -113,7 +123,8 @@ fn window_options_carry_app_title() {
 
 #[test]
 fn window_options_carry_startup_size() {
-    let options = manyproxy_ui::app_window_options(manyproxy_ui::startup_window_bounds(None, None), None);
+    let options =
+        manyproxy_ui::app_window_options(manyproxy_ui::startup_window_bounds(None, None), None);
     let bounds = options
         .window_bounds
         .expect("startup window bounds")
@@ -135,7 +146,10 @@ fn t82_app_options_seeds_stored_geometry() {
         width: 1280.,
         height: 900.,
     };
-    let options = manyproxy_ui::app_window_options(manyproxy_ui::startup_window_bounds(Some(stored), None), None);
+    let options = manyproxy_ui::app_window_options(
+        manyproxy_ui::startup_window_bounds(Some(stored), None),
+        None,
+    );
     let bounds = options
         .window_bounds
         .expect("startup window bounds")
@@ -511,8 +525,10 @@ fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
             let theme = manyproxy_ui::Theme::global(cx);
             assert_eq!(theme.mode, mode, "the tone check runs in {mode:?}");
             for level in levels {
-                let ratio =
-                    contrast_ratio(manyproxy_ui::log_level_text_color(level, theme), theme.background);
+                let ratio = contrast_ratio(
+                    manyproxy_ui::log_level_text_color(level, theme),
+                    theme.background,
+                );
                 assert!(
                     ratio >= 4.5,
                     "{level:?} text reaches WCAG AA in {mode:?}, got {ratio:.2}:1"
@@ -568,7 +584,9 @@ fn signal_and_muted_text_clear_aa_on_paper_and_quiet_surface(cx: &mut TestAppCon
 
     cx.update(gpui_kit::init);
     for appearance in ["light", "dark"] {
-        cx.update(|cx| manyproxy_ui::apply_appearance(appearance, manyproxy_ui::store::Accent::Blue, None, cx));
+        cx.update(|cx| {
+            manyproxy_ui::apply_appearance(appearance, manyproxy_ui::store::Accent::Blue, None, cx)
+        });
         cx.update(|cx| {
             let theme = manyproxy_ui::Theme::global(cx);
             let surfaces = [
@@ -703,7 +721,13 @@ fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
         ("", "slow", "", None, true),
         ("", "", "refused$", None, false),
         ("", "", "", Some(manyproxy_ui::LogLevel::Warn), true),
-        ("heartbeat", "", "", Some(manyproxy_ui::LogLevel::Info), false),
+        (
+            "heartbeat",
+            "",
+            "",
+            Some(manyproxy_ui::LogLevel::Info),
+            false,
+        ),
     ];
     for (filter, exclude, pattern, level, tail) in cases {
         let mut by_cap = Vec::new();
@@ -851,9 +875,7 @@ fn shell_boots_with_empty_library(cx: &mut TestAppContext) {
     assert!(cx.update(|window, _| window.try_find("action-bar-count").is_some()));
 
     cx.update(|window, cx| {
-        window.open_dialog(cx, |dialog: Dialog, _, _| {
-            dialog.title("Add proxy config")
-        });
+        window.open_dialog(cx, |dialog: Dialog, _, _| dialog.title("Add proxy config"));
     });
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -1118,8 +1140,8 @@ fn t01_edit_locks_protocol_type(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn t01_virtual_types_hide_server_port(cx: &mut TestAppContext) {
-    use manyproxy_ui::store::VALID_PROTOCOLS;
     use gpui_kit::VisualTestContext;
+    use manyproxy_ui::store::VALID_PROTOCOLS;
     cx.update(gpui_kit::init);
     cx.update(|cx| cx.set_reduce_motion(true));
     let store = Store::open_in_memory().expect("in-memory store opens");
@@ -1723,7 +1745,11 @@ fn t03_dropdown_counts() {
         18,
         "ss method lists 18 ciphers"
     );
-    assert_eq!(manyproxy_ui::ss_plugin_choices().len(), 3, "ss plugin lists 3");
+    assert_eq!(
+        manyproxy_ui::ss_plugin_choices().len(),
+        3,
+        "ss plugin lists 3"
+    );
 }
 
 #[gpui_kit::test]
@@ -2862,8 +2888,8 @@ fn t04_enter_in_awg_picker_popup_does_not_commit(cx: &mut TestAppContext) {
 
 #[test]
 fn t04_generate_wireguard_key_shape() {
-    use manyproxy_ui::generate_wireguard_key;
     use base64::Engine as _;
+    use manyproxy_ui::generate_wireguard_key;
     for _ in 0..8 {
         let key = generate_wireguard_key();
         assert_eq!(key.len(), 44, "base64 32 bytes: {key}");
@@ -2886,7 +2912,11 @@ fn t05_dropdown_counts() {
         3,
         "auth_type lists blank + 2"
     );
-    assert_eq!(manyproxy_ui::tuic_cc_choices().len(), 4, "cc lists blank + 3");
+    assert_eq!(
+        manyproxy_ui::tuic_cc_choices().len(),
+        4,
+        "cc lists blank + 3"
+    );
     assert_eq!(
         manyproxy_ui::tuic_relay_choices().len(),
         3,
@@ -3333,7 +3363,11 @@ fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
             }
         })
     });
-    assert_eq!(manyproxy_ui::tuic_cc_choices().len(), 4, "cc lists blank + 3");
+    assert_eq!(
+        manyproxy_ui::tuic_cc_choices().len(),
+        4,
+        "cc lists blank + 3"
+    );
     assert_eq!(
         manyproxy_ui::tuic_relay_choices().len(),
         3,
@@ -3444,7 +3478,11 @@ fn t06_dropdown_counts() {
         2,
         "network lists tcp + udp"
     );
-    assert_eq!(manyproxy_ui::naive_cc_choices().len(), 5, "cc lists blank + 4");
+    assert_eq!(
+        manyproxy_ui::naive_cc_choices().len(),
+        5,
+        "cc lists blank + 4"
+    );
 }
 
 #[gpui_kit::test]
@@ -4339,8 +4377,16 @@ fn t07_dropdown_counts() {
         6,
         "network lists blank + 5"
     );
-    assert_eq!(manyproxy_ui::xray_flow_choices().len(), 3, "flow lists blank + 2");
-    assert_eq!(manyproxy_ui::xray_mux_choices().len(), 3, "mux lists blank + 2");
+    assert_eq!(
+        manyproxy_ui::xray_flow_choices().len(),
+        3,
+        "flow lists blank + 2"
+    );
+    assert_eq!(
+        manyproxy_ui::xray_mux_choices().len(),
+        3,
+        "mux lists blank + 2"
+    );
 }
 
 #[gpui_kit::test]
@@ -5058,15 +5104,15 @@ fn ticks_idle_with_nothing_running_touch_no_network(cx: &mut TestAppContext) {
 #[test]
 fn no_pseudo_plural_or_checked_string_survives() {
     const CATALOG: &str = include_str!("../locales/en/main.ftl");
-    for (needle, why) in [("(s)", "pseudo-plurals are banned"), ("checked", "the checked set is retired")] {
+    for (needle, why) in [
+        ("(s)", "pseudo-plurals are banned"),
+        ("checked", "the checked set is retired"),
+    ] {
         let offenders: Vec<&str> = CATALOG
             .lines()
             .filter(|line| line.contains(needle) && !line.trim_start().starts_with('#'))
             .collect();
-        assert!(
-            offenders.is_empty(),
-            "{why}: {offenders:?}"
-        );
+        assert!(offenders.is_empty(), "{why}: {offenders:?}");
     }
     for line in CATALOG.lines() {
         if !line.contains(" = ") || line.trim_start().starts_with('#') {
@@ -5145,7 +5191,11 @@ fn every_icon_only_control_has_an_accessible_name(cx: &mut TestAppContext) {
     // The scope strip only exists inside a source scope.
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.set_scope(manyproxy_ui::LibraryScope::Source(sub_id.clone()), window, cx)
+            view.set_scope(
+                manyproxy_ui::LibraryScope::Source(sub_id.clone()),
+                window,
+                cx,
+            )
         });
     });
     cx.run_until_parked();

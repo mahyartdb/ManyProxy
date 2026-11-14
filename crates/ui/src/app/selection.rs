@@ -204,11 +204,7 @@ impl AppView {
 
     /// Prune the selection to the rows that still exist. A row that stops
     /// existing leaves the set; a row that is merely filtered out stays.
-    pub fn prune_selection_to_live(
-        &mut self,
-        live_ids: &HashSet<String>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn prune_selection_to_live(&mut self, live_ids: &HashSet<String>, cx: &mut Context<Self>) {
         self.selection_changed();
         self.selection.retain(|id| live_ids.contains(id));
         if self
@@ -302,12 +298,7 @@ impl AppView {
 
     /// Shift+Up/Down: the focus moves one visible row and the range from the
     /// anchor to the new focus replaces the set.
-    pub fn extend_focus(
-        &mut self,
-        delta: isize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn extend_focus(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.focus_target(delta, cx) else {
             return;
         };

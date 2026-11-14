@@ -142,7 +142,12 @@ impl Cache {
         self.bundles.get(locale)
     }
 
-    pub fn format(&mut self, locale: &str, key: &str, args: Option<&FluentArgs<'_>>) -> Option<String> {
+    pub fn format(
+        &mut self,
+        locale: &str,
+        key: &str,
+        args: Option<&FluentArgs<'_>>,
+    ) -> Option<String> {
         let bundle = self.bundle(locale)?;
         let message = bundle.get_message(key)?;
         let pattern = message.value()?;

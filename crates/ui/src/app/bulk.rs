@@ -389,11 +389,7 @@ impl AppView {
     }
 
     /// The batch bar's `Reset → Traffic`: every selected config's counters.
-    pub fn reset_traffic_for_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn reset_traffic_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -405,11 +401,7 @@ impl AppView {
     }
 
     /// The batch bar's `Reset → Usage`: every selected config's counters.
-    pub fn reset_usage_for_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn reset_usage_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_ids_in_visible_order(cx);
         if ids.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -1089,12 +1081,7 @@ impl AppView {
         });
     }
 
-    pub fn open_row_move_dialog(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_row_move_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
@@ -1407,12 +1394,7 @@ impl AppView {
         }
     }
 
-    pub fn commit_delete_group(
-        &mut self,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn commit_delete_group(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_group(name) {
             Ok(()) => {
                 self.created_groups.retain(|group| group != name);

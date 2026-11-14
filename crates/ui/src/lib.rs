@@ -2,7 +2,6 @@
 
 pub mod app;
 pub mod appearance;
-pub mod skin;
 pub mod chain;
 pub mod dialog;
 pub mod forms;
@@ -12,6 +11,7 @@ pub mod library;
 pub mod os;
 pub mod pickers;
 pub mod preset;
+pub mod skin;
 pub mod text;
 pub mod tray;
 pub mod update;
@@ -728,4 +728,3 @@ pub fn run() {
         .detach();
     });
 }
-

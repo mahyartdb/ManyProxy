@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -386,8 +395,8 @@ fn ctrl_backtick_toggles_console_and_engine_bar_does_not_move(cx: &mut TestAppCo
 /// A launch starts collapsed on Logs / All with no filter and no pause.
 #[gpui_kit::test]
 fn console_starts_collapsed_and_launch_defaults_are_logs_all(cx: &mut TestAppContext) {
-    use manyproxy_ui::{ConsoleScope, ConsoleTab};
     use gpui_kit::Keystroke;
+    use manyproxy_ui::{ConsoleScope, ConsoleTab};
     cx.update(gpui_kit::init);
     cx.update(manyproxy_ui::bind_app_keys);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -445,8 +454,8 @@ fn console_starts_collapsed_and_launch_defaults_are_logs_all(cx: &mut TestAppCon
 /// that belong to no config.
 #[gpui_kit::test]
 fn console_logs_selected_scope_uses_the_whole_selection(cx: &mut TestAppContext) {
-    use manyproxy_ui::engine::inbound_tag;
     use gpui_kit::{Keystroke, Modifiers};
+    use manyproxy_ui::engine::inbound_tag;
     cx.update(gpui_kit::init);
     cx.update(manyproxy_ui::bind_app_keys);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -459,7 +468,8 @@ fn console_logs_selected_scope_uses_the_whole_selection(cx: &mut TestAppContext)
     let charlie = store
         .add(row19_seed("Charlie", "c.example.com", "10803"))
         .expect("seed works");
-    let tags = manyproxy_ui::health::LogTagIndex::build(&[alpha.clone(), bravo.clone(), charlie.clone()]);
+    let tags =
+        manyproxy_ui::health::LogTagIndex::build(&[alpha.clone(), bravo.clone(), charlie.clone()]);
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
@@ -524,8 +534,8 @@ fn console_logs_selected_scope_uses_the_whole_selection(cx: &mut TestAppContext)
 /// `Selected` keeps every flow claimed by any selected row, and nothing else.
 #[gpui_kit::test]
 fn console_connections_selected_scope_uses_the_whole_selection(cx: &mut TestAppContext) {
-    use manyproxy_ui::health::ClashConn;
     use gpui_kit::{Keystroke, Modifiers};
+    use manyproxy_ui::health::ClashConn;
 
     cx.update(gpui_kit::init);
     cx.update(manyproxy_ui::bind_app_keys);
@@ -633,8 +643,8 @@ fn console_connections_selected_scope_uses_the_whole_selection(cx: &mut TestAppC
 /// carries the old runtime lines in the same scroll.
 #[gpui_kit::test]
 fn console_traffic_scope_totals_and_runtime_lines(cx: &mut TestAppContext) {
-    use manyproxy_ui::health::ClashConn;
     use gpui_kit::Keystroke;
+    use manyproxy_ui::health::ClashConn;
 
     cx.update(gpui_kit::init);
     cx.update(manyproxy_ui::bind_app_keys);

@@ -222,7 +222,9 @@ impl AppView {
                 // Windows handles HTCAPTION double clicks natively; the
                 // explicit path covers non-Windows and the hermetic wiring
                 // test. `apply_titlebar_action` is inert on the test platform.
-                if event.click_count() == 2 && (cfg!(any(test, feature = "test-support")) || !cfg!(windows)) {
+                if event.click_count() == 2
+                    && (cfg!(any(test, feature = "test-support")) || !cfg!(windows))
+                {
                     apply_titlebar_action(titlebar_double_click_action(), window);
                 }
             })

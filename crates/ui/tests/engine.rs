@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -2166,15 +2175,18 @@ fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
     let (view, cx) = mount_view(store, cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            view.logs
-                .store
-                .push_raw("error boom one", &manyproxy_ui::health::LogTagIndex::default());
-            view.logs
-                .store
-                .push_raw("info chatter", &manyproxy_ui::health::LogTagIndex::default());
-            view.logs
-                .store
-                .push_raw("warn boom two", &manyproxy_ui::health::LogTagIndex::default());
+            view.logs.store.push_raw(
+                "error boom one",
+                &manyproxy_ui::health::LogTagIndex::default(),
+            );
+            view.logs.store.push_raw(
+                "info chatter",
+                &manyproxy_ui::health::LogTagIndex::default(),
+            );
+            view.logs.store.push_raw(
+                "warn boom two",
+                &manyproxy_ui::health::LogTagIndex::default(),
+            );
             view.logs.tail = true;
         });
     });
@@ -2674,8 +2686,8 @@ fn crud_commits_toast_once_naming_row(cx: &mut TestAppContext) {
 
 #[test]
 fn import_preview_counts_and_message() {
-    use manyproxy_ui::import_preview_message;
     use manyproxy_core::import_preview_counts;
+    use manyproxy_ui::import_preview_message;
     let body = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x";
     assert_eq!(import_preview_counts(body, None), (1, 1));
     assert_eq!(import_preview_message(1, 1), "1 valid · 1 invalid");
@@ -2723,8 +2735,8 @@ fn import_dialog_shows_preview_and_files(cx: &mut TestAppContext) {
 
 #[test]
 fn t07_preview_two_valid_one_invalid_names_first_failure() {
-    use manyproxy_ui::import_preview_message;
     use manyproxy_core::{first_import_failure_reason, import_preview_counts};
+    use manyproxy_ui::import_preview_message;
     let body = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nvless://22222222-3333-4444-8555-666666666666@b.example.com:443#two\nbogus://x";
     assert_eq!(import_preview_counts(body, None), (2, 1));
     assert_eq!(import_preview_message(2, 1), "2 valid · 1 invalid");
@@ -3391,8 +3403,8 @@ fn ticket43_traffic_text() {
 
 #[test]
 fn ticket43_search_covers_sub_preset_state() {
-    use manyproxy_ui::store::ProxyConfig;
     use manyproxy_core::{library_row_matches_full, MatchContext};
+    use manyproxy_ui::store::ProxyConfig;
     fn row() -> ProxyConfig {
         ProxyConfig {
             id: "7".to_string(),
@@ -3490,12 +3502,12 @@ fn ticket43_import_preview_and_browse() {
 
 #[test]
 fn ticket43_export_logs_subs_copy() {
+    use manyproxy_core::tick_interval_summary;
     use manyproxy_ui::health::LogLevel;
     use manyproxy_ui::store::ProxyConfig;
     use manyproxy_ui::{
         export_overwrite_confirm_description, log_level_matches, subscription_member_names,
     };
-    use manyproxy_core::tick_interval_summary;
     let desc = export_overwrite_confirm_description("/tmp/x.json");
     assert!(desc.contains("/tmp/x.json"), "names path: {desc}");
     assert!(desc.contains("Overwrite"), "says overwrite: {desc}");
@@ -3685,7 +3697,10 @@ fn ticket43_duplicate_creates_disabled_auto_row(cx: &mut TestAppContext) {
     assert_eq!(copy.name, "Alpha copy");
     assert!(!copy.enabled, "copy lands disabled");
     assert_ne!(copy.port, alpha.port, "fresh auto port");
-    assert!(manyproxy_ui::store::is_auto_port(copy.port), "port is auto-range");
+    assert!(
+        manyproxy_ui::store::is_auto_port(copy.port),
+        "port is auto-range"
+    );
     assert_eq!(copy.protocol, alpha.protocol);
     assert_eq!(copy.params, alpha.params);
 }
@@ -3759,7 +3774,10 @@ fn t03_row_duplicate_and_move_ignore_selection(cx: &mut TestAppContext) {
         .expect("copy of B there");
     assert!(!copy.enabled, "copy lands disabled");
     assert_ne!(copy.port, beta.port, "fresh auto port");
-    assert!(manyproxy_ui::store::is_auto_port(copy.port), "port is auto-range");
+    assert!(
+        manyproxy_ui::store::is_auto_port(copy.port),
+        "port is auto-range"
+    );
     let moved = rows
         .iter()
         .find(|row| row.id == beta.id)
@@ -3841,7 +3859,9 @@ fn cua08_paste_intake_refusal_gates_prose_not_links() {
         "partially-valid paste still opens the dialog"
     );
     assert_eq!(
-        manyproxy_ui::AppView::paste_intake_refusal("throne://addsub/demo?url=https://example.com/feed"),
+        manyproxy_ui::AppView::paste_intake_refusal(
+            "throne://addsub/demo?url=https://example.com/feed"
+        ),
         None
     );
     assert_eq!(
@@ -3916,7 +3936,10 @@ fn ticket43_reauto_port_via_auto_word(cx: &mut TestAppContext) {
             .expect("row there")
     });
     assert_ne!(row.port, 10855, "concrete port released");
-    assert!(manyproxy_ui::store::is_auto_port(row.port), "back to auto-assign");
+    assert!(
+        manyproxy_ui::store::is_auto_port(row.port),
+        "back to auto-assign"
+    );
 }
 
 #[gpui_kit::test]
@@ -5223,10 +5246,22 @@ fn t02_shell_surfaces_run_the_same_handlers(cx: &mut TestAppContext) {
 
 #[test]
 fn t02_global_toggle_present_pins_three_states() {
-    assert_eq!(manyproxy_ui::global_toggle_present(0, false), ("▶", "Start all"));
-    assert_eq!(manyproxy_ui::global_toggle_present(3, false), ("■", "Stop all"));
-    assert_eq!(manyproxy_ui::global_toggle_present(0, true), ("…", "Connecting…"));
-    assert_eq!(manyproxy_ui::global_toggle_present(2, true), ("…", "Connecting…"));
+    assert_eq!(
+        manyproxy_ui::global_toggle_present(0, false),
+        ("▶", "Start all")
+    );
+    assert_eq!(
+        manyproxy_ui::global_toggle_present(3, false),
+        ("■", "Stop all")
+    );
+    assert_eq!(
+        manyproxy_ui::global_toggle_present(0, true),
+        ("…", "Connecting…")
+    );
+    assert_eq!(
+        manyproxy_ui::global_toggle_present(2, true),
+        ("…", "Connecting…")
+    );
 }
 
 #[gpui_kit::test]
@@ -5799,9 +5834,9 @@ fn empty_start_and_stopped_stop_warn_honestly(cx: &mut TestAppContext) {
 
 #[test]
 fn library_search_matches_host_bind_port() {
+    use manyproxy_core::library_row_matches;
     use manyproxy_ui::store::ProxyConfig;
     use manyproxy_ui::LibraryDelegate;
-    use manyproxy_core::library_row_matches;
     fn row(name: &str, server: &str, bind: &str, port: u16) -> ProxyConfig {
         ProxyConfig {
             id: format!("id-{name}"),
@@ -5982,9 +6017,9 @@ fn t47_search_index_matches_scan_parity() {
 
 #[test]
 fn t47_search_index_matches_full_with_context() {
+    use manyproxy_core::{library_row_matches_full, MatchContext};
     use manyproxy_ui::store::ProxyConfig;
     use manyproxy_ui::LibraryDelegate;
-    use manyproxy_core::{library_row_matches_full, MatchContext};
     fn row(id: &str, name: &str, enabled: bool, sub: Option<&str>) -> ProxyConfig {
         ProxyConfig {
             id: id.to_string(),
@@ -6505,7 +6540,8 @@ fn t09_show_security_and_type_security_sort() {
         row("2", "Vtls", "vless", r#"{"security":"tls"}"#),
         row("3", "Vreal", "vless", r#"{"security":"reality"}"#),
     ]);
-    let order = |delegate: &LibraryDelegate| test_names(delegate, &manyproxy_ui::FilterQuery::default());
+    let order =
+        |delegate: &LibraryDelegate| test_names(delegate, &manyproxy_ui::FilterQuery::default());
     assert_eq!(order(&delegate), vec!["T", "Vtls", "Vreal"]);
     // T-27: the toggle retired into the sort picker; the equivalent key
     // (direction is fixed for it) must order exactly as the toggle did.

@@ -67,12 +67,7 @@ impl AppView {
     /// One balloon, subject to the same visibility/setting/dedup rules the
     /// policy unit tests pin. The caller supplies the event text the in-app
     /// toast would have shown.
-    pub fn os_notify(
-        &mut self,
-        kind: crate::os::notify::NoticeKind,
-        title: &str,
-        body: &str,
-    ) {
+    pub fn os_notify(&mut self, kind: crate::os::notify::NoticeKind, title: &str, body: &str) {
         let enabled = self.notify_from_tray_enabled();
         let Some(notifier) = self.os_notifier.as_ref() else {
             return;

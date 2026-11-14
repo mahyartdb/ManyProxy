@@ -144,10 +144,7 @@ pub fn engine_status_text(engine: &EngineController) -> String {
 pub fn unclean_exit_notice_text() -> String {
     t!("unclean-exit-notice")
 }
-pub fn unclean_exit_notice(
-    previous_clean: bool,
-    last_snapshot: &[String],
-) -> Option<Notification> {
+pub fn unclean_exit_notice(previous_clean: bool, last_snapshot: &[String]) -> Option<Notification> {
     if previous_clean || last_snapshot.is_empty() {
         return None;
     }
@@ -243,11 +240,7 @@ pub fn group_delete_confirm_text(name: &str, count: usize) -> String {
         t!("group-delete-rows", name = name, count = count)
     }
 }
-pub fn group_delete_confirm_description(
-    name: &str,
-    count: usize,
-    subscriptions: usize,
-) -> String {
+pub fn group_delete_confirm_description(name: &str, count: usize, subscriptions: usize) -> String {
     if subscriptions == 0 {
         return group_delete_confirm_text(name, count);
     }
@@ -359,11 +352,7 @@ pub fn restore_done_message(outcome: &RestoreOutcome) -> String {
 pub fn already_subscribed_message(label: &str) -> String {
     t!("already-subscribed", label = label)
 }
-pub fn subscription_interval_failure_message(
-    action: &str,
-    label: &str,
-    error: &str,
-) -> String {
+pub fn subscription_interval_failure_message(action: &str, label: &str, error: &str) -> String {
     t!(
         "subscription-interval-failure",
         action = action,
@@ -635,11 +624,7 @@ pub fn log_level_tooltip(level: Option<LogLevel>) -> String {
 /// The retired Library menu's the prune family. Slice 7 re-homes it in the group
 /// and source manage sheet.
 #[allow(dead_code)]
-pub fn prune_duplicates_confirm_text(
-    group: &str,
-    total: usize,
-    preview: &[String],
-) -> String {
+pub fn prune_duplicates_confirm_text(group: &str, total: usize, preview: &[String]) -> String {
     if preview.is_empty() {
         return t!("prune-duplicates-confirm", group = group, total = total);
     }

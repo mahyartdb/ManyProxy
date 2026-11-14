@@ -730,11 +730,7 @@ impl AppView {
         );
     }
 
-    pub fn list_or_notify(
-        &self,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<Vec<ProxyConfig>> {
+    pub fn list_or_notify(&self, window: &mut Window, cx: &mut App) -> Option<Vec<ProxyConfig>> {
         match self.store.list() {
             Ok(rows) => Some(rows),
             Err(error) => {
@@ -882,11 +878,7 @@ impl AppView {
         }
     }
 
-    pub fn push_engine_notification(
-        &self,
-        notification: Notification,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn push_engine_notification(&self, notification: Notification, cx: &mut Context<Self>) {
         if let Some(handle) = cx.active_window() {
             let _ = handle.update(cx, move |_, window, cx| {
                 window.push_notification(notification, cx);
@@ -1487,12 +1479,7 @@ impl AppView {
 
     /// K5: Retry from a group sweep summary. The group's running set is read
     /// again so a row started or stopped since the first pass is respected.
-    pub fn retry_group_probe(
-        &mut self,
-        group: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn retry_group_probe(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.group_test_in_flight {
             window.push_notification(Notification::info(t!("group-test-running")), cx);
             return;
@@ -2066,12 +2053,7 @@ impl AppView {
         Some((total.saturating_sub(self.refresh.members.len()), total))
     }
 
-    pub fn close_batch_slot(
-        &mut self,
-        sub_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_batch_member(sub_id)
             && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[])
         {
@@ -2582,12 +2564,7 @@ impl AppView {
         }
     }
 
-    pub fn update_group_subs(
-        &mut self,
-        group: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn update_group_subs(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
         let subs = self
             .store
             .list_subscriptions()
@@ -2835,11 +2812,7 @@ impl AppView {
     /// R9: the row menu's `Open logs`, and the inspector's console link. Opens
     /// the dock on Logs with scope `Selected`; the console filter stays as the
     /// session left it — only the inspector link lands with it empty.
-    pub fn open_console_scoped_to_selection(
-        &mut self,
-        clear_filter: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_console_scoped_to_selection(&mut self, clear_filter: bool, cx: &mut Context<Self>) {
         self.console.open = true;
         self.console.tab = ConsoleTab::Logs;
         self.console.scope = ConsoleScope::Selected;
@@ -2897,11 +2870,7 @@ impl AppView {
 
     /// Focus the table. Closing a dock (console or inspector) lands here —
     /// never the root handle, so arrows keep driving rows.
-    pub fn close_console_focus_table(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn close_console_focus_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let list = self.libraries.read(cx).focus_handle(cx);
         window.focus(&list, cx);
     }

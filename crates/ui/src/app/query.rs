@@ -115,12 +115,7 @@ impl AppView {
             .collect()
     }
 
-    pub fn set_status_facet(
-        &mut self,
-        status: StatusFacet,
-        on: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_status_facet(&mut self, status: StatusFacet, on: bool, cx: &mut Context<Self>) {
         if on {
             self.query.statuses.insert(status);
         } else {
@@ -129,12 +124,7 @@ impl AppView {
         self.query_edited(cx);
     }
 
-    pub fn set_protocol_facet(
-        &mut self,
-        protocol: String,
-        on: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_protocol_facet(&mut self, protocol: String, on: bool, cx: &mut Context<Self>) {
         if on {
             self.query.protocols.insert(protocol);
         } else {
@@ -258,12 +248,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub fn write_search_box(
-        &mut self,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn write_search_box(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.update(cx, |input, cx| {
             input.set_value(text.to_string(), window, cx);
         });

@@ -13,6 +13,13 @@ use support::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+};
+use manyproxy_core::Secret;
 use manyproxy_ui::engine::AutoRestartConfig;
 use manyproxy_ui::import::OpenWithKind;
 use manyproxy_ui::overlay_open;
@@ -24,13 +31,6 @@ use manyproxy_ui::ColumnId;
 use manyproxy_ui::ColumnLayout;
 use manyproxy_ui::ConfigForm;
 use manyproxy_ui::ExitTraffic;
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
-};
-use manyproxy_core::Secret;
 
 fn seed_input(name: &str) -> NewConfig {
     NewConfig {
@@ -54,7 +54,10 @@ fn test_facts(delegate: &manyproxy_ui::LibraryDelegate) -> manyproxy_ui::QueryFa
 
 /// The pure query over a delegate's mirrors, for tests that exercise matching
 /// without mounting a window.
-fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_visible(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     manyproxy_ui::filter(
         &delegate.rows,
         &delegate.search_index,
@@ -65,7 +68,10 @@ fn test_visible(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::
 }
 
 /// The app's filter-then-sort order, reproduced without an `AppView`.
-fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<usize> {
+fn test_sorted(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<usize> {
     let mut visible = test_visible(delegate, query);
     if !delegate.sort.is_none() {
         if delegate.sort.key == manyproxy_ui::store::LibrarySortKey::TypeSecurity {
@@ -93,7 +99,10 @@ fn test_sorted(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::F
     visible
 }
 
-fn test_names(delegate: &manyproxy_ui::LibraryDelegate, query: &manyproxy_ui::FilterQuery) -> Vec<String> {
+fn test_names(
+    delegate: &manyproxy_ui::LibraryDelegate,
+    query: &manyproxy_ui::FilterQuery,
+) -> Vec<String> {
     test_sorted(delegate, query)
         .into_iter()
         .map(|index| delegate.rows[index].name.clone())
@@ -402,7 +411,8 @@ fn k5_paste_imports_direct_into_current_group_no_dialog(cx: &mut TestAppContext)
 #[test]
 fn k5_clipboard_refusal_is_one_liner() {
     assert_eq!(
-        manyproxy_ui::AppView::paste_intake_refusal("meeting notes for Thursday").expect("prose refuses"),
+        manyproxy_ui::AppView::paste_intake_refusal("meeting notes for Thursday")
+            .expect("prose refuses"),
         "Nothing importable in clipboard"
     );
     assert_eq!(
@@ -1021,7 +1031,10 @@ fn b3_console_logs_keep_their_scroll_across_tabs(cx: &mut TestAppContext) {
         "a scrolled console still builds a window, not the page: {built_while_scrolled}"
     );
 
-    for tab in [manyproxy_ui::ConsoleTab::Connections, manyproxy_ui::ConsoleTab::Logs] {
+    for tab in [
+        manyproxy_ui::ConsoleTab::Connections,
+        manyproxy_ui::ConsoleTab::Logs,
+    ] {
         view.update(cx, |view, cx| {
             view.console.tab = tab;
             cx.notify();
@@ -1176,9 +1189,9 @@ fn b16_search_no_matches_keeps_its_copy_while_a_refresh_is_in_flight(cx: &mut Te
 /// sort, and the text-size toggle is reachable without opening Settings.
 #[gpui_kit::test]
 fn k12_palette_sort_and_text_size_actions(cx: &mut TestAppContext) {
+    use gpui_kit::component::IndexPath;
     use manyproxy_ui::app::actions::{palette_action_at, PALETTE_GROUPS};
     use manyproxy_ui::store::{LibrarySort, LibrarySortKey, SortDirection, TextSize};
-    use gpui_kit::component::IndexPath;
 
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");

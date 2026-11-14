@@ -663,21 +663,11 @@ impl AppView {
         push_toast_spec(spec, window, cx)
     }
 
-    pub fn toast_success(
-        &mut self,
-        message: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toast_success(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
         self.push_toast(ToastSpec::success(message), window, cx);
     }
 
-    pub fn toast_error(
-        &mut self,
-        message: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toast_error(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
         self.push_toast(ToastSpec::error(message), window, cx);
     }
 }
@@ -755,12 +745,7 @@ impl AppView {
     /// group assignments. Restore re-adds the rows through `add_batch`, never
     /// restarting engines: the row returns disabled, exactly as a manual
     /// re-add would.
-    pub fn undo_expired_delete(
-        &mut self,
-        batch: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn undo_expired_delete(&mut self, batch: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(rows) = take_undo_rows(batch) else {
             return;
         };

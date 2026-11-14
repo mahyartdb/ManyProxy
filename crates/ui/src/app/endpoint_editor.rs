@@ -155,12 +155,7 @@ impl AppView {
     /// `Ctrl+E`: the inspector's inline host when it is already showing, the
     /// row's popover when the row is on screen, and the inspector inline host
     /// for a row a filter hides (never invent an off-screen anchor).
-    pub fn open_endpoint_for_row(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_endpoint_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.inspector_visible {
             self.open_endpoint_draft(id, EndpointHost::InspectorInline, window, cx);
             return;
@@ -241,12 +236,7 @@ impl AppView {
     }
 
     /// The first free port for the typed bind, written into the port field.
-    pub fn use_suggested_port(
-        &mut self,
-        port: u16,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn use_suggested_port(&mut self, port: u16, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.endpoint_draft.as_ref() else {
             return;
         };
@@ -394,11 +384,7 @@ impl AppView {
     /// Apply the draft. A stopped row is a store write; a running row also
     /// restarts, and an engine refusal rolls the store back and restores the
     /// old serving endpoint.
-    pub fn apply_endpoint_draft(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn apply_endpoint_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(check) = self.endpoint_check(cx) else {
             return false;
         };
@@ -558,11 +544,7 @@ pub fn render_endpoint_popover(app: Entity<AppView>, frame: EndpointFrame) -> An
 
 /// The one form both hosts paint. It reads the live `InputState`s directly, so
 /// every keystroke re-validates without a third copy of the text.
-pub fn render_endpoint_form(
-    app: Entity<AppView>,
-    frame: &EndpointFrame,
-    cx: &App,
-) -> AnyElement {
+pub fn render_endpoint_form(app: Entity<AppView>, frame: &EndpointFrame, cx: &App) -> AnyElement {
     let inline = frame.host == EndpointHost::InspectorInline;
     let muted = cx.theme().muted_foreground;
     let danger = danger_text_color(cx.theme());

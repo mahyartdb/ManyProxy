@@ -19,10 +19,7 @@ pub fn labelled_masked_input(label: impl Into<String>, state: &Entity<InputState
         .aria_label(accessible_label(&label))
 }
 
-pub fn labelled_textarea(
-    label: impl Into<String>,
-    state: &Entity<TextareaState>,
-) -> Textarea {
+pub fn labelled_textarea(label: impl Into<String>, state: &Entity<TextareaState>) -> Textarea {
     let label = label.into();
     Textarea::new(state).aria_label(accessible_label(&label))
 }

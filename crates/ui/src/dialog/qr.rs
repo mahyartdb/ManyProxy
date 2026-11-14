@@ -185,10 +185,7 @@ pub fn share_qr_block(
 }
 
 /// The dialog's QR region: both schemes side by side, one scannable code each.
-pub fn share_qr_region(
-    payloads: &[(&'static str, String); 2],
-    cx: &App,
-) -> impl IntoElement {
+pub fn share_qr_region(payloads: &[(&'static str, String); 2], cx: &App) -> impl IntoElement {
     div()
         .id("share-qr-region")
         .test_support()

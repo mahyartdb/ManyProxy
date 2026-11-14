@@ -143,11 +143,7 @@ impl AppView {
         self.commit_column_layout(layout, window, cx);
     }
 
-    pub fn fit_all_columns_to_content(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn fit_all_columns_to_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let measured = self.measured_column_widths(window, cx);
         let mut layout = self.column_layout;
         layout.fit_all(|column| measured[column.index()]);
@@ -278,12 +274,7 @@ impl Render for ColumnDragPreview {
 }
 
 impl AppView {
-    pub fn hover_column_drop(
-        &mut self,
-        column: ColumnId,
-        side: DropSide,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn hover_column_drop(&mut self, column: ColumnId, side: DropSide, cx: &mut Context<Self>) {
         if self.column_drop != Some((column, side)) {
             self.column_drop = Some((column, side));
             cx.notify();

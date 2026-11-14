@@ -150,11 +150,7 @@ impl AppView {
         );
     }
 
-    pub fn write_visible_logs_to(
-        &self,
-        path: &std::path::Path,
-        cx: &App,
-    ) -> Result<(), String> {
+    pub fn write_visible_logs_to(&self, path: &std::path::Path, cx: &App) -> Result<(), String> {
         let body = self.log_lines(cx).join("\n");
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, body)
@@ -263,11 +259,7 @@ impl AppView {
         self.commit_import_dialog(text, group, None, None, None, window, cx);
     }
 
-    pub fn import_from_clipboard_direct(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn import_from_clipboard_direct(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -341,7 +333,9 @@ impl AppView {
         }
     }
 
-    pub fn read_dropped_import_files(paths: &ExternalPaths) -> (Vec<(String, String)>, Vec<String>) {
+    pub fn read_dropped_import_files(
+        paths: &ExternalPaths,
+    ) -> (Vec<(String, String)>, Vec<String>) {
         let mut files: Vec<(String, String)> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
         for path in paths.0.iter() {
@@ -385,9 +379,7 @@ impl AppView {
         )
     }
 
-    pub fn take_batch_counts(
-        &mut self,
-    ) -> (usize, usize, usize, usize, usize, usize, usize) {
+    pub fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize, usize) {
         self.refresh.members.clear();
         let total = std::mem::take(&mut self.refresh.total);
         let added = std::mem::take(&mut self.refresh.added);

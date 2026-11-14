@@ -85,12 +85,7 @@ impl AppView {
         self.commit_rename_group(old, new, window, cx)
     }
 
-    pub fn delete_group_scope(
-        &mut self,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn delete_group_scope(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_delete_group(name, window, cx);
     }
 

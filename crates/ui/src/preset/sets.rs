@@ -236,10 +236,7 @@ pub fn subscription_row(
     )
 }
 
-pub fn update_target_subs(
-    subs: &[ProxySubscription],
-    group: &str,
-) -> Vec<ProxySubscription> {
+pub fn update_target_subs(subs: &[ProxySubscription], group: &str) -> Vec<ProxySubscription> {
     let mut out: Vec<ProxySubscription> = subs
         .iter()
         .filter(|sub| sub.group == group)
