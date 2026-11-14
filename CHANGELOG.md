@@ -4,49 +4,42 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ## [Unreleased]
 
-### Added
+Nothing yet.
 
-- The signed lab skin ships in the app. Dark and Light now paint from the design's own token values (port `Native` skin) instead of the kit's default look; System resolves to one of the two. The Settings accent picker still tints selection, primary actions, and the focus ring on top of the skin.
-- Contrast is a test, not a promise: text and signal tones clear WCAG AA on their surfaces in both modes, and the focus ring clears 3:1.
-- The 1,000-row promise is a test: a 1,000-row fixture renders, filters, and reaches its last row, and the row pitch is unchanged at scale. Nothing in the row render clones a secret or allocates per hover.
+## [0.1.0] - 2026-11-14
 
-### Changed
-
-- The whole copy speaks the new nouns: a row is a **config**, the collection is the **library**, the home view is **All configs**. Real plurals everywhere — no `(s)` anywhere in the interface, no "checked" anywhere, and counts read `1 config`, `2 configs`.
-- The About dialog prints its shortcut list from the live binding table; the README's shortcut table matches it. The retired `Ctrl+1..6` inspector-tab keys are gone from both.
-- Settings → General reads `Relaunch the configs that were running…`; resetting columns reports `Column widths and order reset`; the no-match state says `No configs match`; the update hint points at the action bar's overflow; the auto-clear confirm's button says `Enable auto-clear`.
-
-### Fixed
-
-- The health history's samples line shows the latency again (`N samples · latest Mms`) instead of a broken placeholder.
-- The About dialog prints real line breaks instead of the literal `\n`.
-
-## [0.0.3-redesign]
+The redesign lands: one workbench shell, one selection model, one endpoint editor, the signed Native skin, and the copy contract.
 
 ### Added
 
-- The nav is a scope chooser. `All configs` carries the library total; a flat alphabetical `Groups` section lists every group with its count, puts a zero-count `New group` creation at the top and `Ungrouped` last; a `Sources` section lists each subscription with a freshness dot, its label and row count, a per-source `↻` and a `Manage.` header; `Routing presets` and `Settings` stay pinned at the bottom. Scope entries scroll; the utilities never move.
-- Groups are managed where they live now: `New group` creates a session group that becomes the scope, a group's context menu offers `Manage group.` and `Delete group.`, and the manage sheet carries rename, edit, refresh, auto-clear, the four prune verbs and delete for exactly the group it was opened from. Dragging a row onto a group moves just that row. A group with rows or subscriptions refuses to delete.
-- Selecting a scope filters the library to it without touching the search, facets or column state, clears the selection, and names itself in the action bar. `Ctrl+R` (`Update current scope`) refreshes the source behind a source scope or the subscriptions feeding a group scope, and refuses in `All configs` with a reason instead of guessing a target.
-- The source strip sits above the filter row inside a source scope: the source's label, freshness (`Fresh`/`Stale`/`Failed`/never refreshed), config and running counts, last update, quota (`Used X of Y · Expires …` when the subscription reports one) and live session traffic, with `↻`, `All configs` and `Manage.` on its right.
-- The nav's 56px collapsed state keeps every entry reachable: letters for `All configs`, groups and `Ungrouped`, the freshness dot for sources, `+` and the sources `…`, and the utilities' letters, each with a tooltip. A long group list scrolls inside the nav; the pinned utilities stay put.
 - A workbench shell: a left nav carrying `All configs` and the bottom utilities, an action bar with the view title, its count, `Import`, `Add`, the command palette and a `⋯` overflow, a 36px filter slot above the table, and an engine bar under the table with the engine's state, the running count, the session traffic, `Start all`, `Stop all` and a `⋯` menu with `Test all` and `Stop testing`.
+- The nav is a scope chooser. `All configs` carries the library total; a flat alphabetical `Groups` section lists every group with its count, a zero-count `New group` creation and `Ungrouped` last; a `Sources` section lists each subscription with a freshness dot, its label and row count, a per-source `↻` and a `Manage…` header; `Routing presets` and `Settings` stay pinned at the bottom. Scope entries scroll; the utilities never move.
+- Groups are managed where they live: `New group` creates a group that becomes the scope, a group's context menu offers `Manage group…` and `Delete group…`, and the manage sheet carries rename, edit, refresh, auto-clear, the four prune verbs and delete for exactly the group it was opened from. Dragging a row onto a group moves just that row. A group with rows or subscriptions refuses to delete.
+- Selecting a scope filters the library to it without touching search or facets, clears the selection, and names itself in the action bar. `Ctrl+R` (`Update current scope`) refreshes the source behind a source scope or the subscriptions feeding a group scope, and refuses in `All configs` with a reason instead of guessing a target.
+- The source strip sits above the filter row inside a source scope: freshness (`Fresh`/`Stale`/`Failed`/never refreshed), config and running counts, last update, quota when the subscription reports one, and live session traffic, with `↻`, `All configs` and `Manage…` on its right.
+- The nav's 56px collapsed state keeps every entry reachable: letters for `All configs`, groups and `Ungrouped`, the freshness dot for sources, and the utilities' letters, each with a tooltip. A long group list scrolls inside the nav; the pinned utilities stay put.
 - The filter row searches configs and narrows by Status, Protocol, and a Filter popover for latency, bind, port range and custom endpoints, with `N of M` always visible and a no-match state that clears in place. Search is session-only.
-- The nav collapses to its letters below 1200px and expands again at 1200px, so the window's new minimum still fits the table beside it.
-- `Ctrl+I` opens the inspector and closes it again.
-- The library table has seven columns — Name, Group, Protocol, Upstream, Endpoint, Health and Traffic. Every header opens one menu with Size Column to Fit, Size All Columns to Fit, per-column visibility and `More…`; the Columns sheet adds order buttons and Reset width, order, visibility and all.
+- The library table has seven columns - Name, Group, Protocol, Upstream, Endpoint, Health and Traffic. Every header opens one menu with Size Column to Fit, Size All Columns to Fit, per-column visibility and `More…`; the Columns sheet adds order buttons and Reset width, order, visibility and all. Every visible header sorts on click and reverses on a second click.
 - The table scrolls horizontally when the chosen widths exceed the pane, with the header and rows sharing one offset. Name and Endpoint stay visible, and no column is dropped to fit.
-- One endpoint editor on every surface: the endpoint chip's pencil, `Edit` in the inspector, and `Ctrl+E` on the selected row all open the same form. It validates the bind and port as you type, offers the first free port on that bind when the port is taken, saves in place while the endpoint is stopped, and restarts it with rollback while it is running. `Ctrl+Shift+E` still opens the full config form.
-- The inspector is one stacked scroll — Identity, Endpoint, Health, Actions and `Open in console →` — with no tabs. One selected row shows that row; two or more show counts and point at the selection bar; none shows the empty state. Its width persists between sessions (240–360, default 300).
-- A console dock above the engine bar with `Logs | Connections | Traffic`, `All | Selected` scopes, one shared quick filter, log pause/clear with auto-tail, live connections, and session traffic plus runtime stats. `Ctrl+\`` or the engine bar's `Console` button toggles it; it starts collapsed.
+- One endpoint editor on every surface: the endpoint chip's pencil, `Edit` in the inspector, and `Ctrl+E` on the selected row all open the same form. It validates the bind and port as you type, offers the first free port on that bind when the port is taken, saves in place while the endpoint is stopped, and restarts with rollback while it is running. `Ctrl+Shift+E` still opens the full config form.
+- The inspector is one stacked scroll - Identity, Endpoint, Health, Actions and `Open in console →` - with no tabs. One selected row shows that row; two or more show counts and point at the selection bar; none shows the empty state. Its width persists between sessions (240-360, default 300).
+- A console dock above the engine bar with `Logs | Connections | Traffic`, `All | Selected` scopes, one shared quick filter, log pause/clear with auto-tail, live connections, and session traffic plus runtime stats. `` Ctrl+` `` or the engine bar's `Console` button toggles it; it starts collapsed.
 - The engine bar's `⋯` gains `Clear test results…`, enabled only while health evidence exists and routed through the existing confirm.
+- One selection model for the table: click, Ctrl-click, Shift-click, `Ctrl+A`, arrows, `Shift+arrows`, `Home`/`End`, `Space`, `Esc`. The selection bar swaps into the filter slot with Start/Stop/Test/Delete, `Show failures`, and a `N hidden` jump that clears the filters hiding selected rows.
+- The signed lab skin ships in the app. Dark and Light paint from the design's own token values (port `Native` skin) instead of the kit's default look; System resolves to one of the two. The Settings accent picker still tints selection, primary actions and the focus ring on top of the skin.
+- Contrast is a test, not a promise: text and signal tones clear WCAG AA on their surfaces in both modes, and the focus ring clears 3:1.
+- The 1,000-row promise is a test: a 1,000-row fixture renders, filters and reaches its last row, and the row pitch is unchanged at scale. Nothing in the row render clones a secret or allocates per hover.
+- `Ctrl+I` opens the inspector and closes it again. `Ctrl+K` palette, `Ctrl+F` search, `Ctrl+O` import, `Ctrl+N` add.
 
 ### Changed
 
+- The whole copy speaks the new nouns: a row is a **config**, the collection is the **library**, the home view is **All configs**. Real plurals everywhere - no `(s)` anywhere in the interface, no "checked" anywhere, and counts read `1 config`, `2 configs`.
+- The About dialog prints its shortcut list from the live binding table; the README's shortcut table matches it.
+- Settings General reads `Relaunch the configs that were running.`; resetting columns reports `Column widths and order reset`; the no-match state says `No configs match`; the update hint points at the action bar's overflow; the auto-clear confirm's button says `Enable auto-clear`.
 - Endpoint edits are explicit: the unapplied-edit dirty dot and the Start gate that blocked on it are gone, because the editor writes on Apply or not at all.
-- Column order, visibility and widths persist as one `library_column_layout` value. The Row columns dialog and the eight standalone palette sort commands are retired; every visible header sorts on click and reverses on a second click.
+- Column order, visibility and widths persist as one `library_column_layout` value. The Row columns dialog and the eight standalone palette sort commands are retired.
 - The five-menu toolbar, the three-segment status strip and the facet band are gone. Export, About and `Check for updates` live in the action bar's `⋯`, Routing presets and Settings at the bottom of the nav, and the transport controls in the engine bar.
-- The window's minimum size is 1100×640 and it opens at 1200×700, so the nav starts expanded.
+- The window's minimum size is 1100x640 and it opens at 1200x700, so the nav starts expanded.
 - Toasts park above the engine bar, so a toast never covers the engine's own controls.
 - `Ctrl+1..6`, the five inspector-tab actions, the tab strip, and the Runtime stats and Traffic stats dialogs are retired. Their evidence lives in the console and the stacked inspector, and the palette no longer offers those commands.
 - The old all-groups sheet and the palette's `groups` action are gone; the nav owns the group list and every group verb acts on one named group. Group order is alphabetical and no longer persisted, so `Move up`/`Move down` are gone too.
@@ -54,10 +47,10 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Fixed
 
+- The health history's samples line shows the latency again (`N samples · latest Mms`) instead of a broken placeholder.
+- The About dialog prints real line breaks instead of the literal `\n` escape sequence.
 - Closing the inspector or the console returns keyboard focus to the table.
-- The About dialog prints its body as lines instead of the literal `\n` escape sequence.
 - Stopping every endpoint asks "Stop N running configs" with a real plural.
-
 ## [0.0.2] - 2026-11-07
 
 ### Added
@@ -152,5 +145,6 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 - UI affordances: port-filter search grammar, click-to-copy cells, connection counters, the window title running marker, header sort pickers, QR encode of listener URLs, traffic dialog top-9 exits, per-shard CPU/RAM mini-charts, log polish with `log_max_lines`, window geometry persistence, and the bind-IP picker.
 - Ops marker: `last_clean_exit` with an unclean-exit startup toast.
 
+[0.1.0]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.1.0
 [0.0.2]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.2
 [0.0.1-beta.1]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.1-beta.1
