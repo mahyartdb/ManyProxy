@@ -1148,7 +1148,7 @@ fn laneb_group_delete_confirms_naming_count(cx: &mut TestAppContext) {
         "empty arm names the group"
     );
     assert!(
-        manyproxy_ui::text::group_delete_confirm_text("site/east", 2).contains("2 row(s)"),
+        manyproxy_ui::text::group_delete_confirm_text("site/east", 2).contains("2 configs"),
         "non-empty arm names the count"
     );
     assert!(
@@ -1157,12 +1157,12 @@ fn laneb_group_delete_confirms_naming_count(cx: &mut TestAppContext) {
     );
     let mixed = manyproxy_ui::group_delete_confirm_description("site/east", 2, 3);
     assert!(
-        mixed.contains("2 row(s) and 3 subscription(s)"),
+        mixed.contains("2 configs and 3 subscriptions"),
         "mixed arm names both counts: {mixed}"
     );
     let sub_only = manyproxy_ui::group_delete_confirm_description("site/east", 0, 3);
     assert!(
-        sub_only.contains("3 subscription(s)"),
+        sub_only.contains("3 subscriptions"),
         "subscription-only arm kept: {sub_only}"
     );
     assert_eq!(
@@ -3966,11 +3966,11 @@ fn f10_palette_footer_and_bound_row_chips(cx: &mut TestAppContext) {
     // are the ones on screen.
     assert!(
         cx.debug_bounds("kbd:ctrl-n").is_some(),
-        "Add configuration wears Ctrl+N"
+        "Add config wears Ctrl+N"
     );
     assert!(
         cx.debug_bounds("kbd:ctrl-o").is_some(),
-        "Import configurations wears Ctrl+O"
+        "Import configs wears Ctrl+O"
     );
 
     let state = view.read_with(cx, |view, _| view.palette.clone().expect("palette state"));
@@ -3983,7 +3983,7 @@ fn f10_palette_footer_and_bound_row_chips(cx: &mut TestAppContext) {
         state.read_with(cx, |state, _| state.matched_count())
     };
 
-    assert_eq!(filter(cx, "add"), 1, "only Add configuration matches");
+    assert_eq!(filter(cx, "add"), 1, "only Add config matches");
     assert!(
         cx.debug_bounds("kbd:ctrl-n").is_some(),
         "the chip rides along when the row is filtered to the top"
@@ -6845,11 +6845,11 @@ fn t08_update_targets_partition_and_confirm() {
     assert_eq!(skipped.len(), 1);
     assert_eq!(
         update_all_confirm_text(2, 1),
-        "Update 2 subscription(s)? 1 skipped (auto-refresh off for their group)."
+        "Update 2 subscriptions? 1 skipped (auto-refresh off for their group)."
     );
     assert_eq!(
         update_all_confirm_text(2, 0),
-        "Update all 2 subscription(s)?"
+        "Update all 2 subscriptions?"
     );
 }
 
@@ -8021,7 +8021,7 @@ fn honest_engine_feedback_copies() {
         !restarted.starts_with("Started \""),
         "never bare Started: {restarted}"
     );
-    assert_eq!(no_selection_message(), "Select a configuration first");
+    assert_eq!(no_selection_message(), "Select a config first");
     assert!(
         start_busy_message().contains("Starting"),
         "{}",
@@ -10514,4 +10514,231 @@ fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
     assert_eq!(manyproxy_ui::search_count_text(visible, total), "1 of 2");
     assert_painted(cx, "library-search");
     assert_painted(cx, "filter-count");
+}
+
+// --- slice 8 anchors: the 1,000-row fixture and the secret-render pin ------
+
+/// A 1,000-row fixture built in memory and installed through the same
+/// delegate path the store load uses: 1,000 rows paint, the count reads
+/// N of M, a filter narrows them, and the last row is reachable.
+#[gpui_kit::test]
+fn thousand_rows_render_filter_and_scroll(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    let total = 1_000u16;
+    let rows: Vec<_> = (0..total)
+        .map(|index| {
+            t77_row(
+                &format!("r{index:04}"),
+                &format!("Config {index:04}"),
+                "vless",
+                "bulk",
+                20_000 + index,
+            )
+        })
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries
+                .update(cx, |state, _| state.delegate_mut().set_rows(rows));
+            view.apply_query(cx);
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-count", cx),
+        "1000 of 1000",
+        "with no query N = M"
+    );
+
+    // A port-range filter narrows the set; the count follows in the same pass.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_search_now("port=20990:20999".to_string(), cx)
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(label_of("filter-count", cx), "10 of 1000");
+
+    // Clearing brings every row back in the same order.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.clear_search(window, cx));
+    });
+    paint_frame(cx);
+    assert_eq!(label_of("filter-count", cx), "1000 of 1000");
+
+    // The last row is reachable: focusing the last row scrolls the
+    // virtualized list to the bottom and paints its surface. (The End
+    // binding itself is pinned by the table suite.)
+    focus_library(&view, cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.focus_last_row(window, cx));
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    let focus = view.read_with(cx, |view, _| view.selection_focus.clone());
+    assert_eq!(
+        focus.as_deref(),
+        Some("r0999"),
+        "End reaches the last row of the 1,000-row fixture"
+    );
+    let painted_last = cx.update(|window, _| {
+        (992..=999).any(|index| {
+            window
+                .try_find(format!("row-surface-r{index:04}"))
+                .map(|snapshot| snapshot.visible())
+                .unwrap_or(false)
+        })
+    });
+    assert!(
+        painted_last,
+        "the virtualized list scrolls the bottom of the fixture into view"
+    );
+}
+
+fn pitch_of_rows() -> f32 {
+    manyproxy_ui::Density::Comfortable.pitch()
+}
+
+/// At 1,000 rows every painted row keeps the density pitch: the virtualized
+/// list never reflows to squeeze or stretch a row.
+#[gpui_kit::test]
+fn thousand_rows_keep_the_row_pitch(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    let rows: Vec<_> = (0..1_000u16)
+        .map(|index| {
+            t77_row(
+                &format!("r{index:04}"),
+                &format!("Config {index:04}"),
+                "vless",
+                "bulk",
+                20_000 + index,
+            )
+        })
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries
+                .update(cx, |state, _| state.delegate_mut().set_rows(rows));
+            view.apply_query(cx);
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+
+    let pitch = pitch_of_rows();
+    let pitches: Vec<(f32, f32)> = cx.update(|window, _| {
+        (0..30u16)
+            .filter_map(|index| {
+                let surface = window.try_find(format!("row-surface-r{index:04}"))?;
+                let bounds = surface.bounds();
+                Some((bounds.origin.y.as_f32(), bounds.size.height.as_f32()))
+            })
+            .collect()
+    });
+    assert!(pitches.len() >= 10, "the virtualized list paints rows");
+    for (index, (y, height)) in pitches.iter().enumerate() {
+        assert_eq!(
+            *height, pitch,
+            "row {index} fills the density pitch at 1,000 rows"
+        );
+        if let Some((prev_y, _)) = index
+            .checked_sub(1)
+            .and_then(|prev| pitches.get(prev))
+        {
+            assert_eq!(
+                y - prev_y,
+                pitch,
+                "row {index} sits exactly one pitch below its neighbour"
+            );
+        }
+    }
+}
+
+/// No secret reaches the rendered tree at scale: 1,000 rows carry a marked
+/// secret in params, and neither the search index nor any painted label
+/// surface exposes it.
+#[gpui_kit::test]
+fn no_secret_reaches_the_rendered_tree_at_scale(cx: &mut TestAppContext) {
+    use manyproxy_core::Secret;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    const MARKER: &str = "ZZSECRETZZ-do-not-render";
+    let rows: Vec<_> = (0..1_000u16)
+        .map(|index| {
+            let mut row = t77_row(
+                &format!("r{index:04}"),
+                &format!("Config {index:04}"),
+                "vless",
+                "bulk",
+                20_000 + index,
+            );
+            row.params = format!(
+                "{{\"type\":\"vless\",\"server\":\"s.example.com\",\"server_port\":443,\"uuid\":\"{MARKER}\"}}"
+            )
+            .into();
+            row
+        })
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.libraries
+                .update(cx, |state, _| state.delegate_mut().set_rows(rows));
+            view.apply_query(cx);
+            cx.notify();
+        });
+    });
+    paint_frame(cx);
+
+    // Searching for the secret never matches a row.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_search_now(MARKER.to_string(), cx)
+        });
+    });
+    paint_frame(cx);
+    assert_eq!(
+        label_of("filter-count", cx),
+        "0 of 1000",
+        "the secret never matches the search"
+    );
+
+    // The painted frame carries no secret: every visible label and text node
+    // is checked through the completed frame's snapshots.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.clear_search(window, cx));
+    });
+    paint_frame(cx);
+    let leaked = cx.update(|window, _| {
+        let mut found = Vec::new();
+        for index in 0..40u16 {
+            let id = format!("row-name-text-r{index:04}");
+            if let Some(snapshot) = window.try_find(id.clone()) {
+                if let Some(label) = snapshot.label() {
+                    if label.contains(MARKER) {
+                        found.push(id);
+                    }
+                }
+            }
+        }
+        found
+    });
+    assert!(leaked.is_empty(), "no row label carries the secret: {leaked:?}");
+    let _ = Secret::default();
 }

@@ -614,7 +614,9 @@ fn source_strip_shows_freshness_counts_quota_and_traffic(cx: &mut TestAppContext
             &sub.id,
             parse_subscription_userinfo("upload=2048; download=0; total=1048576").map(
                 |mut quota| {
-                    quota.expire = Some(now + 4 * 86_400);
+                    // Half a day of slack keeps the "4d left" rounding stable
+                    // no matter when in the day the test runs.
+                    quota.expire = Some(now + 4 * 86_400 + 43_200);
                     quota
                 },
             ),
@@ -882,5 +884,57 @@ fn update_current_scope_refreshes_the_scoped_source_or_group(cx: &mut TestAppCon
     assert!(
         view.read_with(cx, |view, _| view.refresh.inflight.is_empty()),
         "All configs starts nothing"
+    );
+}
+
+/// The focus surface follows the shell: the regions a Tab walk crosses are
+/// laid out in the signed order — title bar → nav → action bar → filter row →
+/// header → rows → engine bar, and the engine bar is the last stop in the
+/// window. (The keystroke-level focus transitions are pinned by the escape
+/// reclaim and selection focus tests; this pins the order they walk.)
+#[gpui_kit::test]
+fn focus_order_follows_the_shell(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(manyproxy_ui::bind_app_keys);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let _ = alpha;
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let ys: Vec<(&str, f32)> = cx.update(|window, _| {
+        [
+            "title-bar",
+            "nav",
+            "action-bar",
+            "filter-slot",
+            "library-column-headers",
+            "engine-bar",
+        ]
+        .into_iter()
+        .filter_map(|id| {
+            let bounds = window.try_find(id.to_string())?.bounds();
+            Some((id, bounds.origin.y.as_f32()))
+        })
+        .collect()
+    });
+    for pair in ys.windows(2) {
+        assert!(
+            pair[0].1 <= pair[1].1,
+            "the focus surface runs top-down through the shell: {} at {} then {} at {}",
+            pair[0].0,
+            pair[0].1,
+            pair[1].0,
+            pair[1].1
+        );
+    }
+    assert_eq!(
+        ys.last().map(|(id, _)| *id),
+        Some("engine-bar"),
+        "the engine bar is the last stop in the window"
     );
 }

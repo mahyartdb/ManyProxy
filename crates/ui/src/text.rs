@@ -768,8 +768,8 @@ pub fn rule_set_summary(row: &RuleSetRow, used_by: &[String]) -> String {
 }
 pub fn shortcut_action_label(action: &str) -> String {
     match action {
-        "Add configuration" => t!("shortcut-add-configuration"),
-        "Import configurations" => t!("shortcut-import-configurations"),
+        "Add configuration" => t!("shortcut-add-config"),
+        "Import configurations" => t!("shortcut-import-configs"),
         "Paste clipboard into Import" => t!("shortcut-paste-clipboard"),
         "Start selected" => t!("shortcut-start-selected"),
         "Stop selected" => t!("shortcut-stop-selected"),
@@ -884,7 +884,7 @@ pub fn window_corners_explanation(corners: WindowCorners) -> String {
 pub fn test_all_scope_label(scope: TestAllScope) -> String {
     match scope {
         TestAllScope::Running => t!("test-scope-running"),
-        TestAllScope::Checked => t!("test-scope-checked"),
+        TestAllScope::Checked => t!("test-scope-selected"),
     }
 }
 pub fn shard_stats_summary(rows: &[ShardStatRow]) -> String {

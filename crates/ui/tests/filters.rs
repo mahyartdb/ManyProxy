@@ -1065,7 +1065,7 @@ fn preset_copy_names_reasons_never_content() {
     };
     let summary = preset_row_summary(&preset, &["\"Row\"".to_string()]);
     assert!(summary.contains("ads"), "{summary}");
-    assert!(summary.contains("1 rule(s)"), "{summary}");
+    assert!(summary.contains("1 rule"), "{summary}");
     assert!(summary.contains("\"Row\""), "{summary}");
     let lone = preset_row_summary(&preset, &[]);
     assert!(lone.contains("unattached"), "{lone}");
@@ -1318,7 +1318,7 @@ fn appearance_mapping_and_summaries() {
     assert_eq!(appearance_theme_mode("system", false), ThemeMode::Dark);
     assert_eq!(appearance_theme_mode("midnight", true), ThemeMode::Dark);
     assert!(
-        preset_summary_text(Some(0)).contains("0 routing preset(s)"),
+        preset_summary_text(Some(0)).contains("0 routing presets"),
         "honest zero"
     );
     assert!(
@@ -2143,7 +2143,7 @@ fn t10_traffic_stats_summary_labels_all_time() {
     let text = traffic_stats_summary_text(TrafficPeriod::Week, 2, 4_000, 140);
     assert!(text.contains("7d"), "{text}");
     assert!(text.contains("all-time"), "{text}");
-    assert!(text.contains("2 exit(s)"), "{text}");
+    assert!(text.contains("2 exits"), "{text}");
 }
 
 #[gpui_kit::test]
@@ -5850,7 +5850,7 @@ fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) 
     assert_eq!(engine_text, "engine running");
     assert_eq!(
         manyproxy_ui::status_count_text(total, 3),
-        "3 configurations · 3 set for launch"
+        "3 configs · 3 set for launch"
     );
     let totals = totals.expect("traffic totals render once bytes flow");
     assert_eq!(totals, "out 1.0 KB · in 2.0 KB", "traffic totals read");
@@ -5977,7 +5977,7 @@ fn f06_restore_flag_count_and_row_menu(cx: &mut TestAppContext) {
     paint_frame(cx);
     assert_eq!(
         label_of("action-bar-count", cx),
-        "2 configurations · 1 set for launch",
+        "2 configs · 1 set for launch",
         "the count names the launch contract, not a start promise"
     );
     cx.update(|_, cx| {
@@ -6152,7 +6152,7 @@ fn k12_engine_bar_names_engine_running_and_traffic(cx: &mut TestAppContext) {
 
     assert_eq!(
         label_of("action-bar-count", cx),
-        "1 configuration · 1 set for launch",
+        "1 config · 1 set for launch",
         "the action bar counts the library"
     );
     assert_eq!(
@@ -6213,7 +6213,7 @@ fn k12_engine_bar_counts_stay_honest(cx: &mut TestAppContext) {
     );
     assert_eq!(
         label_of("action-bar-count", cx),
-        "0 configurations · 0 set for launch",
+        "0 configs · 0 set for launch",
         "empty counts stay honest"
     );
     assert_eq!(
@@ -9731,7 +9731,7 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
     assert_eq!(rows[3].caption, Some(manyproxy_ui::ShardCaption::Collecting));
     assert_eq!(
         manyproxy_ui::shard_stats_summary(&rows),
-        "3 live shard(s), 1 charted, sampling unavailable"
+        "3 live shards, 1 charted, sampling unavailable"
     );
 
     cx.update(gpui_kit::init);

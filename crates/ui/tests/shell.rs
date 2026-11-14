@@ -382,7 +382,7 @@ fn old_table_still_filters_through_the_slot_search(cx: &mut TestAppContext) {
     assert_painted(cx, "library-search");
     assert_eq!(
         label_of("action-bar-count", cx),
-        "2 configurations · 0 set for launch",
+        "2 configs · 0 set for launch",
         "the action bar counts the whole library"
     );
 
@@ -395,7 +395,7 @@ fn old_table_still_filters_through_the_slot_search(cx: &mut TestAppContext) {
     assert_eq!(visible, 1, "the slot's query still filters the rows");
     assert_eq!(
         label_of("action-bar-count", cx),
-        "2 configurations · 0 set for launch",
+        "2 configs · 0 set for launch",
         "the count names the library, not the filtered rows"
     );
 }

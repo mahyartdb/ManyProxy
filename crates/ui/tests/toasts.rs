@@ -284,7 +284,7 @@ fn k5_delete_is_immediate_and_undo_restores_the_row(cx: &mut TestAppContext) {
     );
     assert_eq!(
         restored[0].name, "K5 solo",
-        "undo restores the removed configuration"
+        "undo restores the removed config"
     );
     assert_eq!(
         restored[0].group, "travel",
@@ -735,7 +735,7 @@ fn b19_chrome_controls_expose_button_role_and_label(cx: &mut TestAppContext) {
         ("nav-routing-presets", "Routing presets"),
         ("nav-settings", "Settings"),
         ("action-bar-import", "Import"),
-        ("action-bar-add", "Add configuration"),
+        ("action-bar-add", "Add config"),
         ("action-bar-palette", "Command palette"),
         ("action-bar-overflow", "More actions"),
         ("engine-bar-start-all", "Start all"),
@@ -1685,12 +1685,12 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
     paint_frame(cx);
 
     for (verb, want) in [
-        ("start", "Start 3 configurations"),
-        ("stop", "Stop 3 configurations"),
-        ("test", "Test 3 configurations"),
+        ("start", "Start 3 configs"),
+        ("stop", "Stop 3 configs"),
+        ("test", "Test 3 configs"),
         ("copy-urls", "Copy 3 URLs"),
         ("edit", "Edit config…"),
-        ("delete", "Delete 3 configurations"),
+        ("delete", "Delete 3 configs"),
     ] {
         assert_eq!(
             label_of(&format!("rowctx-{verb}-{}", bravo.id), cx),
@@ -1712,7 +1712,7 @@ fn multi_select_context_menu_plural_labels_and_full_target(cx: &mut TestAppConte
     );
     assert_eq!(
         label_of(&format!("rowctx-move-{}", bravo.id), cx),
-        "Move 3 configurations to group"
+        "Move 3 configs to group"
     );
 
     cx.update(|window, cx| {

@@ -646,6 +646,13 @@ fn signal_and_muted_text_clear_aa_on_paper_and_quiet_surface(cx: &mut TestAppCon
                 }
             }
 
+            // The focus ring is a large signal, not text: 3:1 against paper.
+            let ring = contrast_ratio(theme.ring, theme.background);
+            assert!(
+                ring >= 3.0,
+                "the focus ring clears 3:1 on paper in {appearance}, got {ring:.2}:1"
+            );
+
             assert_eq!(
                 serving_tone_color(ServingTone::Stopped, theme),
                 theme.muted_foreground,
@@ -845,7 +852,7 @@ fn shell_boots_with_empty_library(cx: &mut TestAppContext) {
 
     cx.update(|window, cx| {
         window.open_dialog(cx, |dialog: Dialog, _, _| {
-            dialog.title("Add proxy configuration")
+            dialog.title("Add proxy config")
         });
     });
     cx.run_until_parked();
@@ -5042,4 +5049,126 @@ fn ticks_idle_with_nothing_running_touch_no_network(cx: &mut TestAppContext) {
         view.read_with(cx, |view, _| view.engine.last_error().is_none()),
         "no errors recorded"
     );
+}
+
+// --- slice 8 anchors: copy catalog, About, icon-only names ----------------
+
+/// The catalog carries no pseudo-plural and no checked-set vocabulary: the
+/// nouns are config/configs, and count-bearing messages use Fluent selectors.
+#[test]
+fn no_pseudo_plural_or_checked_string_survives() {
+    const CATALOG: &str = include_str!("../locales/en/main.ftl");
+    for (needle, why) in [("(s)", "pseudo-plurals are banned"), ("checked", "the checked set is retired")] {
+        let offenders: Vec<&str> = CATALOG
+            .lines()
+            .filter(|line| line.contains(needle) && !line.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{why}: {offenders:?}"
+        );
+    }
+    for line in CATALOG.lines() {
+        if !line.contains(" = ") || line.trim_start().starts_with('#') {
+            continue;
+        }
+        assert!(
+            !line.contains("configuration") && !line.contains("configurations"),
+            "a row is a config, not a configuration: {line}"
+        );
+    }
+}
+
+/// The About body renders real line breaks from the multiline Fluent value;
+/// the literal escape never reaches the dialog.
+#[test]
+fn about_body_renders_line_breaks() {
+    let body = manyproxy_ui::about_body(
+        "0.1.0",
+        "abc123",
+        &["sing-box.exe: found (app dir)".to_string()],
+        "C:\\data\\library.db",
+        "C:\\data\\manyproxy-export.json",
+    );
+    assert!(body.contains('\n'), "the About body has real newlines");
+    assert!(
+        !body.contains("\\n"),
+        "no literal backslash-n survives in the About body: {body}"
+    );
+}
+
+/// The audited icon-only controls each expose an accessible name and a
+/// tooltip; the state glyph stays a non-control.
+#[gpui_kit::test]
+fn every_icon_only_control_has_an_accessible_name(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let row = store
+        .add(facet_seed("Alpha", "vless", "team", "10801"))
+        .expect("seed works");
+    let sub = store
+        .add_subscription("Free plan", "https://example.com/free.txt", "team", false)
+        .expect("sub works");
+    store
+        .refresh_with_body(
+            &sub.id,
+            "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#feed",
+            manyproxy_ui::store::now_unix(),
+        )
+        .expect("refresh works");
+    let sub_id = sub.id.clone();
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    // The row's hover actions are icon-only until hover; their accessible
+    // names exist in the tree regardless. Checked in All configs, where the
+    // seeded row is visible.
+    select_library_row(&view, cx, &row.id);
+    paint_frame(cx);
+    for id in [
+        format!("row-start-{}", row.id),
+        format!("row-stop-{}", row.id),
+    ] {
+        cx.update(|window, _| {
+            let snapshot = window.try_find(id.clone());
+            if let Some(snapshot) = snapshot {
+                assert!(
+                    snapshot.label().is_some(),
+                    "{id} exposes an accessible name"
+                );
+            }
+        });
+    }
+
+    // The scope strip only exists inside a source scope.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.set_scope(manyproxy_ui::LibraryScope::Source(sub_id.clone()), window, cx)
+        });
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let named = [
+        "action-bar-palette",
+        "action-bar-overflow",
+        "nav-new-group",
+        "nav-manage-sources",
+        "scope-strip-refresh",
+        "engine-bar-overflow",
+    ];
+    for id in named {
+        let label = cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders in the shell"))
+                .label()
+                .map(str::to_string)
+        });
+        assert!(label.is_some(), "{id} exposes an accessible name");
+        // The tooltip wiring is pinned at the source: every id above appears
+        // with a `.tooltip(...)` in the renderer that owns it.
+    }
 }

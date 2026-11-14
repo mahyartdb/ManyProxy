@@ -954,8 +954,8 @@ impl SettingsState {
         ));
 
         let last = match *self.last_check.borrow() {
-            Some(at) => t!("settings-last-checked-at", time = format_check_time(at)),
-            None => t!("settings-never-checked"),
+            Some(at) => t!("settings-last-update-check-at", time = format_check_time(at)),
+            None => t!("settings-no-update-check"),
         };
         // K9: `Check now` is a row action, not a commit. It rides beside the
         // timestamp so the section keeps one commit row: the dialog footer.
@@ -963,7 +963,7 @@ impl SettingsState {
         body = body.child(settings_row(
             self,
             "settings-row-last-check",
-            t!("settings-last-checked"),
+            t!("settings-last-update-check"),
             None,
             muted,
             div()
@@ -2001,7 +2001,7 @@ impl AppView {
             Ok(()) => {
                 let message = match scope {
                     TestAllScope::Running => t!("test-all-scope-running-toast"),
-                    TestAllScope::Checked => t!("test-all-scope-checked-toast"),
+                    TestAllScope::Checked => t!("test-all-scope-selected-toast"),
                 };
                 window.push_notification(Notification::success(message), cx);
                 cx.notify();

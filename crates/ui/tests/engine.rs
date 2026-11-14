@@ -2533,7 +2533,7 @@ fn export_count_message_states_both_numbers() {
     use manyproxy_ui::export_count_message;
     assert_eq!(
         export_count_message(3, 3, "/tmp/x.json"),
-        "Exported 3 config(s) to /tmp/x.json"
+        "Exported 3 configs to /tmp/x.json"
     );
     let both = export_count_message(4, 3, "/tmp/x.json");
     assert!(both.contains('4'), "total in: {both}");
@@ -4656,7 +4656,7 @@ fn t02_shell_surfaces_announce_names(cx: &mut TestAppContext) {
         ("nav-routing-presets", "Routing presets"),
         ("nav-settings", "Settings"),
         ("action-bar-import", "Import"),
-        ("action-bar-add", "Add configuration"),
+        ("action-bar-add", "Add config"),
         ("action-bar-palette", "Command palette"),
         ("action-bar-overflow", "More actions"),
         ("engine-bar-start-all", "Start all"),
@@ -5712,7 +5712,7 @@ fn laneb_settings_clears_confirm(cx: &mut TestAppContext) {
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (view, cx) = mount_view(store, cx);
     assert!(
-        settings_clear_traffic_text(3).contains("all 3 configuration(s)"),
+        settings_clear_traffic_text(3).contains("all 3 configs"),
         "traffic confirm names scope"
     );
     assert!(
@@ -6533,7 +6533,7 @@ fn t09_group_toast_texts_name_scope() {
     use manyproxy_ui::group_test_summary_toast;
     assert_eq!(
         group_test_summary_toast("g", 3, 2, 1, false),
-        "Tested 3 endpoint(s) in group \"g\": 2 live · 1 dead"
+        "Tested 3 endpoints in group \"g\": 2 live · 1 dead"
     );
     assert!(
         group_test_summary_toast("g", 3, 1, 0, true).contains("(stopped early)"),
