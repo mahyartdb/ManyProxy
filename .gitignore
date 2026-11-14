@@ -4,3 +4,6 @@
 .playwright-mcp/
 # Local cargo build config (shared target dir with the Herdr worktrees).
 .cargo/
+
+# Local live-test sandbox (app + throwaway db).
+.sandbox-run/
