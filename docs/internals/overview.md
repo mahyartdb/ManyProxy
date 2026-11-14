@@ -22,7 +22,7 @@ tests. The root package is a shell around `manyproxy_ui::run()`.
 | `crates/core/src/library/` | The pure row logic: rows, match, columns, metrics | Rendering, `ListDelegate` |
 | `crates/ui/src/library/` | The list adapter: the delegate, row render, tone, shard, host picker | Store mutations |
 | `crates/ui/src/app/` | `AppView`, dialogs, ticks, the wire between the modules above | Anything another module imports |
-| `crates/ui/src/tests.rs` | Every windowed test | Production code |
+| `crates/ui/tests/` | The windowed test suite, one integration binary per area | Production code |
 
 Within `manyproxy-ui`, `app` may depend on everything below it and nothing
 below `app` may import `app`. Actions (start, stop, delete, import) are

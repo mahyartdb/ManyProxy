@@ -6,14 +6,30 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ### Added
 
+- The signed lab skin ships in the app. Dark and Light now paint from the design's own token values (port `Native` skin) instead of the kit's default look; System resolves to one of the two. The Settings accent picker still tints selection, primary actions, and the focus ring on top of the skin.
+- Contrast is a test, not a promise: text and signal tones clear WCAG AA on their surfaces in both modes, and the focus ring clears 3:1.
+- The 1,000-row promise is a test: a 1,000-row fixture renders, filters, and reaches its last row, and the row pitch is unchanged at scale. Nothing in the row render clones a secret or allocates per hover.
+
+### Changed
+
+- The whole copy speaks the new nouns: a row is a **config**, the collection is the **library**, the home view is **All configs**. Real plurals everywhere — no `(s)` anywhere in the interface, no "checked" anywhere, and counts read `1 config`, `2 configs`.
+- The About dialog prints its shortcut list from the live binding table; the README's shortcut table matches it. The retired `Ctrl+1..6` inspector-tab keys are gone from both.
+- Settings → General reads `Relaunch the configs that were running…`; resetting columns reports `Column widths and order reset`; the no-match state says `No configs match`; the update hint points at the action bar's overflow; the auto-clear confirm's button says `Enable auto-clear`.
+
+### Fixed
+
+- The health history's samples line shows the latency again (`N samples · latest Mms`) instead of a broken placeholder.
+- The About dialog prints real line breaks instead of the literal `\n`.
+
+## [0.0.3-redesign]
+
+### Added
+
 - The nav is a scope chooser. `All configs` carries the library total; a flat alphabetical `Groups` section lists every group with its count, puts a zero-count `New group` creation at the top and `Ungrouped` last; a `Sources` section lists each subscription with a freshness dot, its label and row count, a per-source `↻` and a `Manage.` header; `Routing presets` and `Settings` stay pinned at the bottom. Scope entries scroll; the utilities never move.
 - Groups are managed where they live now: `New group` creates a session group that becomes the scope, a group's context menu offers `Manage group.` and `Delete group.`, and the manage sheet carries rename, edit, refresh, auto-clear, the four prune verbs and delete for exactly the group it was opened from. Dragging a row onto a group moves just that row. A group with rows or subscriptions refuses to delete.
 - Selecting a scope filters the library to it without touching the search, facets or column state, clears the selection, and names itself in the action bar. `Ctrl+R` (`Update current scope`) refreshes the source behind a source scope or the subscriptions feeding a group scope, and refuses in `All configs` with a reason instead of guessing a target.
 - The source strip sits above the filter row inside a source scope: the source's label, freshness (`Fresh`/`Stale`/`Failed`/never refreshed), config and running counts, last update, quota (`Used X of Y · Expires …` when the subscription reports one) and live session traffic, with `↻`, `All configs` and `Manage.` on its right.
 - The nav's 56px collapsed state keeps every entry reachable: letters for `All configs`, groups and `Ungrouped`, the freshness dot for sources, `+` and the sources `…`, and the utilities' letters, each with a tooltip. A long group list scrolls inside the nav; the pinned utilities stay put.
-
-### Added
-
 - A workbench shell: a left nav carrying `All configs` and the bottom utilities, an action bar with the view title, its count, `Import`, `Add`, the command palette and a `⋯` overflow, a 36px filter slot above the table, and an engine bar under the table with the engine's state, the running count, the session traffic, `Start all`, `Stop all` and a `⋯` menu with `Test all` and `Stop testing`.
 - The filter row searches configs and narrows by Status, Protocol, and a Filter popover for latency, bind, port range and custom endpoints, with `N of M` always visible and a no-match state that clears in place. Search is session-only.
 - The nav collapses to its letters below 1200px and expands again at 1200px, so the window's new minimum still fits the table beside it.
