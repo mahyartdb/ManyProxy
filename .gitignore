@@ -2,3 +2,5 @@
 
 # Scratch output from browser-automation tooling (unrelated to this app).
 .playwright-mcp/
+# Local cargo build config (shared target dir with the Herdr worktrees).
+.cargo/
