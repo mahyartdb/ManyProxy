@@ -3,10 +3,9 @@ use crate::*;
 /// T-31: the kit's signal tokens (green, amber, red) are *fills* paired with a
 /// light foreground — a button ground, not text. On the light theme's paper
 /// every one of them is far under WCAG AA as text, so in light mode each backs
-/// off toward black along its own hue until it reads on the quiet surface
-/// (#f5f5f5, the most-tinted ground a label sits on in light mode). Dark keeps
-/// the raw tokens, which already read on near-black. Hue still identifies the
-/// signal; only lightness moves.
+/// off toward black along its own hue until it reads on the quiet surface (the
+/// lightest ground a label sits on). Dark keeps the raw tokens, which already
+/// read on near-black. Hue still identifies the signal; only lightness moves.
 pub fn signal_text_color(signal: Hsla, darken: f32, theme: &Theme) -> Hsla {
     match theme.mode {
         ThemeMode::Light => signal.blend(hsla(0., 0., 0., darken)),

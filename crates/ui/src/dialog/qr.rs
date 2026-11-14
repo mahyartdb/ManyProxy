@@ -102,15 +102,17 @@ impl QrPlate {
 
 /// Paint the white plate (quiet zone included) and the dark modules on top of it.
 /// Scanners read black-on-white, so the plate keeps that pair in both themes while the
-/// surrounding dialog and the labels stay theme-colored.
+/// surrounding dialog and the labels stay theme-colored. The pair itself lives in
+/// `skin.rs` (`QR_PLATE`/`QR_MODULE`) with the rest of the palette.
 pub fn paint_share_qr(grid: &QrGrid, plate: QrPlate, window: &mut Window) {
+    use crate::skin::{qr_module, qr_plate};
     let plate_side = px(plate.plate_side());
     window.paint_quad(fill(
         Bounds::new(
             point(px(plate.x), px(plate.y)),
             size(plate_side, plate_side),
         ),
-        rgb(0xFFFFFF),
+        qr_plate(),
     ));
     for row in 0..grid.side {
         for col in 0..grid.side {
@@ -120,7 +122,7 @@ pub fn paint_share_qr(grid: &QrGrid, plate: QrPlate, window: &mut Window) {
             let (x, y) = plate.module_origin(col, row);
             window.paint_quad(fill(
                 Bounds::new(point(px(x), px(y)), size(px(plate.cell), px(plate.cell))),
-                rgb(0x000000),
+                qr_module(),
             ));
         }
     }
