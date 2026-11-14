@@ -97,15 +97,16 @@ pub fn resolve_locale_with(stored: Option<&str>, system: Option<&str>) -> String
 /// Tests force English: the suite asserts literal English copy, and a machine
 /// whose OS locale is not English must not change those assertions.
 pub fn resolve_locale(stored: Option<&str>) -> String {
+    // Tests force English: the suite asserts literal English copy, and a
+    // machine whose OS locale is not English must not change those assertions.
     #[cfg(any(test, feature = "test-support"))]
-    {
+    let locale = {
         let _ = stored;
-        return DEFAULT_LOCALE.to_string();
-    }
+        DEFAULT_LOCALE.to_string()
+    };
     #[cfg(not(any(test, feature = "test-support")))]
-    {
-        resolve_locale_with(stored, sys_locale::get_locale().as_deref())
-    }
+    let locale = resolve_locale_with(stored, sys_locale::get_locale().as_deref());
+    locale
 }
 
 pub fn set_locale(tag: &str) {

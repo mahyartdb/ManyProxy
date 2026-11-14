@@ -126,6 +126,12 @@ pub struct LibraryDelegate {
     pub settle_seq: u64,
 }
 
+impl Default for LibraryDelegate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LibraryDelegate {
     pub fn new() -> Self {
         Self {

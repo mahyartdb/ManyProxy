@@ -16,6 +16,10 @@ pub mod text;
 pub mod tray;
 pub mod update;
 
+// The split test binaries resolve the same root names the in-crate suite did,
+// so the app's re-exports are public. The app's own globs deliberately shadow
+// the core's same-named items where the product's copy wins.
+#[allow(ambiguous_glob_reexports)]
 pub use manyproxy_core::*;
 
 use std::cell::{Cell, RefCell};
@@ -67,7 +71,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
 pub use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
-use gpui_kit::Subscription;
+pub use gpui_kit::Subscription;
 // `gpui_kit::*` re-exports gpui itself, so it also brings gpui's `Path` and
 // `ListState` into scope alongside the kit's own types. Modules that need the
 // kit's `ListState` or std's `Path` import them by name, which shadows the
@@ -124,6 +128,9 @@ pub const INSPECTOR_WIDTH_MAX: f32 = store::Store::INSPECTOR_WIDTH_MAX;
 
 pub use i18n::translate;
 
+// See the note on the core glob above: the app's globs shadow the core's
+// same-named items on purpose.
+#[allow(ambiguous_glob_reexports)]
 pub use app::actions::*;
 pub use app::bits::*;
 use app::endpoint_editor::{
@@ -142,11 +149,15 @@ pub use app::window::*;
 pub use appearance::*;
 pub use chain::*;
 pub use dialog::*;
+// The config/rules forms' names join the root glob; the preset module's own
+// rules module keeps its place.
+#[allow(ambiguous_glob_reexports)]
 pub use forms::*;
 pub use keys::*;
 pub use library::*;
 pub use pickers::*;
 pub use preset::*;
+#[allow(ambiguous_glob_reexports)]
 pub use text::*;
 
 // The UI's localized copy shadows the core crate's plain builders of the same

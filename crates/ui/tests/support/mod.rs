@@ -632,7 +632,6 @@ pub fn t73_rows() -> Vec<manyproxy_ui::store::ProxyConfig> {
 /// row — two spreadsheet columns, the name and the URL.
 ///
 /// T-05: the copy toast is honest about what it skipped.
-
 pub fn paint_dialog_open(cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);

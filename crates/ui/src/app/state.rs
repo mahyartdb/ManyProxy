@@ -254,6 +254,12 @@ pub struct PaneWindow {
     pub scroll: VirtualListScrollHandle,
 }
 
+impl Default for PaneWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PaneWindow {
     pub fn new() -> Self {
         Self {
@@ -2329,6 +2335,9 @@ impl AppView {
     /// text for the editor's "Invalid lines" fold. The expanded rules flow
     /// through the store's own `validate_preset_rules` gate unchanged — no
     /// new intake errors here.
+    // The `()` error is the point: any failure already named its line in the
+    // boxes, so there is no second payload to carry.
+    #[allow(clippy::result_unit_err)]
     pub fn expand_simple_rule_boxes(
         boxes: &SimpleRuleBoxes,
         window: &mut Window,
