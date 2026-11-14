@@ -4,8 +4,8 @@
 pub mod rules;
 pub mod sets;
 
-// Crate-visible, not `pub`: a pub glob would re-export core's
-// `group_quota_line` next to the UI's own and make the root glob ambiguous.
-pub(crate) use manyproxy_core::preset::*;
+// The core preset shapes re-export publicly: the split test binaries reach
+// them as `manyproxy_ui::preset::…`.
+pub use manyproxy_core::preset::*;
 pub use rules::*;
 pub use sets::*;

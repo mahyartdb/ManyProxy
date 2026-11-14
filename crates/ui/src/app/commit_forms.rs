@@ -4,7 +4,7 @@
 use crate::*;
 
 impl AppView {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn commit_add(
         &mut self,
         input: NewConfig,
@@ -99,7 +99,7 @@ impl AppView {
 
     /// The tests' direct store-edit path. Production edit actions go through
     /// `commit_edit_with_focus`, which owns the form error and focus.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn commit_edit(
         &mut self,
         id: &str,
@@ -1065,7 +1065,7 @@ impl AppView {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn commit_import(
         &mut self,
         text: String,
@@ -1077,7 +1077,7 @@ impl AppView {
         self.commit_import_with_context(text, group, file_hint, None, None, window, cx)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn commit_import_with_context(
         &mut self,
@@ -1407,7 +1407,7 @@ impl AppView {
 
     /// Compat entry for contract tests that only exercise the rules JSON
     /// layer (empty boxes expand to nothing).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn commit_preset_edit(
         &mut self,
         id: &str,

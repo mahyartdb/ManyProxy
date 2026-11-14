@@ -2,10 +2,11 @@
 
 pub mod app;
 pub mod appearance;
+pub mod skin;
 pub mod chain;
 pub mod dialog;
 pub mod forms;
-mod i18n;
+pub mod i18n;
 pub mod keys;
 pub mod library;
 pub mod os;
@@ -15,7 +16,7 @@ pub mod text;
 pub mod tray;
 pub mod update;
 
-use manyproxy_core::*;
+pub use manyproxy_core::*;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -64,7 +65,7 @@ use gpui_kit::component::Selectable as _;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
-use gpui_kit::component::{Theme, ThemeMode};
+pub use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::Subscription;
 // `gpui_kit::*` re-exports gpui itself, so it also brings gpui's `Path` and
@@ -74,22 +75,22 @@ use gpui_kit::Subscription;
 use gpui_kit::*;
 use qrcodegen::{QrCode, QrCodeEcc};
 
-use manyproxy_core::engine::{
+pub use manyproxy_core::engine::{
     engine_binary_file_name, fork_binary_file_name, is_custom_config_protocol,
     requires_lan_confirm, resolve_engine_binary, resolve_fork_binary, resolve_xray_binary,
     xray_binary_file_name, AutoRestartConfig, EngineController, EngineError,
 };
-use manyproxy_core::health::{
+pub use manyproxy_core::health::{
     clamp_log_max_lines, outcome_is_neutral, ping_all, redact_secrets, sparkline_caption_tone,
     test_all_stoppable, test_group, truncate, url_test_sparkline, HealthKind, HealthProber,
     HealthStore, LatencyTone, LogLevel, LogStore, LogTagIndex, ProbeExclusions, RealHealthProber,
     TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL,
 };
-use manyproxy_core::import::{
+pub use manyproxy_core::import::{
     classify_open_with, commit_batch, format_import_failures, import_text, is_addsub_attempt,
     is_library_export, parse_addsub_link, AddSubRequest, OpenWithKind,
 };
-use manyproxy_core::store::{
+pub use manyproxy_core::store::{
     blank_name, chain_hop_rejection, chain_nodes_of, compare_type_security, count_importable,
     due_for_refresh_for, extra_config_prefill, fold_amneziawg_into_params, fold_anytls_into_params,
     fold_chain_nodes_into_params, fold_dial_into_params, fold_extra_into_params,
@@ -123,30 +124,30 @@ pub const INSPECTOR_WIDTH_MAX: f32 = store::Store::INSPECTOR_WIDTH_MAX;
 
 pub use i18n::translate;
 
-use app::actions::*;
-use app::bits::*;
+pub use app::actions::*;
+pub use app::bits::*;
 use app::endpoint_editor::{
     render_endpoint_form, render_endpoint_popover, EndpointDraft, EndpointFrame, EndpointHost,
     ENDPOINT_EDITOR_CONTEXT,
 };
-use app::focus::*;
-use app::kit_bits::*;
+pub use app::focus::*;
+pub use app::kit_bits::*;
 use app::nav_scopes::{RowDrag, RowDragPreview};
-use app::open::*;
-use app::selection::{BatchKind, BatchRun};
+pub use app::open::*;
+pub use app::selection::{BatchKind, BatchRun};
 use app::state::{
     ConnectionState, ConsoleState, GroupEntry, LogsState, PaneWindow, RefreshBatch, SourceEntry,
 };
-use app::window::*;
-use appearance::*;
-use chain::*;
-use dialog::*;
-use forms::*;
-use keys::*;
-use library::*;
-use pickers::*;
-use preset::*;
-use text::*;
+pub use app::window::*;
+pub use appearance::*;
+pub use chain::*;
+pub use dialog::*;
+pub use forms::*;
+pub use keys::*;
+pub use library::*;
+pub use pickers::*;
+pub use preset::*;
+pub use text::*;
 
 // The UI's localized copy shadows the core crate's plain builders of the same
 // name. An explicit import wins over both globs, so every call site below
@@ -177,7 +178,7 @@ pub use text::{
     undo_restored_message, unreadable_drop_message, update_all_confirm_text,
     update_feed_failure_message,
 };
-use update::*;
+pub use update::*;
 
 actions!(
     manyproxy,

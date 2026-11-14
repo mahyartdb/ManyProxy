@@ -243,7 +243,7 @@ impl AppView {
 
     /// The visible row at an index, by position. The tests drive the
     /// selection by position; the app itself only ever names ids.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn select_visible_row(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(id) = self.visible_row_ids(cx).get(index).cloned() else {
             return;
@@ -252,7 +252,7 @@ impl AppView {
     }
 
     /// The tests name the rows they mean, without a pointer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn select_rows(&mut self, ids: &[String], cx: &mut Context<Self>) {
         self.selection_changed();
         self.selection.clear();
@@ -265,7 +265,7 @@ impl AppView {
     }
 
     /// The selection's ids, sorted, so a test can compare them.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn selection_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.selection.iter().cloned().collect();
         ids.sort();

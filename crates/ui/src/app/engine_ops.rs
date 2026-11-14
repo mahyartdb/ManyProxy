@@ -91,7 +91,7 @@ impl AppView {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -106,7 +106,7 @@ impl AppView {
         self.engine.poll()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let crashed = self.engine.crashed_shards();
         if crashed.is_empty() {
@@ -158,7 +158,7 @@ impl AppView {
             return;
         }
 
-        if cfg!(test) {
+        if cfg!(any(test, feature = "test-support")) {
             self.commit_start_selected(&config.id, window, cx);
         } else {
             self.spawn_commit_start_selected(config.id.clone(), window, cx);
@@ -259,7 +259,7 @@ impl AppView {
             });
             return;
         }
-        if cfg!(test) {
+        if cfg!(any(test, feature = "test-support")) {
             self.commit_start_all(window, cx);
         } else {
             self.spawn_commit_start_all(window, cx);
@@ -532,7 +532,7 @@ impl AppView {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
         self.logs.filter = filter;
         cx.notify();
@@ -701,7 +701,7 @@ impl AppView {
         started
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stop_background_ticks(&mut self) {
         self.ticks_enabled = false;
     }
@@ -723,7 +723,7 @@ impl AppView {
         cause
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn tick_engine_poll_notify(
         &mut self,
         window: &mut Window,
@@ -823,7 +823,7 @@ impl AppView {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;

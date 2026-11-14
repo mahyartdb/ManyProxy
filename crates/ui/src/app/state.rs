@@ -435,8 +435,9 @@ impl AppView {
 
         // The sweep shells out to netstat/tasklist; the suite mounts hundreds of
         // views and proves nothing by reaping the runner's process table. The
-        // sweep itself is unit-tested with injected probes.
-        #[cfg(not(test))]
+        // sweep itself is unit-tested with injected probes. The integration
+        // binaries count as tests here too: no startup reap under either gate.
+        #[cfg(not(any(test, feature = "test-support")))]
         {
             let our_ports: Vec<u16> = store
                 .list()
@@ -1141,7 +1142,7 @@ impl AppView {
     /// would read as a measured idle instead of "nothing is being polled".
     /// K12/A5-1: the strip no longer renders this count; the Links
     /// inspector tab carries it. Retained for the counter merge tests only.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn conn_counter_text(&self) -> Option<String> {
         if self.engine.running_count() == 0 {
             return None;

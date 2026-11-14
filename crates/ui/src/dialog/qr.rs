@@ -26,7 +26,7 @@ impl QrGrid {
 
     /// FNV-1a over the row-major module bits: the regression fingerprint for a fixed
     /// payload, since decoding a rendered QR is out of scope by decision.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fingerprint(&self) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for &dark in &self.dark {

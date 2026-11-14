@@ -79,12 +79,15 @@ pub static TITLEBAR_ACTION_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub fn apply_titlebar_action(action: TitlebarAction, window: &mut Window) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
-        let _ = (action, window);
+        // Borrow, don't move: the production match below still compiles under
+        // the test feature, and `window` must survive for it.
+        let _ = &action;
+        let _ = &*window;
         TITLEBAR_ACTION_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     match action {
         TitlebarAction::Minimize => window.minimize_window(),
         TitlebarAction::ToggleMaximize => window.zoom_window(),
@@ -121,7 +124,7 @@ pub fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> 
     // On Windows the NC hit-test area performs the native action; a click
     // listener on top of it would act twice. Tests (and non-Windows builds)
     // take the explicit path so the id → action wiring stays observable.
-    let clickable = cfg!(test) || !cfg!(windows);
+    let clickable = cfg!(any(test, feature = "test-support")) || !cfg!(windows);
     div()
         .id(control.id())
         .test_support()
@@ -219,7 +222,7 @@ impl AppView {
                 // Windows handles HTCAPTION double clicks natively; the
                 // explicit path covers non-Windows and the hermetic wiring
                 // test. `apply_titlebar_action` is inert on the test platform.
-                if event.click_count() == 2 && (cfg!(test) || !cfg!(windows)) {
+                if event.click_count() == 2 && (cfg!(any(test, feature = "test-support")) || !cfg!(windows)) {
                     apply_titlebar_action(titlebar_double_click_action(), window);
                 }
             })

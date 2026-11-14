@@ -602,7 +602,7 @@ impl AppView {
             return;
         }
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-        if cfg!(test) {
+        if cfg!(any(test, feature = "test-support")) {
             self.commit_bulk_start_ids(&ids, window, cx);
         } else {
             self.spawn_commit_bulk_start_ids(ids, window, cx);

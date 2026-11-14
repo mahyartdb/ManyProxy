@@ -40,7 +40,7 @@ impl SettingsSection {
 
     /// The section's name — the column header. Test-only: the live header
     /// reads `settings_section_label`, which can reach the Fluent bundle.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn title(self) -> &'static str {
         match self {
             SettingsSection::General => "General",

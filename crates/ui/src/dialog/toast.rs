@@ -173,7 +173,7 @@ pub struct ToastHandle {
 }
 
 impl ToastHandle {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn key(self) -> u64 {
         self.key
     }
