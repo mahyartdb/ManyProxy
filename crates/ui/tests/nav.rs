@@ -636,7 +636,6 @@ fn source_strip_shows_freshness_counts_quota_and_traffic(cx: &mut TestAppContext
     );
 }
 
-
 #[gpui_kit::test]
 fn sources_manage_opens_the_existing_sheet(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
