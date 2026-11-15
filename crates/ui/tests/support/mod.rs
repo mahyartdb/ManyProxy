@@ -652,6 +652,15 @@ pub fn paint_frame(cx: &mut VisualTestContext) {
     });
 }
 
+/// The smallest window that still shows the expanded 220px nav. The nav
+/// collapses below 1200px, so a nav test that only needs every entry visible
+/// paints at this size instead of 1440x900 - CI's software renderer fails
+/// fast (0xC0000409) once a single process has painted too many full-size
+/// surfaces, and 19 nav tests at 1440x900 crossed that line.
+pub fn paint_frame_expanded(cx: &mut VisualTestContext) {
+    paint_frame_at(cx, 1201., 701.);
+}
+
 pub fn assert_painted(cx: &mut VisualTestContext, id: &str) {
     let snapshot = cx.update(|window, _| window.try_find(id.to_owned()));
     let snapshot =

@@ -60,7 +60,7 @@ fn nav_lists_all_configs_groups_ungrouped_and_sources(cx: &mut TestAppContext) {
     let sub_id = sub.id.clone();
     let (_view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     for id in [
         "nav-all-configs",
@@ -122,7 +122,7 @@ fn nav_counts_are_scope_totals_and_ignore_the_filter(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -133,7 +133,7 @@ fn nav_counts_are_scope_totals_and_ignore_the_filter(cx: &mut TestAppContext) {
             )
         });
     });
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_eq!(
         view.read_with(cx, |view, cx| view.filter_count_text(cx)),
         "2 of 2",
@@ -146,7 +146,7 @@ fn nav_counts_are_scope_totals_and_ignore_the_filter(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_eq!(
         view.read_with(cx, |view, cx| view.filter_count_text(cx)),
         "1 of 2",
@@ -176,7 +176,7 @@ fn switching_scope_clears_the_selection(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -198,7 +198,7 @@ fn switching_scope_clears_the_selection(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     view.read_with(cx, |view, _| {
         assert!(view.selection.is_empty(), "the old scope's rows are gone");
@@ -222,7 +222,7 @@ fn scope_change_keeps_search_status_and_protocol(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -278,7 +278,7 @@ fn filter_row_counts_inside_the_scope(cx: &mut TestAppContext) {
             )
         });
     });
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_eq!(
         view.read_with(cx, |view, cx| view.filter_count_text(cx)),
         "2 of 2"
@@ -304,7 +304,7 @@ fn new_group_appears_with_zero_count_and_refuses_the_reserved_name(cx: &mut Test
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     let reserved = cx
         .update(|window, cx| view.update(cx, |view, cx| view.create_group("default", window, cx)));
@@ -330,7 +330,7 @@ fn new_group_appears_with_zero_count_and_refuses_the_reserved_name(cx: &mut Test
             view.set_scope(manyproxy_ui::LibraryScope::All, window, cx)
         });
     });
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_painted(cx, "nav-group-Alpha");
     assert_eq!(label_of("nav-group-Alpha-count", cx), "0");
     assert!(
@@ -356,7 +356,7 @@ fn group_manage_sheet_renames_and_deletes(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -369,7 +369,7 @@ fn group_manage_sheet_renames_and_deletes(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_eq!(
         view.read_with(cx, |view, _| view.scope.clone()),
         manyproxy_ui::LibraryScope::Group("Office".to_string()),
@@ -468,7 +468,7 @@ fn drag_row_into_group_moves_that_row(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_painted(cx, &format!("row-surface-{}", alpha.id));
 
     cx.update(|_, cx| {
@@ -485,7 +485,7 @@ fn drag_row_into_group_moves_that_row(cx: &mut TestAppContext) {
         );
     });
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     let groups: Vec<(String, String)> = view.read_with(cx, |view, _| {
         view.store
@@ -520,7 +520,7 @@ fn dropping_on_a_group_the_row_is_already_in_changes_nothing(cx: &mut TestAppCon
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     cx.update(|window, cx| {
         window.drag_to(
@@ -605,7 +605,7 @@ fn source_strip_shows_freshness_counts_quota_and_traffic(cx: &mut TestAppContext
             )
         });
     });
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     assert_painted(cx, "scope-strip");
     assert_eq!(label_of("scope-strip-name", cx), "Free plan");
@@ -628,7 +628,7 @@ fn source_strip_shows_freshness_counts_quota_and_traffic(cx: &mut TestAppContext
         window.click("scope-strip-all", cx);
     });
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_absent(cx, "scope-strip".to_string());
     assert_eq!(
         view.read_with(cx, |view, _| view.scope.clone()),
@@ -648,7 +648,7 @@ fn nav_source_refresh_refreshes_that_source_only(cx: &mut TestAppContext) {
         .expect("sub works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     assert_painted(cx, &format!("nav-source-refresh-{}", free.id));
 
     cx.update(|window, cx| {
@@ -665,7 +665,7 @@ fn sources_manage_opens_the_existing_sheet(cx: &mut TestAppContext) {
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     cx.update(|window, cx| window.click("nav-manage-sources", cx));
     paint_dialog_open(cx);
     assert_painted(cx, "subscriptions-dialog-ok");
@@ -678,7 +678,7 @@ fn routing_presets_utility_opens_the_presets_sheet(cx: &mut TestAppContext) {
     let store = Store::open_in_memory().expect("in-memory store opens");
     let (_view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
     cx.update(|window, cx| window.click("nav-routing-presets", cx));
     paint_dialog_open(cx);
     assert_painted(cx, "presets-dialog-ok");
@@ -766,7 +766,7 @@ fn update_current_scope_refreshes_the_scoped_source_or_group(cx: &mut TestAppCon
         .expect("sub works");
     let (view, cx) = mount_view(store, cx);
     cx.run_until_parked();
-    paint_frame_at(cx, 1440., 900.);
+    paint_frame_expanded(cx);
 
     // Adopt an in-flight fetch so the test proves the target, not the network.
     cx.update(|_, cx| {
