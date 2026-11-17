@@ -1,13 +1,16 @@
 //! The signed lab skin, ported from `crates/lab/src/skin.rs` (ruling R2).
 //! The lab's file is the source of truth for every token value below; this
 //! module is the only place in the UI crate that may name a color literal.
+//! The kit 0.9.1 colors the lab never named (chart ramps, state hovers, tinted
+//! button variants) derive from those values with the kit's own fallback
+//! formulas, so every kit component reads the signed palette.
 //!
 //! Port notes: `SkinKind` keeps the lab's two skins, but production ships the
 //! user's signed choice (Native) — `SIGNED_SKIN` is the only kind
 //! `apply_appearance` stamps. The lab's `overlay: hex(0x000000)` is an opaque
 //! black the dialog scrim would paint verbatim, and the signed lab never
 //! opened a dialog, so the scrim keeps the app's tuned values (F17) instead.
-use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::component::{Colorize as _, Theme, ThemeMode};
 use gpui_kit::*;
 
 /// The skin the user signed. `Signal` stays in the enum so the port matches
@@ -181,19 +184,65 @@ impl Skin {
     }
 }
 
+/// The kit's fallback formulas for one state family, seeded from a signed hue.
+/// 0.9.1 grew hover/active tones and tinted button variants the lab skin never
+/// named; deriving them here keeps a kit component's states in the family of
+/// its base color instead of falling back to the kit's stock blue palette.
+struct Tone {
+    hover: Hsla,
+    active: Hsla,
+    button: Hsla,
+    button_hover: Hsla,
+    button_active: Hsla,
+}
+
+impl Tone {
+    fn new(background: Hsla, hue: Hsla, mode: ThemeMode) -> Self {
+        let transparent = transparent_black();
+        let active_darken = if mode.is_dark() { 0.2 } else { 0.1 };
+        Self {
+            hover: background.blend(hue.opacity(0.9)),
+            active: hue.darken(active_darken),
+            button: hue.mix_oklab(transparent, 0.2),
+            button_hover: hue.mix_oklab(transparent, 0.3),
+            button_active: hue.mix_oklab(transparent, 0.4),
+        }
+    }
+}
+
 /// Stamps the whole kit theme after `Theme::change` rebuilt it from config.
-/// Field-for-field the lab's `apply_theme`; the `overlay` token and the type
-/// scale stay with the app (`apply_appearance`), which owns the F17 scrim and
-/// the K12 reading scale the lab never carried.
+/// Field-for-field the lab's `apply_theme`, extended with the colors 0.9.1
+/// added since the skin was signed. The `overlay` token and the type scale
+/// stay with the app (`apply_appearance`), which owns the F17 scrim and the
+/// K12 reading scale the lab never carried.
 pub fn apply_theme(kind: SkinKind, mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(mode, window, cx);
     let skin = Skin::new(kind, mode);
-    let theme = Theme::global_mut(cx);
+    // `update` reconciles every token with the colors edited here, rebuilds the
+    // Base projection (scrollbars, resize handles, TextView defaults) and
+    // refreshes the windows; a `global_mut` edit would leave all three behind.
+    Theme::update(cx, |theme| stamp(theme, kind, mode, &skin));
+}
+
+fn stamp(theme: &mut Theme, kind: SkinKind, mode: ThemeMode, skin: &Skin) {
     theme.radius = px(kind.radius());
     theme.radius_lg = px(kind.radius_lg());
 
+    let danger = Tone::new(skin.bg, skin.danger, mode);
+    let success = Tone::new(skin.bg, skin.success, mode);
+    let warning = Tone::new(skin.bg, skin.warning, mode);
+    let info = Tone::new(skin.bg, skin.info, mode);
+    // Signal-box stripes stay whisper-quiet: a barely-stepped alternate of the
+    // paper, never an alternating band.
+    let stripe = skin.bg.blend(skin.border.opacity(0.25));
+    let ramp = skin.info;
+    let ramp_light = |base: Hsla| skin.bg.blend(base.opacity(0.8));
+
     theme.background = skin.bg;
     theme.table = skin.bg;
+    // `theme.list` is the list settings; the color lives on `colors`.
+    theme.colors.list = skin.bg;
+    theme.accordion = skin.bg;
     theme.sidebar = skin.panel;
     theme.title_bar = skin.panel;
     theme.status_bar = skin.panel;
@@ -204,6 +253,13 @@ pub fn apply_theme(kind: SkinKind, mode: ThemeMode, window: Option<&mut Window>,
     theme.list_head = skin.panel;
     theme.table_head = skin.panel;
     theme.table_foot = skin.panel;
+    theme.tab = skin.panel;
+    theme.tab_bar = skin.panel;
+    theme.tab_bar_segmented = skin.hover;
+    theme.scrollbar = transparent_black();
+    theme.skeleton = skin.hover;
+    theme.switch = skin.hover;
+    theme.switch_thumb = skin.panel;
 
     theme.list_hover = skin.hover;
     theme.table_hover = skin.hover;
@@ -217,23 +273,39 @@ pub fn apply_theme(kind: SkinKind, mode: ThemeMode, window: Option<&mut Window>,
     theme.list_active_border = skin.rim;
     theme.table_active_border = skin.rim;
     theme.selection = skin.accent;
+    theme.tab_active = skin.selected;
+    theme.tab_active_foreground = skin.text;
+
+    theme.list_even = stripe;
+    theme.table_even = stripe;
 
     theme.border = skin.border;
     theme.sidebar_border = skin.border;
     theme.title_bar_border = skin.border;
     theme.status_bar_border = skin.border;
     theme.table_row_border = skin.divider;
+    theme.window_border = skin.border;
+    theme.drag_border = skin.accent.opacity(0.65);
+    theme.drop_target = skin.accent.opacity(0.2);
 
     theme.foreground = skin.text;
     theme.popover_foreground = skin.text;
     theme.sidebar_foreground = skin.text;
     theme.secondary_foreground = skin.text;
     theme.button_foreground = skin.text;
+    theme.group_box_foreground = skin.text;
     theme.table_head_foreground = skin.muted;
+    theme.table_foot_foreground = skin.muted;
     theme.muted_foreground = skin.muted;
     theme.muted = skin.muted;
-    theme.description_list_label_foreground = skin.muted;
+    theme.tab_foreground = skin.muted;
     theme.description_list_label = skin.muted;
+    theme.description_list_label_foreground = skin.muted;
+    // Links keep the signal blue even when the accent is monochrome (Signal),
+    // and their states step toward the ink so both grounds gain contrast.
+    theme.link = skin.rim;
+    theme.link_hover = skin.rim.blend(skin.text.opacity(0.25));
+    theme.link_active = skin.rim.blend(skin.text.opacity(0.4));
 
     theme.primary = skin.accent;
     theme.primary_hover = skin.accent_hover;
@@ -247,59 +319,80 @@ pub fn apply_theme(kind: SkinKind, mode: ThemeMode, window: Option<&mut Window>,
     theme.button_secondary_hover = skin.hover;
     theme.button_secondary_active = skin.selected;
     theme.button_secondary_foreground = skin.text;
+    theme.secondary_active = skin.selected;
     theme.button = skin.plate;
     theme.button_active = skin.selected;
+    theme.sidebar_primary = skin.accent;
+    theme.sidebar_primary_foreground = skin.on_accent;
+    theme.sidebar_accent = skin.selected;
+    theme.sidebar_accent_foreground = skin.text;
+    theme.progress_bar = skin.accent;
+    theme.slider_bar = skin.accent;
+    theme.slider_thumb = skin.on_accent;
 
     theme.ring = skin.focus;
     theme.caret = skin.focus;
     theme.success = skin.success;
     theme.success_foreground = skin.success_text;
+    theme.success_hover = success.hover;
+    theme.success_active = success.active;
+    theme.button_success = success.button;
+    theme.button_success_hover = success.button_hover;
+    theme.button_success_active = success.button_active;
+    theme.button_success_foreground = skin.success;
     theme.warning = skin.warning;
     theme.warning_foreground = skin.warning_text;
+    theme.warning_hover = warning.hover;
+    theme.warning_active = warning.active;
+    theme.button_warning = warning.button;
+    theme.button_warning_hover = warning.button_hover;
+    theme.button_warning_active = warning.button_active;
+    theme.button_warning_foreground = skin.warning;
     theme.danger = skin.danger;
     theme.danger_foreground = skin.danger_text;
+    theme.danger_hover = danger.hover;
+    theme.danger_active = danger.active;
+    theme.button_danger = danger.button;
+    theme.button_danger_hover = danger.button_hover;
+    theme.button_danger_active = danger.button_active;
+    theme.button_danger_foreground = skin.danger;
     theme.info = skin.info;
-    theme.tab_active = skin.selected;
-    theme.tab_active_foreground = skin.text;
-    theme.tab_bar = skin.panel;
-    theme.tab_foreground = skin.muted;
+    theme.info_foreground = skin.on_accent;
+    theme.info_hover = info.hover;
+    theme.info_active = info.active;
+    theme.button_info = info.button;
+    theme.button_info_hover = info.button_hover;
+    theme.button_info_active = info.button_active;
+    theme.button_info_foreground = skin.info;
+
+    theme.chart_1 = ramp.lighten(0.4);
+    theme.chart_2 = ramp.lighten(0.2);
+    theme.chart_3 = ramp;
+    theme.chart_4 = ramp.darken(0.2);
+    theme.chart_5 = ramp.darken(0.4);
+    theme.chart_bullish = skin.success;
+    theme.chart_bearish = skin.danger;
+    theme.chart_grid = skin.border.opacity(0.6);
+
+    theme.red = skin.danger;
+    theme.red_light = ramp_light(skin.danger);
+    theme.green = skin.success;
+    theme.green_light = ramp_light(skin.success);
+    theme.blue = skin.info;
+    theme.blue_light = ramp_light(skin.info);
+    theme.yellow = skin.warning;
+    theme.yellow_light = ramp_light(skin.warning);
+    // Magenta and cyan are chart complements only; they keep the info tone and
+    // drop some saturation so the ramp reads as one family.
+    let magenta = skin.info.hue(0.88).saturation(0.62);
+    let cyan = skin.info.hue(0.52).saturation(0.55);
+    theme.magenta = magenta;
+    theme.magenta_light = ramp_light(magenta);
+    theme.cyan = cyan;
+    theme.cyan_light = ramp_light(cyan);
+
     theme.scrollbar_thumb = skin.scrollbar_thumb;
     theme.scrollbar_thumb_hover = skin.muted;
-    theme.window_border = skin.border;
-
-    let tokens = &mut theme.tokens;
-    tokens.primary.background = skin.accent.into();
-    tokens.primary.color = skin.accent;
-    tokens.primary_hover.background = skin.accent_hover.into();
-    tokens.primary_hover.color = skin.accent_hover;
-    tokens.primary_active.background = skin.accent_active.into();
-    tokens.primary_active.color = skin.accent_active;
-    tokens.primary_foreground.background = skin.on_accent.into();
-    tokens.primary_foreground.color = skin.on_accent;
-    tokens.button_primary.background = skin.accent.into();
-    tokens.button_primary.color = skin.accent;
-    tokens.button_primary_hover.background = skin.accent_hover.into();
-    tokens.button_primary_hover.color = skin.accent_hover;
-    tokens.button_primary_active.background = skin.accent_active.into();
-    tokens.button_primary_active.color = skin.accent_active;
-    tokens.button_primary_foreground.background = skin.on_accent.into();
-    tokens.button_primary_foreground.color = skin.on_accent;
-    tokens.ring.background = skin.focus.into();
-    tokens.ring.color = skin.focus;
-    tokens.selection.background = skin.accent.into();
-    tokens.selection.color = skin.accent;
-    tokens.list_active.background = skin.selected.into();
-    tokens.list_active.color = skin.selected;
-    tokens.list_active_border.background = skin.rim.into();
-    tokens.list_active_border.color = skin.rim;
-    tokens.table_active.background = skin.selected.into();
-    tokens.table_active.color = skin.selected;
-    tokens.table_active_border.background = skin.rim.into();
-    tokens.table_active_border.color = skin.rim;
-    tokens.accent.background = skin.hover.into();
-    tokens.accent.color = skin.hover;
-
-    cx.refresh_windows();
 }
 
 impl SkinKind {

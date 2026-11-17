@@ -29,7 +29,8 @@ pub struct ActionDef {
     pub keywords: &'static [&'static str],
     /// Fluent key for the verb's tooltip, when it has one.
     pub tooltip_key: Option<&'static str>,
-    /// (keystroke, chip) pairs. A slice because ctrl-1/ctrl-3 alias one id.
+    /// (keystroke, chip) pairs. A slice because one verb may carry several
+    /// keystrokes (e.g. aliases added for muscle memory).
     pub shortcuts: &'static [(&'static str, &'static str)],
     pub enabled: fn(&AppView, ActionTarget<'_>, &App) -> bool,
     pub run: Handler,
@@ -167,6 +168,41 @@ pub const ACTIONS: &[ActionDef] = &[
         &["log", "output", "console"],
         &[],
         open_console_for_logs,
+    ),
+    selected(
+        "console-logs",
+        "action-label-console-logs",
+        &["console", "logs", "tab"],
+        &[("ctrl-1", "Ctrl+1")],
+        open_console_logs,
+    ),
+    selected(
+        "console-connections",
+        "action-label-console-connections",
+        &["console", "connections", "tab"],
+        &[("ctrl-2", "Ctrl+2")],
+        open_console_connections,
+    ),
+    selected(
+        "console-traffic",
+        "action-label-console-traffic",
+        &["console", "traffic", "tab"],
+        &[("ctrl-3", "Ctrl+3")],
+        open_console_traffic,
+    ),
+    selected(
+        "console-scope-all",
+        "action-label-console-scope-all",
+        &["console", "scope", "all"],
+        &[],
+        set_console_scope_all,
+    ),
+    selected(
+        "console-scope-selected",
+        "action-label-console-scope-selected",
+        &["console", "scope", "selected"],
+        &[],
+        set_console_scope_selected,
     ),
     selected(
         "settings",
@@ -480,6 +516,8 @@ pub const PALETTE_GROUPS: &[(&str, &[&str])] = &[
             "subscriptions",
             "presets",
             "logs",
+            "console-scope-all",
+            "console-scope-selected",
             "settings",
             "about",
             "inspector-toggle",
@@ -590,6 +628,46 @@ pub fn toggle_inspector(view: &mut AppView, _window: &mut Window, _cx: &mut Cont
 /// the full log sheet survives only behind the console's `Filters…`.
 pub fn open_console_for_logs(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
     view.open_console_scoped_to_selection(false, cx);
+}
+
+/// Ctrl+1/2/3 are the console tab set's keyboard path: the tabs carry tab
+/// roles but stay mouse-driven chips, so the actions give the announced tab
+/// list a way in that does not depend on the pointer. Each opens the dock on
+/// its tab; scope and filter stay as they were.
+pub fn open_console_logs(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
+    view.open_console_tab(ConsoleTab::Logs, cx);
+}
+
+pub fn open_console_connections(
+    view: &mut AppView,
+    _window: &mut Window,
+    cx: &mut Context<AppView>,
+) {
+    view.open_console_tab(ConsoleTab::Connections, cx);
+}
+
+pub fn open_console_traffic(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
+    view.open_console_tab(ConsoleTab::Traffic, cx);
+}
+
+/// The console scope chips' keyboard path: the chips stay mouse-driven, but
+/// the palette can reach both states — `Selected` is otherwise a one-way
+/// door for a keyboard user (the Logs verb and the inspector link both set
+/// it, and only a pointer click set `All` before these existed).
+pub fn set_console_scope_all(view: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) {
+    view.console.open = true;
+    view.console.tab = ConsoleTab::Logs;
+    view.set_console_scope(ConsoleScope::All, cx);
+}
+
+pub fn set_console_scope_selected(
+    view: &mut AppView,
+    _window: &mut Window,
+    cx: &mut Context<AppView>,
+) {
+    view.console.open = true;
+    view.console.tab = ConsoleTab::Logs;
+    view.set_console_scope(ConsoleScope::Selected, cx);
 }
 
 /// Ctrl-` toggles the dock; the engine-bar button lands in the same method.

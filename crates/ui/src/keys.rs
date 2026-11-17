@@ -1,6 +1,8 @@
 use crate::*;
 
 use gpui_kit::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// The context the shortcuts below live in; the shell sets it as its
 /// `key_context`, so a focused text input still wins.
@@ -103,5 +105,25 @@ pub fn bind_app_keys(cx: &mut App) {
     bind(&mut keys, "focus-search", FocusSearch);
     bind(&mut keys, "inspector-toggle", ToggleInspector);
     bind(&mut keys, "toggle-console", ToggleConsole);
+    bind(&mut keys, "console-logs", ConsoleLogs);
+    bind(&mut keys, "console-connections", ConsoleConnections);
+    bind(&mut keys, "console-traffic", ConsoleTraffic);
     cx.bind_keys(keys);
+    // T-06: under a 0.9 dialog the shell's context is off the dispatch path,
+    // so an app shortcut resolves to nothing; the observer gives that
+    // fall-through its spoken refusal. The handle parks here for the process
+    // lifetime, the same discipline as the global keymap.
+    park_overlay_refusal_subscription(crate::app::focus::observe_refused_shortcuts(cx));
+}
+
+/// T-06: the refusal observer's handle. A dropped `Subscription` removes the
+/// observer, so the app keeps the one handle alive here — the keymap itself is
+/// global and bound once per process, and this rides the same call.
+fn park_overlay_refusal_subscription(subscription: Subscription) {
+    REFUSED_SHORTCUT_SUBSCRIPTION.with(|slot| *slot.borrow_mut() = Some(subscription));
+}
+
+thread_local! {
+    static REFUSED_SHORTCUT_SUBSCRIPTION: Rc<RefCell<Option<Subscription>>> =
+        Rc::new(RefCell::new(None));
 }

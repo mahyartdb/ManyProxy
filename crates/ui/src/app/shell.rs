@@ -87,6 +87,15 @@ impl AppView {
             .on_action(cx.listener(|view, _: &ToggleConsole, window, cx| {
                 shortcut_action(view, "toggle-console", window, cx);
             }))
+            .on_action(cx.listener(|view, _: &ConsoleLogs, window, cx| {
+                shortcut_action(view, "console-logs", window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ConsoleConnections, window, cx| {
+                shortcut_action(view, "console-connections", window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ConsoleTraffic, window, cx| {
+                shortcut_action(view, "console-traffic", window, cx);
+            }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
                     view.import_dropped_files(paths, window, cx);

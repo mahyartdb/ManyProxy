@@ -5,6 +5,7 @@ use crate::*;
 
 use gpui_kit::base::VirtualListScrollHandle;
 use gpui_kit::component::list::ListState;
+use std::cell::RefCell;
 
 /// Live completion count for the `Testing N…` toast and the taskbar progress
 /// bar. Probes run on worker threads, so the sweep writes here and a UI poller
@@ -228,6 +229,67 @@ pub struct ConsoleState {
     pub filter: String,
     /// Some(rows) while paused: the frozen paint. `None` recomputes live.
     pub paused: Option<Vec<crate::ConsoleLogRow>>,
+    /// The frozen paint's lines, formatted once by `pause_console`.
+    pub paused_lines: Option<Rc<Vec<String>>>,
+    /// The Runtime group's store reads. `reload_inner_impl` is its owner: it
+    /// already has the row list and the subscription list in hand.
+    pub runtime: ConsoleRuntime,
+    /// The filtered log rows plus the lines the Logs tab paints, rebuilt only
+    /// when `LogRowsKey` moves. `console_log_rows` must answer through `&self`,
+    /// so the cache borrows the single UI thread's ownership.
+    pub log_rows: RefCell<Option<LogRowsCache>>,
+    /// Per-shard stat rows and the input fingerprint they were built from.
+    /// `shard_rows_for_paint` compares the fingerprint before rebuilding.
+    pub shard_rows: Option<ShardRowsCache>,
+}
+
+/// The Runtime group's figures. Each is a store read or a file stat that must
+/// never happen at paint, so `reload_inner_impl` fills them and the renderer
+/// reads them.
+#[derive(Default)]
+pub struct ConsoleRuntime {
+    pub rows: usize,
+    pub running_binds: Vec<String>,
+    pub subs_total: usize,
+    pub subs_due: usize,
+    pub subs_auto: bool,
+    pub db_bytes: Option<u64>,
+    /// The Connections tab's persisted destination-column width. No UI surface
+    /// writes it today, so the reload snapshot is fresh enough for every paint.
+    pub conn_dest_width: f32,
+}
+
+/// One built log-row set. `key` is every input the filter reads; a painted
+/// frame compares the key and only rebuilds when one of them moved.
+pub struct LogRowsCache {
+    key: LogRowsKey,
+    rows: Rc<Vec<crate::ConsoleLogRow>>,
+    lines: Rc<Vec<String>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LogRowsKey {
+    push_seq: u64,
+    records: usize,
+    /// A settings change swaps the ring, resetting `push_seq`; the cap moves
+    /// with that swap and keeps the two stores' keys apart.
+    cap: usize,
+    scope: ConsoleScope,
+    quick: String,
+    include: String,
+    exclude: String,
+    regex: String,
+    level: Option<LogLevel>,
+    /// One number per selection mutation — the log rows filter on set
+    /// membership, never on order, so materializing and sorting every
+    /// selected id here cost O(library) Strings per frame under Ctrl+A.
+    selection_rev: u64,
+}
+
+/// The per-shard stat rows and the fingerprint of every input they read.
+pub struct ShardRowsCache {
+    fingerprint: u64,
+    rows: Vec<ShardStatRow>,
 }
 
 impl Default for ConsoleState {
@@ -238,8 +300,18 @@ impl Default for ConsoleState {
             scope: ConsoleScope::All,
             filter: String::new(),
             paused: None,
+            paused_lines: None,
+            runtime: ConsoleRuntime::default(),
+            log_rows: RefCell::new(None),
+            shard_rows: None,
         }
     }
+}
+
+/// The Logs tab's one painted line shape: the cache and the paused paint both
+/// write it, so a resumed console reads identically to a live one.
+pub fn console_log_line(row: &crate::ConsoleLogRow) -> String {
+    format!("{}  {}", format_clock_time(row.at), row.line())
 }
 
 /// B3: one row-listing inspector pane's scroll window. `sizes` is the list's
@@ -301,15 +373,116 @@ pub struct ConnectionState {
     pub copied: Option<ConnCopyTarget>,
     pub copied_generation: u64,
     pub last_poll_at: i64,
+    /// The store's per-row traffic totals and their sum. `reload_inner_impl`
+    /// is the owner; the engine bar and the inspector's usage block read this
+    /// copy instead of scanning the table on every paint.
+    pub stored_traffic: Option<StoredTraffic>,
+    /// The console's exit identity per row id, rebuilt when the row list
+    /// changes so the Connections and Traffic tabs never clone configs.
+    pub exit_index: Rc<HashMap<String, ExitIdentity>>,
+    /// Whether the last reload's traffic read succeeded. A failed read leaves
+    /// the engine bar's usage segment hidden instead of painting "0 B" as if
+    /// the store had measured it.
+    pub traffic_ok: bool,
+    /// The selected row's 90-day probe history. `record_and_persist` owns the
+    /// epoch: every persisted snapshot batch bumps it, so the inspector's
+    /// history block reads this copy instead of querying per frame. Selection
+    /// changes swap the entries outright.
+    pub history_epoch: u64,
+    /// Keyed on (config id, epoch, loaded-at day): ids are store rowids and
+    /// SQLite reuses `max(rowid)+1`, so a delete+add can resurrect a brand-new
+    /// row under the id a deleted row's cache entry still holds. The row-list
+    /// change in `reload_inner_impl` drops the entry outright; the day guard
+    /// bounds the 90-day window's drift over a long session.
+    pub history_for: Option<(String, u64, u64, Rc<HistoryFor>)>,
+}
+
+/// One snapshot of the store's traffic table, moved, never rebuilt at paint.
+pub struct StoredTraffic {
+    pub totals: HashMap<String, (u64, u64)>,
+    pub sum: (u64, u64),
+}
+
+/// The inspector's history read for one row: `Err` keeps the store's failure
+/// visible (`detail-history-unavailable`) instead of blurring it into "no
+/// probes yet", and the day the window was cut bounds the 90-day drift. The
+/// sparkline and its caption tone are computed once here — the render path
+/// reads them per paint without re-walking the window.
+pub enum HistoryFor {
+    Loaded {
+        entries: Rc<Vec<HealthHistoryEntry>>,
+        latencies: Rc<Vec<u64>>,
+        tone: LatencyTone,
+    },
+    Unavailable,
+}
+
+/// The three words the console's exit lookups need from a row. Deliberately
+/// not `ProxyConfig`: that carries the sealed params, which a paint must not
+/// copy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExitIdentity {
+    pub name: String,
+    pub bind: String,
+    pub protocol: String,
+}
+
+impl ConnectionState {
+    pub fn set_stored_traffic(&mut self, totals: HashMap<String, (u64, u64)>) {
+        self.stored_traffic = Some(StoredTraffic {
+            sum: sum_traffic_totals(&totals),
+            totals,
+        });
+    }
+
+    pub fn set_exit_index(&mut self, rows: &[ProxyConfig]) {
+        self.exit_index = Rc::new(
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.id.clone(),
+                        ExitIdentity {
+                            name: row.name.clone(),
+                            bind: format!("{}:{}", row.bind_ip, row.port),
+                            protocol: row.protocol.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    /// The console's `conn_exit_of`, served from the cached index.
+    pub fn exit_of(&self, row_id: Option<&str>) -> (String, String, String) {
+        match row_id.and_then(|id| self.exit_index.get(id)) {
+            Some(exit) => (exit.name.clone(), exit.bind.clone(), exit.protocol.clone()),
+            None => ("unclaimed".to_string(), "—".to_string(), "—".to_string()),
+        }
+    }
+
+    /// Borrowed exit identity for filter passes: the quick filter walks
+    /// every scoped flow before narrowing, so owned triples would be one
+    /// three-string allocation per flow per frame.
+    pub fn exit_ref(&self, row_id: Option<&str>) -> (&str, &str, &str) {
+        const UNCLAIMED: (&str, &str, &str) = ("unclaimed", "—", "—");
+        match row_id.and_then(|id| self.exit_index.get(id)) {
+            Some(exit) => (
+                exit.name.as_str(),
+                exit.bind.as_str(),
+                exit.protocol.as_str(),
+            ),
+            None => UNCLAIMED,
+        }
+    }
 }
 
 impl AppView {
     /// Defect: boot runs inside `cx.open_window`'s closure, and the window only
-    /// adopts its `gpui_component::Root` layer after that closure returns —
-    /// `Root::new` does not install the first layer during it. A notification
-    /// or dialog pushed there panics inside `Root::update` ("window first layer
-    /// should be a gpui_component::Root"). Boot paths hand their overlay to
-    /// these helpers, which land it on the first frame, after Root exists. The
+    /// adopts the kit's Root plugin state after that closure returns —
+    /// `Root::new` does not install it during it, so the window's
+    /// root is not yet reachable and any overlay push inside `Root::update`
+    /// panics. Boot paths hand their overlay to these helpers, which land it
+    /// on the first frame, after Root exists. The
     /// decision (message, severity, dialog content) is still taken at boot.
     pub fn after_root(
         &mut self,
@@ -331,8 +504,8 @@ impl AppView {
         });
     }
 
-    /// Whether the window has adopted its `gpui_component::Root` first layer
-    /// yet. `Root::update` - which every `WindowExt` overlay call funnels
+    /// Whether the window has adopted the kit's Root plugin state yet.
+    /// `Root::update` - which every `WindowExt` overlay call funnels
     /// through - does `window.root::<Root>().flatten().expect(..)`, so this is
     /// exactly the panic condition: it is false while `cx.open_window`'s
     /// closure is still running, and also for a window whose root view is not
@@ -480,6 +653,7 @@ impl AppView {
                     return;
                 }
                 view.console.filter = view.console_filter_input.read(cx).value().to_string();
+                view.thaw_console_for_filter_change();
                 cx.notify();
             },
         );
@@ -488,6 +662,7 @@ impl AppView {
             libraries: libraries.clone(),
             detail_scroll: ScrollHandle::new(),
             split_state,
+            stored_inspector_width: store.inspector_width(),
             inspector_visible: false,
             console: ConsoleState::default(),
             console_filter_input,
@@ -510,6 +685,7 @@ impl AppView {
             settings_last_check: None,
             expanded_subs: HashSet::new(),
             selection: HashSet::new(),
+            selection_rev: 0,
             selection_anchor: None,
             selection_focus: None,
             batch: None,
@@ -653,6 +829,13 @@ impl AppView {
                 .collect();
             view.health_store.hydrate(&kept);
         }
+        let subs = view.store.list_subscriptions().unwrap_or_default();
+        let boot_traffic = view.store.traffic_totals();
+        view.conn.traffic_ok = boot_traffic.is_ok();
+        view.conn
+            .set_stored_traffic(boot_traffic.unwrap_or_default());
+        view.conn.set_exit_index(&rows);
+        view.sync_console_runtime(&rows, &subs);
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
 
@@ -681,8 +864,24 @@ impl AppView {
         libraries.delegate().row_by_id(&id).cloned()
     }
 
-    /// R6: the selection set, ordered as the table paints it. Every console
-    /// scope and the inspector aggregate read this one list.
+    /// The selected row's display name, borrowed — the paint paths that only
+    /// label must not clone a full `ProxyConfig` (sealed params included).
+    pub fn selected_name<'a>(&self, cx: &'a App) -> Option<&'a str> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let libraries = self.libraries.read(cx);
+        libraries
+            .delegate()
+            .row_by_id(id)
+            .map(|row| row.name.as_str())
+    }
+
+    /// Test-only helper naming the selected ids without a pointer; the
+    /// production console paths borrow `selection` directly, so this stays
+    /// out of the app binary.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn selected_id_set(&self, cx: &App) -> HashSet<String> {
         self.selected_ids_in_visible_order(cx).into_iter().collect()
     }
@@ -1169,8 +1368,23 @@ impl AppView {
             if let Err(error) = self.store.save_health_snapshots(&snapshots) {
                 eprintln!("health snapshot persist failed: {error}");
             }
+            // The inspector's history block reads the cached entries; a new
+            // batch invalidates them for every row at once.
+            self.conn.history_epoch += 1;
         }
         self.settle_batch_test(outcomes);
+    }
+
+    /// One invalidator for paths that delete `health_history` rows WITHOUT
+    /// touching the config list — the global clear and the group ClearTests.
+    /// Row-deleting paths (single remove, bulk delete) are already covered:
+    /// the reload's row-change guard drops the cache when the row list
+    /// moves. A future delete that preserves the row list MUST call this —
+    /// the group ClearTests arm once forgot it and the inspector kept
+    /// drawing the deleted sparkline.
+    pub fn invalidate_health_history(&mut self) {
+        self.conn.history_epoch += 1;
+        self.conn.history_for = None;
     }
 
     pub fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
@@ -1679,11 +1893,68 @@ impl AppView {
     /// The pure `console::log_rows` does the work; this adapter owns the
     /// committed log-sheet filters and the pause snapshot. A paused console
     /// paints its frozen rows and ignores new records until resume.
-    pub fn console_log_rows(&self, cx: &App) -> Vec<crate::ConsoleLogRow> {
+    pub fn console_log_rows(&self, _cx: &App) -> Vec<crate::ConsoleLogRow> {
         if let Some(frozen) = &self.console.paused {
             return frozen.clone();
         }
-        let selected = self.selected_id_set(cx);
+        self.ensure_log_rows();
+        let cache = self.console.log_rows.borrow();
+        cache
+            .as_ref()
+            .map(|cache| cache.rows.as_ref().clone())
+            .unwrap_or_default()
+    }
+
+    /// The lines the Logs tab paints: `<clock>  [level] message`, built once
+    /// per key alongside the rows they came from.
+    pub fn console_log_lines(&self, _cx: &App) -> Rc<Vec<String>> {
+        if self.console.paused.is_some() {
+            if let Some(lines) = &self.console.paused_lines {
+                return Rc::clone(lines);
+            }
+            let frozen = self.console.paused.as_deref().unwrap_or_default();
+            return Rc::new(frozen.iter().map(console_log_line).collect());
+        }
+        self.ensure_log_rows();
+        let cache = self.console.log_rows.borrow();
+        cache
+            .as_ref()
+            .map(|cache| Rc::clone(&cache.lines))
+            .unwrap_or_default()
+    }
+
+    fn log_rows_key(&self) -> LogRowsKey {
+        LogRowsKey {
+            push_seq: self.logs.store.push_seq(),
+            records: self.logs.store.all().len(),
+            cap: self.logs.store.cap(),
+            scope: self.console.scope,
+            quick: self.console.filter.clone(),
+            include: self.logs.filter.clone(),
+            exclude: self.logs.exclude.clone(),
+            regex: self.logs.regex.clone(),
+            level: self.logs.level,
+            // Under `All` the selection cannot change a row, so it stays out
+            // of the key. Under `Selected` a revision number carries the
+            // membership change in O(1) — no per-frame id clones/sort.
+            selection_rev: match self.console.scope {
+                ConsoleScope::All => 0,
+                ConsoleScope::Selected => self.selection_rev,
+            },
+        }
+    }
+
+    fn ensure_log_rows(&self) {
+        let key = self.log_rows_key();
+        if self
+            .console
+            .log_rows
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.key == key)
+        {
+            return;
+        }
         let regex = self.logs.regex.trim();
         let regex = if regex.is_empty() {
             None
@@ -1696,14 +1967,101 @@ impl AppView {
             regex: regex.as_ref(),
             level: self.logs.level,
         };
-        let records: Vec<crate::LogRecord> = self.logs.store.all().iter().cloned().collect();
-        crate::log_rows(
-            &records,
+        let selected: HashSet<String> = self.selection.iter().cloned().collect();
+        // The ring is borrowed, not cloned: every new log line invalidates
+        // this cache, so a streaming console would otherwise pay a full
+        // ring clone per rebuild.
+        let rows = crate::log_rows(
+            self.logs.store.all().iter(),
             &selected,
             self.console.scope,
             filters,
             &self.console.filter,
-        )
+        );
+        let lines = rows.iter().map(console_log_line).collect();
+        *self.console.log_rows.borrow_mut() = Some(LogRowsCache {
+            key,
+            rows: Rc::new(rows),
+            lines: Rc::new(lines),
+        });
+    }
+
+    /// The Runtime group's figures: store reads and one file stat on the
+    /// refresh, never at paint. `reload_inner_impl` already has the rows and
+    /// subscriptions, so it passes them in instead of reading twice. The
+    /// derived tail — the formatted running-binds list, the subs meta read,
+    /// the DB file stat, the width parse — only runs while the console is
+    /// open on a tab that paints it: the 1 s traffic tick otherwise pays it
+    /// forever with the dock closed, and on a synced data dir `metadata`
+    /// can block the UI thread.
+    pub fn sync_console_runtime(
+        &mut self,
+        rows: &[ProxyConfig],
+        subs: &[crate::store::Subscription],
+    ) {
+        let now = now_unix();
+        let runtime = &mut self.console.runtime;
+        runtime.rows = rows.len();
+        runtime.subs_total = subs.len();
+        runtime.subs_due = subs
+            .iter()
+            .filter(|sub| due_for_refresh_for(sub, now))
+            .count();
+        if !(self.console.open
+            && matches!(
+                self.console.tab,
+                ConsoleTab::Connections | ConsoleTab::Traffic
+            ))
+        {
+            return;
+        }
+        self.sync_console_runtime_tail(rows);
+    }
+
+    /// The console's store-backed tail: meta reads, one file stat, and the
+    /// formatted running-binds list. Both the Connections tab (its Dest
+    /// column width) and the Traffic tab (the Runtime group) consume it, so
+    /// `sync_console_runtime` reaches here on reload only while one of them
+    /// is painted; `open_console_tab` forces one call on arrival so neither
+    /// paints defaults.
+    pub fn sync_console_runtime_tail(&mut self, rows: &[ProxyConfig]) {
+        self.console.runtime.running_binds = rows
+            .iter()
+            .filter(|row| self.engine.is_running(&row.id))
+            .map(|row| format!("{}:{}", row.bind_ip, row.port))
+            .collect();
+        let runtime = &mut self.console.runtime;
+        runtime.subs_auto = self.store.subs_auto_refresh_enabled();
+        runtime.db_bytes = self
+            .store
+            .db_path()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len());
+        runtime.conn_dest_width = self.store.conn_column_widths()[0] as f32;
+    }
+
+    /// The shard rows for the Runtime group. A painted frame compares a
+    /// fingerprint of the processes, the rings and the denied set, so an
+    /// unchanged sampler costs hashing — never a clone of every sample.
+    pub fn shard_rows_for_paint(&mut self) -> &[ShardStatRow] {
+        let processes = self.engine.shard_processes();
+        let fingerprint = shard_stat_fingerprint(&processes, &self.shard_rings, &self.shard_denied);
+        if self
+            .console
+            .shard_rows
+            .as_ref()
+            .is_none_or(|cache| cache.fingerprint != fingerprint)
+        {
+            self.console.shard_rows = Some(ShardRowsCache {
+                fingerprint,
+                rows: shard_stat_rows(&processes, &self.shard_rings, &self.shard_denied),
+            });
+        }
+        self.console
+            .shard_rows
+            .as_ref()
+            .map(|cache| cache.rows.as_slice())
+            .unwrap_or_default()
     }
 
     pub fn set_log_level(
@@ -1713,6 +2071,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.logs.level = level;
+        self.thaw_console_for_filter_change();
         if self.logs.open && window.has_active_sheet(cx) {
             self.logs.reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
@@ -1726,10 +2085,10 @@ impl AppView {
 
     pub fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.logs.filter.clear();
-
         self.logs.exclude.clear();
         self.logs.regex.clear();
         self.logs.level = None;
+        self.thaw_console_for_filter_change();
         // Drop any in-progress draft so the reopen seeds empty, not the text
         // the user was about to discard.
         self.logs.reopen_draft = None;
@@ -2652,40 +3011,66 @@ impl AppView {
     }
 
     pub fn usage_line(&self, config_id: &str) -> String {
-        match self.store.traffic_totals() {
-            Ok(totals) => match totals.get(config_id) {
-                Some((rx, tx)) => t!(
-                    "usage-line",
-                    down = format_bytes(*rx),
-                    up = format_bytes(*tx)
-                ),
-                None => t!("stats-usage-unavailable"),
-            },
-            Err(_) => t!("stats-usage-unavailable"),
+        match self
+            .conn
+            .stored_traffic
+            .as_ref()
+            .and_then(|stored| stored.totals.get(config_id))
+        {
+            Some((rx, tx)) => t!(
+                "usage-line",
+                down = format_bytes(*rx),
+                up = format_bytes(*tx)
+            ),
+            None => t!("stats-usage-unavailable"),
         }
     }
 
     pub fn usage_parts(&self, config_id: &str) -> Option<(String, String)> {
-        match self.store.traffic_totals() {
-            Ok(totals) => totals
-                .get(config_id)
-                .map(|(rx, tx)| (format_bytes(*rx), format_bytes(*tx))),
-            Err(_) => None,
-        }
+        self.conn
+            .stored_traffic
+            .as_ref()
+            .and_then(|stored| stored.totals.get(config_id))
+            .map(|(rx, tx)| (format_bytes(*rx), format_bytes(*tx)))
     }
 
-    pub fn history_line(&self, config_id: &str, cx: &App) -> AnyElement {
-        let since = now_unix().saturating_sub(90 * 86_400);
-        let entries = match self.store.load_health_history(config_id, Some(since)) {
-            Ok(entries) => entries,
-            Err(_) => {
-                return div()
-                    .child(t!("detail-history-unavailable"))
-                    .into_any_element()
+    /// The selected row's 90-day probe history for the inspector. The cache
+    /// answers per paint; only a selection change, a row-list change, or a
+    /// persisted snapshot batch (epoch bump) reaches back to the store. A
+    /// store failure is cached as `Unavailable` so the inspector shows the
+    /// honest copy while the failure lasts, not "no probes yet".
+    pub fn health_history_for(&mut self, config_id: &str) -> Rc<HistoryFor> {
+        let now = now_unix();
+        let since = now.saturating_sub(90 * 86_400);
+        let day = (now / 86_400) as u64;
+        let epoch = self.conn.history_epoch;
+        if let Some((cached_id, cached_epoch, cached_day, entries)) = &self.conn.history_for {
+            if cached_id == config_id && *cached_epoch == epoch && *cached_day == day {
+                return entries.clone();
             }
-        };
-        let latencies = url_test_sparkline(&entries, 120);
-        let caption_tone = sparkline_caption_tone(&entries);
+        }
+        let history = Rc::new(
+            match self.store.load_health_history(config_id, Some(since)) {
+                Ok(entries) => {
+                    let latencies = url_test_sparkline(&entries, 120);
+                    let tone = sparkline_caption_tone(&entries);
+                    HistoryFor::Loaded {
+                        entries: Rc::new(entries),
+                        latencies: Rc::new(latencies),
+                        tone,
+                    }
+                }
+                Err(_) => HistoryFor::Unavailable,
+            },
+        );
+        self.conn.history_for = Some((config_id.to_string(), epoch, day, history.clone()));
+        history
+    }
+
+    /// The history block for the latencies the cache already computed, so
+    /// one frame never walks the history window twice.
+    pub fn history_line_from(&self, latencies: &[u64], tone: LatencyTone, cx: &App) -> AnyElement {
+        let caption_tone = tone;
         if latencies.len() < 2 {
             return div()
                 .id("config-history-empty")
@@ -2718,7 +3103,7 @@ impl AppView {
                         latest = latest
                     )),
             )
-            .child(Self::latency_sparkline(&latencies))
+            .child(Self::latency_sparkline(latencies))
             .into_any_element()
     }
 
@@ -2812,6 +3197,16 @@ impl AppView {
             .focus_handle(cx)
             .is_focused(window);
         self.console.open = !self.console.open;
+        if self.console.open
+            && matches!(
+                self.console.tab,
+                ConsoleTab::Connections | ConsoleTab::Traffic
+            )
+        {
+            // Reopening on a tab whose store-backed figures only refresh
+            // while painted must not paint the pre-open defaults.
+            self.sync_console_runtime_tail_from_store();
+        }
         if !self.console.open && filter_focused {
             self.close_console_focus_table(window, cx);
         }
@@ -2820,20 +3215,36 @@ impl AppView {
 
     /// R9: the row menu's `Open logs`, and the inspector's console link. Opens
     /// the dock on Logs with scope `Selected`; the console filter stays as the
-    /// session left it — only the inspector link lands with it empty.
+    /// session left it — only the inspector link lands with it empty. The
+    /// frozen rows of an earlier pause belong to that moment's scope and
+    /// filters, so a scope switch must thaw — the pause snapshot is not
+    /// re-derived under a new scope.
     pub fn open_console_scoped_to_selection(&mut self, clear_filter: bool, cx: &mut Context<Self>) {
         self.console.open = true;
         self.console.tab = ConsoleTab::Logs;
         self.console.scope = ConsoleScope::Selected;
+        self.console.paused = None;
+        self.console.paused_lines = None;
         if clear_filter {
             self.console.filter.clear();
         }
-        self.console.paused = None;
         cx.notify();
+    }
+
+    /// A filter/scope change while paused must thaw: the frozen rows belong
+    /// to the old filters and re-deriving them per paint is exactly the work
+    /// pause avoids. Every writer of `logs.filter/exclude/regex/level` and the
+    /// console scope/quick-filter calls this.
+    pub fn thaw_console_for_filter_change(&mut self) {
+        if self.console.paused.is_some() {
+            self.console.paused = None;
+            self.console.paused_lines = None;
+        }
     }
 
     pub fn clear_console_filter(&mut self, cx: &mut Context<Self>) {
         self.console.filter.clear();
+        self.thaw_console_for_filter_change();
         cx.notify();
     }
 
@@ -2842,12 +3253,14 @@ impl AppView {
             return;
         }
         let frozen = self.console_log_rows(cx);
+        self.console.paused_lines = Some(Rc::new(frozen.iter().map(console_log_line).collect()));
         self.console.paused = Some(frozen);
         cx.notify();
     }
 
     pub fn resume_console(&mut self, cx: &mut Context<Self>) {
         self.console.paused = None;
+        self.console.paused_lines = None;
         cx.notify();
     }
 
@@ -2857,6 +3270,39 @@ impl AppView {
         self.logs.store.clear();
         self.logs.seen = self.logs.store.push_seq();
         self.console.paused = None;
+        self.console.paused_lines = None;
+        cx.notify();
+    }
+
+    /// Ctrl+1/2/3: open the dock on the named tab. Opening never steals
+    /// focus (same contract as `toggle_console`); Connections and Traffic
+    /// consume the store-backed runtime tail (Dest width, Runtime group),
+    /// which only refreshes while one of them is painted — so force one
+    /// sync on arrival and the tab never paints defaults.
+    pub fn open_console_tab(&mut self, tab: ConsoleTab, cx: &mut Context<Self>) {
+        self.console.open = true;
+        self.console.tab = tab;
+        if matches!(tab, ConsoleTab::Connections | ConsoleTab::Traffic) {
+            self.sync_console_runtime_tail_from_store();
+        }
+        cx.notify();
+    }
+
+    /// The open paths hold no row list, so the tail re-reads the store once
+    /// — the same read `reload_inner_impl` feeds `sync_console_runtime`.
+    fn sync_console_runtime_tail_from_store(&mut self) {
+        let rows = self.store.list().unwrap_or_default();
+        self.sync_console_runtime_tail(&rows);
+    }
+
+    /// The scope chips' keyboard path. All is the way out of `Selected` —
+    /// the brief pins that the user chooses, so nothing auto-resets it.
+    pub fn set_console_scope(&mut self, scope: ConsoleScope, cx: &mut Context<Self>) {
+        if self.console.scope == scope {
+            return;
+        }
+        self.console.scope = scope;
+        self.thaw_console_for_filter_change();
         cx.notify();
     }
 
@@ -2874,7 +3320,13 @@ impl AppView {
                 window,
                 cx,
             );
+            return;
         }
+        // The per-frame fallback reads the cached copy; a successful write
+        // keeps it in step so the next drag restore doesn't show stale bounds.
+        // Clamp like the store does — a squeezed split can hand a width the
+        // store's own reader would never return.
+        self.stored_inspector_width = width.clamp(INSPECTOR_WIDTH_MIN, INSPECTOR_WIDTH_MAX);
     }
 
     /// Focus the table. Closing a dock (console or inspector) lands here —

@@ -90,7 +90,7 @@ impl AppView {
             .get(1)
             .map(|size| size.as_f32())
             .filter(|width| *width >= INSPECTOR_WIDTH_MIN && *width <= INSPECTOR_WIDTH_MAX)
-            .unwrap_or_else(|| self.store.inspector_width())
+            .unwrap_or(self.stored_inspector_width)
     }
 }
 
@@ -305,8 +305,7 @@ impl Render for AppView {
                             .child(engine_bar),
                     ),
             )
-            .children(Root::render_dialog_layer(window, cx))
-            .children(Root::render_sheet_layer(window, cx))
-            .children(Root::render_notification_layer(window, cx))
+        // 0.9: dialog, sheet and notification layers are kit plugin
+        // overlays painted by Root itself; the app no longer mounts them.
     }
 }

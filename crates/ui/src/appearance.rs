@@ -52,10 +52,10 @@ pub const BASE_MONO_FONT_SIZE: f32 = 13.;
 /// `window.set_rem_size` every frame, so refreshing windows is enough.
 pub fn apply_text_size(size: TextSize, cx: &mut App) {
     let scale = size.scale();
-    let theme = Theme::global_mut(cx);
-    theme.font_size = px(BASE_FONT_SIZE * scale);
-    theme.mono_font_size = px(BASE_MONO_FONT_SIZE * scale);
-    cx.refresh_windows();
+    Theme::update(cx, |theme| {
+        theme.font_size = px(BASE_FONT_SIZE * scale);
+        theme.mono_font_size = px(BASE_MONO_FONT_SIZE * scale);
+    });
 }
 
 /// Task 11: the accent-bearing tokens a preset stamps over the kit theme. Blue
@@ -129,14 +129,10 @@ pub fn accent_swatch(accent: Accent, mode: ThemeMode) -> Hsla {
     }
 }
 
-/// Task 11: re-stamp every accent-bearing token after `Theme::change` rebuilt
+/// Task 11: stamp every accent-bearing token after `Theme::change` rebuilt
 /// the theme from its config. Health, danger, and warning tokens are never
 /// touched: those hues carry meaning, not preference.
-pub fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
-    let Some(palette) = accent_palette(accent, mode) else {
-        return;
-    };
-    let theme = Theme::global_mut(cx);
+fn stamp_accent(theme: &mut Theme, palette: &AccentPalette) {
     theme.primary = palette.primary;
     theme.primary_hover = palette.primary_hover;
     theme.primary_active = palette.primary_active;
@@ -148,39 +144,6 @@ pub fn apply_accent(accent: Accent, mode: ThemeMode, cx: &mut App) {
     theme.table_active = palette.wash;
     theme.table_active_border = palette.rim;
     theme.accent = palette.rim;
-
-    let tokens = &mut theme.tokens;
-    tokens.primary.background = palette.primary.into();
-    tokens.primary.color = palette.primary;
-    tokens.primary_hover.background = palette.primary_hover.into();
-    tokens.primary_hover.color = palette.primary_hover;
-    tokens.primary_active.background = palette.primary_active.into();
-    tokens.primary_active.color = palette.primary_active;
-    tokens.primary_foreground.background = palette.primary_foreground.into();
-    tokens.primary_foreground.color = palette.primary_foreground;
-    tokens.button_primary.background = palette.primary.into();
-    tokens.button_primary.color = palette.primary;
-    tokens.button_primary_hover.background = palette.primary_hover.into();
-    tokens.button_primary_hover.color = palette.primary_hover;
-    tokens.button_primary_active.background = palette.primary_active.into();
-    tokens.button_primary_active.color = palette.primary_active;
-    tokens.button_primary_foreground.background = palette.primary_foreground.into();
-    tokens.button_primary_foreground.color = palette.primary_foreground;
-    tokens.ring.background = palette.ring.into();
-    tokens.ring.color = palette.ring;
-    tokens.selection.background = palette.selection.into();
-    tokens.selection.color = palette.selection;
-    tokens.list_active.background = palette.wash.into();
-    tokens.list_active.color = palette.wash;
-    tokens.list_active_border.background = palette.rim.into();
-    tokens.list_active_border.color = palette.rim;
-    tokens.table_active.background = palette.wash.into();
-    tokens.table_active.color = palette.wash;
-    tokens.table_active_border.background = palette.rim.into();
-    tokens.table_active_border.color = palette.rim;
-    tokens.accent.background = palette.rim.into();
-    tokens.accent.color = palette.rim;
-    cx.refresh_windows();
 }
 
 pub fn apply_appearance(
@@ -194,18 +157,20 @@ pub fn apply_appearance(
     // `Theme::change` itself, then stamps the skin; the overrides below ride
     // on top of it.
     apply_theme(SIGNED_SKIN, mode, window, cx);
-    if !mode.is_dark() {
-        let theme = Theme::global_mut(cx);
-        // F17 keeps the app's tuned scrim (the lab's `hex(0x000000)` overlay
-        // is opaque black; see skin.rs). The muted-ink darken tuned the KIT's
-        // palette; the skin's light muted ink already clears AA, so it goes.
-        theme.overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
-    }
-    // Task 11: the rebuild above reset every stamped accent token, so the
-    // accent rides every re-appearance exactly like the light-mode overrides.
-    apply_accent(accent, mode, cx);
-    // Theme::change already refreshed the window; the overrides landed after.
-    cx.refresh_windows();
+    Theme::update(cx, |theme| {
+        if !mode.is_dark() {
+            // F17 keeps the app's tuned scrim: the lab's opaque-black
+            // overlay (see skin.rs) is the wrong scrim for light mode, and
+            // dark keeps the kit's 20%.
+            theme.overlay = hsla(0., 0., 0., LIGHT_MODAL_OVERLAY_ALPHA);
+        }
+        // Task 11: the rebuild above reset every stamped accent token, so the
+        // accent rides every re-appearance exactly like the light-mode
+        // overrides.
+        if let Some(palette) = accent_palette(accent, mode) {
+            stamp_accent(theme, &palette);
+        }
+    });
     // F5: the kit has no per-scrollbar mode switch, only the theme's. Always
     // keeps the dialog body's scrollbar visible while it overflows instead of
     // fading out after two seconds.
@@ -346,6 +311,44 @@ mod tokens {
                 assert_ne!(painted, stock, "blue re-stamps {name} off the kit default");
             }
         });
+    }
+
+    /// 0.9.1 kit components (charts, skeletons, segmented tab bars) read colors
+    /// the lab skin never named. They must come from the signed palette in both
+    /// modes, not the kit's stock blue fallbacks.
+    #[gpui_kit::test]
+    fn kit_component_colors_come_from_the_skin(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dark = theme_for(ThemeMode::Dark, cx);
+        let light = theme_for(ThemeMode::Light, cx);
+
+        // The chart ramp seeds from the skin's info hue; chart_3 is the seed
+        // itself, so pinning it to info binds the whole ramp to the skin — a
+        // mode-only differ would also pass on the kit's stock blue.
+        for (name, theme) in [("dark", &dark), ("light", &light)] {
+            assert_eq!(
+                theme.chart_3, theme.info,
+                "{name} chart ramp seeds from the skin's info hue"
+            );
+        }
+
+        for (name, dark, light) in [
+            ("chart 1", dark.chart_1, light.chart_1),
+            ("chart 2", dark.chart_2, light.chart_2),
+            ("chart 4", dark.chart_4, light.chart_4),
+            ("chart 5", dark.chart_5, light.chart_5),
+        ] {
+            assert_ne!(dark, light, "{name} retunes for the other ground");
+        }
+
+        // Kit components that join the app later (segmented tab bars and
+        // friends) must land on the signed palette, not the kit stock.
+        for (name, theme) in [("dark", &dark), ("light", &light)] {
+            assert_eq!(
+                theme.tab_bar_segmented, theme.list_hover,
+                "{name} segmented tab ground is the skin's quiet chip"
+            );
+        }
     }
 
     /// Task 11: a preset stamps the tokens the brief names — selection wash,

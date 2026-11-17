@@ -143,7 +143,8 @@ use app::nav_scopes::{RowDrag, RowDragPreview};
 pub use app::open::*;
 pub use app::selection::{BatchKind, BatchRun};
 use app::state::{
-    ConnectionState, ConsoleState, GroupEntry, LogsState, PaneWindow, RefreshBatch, SourceEntry,
+    ConnectionState, ConsoleState, GroupEntry, HistoryFor, LogsState, PaneWindow, RefreshBatch,
+    SourceEntry,
 };
 pub use app::window::*;
 pub use appearance::*;
@@ -218,6 +219,9 @@ actions!(
         FocusSearch,
         ToggleInspector,
         ToggleConsole,
+        ConsoleLogs,
+        ConsoleConnections,
+        ConsoleTraffic,
         OpenPalette,
         CopyUrls,
         UpdateCurrentGroup
@@ -267,6 +271,12 @@ pub struct AppView {
     /// the focus the keyboard is on. Session-only — nothing about it is
     /// persisted, and it never survives a launch.
     pub selection: HashSet<String>,
+
+    /// Bumped once per selection MUTATION (see `selection_changed`), so the
+    /// console's log-row cache can key on a number instead of materializing
+    /// and ordering every selected id on each paint. The set's order is not a
+    /// log-rows input — only membership is.
+    pub selection_rev: u64,
 
     pub selection_anchor: Option<String>,
 
@@ -443,6 +453,11 @@ pub struct AppView {
     /// T-03: the split's own state. The width is persisted under
     /// `inspector_width` on mouse-up; between drags the split reads live.
     pub split_state: Entity<ResizableState>,
+
+    /// The persisted inspector width, read once at boot. The per-frame
+    /// fallback in `inspector_width` reads this instead of a meta query;
+    /// `persist_inspector_width` keeps it in step with the store.
+    pub stored_inspector_width: f32,
 
     /// R6: ONE flag owns the inspector's presence in both presentations —
     /// docked (≥1080) and the slide-over drawer below it. It starts closed;
