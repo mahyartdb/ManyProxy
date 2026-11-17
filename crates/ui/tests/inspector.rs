@@ -682,14 +682,14 @@ fn console_traffic_scope_totals_and_runtime_lines(cx: &mut TestAppContext) {
         "console-runtime",
         "console-runtime-title",
         "console-runtime-stat-0",
-        "console-runtime-stat-8",
-        "console-runtime-shards",
     ] {
         assert!(
             cx.update(|window, _| window.try_find(id).is_some()),
             "{id} paints in the console's Runtime group"
         );
     }
+    // The tail is below the fold before the scroll; assert it is actually
+    // visible, not merely mounted — a clipped or zero-height render must fail.
     assert_painted(cx, "console-runtime-stat-8");
     assert_painted(cx, "console-runtime-shards");
 }
@@ -919,6 +919,85 @@ fn engine_bar_clear_test_results_opens_the_existing_confirm_and_clears(cx: &mut 
     );
 }
 
+/// The inspector's history block reads a cache keyed on (row, epoch, day).
+/// A persisted probe batch bumps the epoch; Clear test results drops the
+/// cache outright — both must retire a stale read, because no row-list
+/// change accompanies either write.
+#[gpui_kit::test]
+fn inspector_history_cache_follows_writes(cx: &mut TestAppContext) {
+    use manyproxy_ui::app::state::HistoryFor;
+    use manyproxy_ui::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
+
+    fn outcome(id: &str, at: i64, latency: u64) -> TestOutcome {
+        TestOutcome {
+            sample: HealthSample {
+                config_id: id.to_string(),
+                at,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(latency),
+                error: None,
+            },
+            success: Some(ProbeSuccess {
+                latency_ms: latency,
+                bytes_rx: 0,
+                bytes_tx: 0,
+            }),
+        }
+    }
+
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(row19_seed("Alpha", "a.example.com", "10801"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+
+    let epoch_before = view.read_with(cx, |view, _| view.conn.history_epoch);
+    let empty = view.update(cx, |view, _| {
+        match view.health_history_for(&alpha.id).as_ref() {
+            HistoryFor::Loaded { entries, .. } => entries.len(),
+            HistoryFor::Unavailable => panic!("an in-memory read does not fail"),
+        }
+    });
+    assert_eq!(empty, 0, "a fresh row has no history");
+
+    // The sample's `at` must sit inside the 90-day window the cache reads.
+    let now = manyproxy_ui::now_unix();
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.record_and_persist(&[outcome(&alpha.id, now, 40)]);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.conn.history_epoch) > epoch_before,
+        "a persisted batch bumps the epoch the cache keys on"
+    );
+    let one = view.update(cx, |view, _| {
+        match view.health_history_for(&alpha.id).as_ref() {
+            HistoryFor::Loaded { entries, .. } => entries.len(),
+            HistoryFor::Unavailable => panic!("an in-memory read does not fail"),
+        }
+    });
+    assert_eq!(one, 1, "the cache serves the new sample on the next read");
+
+    // Clear test results deletes rows without a row-list change: the cache
+    // must drop with it, or the inspector keeps drawing cleared history.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_clear_health(window, cx));
+    });
+    cx.run_until_parked();
+    let cleared = view.update(cx, |view, _| {
+        match view.health_history_for(&alpha.id).as_ref() {
+            HistoryFor::Loaded { entries, .. } => entries.len(),
+            HistoryFor::Unavailable => panic!("an in-memory read does not fail"),
+        }
+    });
+    assert_eq!(cleared, 0, "Clear test results retires the cached history");
+}
+
 /// The retired tab verbs, their Ctrl+1..6 bindings and the status strip are
 /// gone from every surface.
 #[gpui_kit::test]
@@ -927,15 +1006,18 @@ fn old_tab_actions_shortcuts_and_status_strip_are_gone(cx: &mut TestAppContext) 
 
     cx.update(gpui_kit::init);
     cx.update(manyproxy_ui::bind_app_keys);
+    // Ctrl+1/2/3 retired with the inspector tabs, then returned as the
+    // console tab set's keyboard path — a different surface, same keys.
+    // The remaining ctrl-4/5/6 stay retired outright.
     let added = bound_key_strings(cx);
-    for key in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6"] {
+    for key in ["ctrl-4", "ctrl-5", "ctrl-6"] {
         assert!(
             !added.contains(&key.to_string()),
             "{key} must not be bound after the tabs retire"
         );
     }
     for (_, keys) in manyproxy_ui::SHORTCUT_LINES.iter() {
-        for key in ["1", "2", "3", "4", "5", "6"] {
+        for key in ["4", "5", "6"] {
             assert!(
                 !keys.contains(&format!("Ctrl-{key}")),
                 "the shortcut reference lists no inspector tab key: {keys}"

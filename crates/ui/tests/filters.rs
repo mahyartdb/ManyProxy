@@ -3419,11 +3419,11 @@ fn restore_off_restores_nothing(cx: &mut TestAppContext) {
 }
 
 /// Defect: boot runs inside `cx.open_window`'s closure, and the window does
-/// not adopt its `gpui_component::Root` layer until that closure returns.
-/// Pushing a notification or opening a dialog then panics inside
-/// `Root::update` ("window first layer should be a gpui_component::Root").
-/// A window whose root view is `AppView` itself is exactly the boot shape:
-/// every boot path must survive it, because nothing has a Root to reach.
+/// not adopt the kit's Root plugin state (`gpui_component::init` installs
+/// it) until that closure returns. Pushing a notification or opening a
+/// dialog before adoption panics in the kit's window-state lookup. A window
+/// whose root view is `AppView` itself is exactly the boot shape: every
+/// boot path must survive it, because nothing has a Root to reach.
 #[gpui_kit::test]
 fn boot_paths_survive_a_window_without_root(cx: &mut TestAppContext) {
     use manyproxy_ui::engine::EngineController;
@@ -3445,7 +3445,7 @@ fn boot_paths_survive_a_window_without_root(cx: &mut TestAppContext) {
         .save_running_snapshot(&[loopback.id.clone(), lan.id.clone()])
         .expect("snapshot writes");
 
-    // No `Root::new` wrapper: this window has AppView as its first layer,
+    // No `Root::new` wrapper: this window's root view is AppView itself,
     // which is what boot sees before the closure hands the Root back.
     let (view, cx) = cx.add_window_view(move |window, cx| AppView::with_store(window, cx, store));
     cx.update(|_, cx| {
@@ -6513,6 +6513,9 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         ("Focus search", "Ctrl-F"),
         ("Toggle inspector", "Ctrl-I"),
         ("Toggle console", "Ctrl-`"),
+        ("Console: Logs", "Ctrl-1"),
+        ("Console: Connections", "Ctrl-2"),
+        ("Console: Traffic", "Ctrl-3"),
         ("Clear selection", "Esc"),
         ("Copy URLs", "Ctrl-U"),
         ("Command palette", "Ctrl-K"),
@@ -6538,7 +6541,7 @@ fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
 
     let focus = view.read_with(cx, |view, _| view.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
-    let press = |cx: &mut VisualTestContext, key: &str| {
+    let press = |cx: &mut VisualTestContext, key: &'static str| {
         let keystroke = Keystroke::parse(key).expect("test keystroke parses");
         cx.update(|window, cx| {
             window.dispatch_keystroke(keystroke, cx);
@@ -7043,7 +7046,9 @@ fn t04_shortcut_lines_cover_every_bound_key(cx: &mut TestAppContext) {
             "{key} is bound and must be listed"
         );
     }
-    for key in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6"] {
+    // Ctrl+1/2/3 retired with the inspector panes, then returned as the
+    // console tab set's keyboard path. Ctrl+4/5/6 stay retired outright.
+    for key in ["ctrl-4", "ctrl-5", "ctrl-6"] {
         assert!(
             !added.contains(&key.to_string()),
             "{key} no longer switches inspector panes and must not be bound"
@@ -7062,7 +7067,7 @@ fn t67_ctrl_period_stops_group_test(cx: &mut TestAppContext) {
 
     let focus = view.read_with(cx, |view, _| view.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
-    let press = |cx: &mut VisualTestContext, key: &str| {
+    let press = |cx: &mut VisualTestContext, key: &'static str| {
         let keystroke = Keystroke::parse(key).expect("test keystroke parses");
         cx.update(|window, cx| {
             window.dispatch_keystroke(keystroke, cx);
@@ -9728,8 +9733,7 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.toggle_console(window, cx);
-            view.console.tab = manyproxy_ui::ConsoleTab::Traffic;
-            cx.notify();
+            view.open_console_tab(manyproxy_ui::ConsoleTab::Traffic, cx);
         });
     });
     paint_frame(cx);
@@ -9759,6 +9763,26 @@ fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
             "{id} paints in the console's Runtime group"
         );
     }
+    // Content, not just presence: the lines read their figures from the
+    // runtime snapshot the reload filled. With no rows and a fake engine
+    // nothing runs, so the endpoints line reads an honest zero pair and the
+    // running-binds line falls back to its em dash — exactly what a stale
+    // snapshot would NOT repaint after these became cached.
+    let endpoints = label_of("console-runtime-stat-1", cx);
+    assert!(
+        endpoints.contains("0 running") && endpoints.contains("0 stored"),
+        "endpoints line reads the snapshot counts: {endpoints}"
+    );
+    assert_eq!(
+        label_of("console-runtime-stat-2", cx),
+        manyproxy_ui::t!("stats-running", list = "—"),
+        "the running-binds line falls back to its em dash with nothing running"
+    );
+    let processes = label_of("console-runtime-stat-8", cx);
+    assert!(
+        processes.contains("live shard"),
+        "processes line summarizes the painted shard rows: {processes}"
+    );
     assert!(
         cx.update(|window, _| window.try_find("shard-chart-fork").is_none()),
         "a shard with no samples paints no chart"

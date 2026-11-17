@@ -347,6 +347,56 @@ fn new_group_appears_with_zero_count_and_refuses_the_reserved_name(cx: &mut Test
     cx.update(|window, cx| window.close_all_dialogs(cx));
 }
 
+/// Deleting the active EMPTY group must re-run `apply_query`: no row moves,
+/// so the reload's `unchanged` gate skips it and `visible` stays cut for a
+/// scope that no longer exists. The library would paint empty until search
+/// without the explicit re-query.
+#[gpui_kit::test]
+fn deleting_active_empty_group_restores_visible(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    store
+        .add(facet_seed("Alpha", "vless", "Home", "10851"))
+        .expect("seed works");
+    store
+        .add(facet_seed("Bravo", "vless", "Home", "10852"))
+        .expect("seed works");
+    let (view, cx) = mount_view(store, cx);
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.create_group("Empty", window, cx);
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.scope.clone()),
+        manyproxy_ui::LibraryScope::Group("Empty".to_string()),
+        "the new empty group is the active scope"
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.visible_row_ids(cx).len()),
+        0,
+        "the empty scope shows no rows"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.commit_delete_group("Empty", window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.scope.clone()),
+        manyproxy_ui::LibraryScope::All,
+        "deleting the active group falls back to All"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.visible_row_ids(cx).len()),
+        2,
+        "the library is visible again without a search"
+    );
+}
+
 #[gpui_kit::test]
 fn group_manage_sheet_renames_and_deletes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

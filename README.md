@@ -118,6 +118,7 @@ Start all / Stop all / Show / Quit.
 | Focus search | `Ctrl-F` |
 | Toggle inspector | `Ctrl-I` |
 | Toggle console | `` Ctrl-` `` |
+| Console: logs / connections / traffic | `Ctrl-1` / `Ctrl-2` / `Ctrl-3` |
 | Clear selection | `Esc` |
 | Copy URLs | `Ctrl-U` |
 | Command palette | `Ctrl-K` |

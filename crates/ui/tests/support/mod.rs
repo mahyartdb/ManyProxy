@@ -13,7 +13,8 @@ pub use gpui_kit::component::dialog::Dialog;
 pub use gpui_kit::component::{IndexPath, Root, WindowExt};
 pub use gpui_kit::test::TestWindowExt;
 pub use gpui_kit::{
-    point, px, size, AppContext, Bounds, Context, Entity, Hsla, TestAppContext, Window,
+    point, px, size, AppContext, Bounds, Context, Entity, Hsla, OperatingSystem, TestAppContext,
+    Window,
 };
 pub use manyproxy_core::Secret;
 pub use manyproxy_ui::engine::AutoRestartConfig;
@@ -358,12 +359,13 @@ pub fn t74_conn_setup<'a>(
             )];
             view.conn.delta = std::collections::HashMap::new();
             // Slice 6: connections live in the console now, not the inspector.
-            view.console.open = true;
-            view.console.tab = manyproxy_ui::ConsoleTab::Connections;
+            // Through open_console_tab: the real path also refreshes the
+            // store-backed Dest width the tab paints.
             view.console.scope = manyproxy_ui::ConsoleScope::All;
             view.conn.sort_desc = true;
             view.select_visible_row(0, cx);
             view.open_inspector();
+            view.open_console_tab(manyproxy_ui::ConsoleTab::Connections, cx);
             cx.notify();
         });
     });
@@ -633,19 +635,46 @@ pub fn t73_rows() -> Vec<manyproxy_ui::store::ProxyConfig> {
 ///
 /// T-05: the copy toast is honest about what it skipped.
 pub fn paint_dialog_open(cx: &mut VisualTestContext) {
+    // See MOTION_SETTLE_BUDGET. Advance between the draws so overlays finish
+    // entering before assertions read them. No resize here: an overlay built
+    // against the default test window (taller than 700) bakes
+    // viewport-derived constants at open time, and shrinking the frame
+    // afterwards would clip rows that a real window at that size shows.
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
     });
     cx.run_until_parked();
+    cx.executor().advance_clock(MOTION_SETTLE_BUDGET);
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
     });
 }
 
+/// The clock budget every paint helper advances. 0.9 animations read the
+/// test executor's virtual clock, so an entry begun in an earlier frame
+/// paints mid-fade (opacity 0, sheet parked off-window) until it settles.
+/// The kit's dialog entry is 250ms (`ANIMATION_DURATION`); the budget adds
+/// one frame past it so a just-over-250ms kit entry still settles. App
+/// motion is const-asserted ≤160ms (`MOTION_FAST_MS` pin). An entry that
+/// begins in the same frame is not covered — `paint_dialog_open` exists
+/// for the just-opened overlay, and the kit's 400ms notification entry
+/// outlives this budget (see the toast-exit advance). A future longer
+/// animation would escape it — the pin test is what keeps that
+/// compile-visible.
+pub const MOTION_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
 pub fn paint_frame(cx: &mut VisualTestContext) {
     cx.simulate_resize(size(px(1000.), px(700.)));
+    // Draw once so entries register, advance MOTION_SETTLE_BUDGET, then read
+    // the settled frame. This covers kit dialog/app entrances; the 400ms
+    // notification entry outlives it (see the toast-exit advance at :769).
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.render_frame(cx);
+    });
+    cx.executor().advance_clock(MOTION_SETTLE_BUDGET);
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
@@ -745,11 +774,15 @@ pub fn paint_frame_at(cx: &mut VisualTestContext, width: f32, height: f32) {
     // The resize lands before the first draw, so the frame is laid out at
     // the size it asks for.
     cx.run_until_parked();
+    // See MOTION_SETTLE_BUDGET: give in-flight entries a budget to finish
+    // between the draws.
+    cx.executor().advance_clock(MOTION_SETTLE_BUDGET);
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
     });
     cx.run_until_parked();
+    cx.executor().advance_clock(MOTION_SETTLE_BUDGET);
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
         window.render_frame(cx);
@@ -914,17 +947,18 @@ pub fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
 }
 
 /// Functions that run inside `cx.open_window`'s closure, before the window
-/// adopts its `Root` layer, so none of them may reach an overlay directly:
-/// `Root::update` panics on a window whose first layer is not a
-/// `gpui_component::Root`. They hand the overlay to a `*_after_root`
+/// adopts the kit's Root plugin state (`gpui_component::init` installs it),
+/// so none of them may reach an overlay directly: the kit's window-state
+/// lookup panics on a window that has not adopted the Root yet. They hand
+/// the overlay to a `*_after_root`
 /// helper, or — when the same path also serves ordinary post-Root use — to
 /// `notify_now_or_after_root`, which decides at runtime. That helper is the
 /// only root-checked direct push, so this list stays complete without
 /// exceptions: `reload` boots via `restore_on_launch` ->
 /// `commit_restore_subset` and is listed here for that reason. Its
 /// Root-READ calls (`has_active_dialog` / `has_active_sheet` /
-/// `close_sheet`, which panic through `Root::read` rather than
-/// `Root::update`) are guarded by the same `root_installed` check, so they
+/// `close_sheet`, which panic through the Root read path rather than
+/// update) are guarded by the same `root_installed` check, so they
 /// cannot fire before the Root exists either.
 pub const BOOT_FUNCTIONS: [&str; 9] = [
     "fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {\n        match Store::open_file",
@@ -1394,7 +1428,7 @@ pub fn bound_key_strings(cx: &mut TestAppContext) -> Vec<String> {
             let key = binding
                 .keystrokes()
                 .iter()
-                .map(|keystroke| keystroke.unparse())
+                .map(|keystroke| keystroke.unparse(OperatingSystem::Windows))
                 .collect::<Vec<_>>()
                 .join(" ");
             if !keys.contains(&key) {
@@ -1791,7 +1825,7 @@ pub fn endpoint_served_ports(handle: &manyproxy_ui::engine::FakeHandle) -> Vec<u
         .collect()
 }
 
-pub fn endpoint_press(view: &Entity<AppView>, cx: &mut VisualTestContext, key: &str) {
+pub fn endpoint_press(view: &Entity<AppView>, cx: &mut VisualTestContext, key: &'static str) {
     let focus = view.read_with(cx, |view, cx| {
         view.endpoint_frame(cx).map(|frame| frame.focus)
     });
@@ -2063,7 +2097,7 @@ pub fn row_aria_selected(cx: &mut VisualTestContext, id: &str) -> bool {
     })
 }
 
-pub fn press_key(cx: &mut VisualTestContext, key: &str) {
+pub fn press_key(cx: &mut VisualTestContext, key: &'static str) {
     let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
     cx.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
     cx.run_until_parked();

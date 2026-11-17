@@ -4,7 +4,35 @@ All notable changes to ManyProxy are recorded here. The format follows Keep a Ch
 
 ## [Unreleased]
 
-Nothing yet.
+The gpui-kit upgrade lands: 0.6.6 → 0.9.1, the UI migrated onto kit components and off custom replacements, and the paint path taken off the store.
+
+### Added
+
+- Console tabs answer the keyboard: `Ctrl+1`/`Ctrl+2`/`Ctrl+3` open the dock on Logs, Connections and Traffic, and `Console scope: all/selected` palette verbs switch the scope — `Selected` is no longer a one-way door without a pointer.
+- The console's section tabs and scope chips carry real semantics (tab set, radio pair, position and set size, focusable tab stops) and the Runtime stat lines are an accessible list whose items name their figures.
+- The inspector's Health block reports `history unavailable` when the store cannot answer, instead of reading as "no probes yet".
+- Shard CPU/RAM sparklines each carry a color-bound key, so the two series are told apart by more than position.
+
+### Changed
+
+- gpui-kit 0.6.6 → 0.9.1 (gpui-pre 0.3.12): dialogs, sheets and notifications render through the kit's Root plugin layers; theme writes go through `Theme::update`; keystroke refusal under an overlay is a keystroke observer that names the refused key ("Ctrl+N is unavailable while an overlay is open — close the sheet or dialog first"); titlebar controls use the kit's window icons.
+- Every touched paint path stopped reading the store: the console's log rows, connections exits, traffic totals and runtime figures are reload-time caches keyed on exactly the inputs that can change them (ring sequence, scope, filters, selection revision, health epoch), and the 1-second tick pays nothing while the dock is closed.
+- A paused console thaws on any filter or scope change — the frozen rows belonged to the old view, and a live-looking control that changes nothing reads as broken.
+- Log severity tones only the `[level]` tag; timestamp and message stay ink, so an error burst reads as text with red tags instead of a red block.
+- "Clear test results…" now clears the 90-day probe history in the same transaction as the latest snapshots, and its confirm says so.
+- The engine bar hides its usage segment when the store cannot read totals, instead of painting `0 B` as if measured.
+- Copy: sentence case everywhere (`TLS security`, `Stop testing`), `Logs for selected rows` states its scope, the pause badge says `Logs paused`, empty states distinguish no-lines-yet from filter-no-match from paused-empty, and the shortcut reference (README, About, Settings) lists the console keys.
+
+### Fixed
+
+- Deleting a config and re-adding one could paint the deleted row's health sparkline: config ids are SQLite rowids, which are reused, so the history cache now drops on any row-list change.
+- Clearing a group's test results (the group manage sheet) left the inspector drawing the deleted history; every history delete path now invalidates the cache.
+- Deleting the active empty group left the library blank until the next search — the scope fallback re-runs the query.
+- The console's Dest column painted at zero width until the Traffic tab was visited.
+- Compound quick-filter queries (`error disk`) still match after the console cache refactor; the log search blob carries both `level message` and `[level] message` forms.
+- A failed totals read at boot no longer reports measured zeros; the inspector falls back to `usage unavailable`.
+- Hover no longer erases the nav's active-scope wash; the table's guarded-hover pattern is applied to scope and source rows.
+
 
 ## [0.1.0] - 2026-11-14
 

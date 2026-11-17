@@ -115,7 +115,8 @@ fn keyboard_selection_moves_focus_and_range(cx: &mut TestAppContext) {
 
     // Escape clears with the list focused too: the app's binding names the
     // list as a descendant of the app, so it outranks the kit's Cancel. It
-    // then hands the keyboard back to the shell.
+    // hands the keyboard back to the table, so the arrows keep driving rows
+    // (DESIGN.md: "Esc … returns focus to the table").
     press_key(cx, "escape");
     assert_eq!(view.read_with(cx, |view, _| view.selection_count()), 0);
     assert_eq!(
@@ -127,10 +128,10 @@ fn keyboard_selection_moves_focus_and_range(cx: &mut TestAppContext) {
         None
     );
     let list_focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
-    assert_ne!(
+    assert_eq!(
         cx.update(|window, cx| window.focused(cx)),
         Some(list_focus),
-        "Escape hands the keyboard back to the shell, not the list"
+        "Escape hands the keyboard back to the table, not the shell"
     );
 
     // The shell's own context keeps the shortcut when the table does not hold

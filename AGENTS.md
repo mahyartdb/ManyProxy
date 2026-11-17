@@ -17,6 +17,13 @@ Lots of apps have gotten bogged down with bad tech decisions and "slop". i have 
 ### General Principles
 
 - use gpui-kit and rust skills when needed
+- **gpui-kit first.** Before writing or keeping any custom widget, element, or
+  surface, check whether `gpui-kit` (component, base, assets, platform) already
+  provides it — and use the kit version. Custom UI code is only allowed when
+  the kit genuinely lacks the capability or the product needs the kit component
+  changed; keep such gaps in `crates/ui/src/` and name the missing kit feature
+  in a comment. When upgrading the kit, prefer migrating the app onto new kit
+  components over patching old custom code.
 
 ## Errors
 

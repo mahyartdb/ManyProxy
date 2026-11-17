@@ -1879,3 +1879,46 @@ fn the_delegate_keeps_no_selection_of_its_own() {
     ]);
     assert_eq!(delegate.rows.len(), 3, "the delegate keeps the rows");
 }
+
+/// T-06: the observer path's refusal toast names the DISPLAY chip ("Ctrl+N"),
+/// never the binding syntax ("ctrl-n"). The notification layer keeps its
+/// text private, so the note itself is the contract — and every chip in the
+/// action table must actually read as a display label for the note to work.
+#[test]
+fn t06_refusal_note_spells_the_display_chip() {
+    use manyproxy_ui::app::actions::ACTIONS;
+    use manyproxy_ui::app::focus::{
+        overlay_refusal_note, refusal_note_for, refusal_note_for_bound_stroke,
+    };
+
+    let keyed = refusal_note_for("Ctrl+N");
+    assert!(keyed.contains("Ctrl+N"), "the note names the chip: {keyed}");
+    assert_ne!(
+        keyed,
+        overlay_refusal_note(),
+        "the keyed note is distinct from the shell path's generic note"
+    );
+    for def in ACTIONS {
+        for (stroke, chip) in def.shortcuts {
+            assert!(
+                chip.chars().next().is_some_and(|c| c.is_uppercase()),
+                "{}'s chip {chip} reads as a display label",
+                def.id
+            );
+            assert_ne!(
+                stroke, chip,
+                "{}: stroke and chip differ (binding syntax vs display)",
+                def.id
+            );
+            // The observer resolves a keystroke through the bound pairs;
+            // pin that it yields the CHIP form, not the raw stroke.
+            let note = refusal_note_for_bound_stroke(stroke, &[(*stroke, chip)]);
+            assert_eq!(
+                note,
+                Some(refusal_note_for(chip)),
+                "{}: the observer's note resolves through the chip {chip}, not {stroke}",
+                def.id
+            );
+        }
+    }
+}

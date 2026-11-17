@@ -2488,10 +2488,10 @@ fn t06_panel_plan_helpers_mirror_guided_pages() {
     assert!(has_advanced_dialog("socks"), "dial fields alone");
     assert!(!has_advanced_dialog("xray"), "nothing advanced on xray");
     assert!(!has_advanced_dialog("mieru"), "no guided page, no dialog");
-    assert_eq!(secret_state_caption(""), "Not Set", "blank reads Not Set");
+    assert_eq!(secret_state_caption(""), "Not set", "blank reads Not set");
     assert_eq!(
         secret_state_caption("pw"),
-        "Already Set",
+        "Already set",
         "presence never renders the value"
     );
 }
@@ -4743,10 +4743,14 @@ fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) 
         before + 1,
         "the engine bar's Start all toasts once"
     );
-    let before = notification_count(cx);
     // The toast park sits at the bottom-right, where the engine bar's own
-    // controls live. Clearing the toast first keeps the click on the button.
+    // controls live. Clearing the toast first keeps the click on the button;
+    // the clock advance lets its exit animation finish, so the count below
+    // sees an empty park (0.9 keeps Ending entries mounted for 200ms).
     cx.update(|window, cx| window.clear_notifications(cx));
+    cx.executor().advance_clock(MOTION_SETTLE_BUDGET);
+    cx.run_until_parked();
+    let before = notification_count(cx);
     cx.update(|window, cx| {
         window.click("engine-bar-stop-all", cx);
     });
@@ -5310,11 +5314,11 @@ fn t09_motion_fast_budget_capped() {
 
     const {
         assert!(
-            AppView::MOTION_FAST_MS <= 200,
-            "Ticket 09 enter fades stay within the 200ms budget"
+            AppView::MOTION_FAST_MS <= 160,
+            "docs/internals promise app motion ≤160ms; keep the pin at the documented budget"
         );
         assert!(
-            AppView::motion_accent_halves_ms() * 2 <= 200,
+            AppView::motion_accent_halves_ms() * 2 <= 160,
             "B18: the row accent's two halves stay inside the same budget"
         );
     }
@@ -5649,7 +5653,7 @@ fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn t09_bulk_clear_returns_focus_to_shell(cx: &mut TestAppContext) {
+fn t09_bulk_clear_returns_focus_to_table(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
     store
@@ -5671,10 +5675,14 @@ fn t09_bulk_clear_returns_focus_to_shell(cx: &mut TestAppContext) {
         view.update(cx, |view, cx| view.clear_selection(window, cx));
     });
     let home = cx.update(|window, cx| {
-        let shell = view.read(cx).focus.clone();
-        window.focused(cx).as_ref() == Some(&shell)
+        use gpui_kit::Focusable as _;
+        // Esc-and-clear return keyboard focus to the table, not the shell:
+        // the list owns the arrow bindings, so the shell handle leaves the
+        // arrows dead until a click.
+        let list_focus = view.read_with(cx, |view, cx| view.libraries.read(cx).focus_handle(cx));
+        window.focused(cx).as_ref() == Some(&list_focus)
     });
-    assert!(home, "bulk clear returns keyboard focus to the shell");
+    assert!(home, "bulk clear returns keyboard focus to the table");
 }
 
 #[gpui_kit::test]
@@ -5698,7 +5706,9 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
     paint_frame(cx);
 
     // T-02: the accessible name is the action alone. The key rides in the
-    // tooltip, never inside the name.
+    // tooltip, never inside the name — and the buttons render no keycap
+    // chips at all (the kit button paints label + tooltip; the chips were
+    // custom code this upgrade removed, and a regression would re-add them).
     for (id, pinned) in [
         ("engine-start", "Start the selected endpoint"),
         ("engine-stop", "Stop"),
@@ -5719,13 +5729,6 @@ fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
         assert!(
             !label.as_deref().unwrap_or_default().contains('('),
             "{id} keeps every key out of its accessible name"
-        );
-    }
-    // The key stays visible as a chip beside the button.
-    for chip in ["kbd:f5", "kbd:shift-f5", "kbd:ctrl-t"] {
-        assert!(
-            cx.debug_bounds(chip).is_some(),
-            "{chip} paints the shortcut hint as a chip on the operate row"
         );
     }
     // …and the tooltip is where the key lives.
@@ -7207,7 +7210,7 @@ fn keyboard_shortcuts_open_and_guard_dialogs(cx: &mut TestAppContext) {
 
     let focus = view.read_with(cx, |view, _| view.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
-    let press = |cx: &mut VisualTestContext, key: &str| {
+    let press = |cx: &mut VisualTestContext, key: &'static str| {
         let keystroke = Keystroke::parse(key).expect("test keystroke parses");
         cx.update(|window, cx| {
             window.dispatch_keystroke(keystroke, cx);
@@ -7220,6 +7223,13 @@ fn keyboard_shortcuts_open_and_guard_dialogs(cx: &mut TestAppContext) {
         "Ctrl+N opens Add"
     );
     assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+    // T-06 isolation: the second Ctrl+N must land with focus inside the
+    // dialog, not on the shell — otherwise the refusal routes through the
+    // shell's own handler and the observer below is never exercised.
+    assert!(
+        !cx.update(|window, cx| window.focused(cx).is_none_or(|f| f == focus)),
+        "focus sits inside the dialog before the guarded press"
+    );
 
     press(cx, "ctrl-n");
     cx.run_until_parked();
@@ -7289,7 +7299,7 @@ fn laneb_keyboard_edit_delete_search(cx: &mut TestAppContext) {
     });
     let focus = view.read_with(cx, |view, _| view.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
-    let press = |cx: &mut VisualTestContext, key: &str| {
+    let press = |cx: &mut VisualTestContext, key: &'static str| {
         let keystroke = Keystroke::parse(key).expect("test keystroke parses");
         cx.update(|window, cx| {
             window.dispatch_keystroke(keystroke, cx);
@@ -7297,16 +7307,36 @@ fn laneb_keyboard_edit_delete_search(cx: &mut TestAppContext) {
         cx.run_until_parked();
     };
 
-    // Slice 6: the five literal tabs (and every `Ctrl+1..6`) are gone. The
-    // inspector stays exactly as it was when one of those keys is pressed.
+    // Slice 6: the five literal tabs are gone, and Ctrl+4..6 retired with
+    // them. The inspector stays exactly as it was when one of those keys
+    // is pressed.
     let inspector_before = view.read_with(cx, |view, _| view.inspector_visible);
-    for key in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6"] {
+    for key in ["ctrl-4", "ctrl-5", "ctrl-6"] {
         press(cx, key);
         assert_eq!(
             view.read_with(cx, |view, _| view.inspector_visible),
             inspector_before,
             "{key} no longer opens or closes the inspector"
         );
+    }
+
+    // Ctrl+1/2/3 are the console tab set's keyboard path now: each opens
+    // the dock on its tab.
+    for (key, want) in [
+        ("ctrl-1", manyproxy_ui::ConsoleTab::Logs),
+        ("ctrl-2", manyproxy_ui::ConsoleTab::Connections),
+        ("ctrl-3", manyproxy_ui::ConsoleTab::Traffic),
+    ] {
+        // Close first so the "opens the dock" assertion cannot pass just
+        // because the previous key left it open.
+        view.update(cx, |view, cx| {
+            view.console.open = false;
+            cx.notify();
+        });
+        press(cx, key);
+        let (open, tab) = view.read_with(cx, |view, _| (view.console.open, view.console.tab));
+        assert!(open, "{key} opens the console dock");
+        assert_eq!(tab, want, "{key} lands on its tab");
     }
 
     let before = notification_count(cx);
@@ -7375,6 +7405,9 @@ fn laneb_keyboard_edit_delete_search(cx: &mut TestAppContext) {
     );
     assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
     cx.update(|window, cx| window.focus(&focus, cx));
+    // The shell is deliberately re-focused here: this half pins the
+    // shortcut_action refusal path (the shell handler sees the stroke), not
+    // the keystroke observer — the ctrl-n test above covers that one.
     let guarded = notification_count(cx);
     press(cx, "delete");
     assert_eq!(

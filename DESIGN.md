@@ -114,12 +114,16 @@ red dead-or-destructive, amber advisory, blue selection.
 - **Signal-only.** Color marks primary actions, selection, and serving state —
   never decoration.
 - **One token source.** No color literal in feature code. `skin.rs` names the
-  palette; the QR plate pair is the named exception. The guard test and the
-  contrast test in `appearance.rs`/the dialogs binary enforce both.
+  palette — it is the only place that names a color, with one named
+  exception: the QR plate pair (a scanner needs real black on real white).
+  Accent presets are hue-based and stamp through the theme, so they need no
+  literal. The CI color-literal step enforces the rule; the contrast test in
+  `appearance.rs`/the dialogs binary enforces legibility.
 
 ## Typography
 
-Platform sans (system-ui, Segoe UI) plus the kit mono face for endpoint data.
+Platform sans (system-ui, Segoe UI) plus the kit mono face for endpoint data
+and console log lines.
 Two text roles: body (1rem) for names, titles, and buttons; small (0.875rem)
 for metadata, badges, filter controls, and the `Acting on:` echo. The type
 scale is 14 / 13 / 12 inside table rows (row name / cells / group). The
@@ -149,9 +153,10 @@ Window (open 1200x700, minimum 1100x640)
 
 - Seven production columns: Name, Group, Protocol, Upstream, Endpoint, Health,
   Traffic. Name and Endpoint are locked visible; every visible header sorts on
-  click and opens one identical menu (Size to Fit, Size All, visibility,
-  More…). The Columns sheet adds order buttons and the resets. Widths, order,
-  and visibility persist as one tolerant `library_column_layout` value.
+  click and opens one identical menu (Size column to fit, Size all columns to
+  fit, visibility, More…). The Columns sheet adds order buttons and the
+  resets. Widths, order, and visibility persist as one tolerant
+  `library_column_layout` value.
 - Below 1200px the nav collapses to 56px; below 1080px the inspector overlays
   from the right and the table never auto-hides a column — the table scrolls
   sideways instead, header and rows sharing one offset.
@@ -199,17 +204,18 @@ selection is exposed as state, not only painted. The density switch
   Undo. Stopping N running endpoints on close asks with the names.
 - **Keyboard covers the mouse.** `Ctrl+K` palette, `Ctrl+F` search, `Ctrl+N`
   add, `Ctrl+O` import, `Ctrl+E` endpoint, `Ctrl+Shift+E` config, `Ctrl+I`
-  inspector, `` Ctrl+` `` console, `Ctrl+R` update scope, `Ctrl+.` stop
-  testing, `F5`/`Shift+F5`/`Ctrl+T`, `Ctrl+U` copy SOCKS, `Delete` delete,
-  `Ctrl+A` select visible, `Space` toggle, `Esc` clears layer by layer and
-  returns focus to the table. Every icon-only control names itself to
-  assistive tech and carries a tooltip; overlays trap and restore focus.
+  inspector, `` Ctrl+` `` console, `Ctrl+1`/`Ctrl+2`/`Ctrl+3` console tabs,
+  `Ctrl+R` update scope, `Ctrl+.` stop testing, `F5`/`Shift+F5`/`Ctrl+T`,
+  `Ctrl+U` copy SOCKS, `Delete` delete, `Ctrl+A` select visible, `Space`
+  toggle, `Esc` clears layer by layer and returns focus to the table. Every
+  icon-only control names itself to assistive tech and carries a tooltip;
+  overlays trap and restore focus.
 
 ## Retired surfaces
 
 The five-menu toolbar, the three-segment status strip, the facet band, the
 checked set and its bulk bar, the row checkbox and occupancy lamp, the
-five-tab inspector, `Ctrl+1..6`, the Row columns dialog, the standalone
+five-tab inspector, `Ctrl+4..6`, the Row columns dialog, the standalone
 latency picker, and the old 880×620 window minimum are gone. Their evidence
 lives in the console and the stacked inspector; their verbs live in the nav,
 the action bar, the header menu, the row More menu, and the engine bar.

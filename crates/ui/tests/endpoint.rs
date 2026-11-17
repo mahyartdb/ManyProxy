@@ -585,7 +585,7 @@ fn ctrl_e_opens_endpoint_and_ctrl_shift_e_opens_config(cx: &mut TestAppContext) 
     let focus = view.read_with(cx, |view, _| view.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
 
-    let press = |cx: &mut VisualTestContext, key: &str| {
+    let press = |cx: &mut VisualTestContext, key: &'static str| {
         cx.update(|window, cx| {
             let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
             window.dispatch_keystroke(keystroke, cx);
@@ -686,7 +686,9 @@ fn t06_palette_second_overlay_keeps_focus(cx: &mut TestAppContext) {
 
     let settings_op = IndexPath {
         section: 1,
-        row: 3,
+        // Manage group: subscriptions, presets, logs, console-scope-all,
+        // console-scope-selected, settings — index 5.
+        row: 5,
         column: 0,
     };
     cx.update(|window, cx| {
@@ -840,7 +842,7 @@ fn t06_list_arrows_traverse_and_report_the_selected_row(cx: &mut TestAppContext)
     cx.run_until_parked();
     paint_frame(cx);
 
-    fn press(cx: &mut VisualTestContext, key: &str) {
+    fn press(cx: &mut VisualTestContext, key: &'static str) {
         let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
         cx.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
         cx.run_until_parked();

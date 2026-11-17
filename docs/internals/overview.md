@@ -59,6 +59,9 @@ through a channel.
 One vocabulary, three shapes: a ≤160 ms ease-out entry, a ≤160 ms accent
 settle on the row that starts or stops, and toasts for completed actions
 (delete also carries Undo). All of it returns zero duration under
-`cx.reduce_motion()`. Nothing loops. The kit owns dialog and sheet entry
-(250 ms and 150 ms, `pub static ANIMATION_DURATION`) — an immutable kit
-constant, so the app does not wrap another fade inside it.
+`cx.reduce_motion()`. Nothing loops. The kit owns dialog and sheet entry —
+the dialog's 250 ms is `gpui_component::dialog::ANIMATION_DURATION`, the
+sheet's 150 ms is an inline literal in its entry style — immutable kit
+timing, so the app does not wrap another fade inside it. The kit's toast
+entry/exit is 400 ms / 200 ms — longer than the budget — which is why the
+test harness advances the clock further for toast-exit assertions.

@@ -2067,6 +2067,14 @@ fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
         .add_traffic_batch(&[(row.id.clone(), 2_048, 1_024)])
         .expect("traffic accrues");
     let (view, cx) = mount_view(store, cx);
+    paint_frame(cx);
+    // The engine bar reads the cached copy, not the store; assert through it
+    // so a cache that misses a mid-session mutation stays red here.
+    let bar_before = label_of("engine-bar-traffic", cx);
+    assert!(
+        bar_before.contains("2.0 KB"),
+        "the bar's cached copy starts at the seeded totals: {bar_before}"
+    );
     let before = view.read_with(cx, |view, _| summed_traffic_text(&view.store));
     assert!(before.is_some(), "totals render while rows exist");
     let text = before.expect("totals render");
@@ -2076,6 +2084,12 @@ fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.commit_usage_reset(&row_id, window, cx));
     });
+    paint_frame(cx);
+    let bar_after = label_of("engine-bar-traffic", cx);
+    assert!(
+        bar_after.contains("0 B"),
+        "the reset reaches the bar's cached copy: {bar_after}"
+    );
     let after = view.read_with(cx, |view, _| {
         (
             view.store
@@ -2087,6 +2101,11 @@ fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(after.0, Some((0, 0)), "counters zeroed");
+    assert_eq!(
+        after.1,
+        Some("out 0 B · in 0 B".to_string()),
+        "the summed copy reads exactly zero, not a substring of a larger figure"
+    );
     assert_eq!(notification_count(cx), 1, "reset notifies");
 }
 
@@ -4849,7 +4868,7 @@ fn cua07_card_context_menu_exposes_every_pinned_item(cx: &mut TestAppContext) {
         ("copy-urls", "Copy URLs"),
         ("move", "Move to group"),
         ("assign-preset", "Assign preset"),
-        ("logs", "Logs"),
+        ("logs", "Logs for selected rows"),
         ("share", "Share…"),
         ("duplicate", "Duplicate"),
         ("ping", "Ping"),
