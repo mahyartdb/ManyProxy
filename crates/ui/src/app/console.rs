@@ -71,12 +71,28 @@ pub fn render_console(
 pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     let view_entity = cx.entity();
 
-    let mut tabs = div().flex().flex_row().items_center().gap_1();
-    for tab in [
+    // The kit's TabBar owns its tabs' element ids (`ix`), so it cannot carry
+    // the stable `console-tab-*` / `console-scope-*` ids the suite pins. These
+    // stay hand-rolled but expose the same tab-list surface the kit's base
+    // tabs do: a TabList parent and a position/size on every Tab.
+    let mut tabs = div()
+        .id("console-tabs")
+        .test_support()
+        .role(Role::TabList)
+        .aria_label(t!("console-tabs-label"))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_shrink_0();
+    for (ix, tab) in [
         ConsoleTab::Logs,
         ConsoleTab::Connections,
         ConsoleTab::Traffic,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let active = view.console.tab == tab;
         let label = match tab {
             ConsoleTab::Logs => t!("console-tab-logs"),
@@ -101,12 +117,18 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
                 .role(Role::Tab)
                 .aria_label(label.clone())
                 .aria_selected(active)
+                .aria_position_in_set(ix + 1)
+                .aria_size_of_set(3)
+                // `tab_stop` alone registers nothing — the tab-stop map only
+                // holds elements with a focus handle, so `focusable` is what
+                // puts the chip in the Tab order.
+                .focusable()
+                .tab_stop(true)
                 .on_click({
                     let entity = view_entity.clone();
                     move |_, _, cx| {
                         entity.update(cx, |view, cx| {
-                            view.console.tab = tab;
-                            cx.notify();
+                            view.open_console_tab(tab, cx);
                         });
                     }
                 })
@@ -121,7 +143,21 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
         );
     }
 
-    let mut scope = div().flex().flex_row().items_center().gap_1();
+    // The scope switch is two mutually exclusive radio choices, not a tab
+    // list: choosing one does not switch a panel (the section tabs above do
+    // that). `aria_selected` says which is active; the keyboard reaches both
+    // through Tab (focusable + tab_stop) and the two palette verbs that call
+    // `set_console_scope`.
+    let mut scope = div()
+        .id("console-scope")
+        .test_support()
+        .aria_label(t!("console-scope-label"))
+        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(t!("console-scope-tip"))).into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_shrink_0();
     for (scope_value, key, slug) in [
         (ConsoleScope::All, "console-scope-all", "all"),
         (ConsoleScope::Selected, "console-scope-selected", "selected"),
@@ -138,15 +174,18 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
             div()
                 .id(format!("console-scope-{slug}"))
                 .test_support()
-                .role(Role::Tab)
+                .role(Role::RadioButton)
                 .aria_label(label.clone())
                 .aria_selected(active)
+                // See the section tabs above: `focusable` registers the
+                // handle the tab-stop map needs.
+                .focusable()
+                .tab_stop(true)
                 .on_click({
                     let entity = view_entity.clone();
                     move |_, _, cx| {
                         entity.update(cx, |view, cx| {
-                            view.console.scope = scope_value;
-                            cx.notify();
+                            view.set_console_scope(scope_value, cx);
                         });
                     }
                 })
@@ -209,9 +248,11 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
         Button::new("console-pause")
             .small()
             .ghost()
-            .disabled(!logs_only)
-            .label(pause_label.clone())
-            .tooltip(pause_label)
+            // Pausing is Logs-only, but a session paused on Logs stays
+            // paused across Ctrl+2/3 hops — Resume must stay operable on
+            // the other tabs or the freeze has no way out.
+            .disabled(!logs_only && !paused)
+            .label(pause_label)
             .on_click({
                 let entity = view_entity.clone();
                 move |_, _, cx| {
@@ -230,11 +271,15 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
             div()
                 .id("console-paused-badge")
                 .test_support()
-                .text_sm()
-                .px_1()
-                .rounded_sm()
-                .bg(cx.theme().list_active)
-                .child(t!("console-paused")),
+                .flex_shrink_0()
+                .child(
+                    gpui_kit::component::tag::Tag::secondary()
+                        .small()
+                        // Only Logs is frozen; Connections and Traffic keep
+                        // updating. Say so instead of claiming the whole
+                        // console is paused.
+                        .child(t!("console-paused-logs")),
+                ),
         );
     }
     actions = actions.child(
@@ -243,7 +288,6 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
             .ghost()
             .disabled(!logs_only)
             .label(t!("console-clear"))
-            .tooltip(t!("console-clear"))
             .on_click({
                 let entity = view_entity.clone();
                 move |_, _, cx| {
@@ -276,6 +320,7 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
                 .child(t!("console-title")),
         )
         .child(tabs)
+        .child(div().w(px(1.)).h_4().flex_shrink_0().bg(cx.theme().border))
         .child(scope)
         .child(filter.child(
             // The kit's Input renders its placeholder from the InputState;
@@ -288,7 +333,6 @@ pub fn render_console_header(view: &mut AppView, cx: &mut Context<AppView>) -> A
                 .small()
                 .ghost()
                 .label(t!("console-close"))
-                .tooltip(t!("console-close"))
                 .on_click(move |_, window, cx| {
                     close_view.update(cx, |view, cx| {
                         view.toggle_console(window, cx);
@@ -314,16 +358,30 @@ pub fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> Any
     if view.console.scope == ConsoleScope::Selected && view.selection_count() == 0 {
         return render_scope_empty(cx);
     }
-    let rows = view.console_log_rows(cx);
-    if rows.is_empty() {
+    let lines = view.console_log_lines(cx);
+    if lines.is_empty() {
+        // One reason per empty state: with any filter set — the quick filter
+        // or a sheet level/include/exclude/regex — "No log lines yet."
+        // contradicts "No lines match". The quick filter is the only one
+        // clearable from here, so it gets the button; a sheet-only filter
+        // points at the sheet.
         let quick = view.console.filter.trim().is_empty();
+        let sheet_filtered = !view.logs.filter.trim().is_empty()
+            || !view.logs.exclude.trim().is_empty()
+            || !view.logs.regex.trim().is_empty()
+            || view.logs.level.is_some();
         let mut empty = div()
             .id("console-empty-logs")
             .test_support()
             .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(t!("console-empty-logs"));
-        if !quick {
+            .text_color(cx.theme().muted_foreground);
+        if view.console.paused.is_some() {
+            // The frozen snapshot may be empty while new records stream in;
+            // "No log lines yet." would be a lie. Point at Resume.
+            empty = empty.child(t!("console-empty-paused"));
+        } else if quick && !sheet_filtered {
+            empty = empty.child(t!("console-empty-logs"));
+        } else if !quick {
             let view_entity = cx.entity();
             empty = empty
                 .child(t!("console-no-match", filter = view.console.filter.trim()))
@@ -332,13 +390,14 @@ pub fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> Any
                         .small()
                         .ghost()
                         .label(t!("console-clear-filter"))
-                        .tooltip(t!("console-clear-filter"))
                         .on_click(move |_, _, cx| {
                             view_entity.update(cx, |view, cx| {
                                 view.clear_console_filter(cx);
                             });
                         }),
                 );
+        } else {
+            empty = empty.child(t!("console-no-match-sheet"));
         }
         return div()
             .id("console-logs")
@@ -351,12 +410,8 @@ pub fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> Any
             .into_any_element();
     }
 
-    let count = rows.len();
+    let count = lines.len();
     let height = view.console_list_height(count, PANE_LOG_ROW_H);
-    let lines: Vec<String> = rows
-        .iter()
-        .map(|row| format!("{}  {}", format_clock_time(row.at), row.line()))
-        .collect();
     div()
         .id("console-logs")
         .test_support()
@@ -370,18 +425,53 @@ pub fn render_console_logs(view: &mut AppView, cx: &mut Context<AppView>) -> Any
             height,
             count,
             PANE_LOG_ROW_H,
-            move |_view, ix, _cx| {
+            move |_view, ix, cx| {
                 let line = lines.get(ix).cloned().unwrap_or_default();
                 note_console_row(ConsoleRows::Logs);
-                div()
+                // The console prepends the clock, so the row's `[level]` tag is
+                // the first bracket rather than the first byte of the line.
+                // Severity tones only the tag: timestamp and message stay
+                // foreground so an error burst reads as text with red tags,
+                // not a solid red block.
+                let level = line
+                    .find('[')
+                    .map(|at| log_line_level(&line[at..]))
+                    .unwrap_or(LogLevel::Info);
+                let tip = line.clone();
+                let tone = log_level_text_color(level, cx.theme());
+                let parts = match (line.find('['), line.find(']')) {
+                    (Some(start), Some(end)) if end > start => Some((
+                        line[..start].to_string(),
+                        line[start..=end].to_string(),
+                        line[end + 1..].to_string(),
+                    )),
+                    _ => None,
+                };
+                let row = div()
                     .id(format!("console-log-line-{ix}"))
                     .test_support()
                     .w_full()
                     .h(px(PANE_LOG_ROW_H))
+                    // Block-flow children stack vertically inside the 20px
+                    // row; the row must be a flex line so clock, tag and
+                    // message share it. The message span carries the
+                    // ellipsis (min_w_0), so the clock and tag never clip.
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .font_family(cx.theme().mono_font_family.clone())
                     .text_sm()
-                    .truncate()
-                    .child(line)
-                    .into_any_element()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into());
+                match parts {
+                    Some((clock, tag, message)) => row
+                        .child(div().flex_shrink_0().child(clock))
+                        .child(div().flex_shrink_0().text_color(tone).child(tag))
+                        .child(div().min_w_0().truncate().child(message))
+                        .into_any_element(),
+                    None => row.child(line).into_any_element(),
+                }
             },
         ))
         .into_any_element()
@@ -391,16 +481,23 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
     if view.console.scope == ConsoleScope::Selected && view.selection_count() == 0 {
         return render_scope_empty(cx);
     }
-    let selected = view.selected_id_set(cx);
+    // Membership is the only thing the flow builders read, and the
+    // selection set already holds hidden rows — no need to re-derive the
+    // visible-order copy (O(rows) id clones) on every repaint.
+    let empty_set = HashSet::new();
+    let selected: &HashSet<String> = if view.console.scope == ConsoleScope::Selected {
+        &view.selection
+    } else {
+        &empty_set
+    };
     let rows = build_conn_rows(
         &view.conn.snapshot,
         &view.conn.delta,
-        &selected,
+        selected,
         view.console.scope == ConsoleScope::Selected,
         view.conn.sort_desc,
     );
-    let library: Vec<ProxyConfig> = view.libraries.read(cx).delegate().rows.clone();
-    let dest_width_px = view.store.conn_column_widths()[0] as f32;
+    let dest_width_px = view.console.runtime.conn_dest_width;
 
     if rows.is_empty() {
         return div()
@@ -422,22 +519,18 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
     }
 
     // The quick filter narrows by destination, exit and protocol — the same
-    // substring contract the logs and traffic tabs honor.
+    // substring contract the logs and traffic tabs honor. Borrowed exits:
+    // every scoped flow walks this pass, not just the visible ones.
     let quick = view.console.filter.trim().to_lowercase();
-    let exits: Vec<(String, String, String)> = rows
-        .iter()
-        .map(|row| {
-            let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
-            (name, bind, protocol)
-        })
-        .collect();
     let keep: Vec<usize> = rows
         .iter()
-        .zip(exits.iter())
         .enumerate()
-        .filter(|(_, (row, (name, bind, protocol)))| {
-            quick.is_empty()
-                || row.dest.to_lowercase().contains(&quick)
+        .filter(|(_, row)| {
+            if quick.is_empty() {
+                return true;
+            }
+            let (name, bind, protocol) = view.conn.exit_ref(row.row_id.as_deref());
+            row.dest.to_lowercase().contains(&quick)
                 || bind.to_lowercase().contains(&quick)
                 || name.to_lowercase().contains(&quick)
                 || protocol.to_lowercase().contains(&quick)
@@ -446,6 +539,7 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
         .collect();
 
     if keep.is_empty() {
+        let view_entity = cx.entity();
         return div()
             .id("console-connections")
             .test_support()
@@ -457,21 +551,37 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                 div()
                     .id("console-no-match-connections")
                     .test_support()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_1()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t!("console-no-match", filter = view.console.filter.trim())),
+                    .child(t!("console-no-match", filter = view.console.filter.trim()))
+                    .child(
+                        Button::new("console-clear-filter")
+                            .small()
+                            .ghost()
+                            .label(t!("console-clear-filter"))
+                            .on_click(move |_, _, cx| {
+                                view_entity.update(cx, |view, cx| {
+                                    view.clear_console_filter(cx);
+                                });
+                            }),
+                    ),
             )
             .into_any_element();
     }
 
     let count = keep.len();
     let height = view.console_list_height(count, PANE_LINK_ROW_H);
-    let library = Rc::new(library);
     let sort_desc = view.conn.sort_desc;
+    // The rows sort by cumulative traffic only, so the control speaks the old
+    // inspector's traffic wording instead of a timestamp order it never had.
     let sort_label = if sort_desc {
-        t!("console-toggle-newest")
+        t!("detail-sort-desc")
     } else {
-        t!("console-toggle-oldest")
+        t!("detail-sort-asc")
     };
     let sort_view = cx.entity();
     div()
@@ -493,8 +603,8 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                     Button::new("console-conn-sort")
                         .small()
                         .ghost()
-                        .label(sort_label.clone())
-                        .tooltip(sort_label)
+                        .label(sort_label)
+                        .tooltip(t!("detail-sort-tip"))
                         .on_click(move |_, _, cx| {
                             sort_view.update(cx, |view, cx| {
                                 view.conn.sort_desc = !view.conn.sort_desc;
@@ -517,7 +627,7 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                 let Some(row) = rows.get(rows_ix) else {
                     return div().into_any_element();
                 };
-                let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
+                let (name, bind, protocol) = view.conn.exit_of(row.row_id.as_deref());
                 let dest = row.dest.clone();
                 let dest_display = if dest.is_empty() {
                     t!("detail-no-destination")
@@ -624,16 +734,21 @@ pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> 
     if view.console.scope == ConsoleScope::Selected && view.selection_count() == 0 {
         return render_scope_empty(cx);
     }
-    let selected = view.selected_id_set(cx);
+    // Membership only — see render_console_connections.
+    let empty_set = HashSet::new();
+    let selected: &HashSet<String> = if view.console.scope == ConsoleScope::Selected {
+        &view.selection
+    } else {
+        &empty_set
+    };
     let (session_rx, session_tx) =
-        session_traffic(&view.conn.snapshot, &selected, view.console.scope);
-    let library: Vec<ProxyConfig> = view.libraries.read(cx).delegate().rows.clone();
+        session_traffic(&view.conn.snapshot, selected, view.console.scope);
 
     // Per-exit session flows for the current scope. The stored totals stay on
     // the engine bar; the console reads the live snapshot, so an idle session
     // shows honest zeros instead of last week's history.
     let mut per_exit: HashMap<String, (u64, u64)> = HashMap::new();
-    for (_, entry) in conn_rows_in_scope(&view.conn.snapshot, &selected, view.console.scope) {
+    for (_, entry) in conn_rows_in_scope(&view.conn.snapshot, selected, view.console.scope) {
         if let Some(row_id) = entry.row_id.clone() {
             let slot = per_exit.entry(row_id).or_insert((0, 0));
             slot.0 = slot.0.saturating_add(entry.rx_bytes);
@@ -643,11 +758,11 @@ pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> 
     let exits: Vec<ExitTraffic> = per_exit
         .into_iter()
         .filter_map(|(row_id, (rx, tx))| {
-            let row = library.iter().find(|row| row.id == row_id)?;
+            let row = view.conn.exit_index.get(&row_id)?;
             Some(ExitTraffic {
                 row_id,
                 name: row.name.clone(),
-                bind: format!("{}:{}", row.bind_ip, row.port),
+                bind: row.bind.clone(),
                 rx_bytes: rx,
                 tx_bytes: tx,
             })
@@ -706,10 +821,10 @@ pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> 
                     div()
                         .id("console-traffic-rows")
                         .test_support()
-                        .aria_label(t!("console-traffic-rows", count = exits.len()))
+                        .aria_label(t!("console-traffic-rows", count = bars.len()))
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(t!("console-traffic-rows", count = exits.len())),
+                        .child(t!("console-traffic-rows", count = bars.len())),
                 ),
         );
 
@@ -722,7 +837,6 @@ pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> 
                     .small()
                     .ghost()
                     .label(t!("console-clear-filter"))
-                    .tooltip(t!("console-clear-filter"))
                     .on_click(move |_, _, cx| {
                         view_entity.update(cx, |view, cx| {
                             view.clear_console_filter(cx);
@@ -783,13 +897,13 @@ pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> 
 pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     let uptime = format_uptime(view.started_at.elapsed().as_secs());
     let running = view.engine.running_count();
-    let rows = view.store.list().unwrap_or_default();
-    let total = rows.len();
-    let running_binds: Vec<String> = rows
-        .iter()
-        .filter(|row| view.engine.is_running(&row.id))
-        .map(|row| format!("{}:{}", row.bind_ip, row.port))
-        .collect();
+    let stats = &view.console.runtime;
+    let total = stats.rows;
+    let running_list = if stats.running_binds.is_empty() {
+        "—".to_string()
+    } else {
+        stats.running_binds.join(", ")
+    };
     let conns = view.conn.snapshot.len();
     let (delta_rx, delta_tx) = view
         .conn
@@ -798,51 +912,50 @@ pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> 
         .fold((0u64, 0u64), |(rx, tx), (d_rx, d_tx)| {
             (rx.saturating_add(*d_rx), tx.saturating_add(*d_tx))
         });
-    let subs = view.store.list_subscriptions().unwrap_or_default();
-    let now = now_unix();
-    let due = subs
-        .iter()
-        .filter(|sub| due_for_refresh_for(sub, now))
-        .count();
-    let subs_line = if view.store.subs_auto_refresh_enabled() {
-        t!("stats-subs-due", count = subs.len(), due = due)
+    let subs_line = if stats.subs_auto {
+        t!(
+            "stats-subs-due",
+            count = stats.subs_total,
+            due = stats.subs_due
+        )
     } else {
-        t!("stats-subs-due-off", count = subs.len(), due = due)
+        t!(
+            "stats-subs-due-off",
+            count = stats.subs_total,
+            due = stats.subs_due
+        )
     };
-    let db_line = view
-        .store
-        .db_path()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|meta| format_bytes(meta.len()))
+    let db_line = stats
+        .db_bytes
+        .map(format_bytes)
         .unwrap_or_else(|| t!("stats-unknown"));
-    let selected_line = match view.selected_config(cx) {
-        Some(config) => {
-            let health = view.health_store.row_summary(&config.id);
-            let health = health.trim();
-            if health.is_empty() {
-                t!("stats-selected-no-probes", name = config.name)
-            } else {
-                t!("stats-selected-health", name = config.name, health = health)
+    // The selected line reads name + health summary only; borrowing the row
+    // avoids the full-config clone the cache rules forbid at paint.
+    let selected_line = {
+        let id = view
+            .selection
+            .iter()
+            .next()
+            .filter(|_| view.selection.len() == 1)
+            .cloned();
+        match (id, view.selected_name(cx)) {
+            (Some(id), Some(name)) => {
+                let health = view.health_store.row_summary(&id);
+                let health = health.trim();
+                if health.is_empty() {
+                    t!("stats-selected-no-probes", name = name)
+                } else {
+                    t!("stats-selected-health", name = name, health = health)
+                }
             }
+            _ => t!("stats-none-selected"),
         }
-        None => t!("stats-none-selected"),
     };
-    let shard_rows = shard_stat_rows(
-        &view.engine.shard_processes(),
-        &view.shard_rings,
-        &view.shard_denied,
-    );
+    let shard_rows = view.shard_rows_for_paint();
     let lines = vec![
         t!("stats-uptime", uptime = uptime),
         t!("stats-endpoints", running = running, total = total),
-        t!(
-            "stats-running",
-            list = if running_binds.is_empty() {
-                "—".to_string()
-            } else {
-                running_binds.join(", ")
-            }
-        ),
+        t!("stats-running", list = running_list),
         t!("stats-connections", conns = conns),
         t!(
             "stats-session-delta",
@@ -852,7 +965,7 @@ pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> 
         t!("stats-subscriptions", line = subs_line),
         t!("stats-database", line = db_line),
         t!("stats-selected", line = selected_line),
-        t!("stats-processes", line = shard_stats_summary(&shard_rows)),
+        t!("stats-processes", line = shard_stats_summary(shard_rows)),
     ];
 
     let mut runtime = div()
@@ -872,15 +985,24 @@ pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> 
                 .text_sm()
                 .child(t!("console-runtime-title")),
         );
+    // A real list: each line is an item with its text as accessible name,
+    // so AT reads the figures and the suite can assert their content.
+    let mut stat_list = div().id("console-runtime-stats").role(Role::List);
     for (ix, line) in lines.iter().enumerate() {
-        runtime = runtime.child(
+        stat_list = stat_list.child(
             div()
                 .id(format!("console-runtime-stat-{ix}"))
                 .test_support()
+                .role(Role::ListItem)
+                .aria_label(line.clone())
                 .text_sm()
                 .child(line.clone()),
         );
     }
+    runtime = runtime.child(stat_list);
+    let cpu_stroke = cx.theme().chart_1;
+    let ram_stroke = cx.theme().chart_2;
+    let muted = cx.theme().muted_foreground;
     runtime = runtime.child(
         div()
             .id("console-runtime-shards")
@@ -888,8 +1010,17 @@ pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> 
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_xs().child(t!("stats-sidecar-tip")))
-            .children(shard_rows.iter().map(shard_stat_row_view)),
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(t!("stats-sidecar-tip")),
+            )
+            .children(
+                shard_rows
+                    .iter()
+                    .map(|row| shard_stat_row_view(row, muted, cpu_stroke, ram_stroke)),
+            ),
     );
     runtime.into_any_element()
 }

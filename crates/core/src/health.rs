@@ -1988,7 +1988,20 @@ impl LogStore {
         let stripped = crate::engine::strip_ansi_codes(line);
         let message = redact_secrets(&stripped);
         let level = parse_level(&stripped);
-        let search = format!("[{}] {}", level.as_str(), message).to_lowercase();
+        // One lowercased blob at ingest serves the quick filter, include and
+        // exclude without per-rebuild allocations. It carries both the
+        // unbracketed "level message" form the quick filter has always
+        // matched and the bracketed "[level] message" form the include/
+        // exclude filters match, so a compound query like "error disk"
+        // keeps working after the console cache refactor.
+        let search = format!(
+            "{} {} [{}] {}",
+            level.as_str(),
+            message,
+            level.as_str(),
+            message
+        )
+        .to_lowercase();
         self.push(LogRecord {
             at: now_unix(),
             config_id: tags.tag_for(&stripped),
@@ -4617,7 +4630,14 @@ mod tests {
         assert_eq!(all[0].level, LogLevel::Error);
         assert_eq!(
             all[0].search,
-            format!("[{}] {}", all[0].level.as_str(), all[0].message).to_lowercase(),
+            format!(
+                "{} {} [{}] {}",
+                all[0].level.as_str(),
+                all[0].message,
+                all[0].level.as_str(),
+                all[0].message
+            )
+            .to_lowercase(),
             "search blob cached at ingest"
         );
     }

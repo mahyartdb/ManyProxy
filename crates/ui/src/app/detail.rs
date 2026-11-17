@@ -89,6 +89,7 @@ pub fn pane_rows(
     div()
         .relative()
         .w_full()
+        .px_2()
         .h(px(height))
         .min_h_0()
         .child(
@@ -344,8 +345,8 @@ impl AppView {
         };
         let badge = inspector_badge_text(state, &config.bind_ip, config.port, latency_ms);
         // DESIGN: the lamp, the badge dot, and the badge text agree. Stopped
-        // used to take `secondary`, a surface token, which painted the badge
-        // #e5e5e5 on white paper and erased it.
+        // used to take `secondary`, a surface token, which painted a
+        // near-white badge on white paper and erased it.
         let badge_color = serving_tone_color(state.into(), cx.theme());
         div()
             .id("detail-header-line")
@@ -675,30 +676,38 @@ impl AppView {
     /// K1/A4-6: the sparkline earns its 160x32 only with 3+ samples — a
     /// one-or-two-point "trend" is noise, so the block says how many probes
     /// it has instead. The real trend (caption + chart) still comes from
-    /// `history_line` once the row has enough history to draw honestly.
-    pub fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+    /// `history_line_from` once the row has enough history to draw honestly.
+    pub fn render_detail_history(&mut self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         // Same 90-day window the sparkline reads, so the count matches the
-        // samples `history_line` would chart.
-        let since = now_unix().saturating_sub(90 * 86_400);
-        let samples = self
-            .store
-            .load_health_history(&config.id, Some(since))
-            .map(|entries| url_test_sparkline(&entries, 120).len())
-            .unwrap_or(0);
-        let body = if samples >= 3 {
-            self.history_line(&config.id, cx)
-        } else {
-            div()
+        // samples `history_line_from` would chart. One cached read feeds both.
+        let history = self.health_history_for(&config.id);
+        let body = match history.as_ref() {
+            HistoryFor::Unavailable => div()
                 .id("config-history-few")
                 .test_support()
                 .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(if samples == 0 {
-                    t!("detail-history-empty")
+                .text_color(danger_text_color(cx.theme()))
+                .child(t!("detail-history-unavailable"))
+                .into_any_element(),
+            HistoryFor::Loaded {
+                latencies, tone, ..
+            } => {
+                if latencies.len() >= 3 {
+                    self.history_line_from(latencies, *tone, cx)
                 } else {
-                    t!("detail-history-few", count = samples)
-                })
-                .into_any_element()
+                    div()
+                        .id("config-history-few")
+                        .test_support()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if latencies.is_empty() {
+                            t!("detail-history-empty")
+                        } else {
+                            t!("detail-history-few", count = latencies.len())
+                        })
+                        .into_any_element()
+                }
+            }
         };
         div().id("config-history").test_support().child(
             GroupBox::new()
@@ -724,12 +733,11 @@ impl AppView {
         // T-03: these three are direct children of the wrapping operate row.
         // A ButtonGroup is a single flex item and cannot break, so inside the
         // 260px drawer it clipped its own last button. Kept as siblings, each
-        // button wraps on its own line and the pinned shortcut chips survive.
+        // button wraps on its own line.
         let mut start = Button::new("engine-start")
             .small()
             .label(start_label)
             .accessibility_label(t!("detail-start-aria"))
-            .child(shortcut_kbd("f5", "(F5)"))
             .tooltip(operate_start_tooltip())
             .loading(self.start_in_flight)
             .on_click(cx.listener(|view, _, window, cx| {
@@ -756,7 +764,6 @@ impl AppView {
             .small()
             .label(t!("detail-stop"))
             .accessibility_label(t!("detail-stop-aria"))
-            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
             .tooltip(operate_stop_tooltip())
             .on_click(cx.listener(|view, _, window, cx| {
                 view.stop_selected_engine(window, cx);
@@ -766,7 +773,6 @@ impl AppView {
             .small()
             .label(t!("detail-test"))
             .accessibility_label(t!("detail-test-aria"))
-            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
             .tooltip(operate_test_tooltip())
             .loading(self.probe_kind_in_flight(false))
             .on_click(cx.listener(|view, _, window, cx| {
@@ -1110,7 +1116,7 @@ impl AppView {
     /// the probe/usage block and the honest history line. `Test` rides the
     /// actions section; this section only reports.
     pub fn render_inspector_health_section(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {

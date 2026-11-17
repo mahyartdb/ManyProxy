@@ -15,7 +15,16 @@ impl AppView {
     pub fn render_engine_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let engine_text = engine_status_text(&self.engine);
         let running = self.engine.running_count();
-        let usage_text = summed_traffic_text(&self.store);
+        // A failed store read hides the usage segment; "0 B / 0 B" would read
+        // as measured quiet instead of unknown.
+        let usage_text = if self.conn.traffic_ok {
+            self.conn
+                .stored_traffic
+                .as_ref()
+                .map(|stored| traffic_totals_text(stored.sum))
+        } else {
+            None
+        };
         // A crash names its cause in `status_text` and stores the same words
         // as the last error; showing both would read the failure twice.
         let engine_error = self

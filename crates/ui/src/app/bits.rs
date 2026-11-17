@@ -210,21 +210,33 @@ pub fn has_advanced_dialog(protocol_raw: &str) -> bool {
 
 pub const INTERVAL_PRESETS: &[i64] = &[0, 3_600, 21_600, 43_200, 86_400, 604_800];
 
+/// Test-only: the per-call `traffic_totals()` read the engine bar moved off
+/// the paint path. Gated so production code cannot quietly regress onto it.
+#[cfg(any(test, feature = "test-support"))]
 pub fn summed_traffic_text(store: &Store) -> Option<String> {
     let totals = store.traffic_totals().ok()?;
+    Some(traffic_totals_text(sum_traffic_totals(&totals)))
+}
+
+/// K12/A5-1: words instead of the tiny `↓`/`↑` pair, which the UI video showed
+/// degrading to a serif "T". `out` is what the endpoints sent (tx), `in` is
+/// what came back (rx).
+pub fn traffic_totals_text(total: (u64, u64)) -> String {
+    let (rx, tx) = total;
+    t!(
+        "traffic-totals",
+        tx = format_bytes(tx),
+        rx = format_bytes(rx)
+    )
+}
+
+pub fn sum_traffic_totals(totals: &HashMap<String, (u64, u64)>) -> (u64, u64) {
     let (mut rx, mut tx) = (0u64, 0u64);
     for (row_rx, row_tx) in totals.values() {
         rx = rx.saturating_add(*row_rx);
         tx = tx.saturating_add(*row_tx);
     }
-    // K12/A5-1: words instead of the tiny `↓`/`↑` pair, which the UI video
-    // showed degrading to a serif "T". `out` is what the endpoints sent
-    // (tx), `in` is what came back (rx).
-    Some(t!(
-        "traffic-totals",
-        tx = format_bytes(tx),
-        rx = format_bytes(rx)
-    ))
+    (rx, tx)
 }
 
 pub fn interval_picker_row(

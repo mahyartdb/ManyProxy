@@ -602,6 +602,7 @@ impl AppView {
             GroupPruneKind::ClearTests => match self.store.clear_tests_in_group(&group) {
                 Ok(cleared) => {
                     self.health_store_prune_group(&group);
+                    self.invalidate_health_history();
                     self.reload(window, cx);
                     window.push_notification(
                         Notification::success(t!(
@@ -833,6 +834,13 @@ impl AppView {
         }
         self.logs.store = LogStore::with_capacity(cap);
         self.logs.seen = 0;
+        // The console's LogRowsKey names a ring by (push_seq, len, cap); a
+        // swapped ring resets push_seq, so drop the cached rows with it or a
+        // same-cap round trip could match the old ring's key. The frozen
+        // pause snapshot is an independent clone of rows that no longer
+        // exist in any ring — keep it: the user paused to inspect evidence,
+        // and a cap change is not a reason to thaw it.
+        self.console.log_rows = RefCell::new(None);
         if let Some(list) = self.logs.list.clone() {
             let lines = self.log_lines(cx);
             list.update(cx, |state, cx| {
@@ -1764,6 +1772,11 @@ impl AppView {
                 Notification::error(t!("cannot-change-auto-refresh", error = error.to_string())),
                 cx,
             );
+        } else {
+            // The Runtime tab reads the cached snapshot, not the store; the
+            // toggle must reach it now or the console shows the old state
+            // until the next engine tick.
+            self.reload_quiet(cx);
         }
         self.reopen_subscriptions_if_open(window, cx);
     }

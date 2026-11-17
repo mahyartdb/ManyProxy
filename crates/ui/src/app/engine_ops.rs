@@ -44,12 +44,13 @@ impl AppView {
             tray.set_running(running.len());
         }
 
-        let traffic = self.store.traffic_totals().unwrap_or_default();
+        let traffic_result = self.store.traffic_totals();
+        let traffic_ok = traffic_result.is_ok();
+        let traffic = traffic_result.unwrap_or_default();
+        let subs = self.store.list_subscriptions().unwrap_or_default();
         let mut sub_labels = HashMap::new();
-        if let Ok(subs) = self.store.list_subscriptions() {
-            for sub in &subs {
-                sub_labels.insert(sub.id.clone(), sub.label.clone());
-            }
+        for sub in &subs {
+            sub_labels.insert(sub.id.clone(), sub.label.clone());
         }
         let mut preset_names = HashMap::new();
         if let Ok(presets) = self.store.list_presets() {
@@ -57,31 +58,101 @@ impl AppView {
                 preset_names.insert(preset.id.clone(), preset.name.clone());
             }
         }
+        let crashed = self.engine.ids_on_crashed_shards();
+        // Each delegate setter rebuilds every row's search words, so a setter
+        // whose input did not move is four enrichment passes paid for nothing.
+        // The cached traffic copy and the exit index are row-load products too.
+        let rows_same = {
+            let libraries = self.libraries.read(cx);
+            libraries.delegate().rows == rows
+        };
+        let traffic_same = {
+            let libraries = self.libraries.read(cx);
+            libraries.delegate().traffic == traffic
+        };
+        if !traffic_same {
+            self.conn.set_stored_traffic(traffic.clone());
+        }
+        // A failed totals read must not read as "no traffic": the bar hides
+        // its usage segment when the store could not say, matching the
+        // pre-cache behavior where a query error rendered nothing.
+        self.conn.traffic_ok = traffic_ok;
+        if !rows_same {
+            self.conn.set_exit_index(&rows);
+            // Row ids are store rowids, which SQLite reuses: a delete+add can
+            // resurrect a new row under an id the cached history still belongs
+            // to, with no epoch bump to say so. Any row-list change orphans
+            // the cache outright.
+            self.conn.history_for = None;
+        }
+        self.sync_console_runtime(&rows, &subs);
+        let health_same = {
+            let libraries = self.libraries.read(cx);
+            libraries.delegate().health == health
+        };
+        let context_same = {
+            let libraries = self.libraries.read(cx);
+            let delegate = libraries.delegate();
+            delegate.sub_labels == sub_labels && delegate.preset_names == preset_names
+        };
+        let (running_same, settled_idle, unchanged) = {
+            let libraries = self.libraries.read(cx);
+            let delegate = libraries.delegate();
+            let running_same = delegate.running.len() == running.len()
+                && running.iter().all(|id| delegate.running.contains(id));
+            let settled_idle = delegate.settled.is_none();
+            let crashed_same = delegate.crashed.len() == crashed.len()
+                && crashed.iter().all(|id| delegate.crashed.contains(id));
+            let unchanged = rows_same
+                && health_same
+                && context_same
+                && running_same
+                && settled_idle
+                && crashed_same
+                && delegate.health_tone == health_tones
+                && traffic_same
+                && delegate.latency == latency
+                && delegate.data_traffic == data_traffic
+                && delegate.out_ips == out_ips;
+            (running_same, settled_idle, unchanged)
+        };
         self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_rows(rows);
-            state.delegate_mut().set_health(health);
+            let delegate = state.delegate_mut();
+            if !rows_same {
+                delegate.set_rows(rows);
+            }
+            if !health_same {
+                delegate.set_health(health);
+            }
 
-            state.delegate_mut().set_health_tone(health_tones);
+            delegate.set_health_tone(health_tones);
 
-            state.delegate_mut().set_running(running);
+            if !running_same || !settled_idle {
+                delegate.set_running(running);
+            }
 
-            state
-                .delegate_mut()
-                .set_crashed(self.engine.ids_on_crashed_shards());
-            state.delegate_mut().set_traffic(traffic);
-            state.delegate_mut().set_latency(latency);
-            state.delegate_mut().set_data_traffic(data_traffic);
-            state.delegate_mut().set_out_ips(out_ips);
-            state
-                .delegate_mut()
-                .set_search_context(sub_labels, preset_names);
+            delegate.set_crashed(crashed);
+            delegate.set_traffic(traffic);
+            delegate.set_latency(latency);
+            delegate.set_data_traffic(data_traffic);
+            delegate.set_out_ips(out_ips);
+            if !context_same {
+                delegate.set_search_context(sub_labels, preset_names);
+            }
 
-            list_cx.notify();
+            if !unchanged {
+                list_cx.notify();
+            }
         });
         // The nav index is a row-load product: one pass over the rows here,
-        // never a per-frame recount.
-        self.refresh_scope_index(cx);
-        self.apply_query(cx);
+        // never a per-frame recount. It also folds the subscription list, so
+        // it runs even when the row mirrors stood still. A dead-scope
+        // fallback rewrites `self.scope` without any row change, so its
+        // result joins the `unchanged` gate.
+        let scope_reset = self.refresh_scope_index_with(&subs, cx);
+        if !unchanged || scope_reset {
+            self.apply_query(cx);
+        }
         // A row that stopped existing leaves the selection; a row that is
         // merely filtered out stays.
         self.prune_selection_to_live_rows(cx);
@@ -532,6 +603,7 @@ impl AppView {
     #[cfg(any(test, feature = "test-support"))]
     pub fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
         self.logs.filter = filter;
+        self.thaw_console_for_filter_change();
         cx.notify();
     }
 
@@ -545,6 +617,7 @@ impl AppView {
         self.logs.filter = include;
         self.logs.exclude = exclude;
         self.logs.regex = pattern;
+        self.thaw_console_for_filter_change();
         cx.notify();
     }
 

@@ -226,6 +226,7 @@ impl AppView {
                     for id in &first {
                         self.selection.insert(id.clone());
                     }
+                    self.selection_changed();
                     self.selection_anchor = first.first().cloned();
                     self.selection_focus = first.first().cloned();
                     self.libraries.update(cx, |_list_state, list_cx| {

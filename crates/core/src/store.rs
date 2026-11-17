@@ -7886,7 +7886,13 @@ impl Store {
     }
 
     pub fn clear_health_snapshots(&mut self) -> Result<usize, StoreError> {
-        let changed = self.conn.execute("DELETE FROM health_snapshots", [])?;
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute("DELETE FROM health_snapshots", [])?;
+        // "Clear test results" must clear what the inspector's history
+        // block draws too — the sparkline reads this table, not the
+        // latest-snapshot one.
+        tx.execute("DELETE FROM health_history", [])?;
+        tx.commit()?;
         Ok(changed)
     }
 
@@ -17147,6 +17153,13 @@ mod tests {
                 .is_empty(),
             "snapshot present"
         );
+        assert!(
+            !store
+                .load_health_history(&row.id, None)
+                .expect("history loads")
+                .is_empty(),
+            "history present (save writes both tables)"
+        );
         store.clear_health_snapshots().expect("clear works");
         assert!(
             store
@@ -17154,6 +17167,15 @@ mod tests {
                 .expect("load works")
                 .is_empty(),
             "snapshots cleared"
+        );
+        // "Clear test results" must clear the 90-day history the inspector's
+        // sparkline draws, not just the latest-snapshot table.
+        assert!(
+            store
+                .load_health_history(&row.id, None)
+                .expect("history loads")
+                .is_empty(),
+            "history cleared in the same transaction"
         );
     }
 

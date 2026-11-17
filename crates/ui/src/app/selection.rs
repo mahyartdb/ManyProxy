@@ -85,6 +85,11 @@ impl AppView {
             .into_iter()
             .filter(|id| self.selection.contains(id))
             .collect();
+        // The hidden pass scans every visible id per candidate (`!ids.contains`
+        // is linear), which under Ctrl+A over a large library turns the
+        // console's per-frame cache-key check into O(selection × rows). One
+        // set makes the membership test O(1); the order is unchanged.
+        let visible: HashSet<&String> = ids.iter().collect();
         let mut hidden: Vec<String> = self
             .libraries
             .read(cx)
@@ -92,7 +97,7 @@ impl AppView {
             .row_ids()
             .into_iter()
             .filter(|id| self.selection.contains(id))
-            .filter(|id| !ids.contains(id))
+            .filter(|id| !visible.contains(id))
             .collect();
         ids.append(&mut hidden);
         ids
@@ -172,12 +177,12 @@ impl AppView {
         cx.notify();
     }
 
-    /// The selection, the anchor and the focus all go, and the keyboard goes
-    /// back to the shell: with no row selected there is nothing for the
-    /// list's key context to drive.
+    /// The selection, the anchor and the focus all go, and the keyboard stays
+    /// on the list: with no row selected, the arrows still drive rows.
     pub fn clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reset_selection(cx);
-        window.focus(&self.focus, cx);
+        let list_focus = self.libraries.read(cx).focus_handle(cx);
+        window.focus(&list_focus, cx);
         cx.notify();
     }
 
@@ -205,25 +210,32 @@ impl AppView {
     /// Prune the selection to the rows that still exist. A row that stops
     /// existing leaves the set; a row that is merely filtered out stays.
     pub fn prune_selection_to_live(&mut self, live_ids: &HashSet<String>, cx: &mut Context<Self>) {
-        self.selection_changed();
-        self.selection.retain(|id| live_ids.contains(id));
-        if self
+        // This runs on every reload (engine + traffic ticks). Bump the
+        // revision only when the set actually changed — an unconditional
+        // bump moves the Selected-scope log cache key every tick and forces
+        // a full ring rebuild with it.
+        let before = self.selection.len();
+        let anchor_dropped = self
             .selection_anchor
             .as_deref()
-            .is_some_and(|id| !live_ids.contains(id))
-        {
-            self.selection_anchor = None;
-        }
-        if self
+            .is_some_and(|id| !live_ids.contains(id));
+        let focus_dropped = self
             .selection_focus
             .as_deref()
-            .is_some_and(|id| !live_ids.contains(id))
-        {
+            .is_some_and(|id| !live_ids.contains(id));
+        self.selection.retain(|id| live_ids.contains(id));
+        if anchor_dropped {
+            self.selection_anchor = None;
+        }
+        if focus_dropped {
             self.selection_focus = None;
         }
         if self.selection.is_empty() {
             self.selection_anchor = None;
             self.selection_focus = None;
+        }
+        if self.selection.len() != before || anchor_dropped || focus_dropped {
+            self.selection_changed();
         }
         cx.notify();
     }
@@ -273,6 +285,7 @@ impl AppView {
     /// now. A batch still in flight keeps reporting, so a mid-flight click
     /// cannot hide the outcome it is about to land.
     pub fn selection_changed(&mut self) {
+        self.selection_rev = self.selection_rev.wrapping_add(1);
         if self.batch.as_ref().is_some_and(BatchRun::is_finished) {
             self.batch = None;
         }

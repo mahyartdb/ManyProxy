@@ -56,6 +56,7 @@ impl AppView {
                 // hydrated once at boot. Reset it here or the inspector and the
                 // engine-bar enablement keep reporting the cleared samples.
                 self.health_store = HealthStore::default();
+                self.invalidate_health_history();
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(t!("cleared-health-toast", count = count)),

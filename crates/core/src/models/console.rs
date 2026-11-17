@@ -81,9 +81,11 @@ pub const CONSOLE_LOG_ROWS: usize = 200;
 /// Global engine lines (`config_id: None`) survive only under `All`: under
 /// `Selected` a line must belong to one of the selected ids. The quick filter
 /// is one case-insensitive substring over level and message. The cap keeps
-/// the NEWEST rows — the console tails.
-pub fn log_rows(
-    records: &[LogRecord],
+/// the NEWEST rows — the console tails. Filtering happens on the record's
+/// pre-lowercased `search` copy BEFORE the redacted message is allocated, so
+/// a streaming ring costs one pass, not one allocation per record.
+pub fn log_rows<'a>(
+    records: impl IntoIterator<Item = &'a LogRecord>,
     selected: &HashSet<String>,
     scope: ConsoleScope,
     filters: ConsoleLogFilters<'_>,
@@ -93,9 +95,26 @@ pub fn log_rows(
     let exclude = filters.exclude.trim().to_lowercase();
     let quick = quick.trim().to_lowercase();
     let mut rows: Vec<ConsoleLogRow> = records
-        .iter()
+        .into_iter()
         .filter(|record| scope_allows(selected, scope, record))
         .filter(|record| filters.level.is_none_or(|want| record.level == want))
+        .filter(|record| {
+            // `search` is the lowercased blob the ring built at push time,
+            // carrying both "level message" and "[level] message" forms —
+            // the same text the case-insensitive filters match, without a
+            // lowercase allocation per record per rebuild. Consequence: the
+            // sheet's include/exclude match a slight superset of the old
+            // bracket-only text (a query spanning the boundary now matches
+            // too). The sheet's regex stays case-sensitive on the
+            // mixed-case line, and only when a pattern is actually set.
+            (include.is_empty() || record.search.contains(&include))
+                && (exclude.is_empty() || !record.search.contains(&exclude))
+                && (quick.is_empty() || record.search.contains(&quick))
+                && filters.regex.is_none_or(|re| {
+                    let line = format!("[{}] {}", record.level.as_str(), record.message);
+                    re.is_match(&line)
+                })
+        })
         .map(|record| ConsoleLogRow {
             at: record.at,
             config_id: record.config_id.clone(),
@@ -103,16 +122,6 @@ pub fn log_rows(
             // The ring already redacted at push; a second pass keeps a raw
             // push path from ever leaking through the console.
             message: redact_secrets(&strip_ansi_codes(&record.message)),
-        })
-        .filter(|row| {
-            let line = row.line().to_lowercase();
-            (include.is_empty() || line.contains(&include))
-                && (exclude.is_empty() || !line.contains(&exclude))
-                && filters.regex.is_none_or(|re| re.is_match(&row.line()))
-                && (quick.is_empty()
-                    || format!("{} {}", row.level.as_str(), row.message)
-                        .to_lowercase()
-                        .contains(&quick))
         })
         .collect();
     if rows.len() > CONSOLE_LOG_ROWS {
@@ -239,7 +248,14 @@ mod tests {
             config_id: config_id.map(str::to_string),
             level,
             message: message.to_string(),
-            search: String::new(),
+            search: format!(
+                "{} {} [{}] {}",
+                level.as_str(),
+                message,
+                level.as_str(),
+                message
+            )
+            .to_lowercase(),
         }
     }
 
@@ -308,6 +324,62 @@ mod tests {
             "DISK",
         );
         assert_eq!(by_message.len(), 1, "the message matches, any case");
+    }
+
+    /// The quick filter matches the ring's pre-lowercased `search` copy.
+    /// That blob carries both the unbracketed "level message" form the
+    /// quick filter has always matched and the bracketed "[level] message"
+    /// form the include/exclude filters match. A compound query spanning
+    /// the level/message boundary ("error disk") must keep working — pin it.
+    #[test]
+    fn console_quick_filter_shape_is_bracketed_level_then_message() {
+        let records = vec![
+            record(Some("a"), LogLevel::Error, "disk full"),
+            record(Some("a"), LogLevel::Warn, "handshake failed"),
+        ];
+        let selected = set(&["a"]);
+        let compound = log_rows(
+            &records,
+            &selected,
+            ConsoleScope::All,
+            ConsoleLogFilters::default(),
+            "error disk",
+        );
+        assert_eq!(
+            compound.len(),
+            1,
+            "a compound level+message query matches: {compound:?}"
+        );
+        let bracketed = log_rows(
+            &records,
+            &selected,
+            ConsoleScope::All,
+            ConsoleLogFilters::default(),
+            "ror] disk",
+        );
+        assert_eq!(
+            bracketed.len(),
+            1,
+            "the bracketed form still matches include-style queries: {bracketed:?}"
+        );
+        // The dual-form blob means include/exclude match a slight superset
+        // of the old bracket-only text: a boundary-spanning sheet filter now
+        // matches too. Pin the widening as deliberate.
+        let spanning_include = log_rows(
+            &records,
+            &selected,
+            ConsoleScope::All,
+            ConsoleLogFilters {
+                include: "warn hand",
+                ..ConsoleLogFilters::default()
+            },
+            "",
+        );
+        assert_eq!(
+            spanning_include.len(),
+            1,
+            "a boundary-spanning include matches the dual-form blob: {spanning_include:?}"
+        );
     }
 
     #[test]
