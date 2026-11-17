@@ -55,9 +55,56 @@ pub fn shard_stat_rows(
         .collect()
 }
 
-/// Sparkline-shaped line for one series: same `LineChart` family and sizing as
-/// the health sparkline, one per series so CPU and RAM never share a scale.
-pub fn shard_sparkline(series: &[f32]) -> impl IntoElement {
+/// The fingerprint the Runtime group compares before rebuilding its rows:
+/// every input `shard_stat_rows` reads, cheap to hash and exact.
+pub fn shard_stat_fingerprint(
+    shards: &[(String, Option<u32>)],
+    rings: &BTreeMap<String, ShardRing>,
+    denied: &HashSet<String>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    0u8.hash(&mut hasher);
+    for (label, pid) in shards {
+        label.hash(&mut hasher);
+        pid.hash(&mut hasher);
+    }
+    1u8.hash(&mut hasher);
+    for (label, ring) in rings {
+        label.hash(&mut hasher);
+        ring.cpu.len().hash(&mut hasher);
+        for value in &ring.cpu {
+            value.to_bits().hash(&mut hasher);
+        }
+        ring.ram.len().hash(&mut hasher);
+        for value in &ring.ram {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+    2u8.hash(&mut hasher);
+    // Hash each label into its own hasher and XOR the results: a HashSet
+    // iterates in an unstable order, and a straight fold would give identical
+    // contents a different fingerprint every tick, defeating the cache while
+    // any shard is sampling-denied. XOR is order-independent. The combined
+    // value is finished once and fed as a single u64 after the section tag,
+    // so the XOR cannot interact with the sections' hash stream; keep it
+    // that way — splicing the per-label hashes into the outer hasher would
+    // reintroduce the churn this exists to prevent.
+    let mut denied_hash: u64 = 0;
+    for label in denied {
+        let mut label_hasher = std::collections::hash_map::DefaultHasher::new();
+        label.hash(&mut label_hasher);
+        denied_hash ^= label_hasher.finish();
+    }
+    denied_hash.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Sparkline-shaped line for one series. 120×24, smaller than the health
+/// sparkline's 160×32 (`AppView::latency_sparkline`); one chart per series so
+/// CPU and RAM never share a scale, and the caller picks the stroke so the two
+/// series read apart.
+pub fn shard_sparkline(series: &[f32], stroke: Hsla) -> impl IntoElement {
     struct SeriesPoint {
         x: String,
         y: f64,
@@ -75,11 +122,17 @@ pub fn shard_sparkline(series: &[f32]) -> impl IntoElement {
             .x(|point: &SeriesPoint| point.x.clone())
             .y(|point: &SeriesPoint| point.y)
             .x_axis(false)
-            .grid(false),
+            .grid(false)
+            .stroke(stroke),
     )
 }
 
-pub fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
+pub fn shard_stat_row_view(
+    row: &ShardStatRow,
+    muted: Hsla,
+    cpu_stroke: Hsla,
+    ram_stroke: Hsla,
+) -> AnyElement {
     let mut entry = div()
         .id(format!("shard-stat-{}", row.label))
         .test_support()
@@ -93,6 +146,7 @@ pub fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
                     .id(format!("shard-caption-{}", row.label))
                     .test_support()
                     .text_xs()
+                    .text_color(muted)
                     .child(format!("{}: {}", row.label, caption.label())),
             );
         }
@@ -120,8 +174,42 @@ pub fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
                         .flex_row()
                         .items_center()
                         .gap_2()
-                        .child(shard_sparkline(&row.cpu))
-                        .child(shard_sparkline(&row.ram)),
+                        .child(
+                            div()
+                                .id(format!("shard-cpu-{}-wrap", row.label))
+                                .test_support()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id(format!("shard-cpu-key-{}", row.label))
+                                        .test_support()
+                                        .text_xs()
+                                        .text_color(cpu_stroke)
+                                        .child(t!("shard-cpu-key")),
+                                )
+                                .child(shard_sparkline(&row.cpu, cpu_stroke)),
+                        )
+                        .child(
+                            div()
+                                .id(format!("shard-ram-{}-wrap", row.label))
+                                .test_support()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id(format!("shard-ram-key-{}", row.label))
+                                        .test_support()
+                                        .text_xs()
+                                        .text_color(ram_stroke)
+                                        .child(t!("shard-ram-key")),
+                                )
+                                .child(shard_sparkline(&row.ram, ram_stroke)),
+                        ),
                 );
         }
     }

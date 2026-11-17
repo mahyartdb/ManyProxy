@@ -5,6 +5,7 @@
 //! render path only reads that snapshot.
 
 use crate::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use std::collections::BTreeSet;
 
 /// The payload a row drag carries. Only the dragged row moves; a selection is
@@ -59,8 +60,20 @@ impl AppView {
     /// Rebuild the group, source and scope-count snapshot. This is the only
     /// writer of the nav's counts; a repaint never touches the store or walks
     /// the library. A scope whose bucket disappeared falls back to `All`.
-    pub fn refresh_scope_index(&mut self, cx: &mut Context<Self>) {
-        let subs = self.store.list_subscriptions().unwrap_or_default();
+    pub fn refresh_scope_index(&mut self, cx: &mut Context<Self>) -> bool {
+        self.refresh_scope_index_with(&self.store.list_subscriptions().unwrap_or_default(), cx)
+    }
+
+    /// The reload path already holds the subscription list, so it passes it
+    /// in instead of paying a second store query per tick. Returns whether
+    /// the selected scope fell back to `All` — the caller must re-run
+    /// `apply_query` when it does, because `visible` was cut for the dead
+    /// scope and no row change will say so.
+    pub fn refresh_scope_index_with(
+        &mut self,
+        subs: &[crate::store::Subscription],
+        cx: &mut Context<Self>,
+    ) -> bool {
         let now = now_unix();
         let (counts, groups, sources) = {
             let libraries = self.libraries.read(cx);
@@ -70,7 +83,7 @@ impl AppView {
             let mut source_totals: HashMap<String, usize> = HashMap::new();
             let mut source_running: HashMap<String, usize> = HashMap::new();
             let mut source_traffic: HashMap<String, (u64, u64)> = HashMap::new();
-            for sub in &subs {
+            for sub in subs {
                 *group_subs.entry(sub.group.clone()).or_default() += 1;
             }
             for row in &delegate.rows {
@@ -167,6 +180,7 @@ impl AppView {
         self.group_list = groups;
         self.source_list = sources;
         self.scope_enabled = enabled;
+        !scope_lives
     }
 
     pub fn scope_count(&self, scope: &LibraryScope) -> usize {
@@ -476,7 +490,6 @@ impl AppView {
             name = source.label.as_str(),
             group = Self::group_drop_label(&source.group)
         );
-        let accent = cx.theme().accent;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let hover = cx.theme().list_hover;
@@ -495,12 +508,6 @@ impl AppView {
             .gap_2()
             .h(px(super::nav::NAV_ENTRY_HEIGHT))
             .px_2()
-            .border_l_2()
-            .border_color(if active {
-                accent
-            } else {
-                cx.theme().transparent
-            })
             .bg(if active {
                 cx.theme().list_active
             } else {
@@ -514,7 +521,10 @@ impl AppView {
                 let scope = scope.clone();
                 view.update(cx, |view, cx| view.set_scope(scope, window, cx));
             })
-            .hover(move |style| style.bg(hover).text_color(foreground));
+            // Keep the active wash readable on hover (see scope rows above).
+            .when(!active, |this| {
+                this.hover(move |style| style.bg(hover).text_color(foreground))
+            });
 
         if collapsed {
             row = row.child(
@@ -536,6 +546,7 @@ impl AppView {
                         .flex_1()
                         .min_w_0()
                         .truncate()
+                        .when(active, |this| this.font_weight(FontWeight::MEDIUM))
                         .child(source.label.clone()),
                 )
                 .child(
@@ -566,8 +577,8 @@ impl AppView {
         row.into_any_element()
     }
 
-    /// One nav scope entry: the label or its letter, the count, the active rim
-    /// and fill, the tooltip, and the row drop target for a group.
+    /// One nav scope entry: the label or its letter, the count, the active
+    /// fill, the tooltip, and the row drop target for a group.
     pub fn render_scope_entry(
         &self,
         spec: ScopeEntrySpec,
@@ -590,7 +601,6 @@ impl AppView {
             RowDrop::Group(group) => self.row_drop_target.as_deref() == Some(group.as_str()),
             _ => false,
         };
-        let accent = cx.theme().accent;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let hover = cx.theme().list_hover;
@@ -607,16 +617,10 @@ impl AppView {
             .gap_2()
             .h(px(super::nav::NAV_ENTRY_HEIGHT))
             .px_2()
-            .border_l_2()
-            .border_color(if active || drop_active {
-                accent
-            } else {
-                cx.theme().transparent
-            })
             .bg(if active {
                 cx.theme().list_active
             } else if drop_active {
-                cx.theme().list_active_border
+                cx.theme().drop_target
             } else {
                 cx.theme().transparent
             })
@@ -627,15 +631,28 @@ impl AppView {
                 let scope = click_scope.clone();
                 view.update(cx, |view, cx| view.set_scope(scope, window, cx));
             })
-            .hover(move |style| style.bg(hover).text_color(foreground));
+            // Hover must not replace the active wash — it is the only cue
+            // left for the current scope. Match the table's guarded hover:
+            // selection keeps its fill, the rest get hover.
+            .when(!active && !drop_active, |this| {
+                this.hover(move |style| style.bg(hover).text_color(foreground))
+            });
 
         if collapsed {
+            // In the 56 px rail the label is one letter, where the medium
+            // weight is the only extra cue beyond the `list_active` wash —
+            // the same wash the table uses for selected rows, but the rail
+            // holds scopes, never rows, so the contexts never share a
+            // screen region. Do NOT tone the letter with `theme.accent`:
+            // the skin stamps that token as a hover *surface*, and as ink
+            // on the active wash it is near-invisible.
             row = row.child(
                 div()
                     .id(format!("{id}-letter"))
                     .test_support()
                     .flex_1()
                     .text_center()
+                    .when(active, |this| this.font_weight(FontWeight::MEDIUM))
                     .child(letter),
             );
         } else {
@@ -649,6 +666,7 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .when(active, |this| this.font_weight(FontWeight::MEDIUM))
                     .child(label.clone()),
             );
         }

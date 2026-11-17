@@ -92,8 +92,8 @@ pub fn health_tone_color(tone: LatencyTone, theme: &Theme) -> Hsla {
 
 /// One verdict, one color: the row's occupancy lamp, the inspector badge dot,
 /// and the badge text all read this. A stopped badge used the kit's
-/// `secondary` fill, which is a *surface* — on light paper it painted #e5e5e5
-/// on #ffffff, so a stopped row had no badge at all.
+/// `secondary` fill, which is a *surface* — on light paper it painted a
+/// near-white on white, so a stopped row had no badge at all.
 pub fn serving_tone_color(tone: ServingTone, theme: &Theme) -> Hsla {
     match tone {
         ServingTone::Serving => success_text_color(theme),

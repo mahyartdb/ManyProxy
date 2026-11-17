@@ -207,6 +207,7 @@ impl AppView {
                 Button::new("filter-status-clear")
                     .small()
                     .label("×")
+                    .accessibility_label(t!("filter-status-clear-aria"))
                     .tooltip(t!("filter-status-clear-tip"))
                     .on_click(move |_, _, cx| {
                         clear.update(cx, |view, cx| {
@@ -286,6 +287,7 @@ impl AppView {
                 Button::new("filter-protocol-clear")
                     .small()
                     .label("×")
+                    .accessibility_label(t!("filter-protocol-clear-aria"))
                     .tooltip(t!("filter-protocol-clear-tip"))
                     .on_click(move |_, _, cx| {
                         clear.update(cx, |view, cx| {
@@ -348,6 +350,7 @@ impl AppView {
                                 Button::new("filter-latency-clear")
                                     .small()
                                     .label("×")
+                                    .accessibility_label(t!("filter-latency-clear-aria"))
                                     .tooltip(t!("filter-latency-clear-tip"))
                                     .on_click(move |_, _, cx| {
                                         clear.update(cx, |view, cx| {
@@ -410,6 +413,7 @@ impl AppView {
                                 Button::new("filter-bind-clear")
                                     .small()
                                     .label("×")
+                                    .accessibility_label(t!("filter-bind-clear-aria"))
                                     .tooltip(t!("filter-bind-clear-tip"))
                                     .on_click(move |_, _, cx| {
                                         clear.update(cx, |view, cx| {
@@ -458,6 +462,7 @@ impl AppView {
                                     Button::new("filter-port-clear")
                                         .small()
                                         .label("×")
+                                        .accessibility_label(t!("filter-port-clear-aria"))
                                         .tooltip(t!("filter-port-clear-tip"))
                                         .on_click(move |_, _, cx| {
                                             clear.update(cx, |view, cx| {

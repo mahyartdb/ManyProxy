@@ -1398,10 +1398,18 @@ impl AppView {
         match self.store.delete_group(name) {
             Ok(()) => {
                 self.created_groups.retain(|group| group != name);
+                let mut scope_reset = false;
                 if matches!(&self.scope, LibraryScope::Group(group) if group == name) {
                     self.scope = LibraryScope::All;
+                    scope_reset = true;
                 }
                 self.reload(window, cx);
+                if scope_reset {
+                    // The group being empty means no rows moved, so the
+                    // reload's `unchanged` gate skips `apply_query` — but
+                    // `visible` was still cut for the deleted scope.
+                    self.apply_query(cx);
+                }
                 window.push_notification(
                     Notification::success(t!("group-deleted-empty", name = name)),
                     cx,

@@ -782,6 +782,9 @@ pub fn shortcut_action_label(action: &str) -> String {
         "Copy URLs" => t!("shortcut-copy-urls"),
         "Command palette" => t!("shortcut-command-palette"),
         "Update the group in focus" => t!("shortcut-update-group"),
+        "Console: Logs" => t!("shortcut-console-logs"),
+        "Console: Connections" => t!("shortcut-console-connections"),
+        "Console: Traffic" => t!("shortcut-console-traffic"),
         other => other.to_string(),
     }
 }

@@ -127,8 +127,6 @@ pub fn nav_entry(entry: NavEntry, collapsed: bool, cx: &mut Context<AppView>) ->
         .h(px(NAV_ENTRY_HEIGHT))
         .flex_shrink_0()
         .px_2()
-        .border_l_2()
-        .border_color(cx.theme().transparent)
         .text_color(muted)
         .role(Role::Button)
         .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())

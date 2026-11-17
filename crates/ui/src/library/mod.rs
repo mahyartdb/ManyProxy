@@ -835,8 +835,8 @@ impl ListDelegate for LibraryDelegate {
                     Button::new(format!("row-stop-{row_id}"))
                         .small()
                         .compact()
-                        .label(t!("action-stop"))
-                        .accessibility_label(t!("action-stop"))
+                        .label(t!("action-label-stop"))
+                        .accessibility_label(t!("row-action-stop", name = row.name.as_str()))
                         .on_click(move |_, window, cx| {
                             if let Some(app) = stop_view.clone() {
                                 app.update(cx, |view, cx| view.stop_row(&stop_id, window, cx));
@@ -850,8 +850,8 @@ impl ListDelegate for LibraryDelegate {
                     Button::new(format!("row-start-{row_id}"))
                         .small()
                         .compact()
-                        .label(t!("action-start"))
-                        .accessibility_label(t!("action-start"))
+                        .label(t!("action-label-start"))
+                        .accessibility_label(t!("row-action-start", name = row.name.as_str()))
                         .on_click(move |_, window, cx| {
                             if let Some(app) = start_view.clone() {
                                 app.update(cx, |view, cx| view.start_row(&start_id, window, cx));
@@ -933,7 +933,7 @@ impl ListDelegate for LibraryDelegate {
                                 app.update(cx, |view, cx| {
                                     if modifiers.shift {
                                         view.extend_to_row(&id, cx);
-                                    } else if modifiers.secondary() {
+                                    } else if modifiers.secondary(cx) {
                                         view.toggle_row(&id, cx);
                                     } else {
                                         view.select_row(&id, cx);

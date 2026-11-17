@@ -28,6 +28,10 @@ pub type Bundle = FluentBundle<FluentResource>;
 pub struct Cache {
     pub bundles: HashMap<String, Bundle>,
     pub current: String,
+    /// Arg-free copy, keyed by message key. A render asks for the same dozen
+    /// keys every frame, so formatting once at first use keeps the paint path
+    /// to a lock and a clone. `set_locale` clears it — the locale is its owner.
+    pub plain: HashMap<String, String>,
 }
 
 pub static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
@@ -37,6 +41,7 @@ pub fn cache() -> &'static Mutex<Cache> {
         Mutex::new(Cache {
             bundles: HashMap::new(),
             current: DEFAULT_LOCALE.to_string(),
+            plain: HashMap::new(),
         })
     })
 }
@@ -111,7 +116,9 @@ pub fn resolve_locale(stored: Option<&str>) -> String {
 
 pub fn set_locale(tag: &str) {
     let negotiated = negotiate(tag);
-    lock_cache().current = negotiated;
+    let mut cache = lock_cache();
+    cache.plain.clear();
+    cache.current = negotiated;
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -176,6 +183,19 @@ pub fn log_once(tag: &str) -> bool {
 
 pub fn translate(key: &str, args: Option<&FluentArgs<'_>>) -> String {
     let mut cache = lock_cache();
+    if args.is_none() {
+        if let Some(text) = cache.plain.get(key) {
+            return text.clone();
+        }
+    }
+    let text = format_translation(&mut cache, key, args);
+    if args.is_none() {
+        cache.plain.insert(key.to_string(), text.clone());
+    }
+    text
+}
+
+fn format_translation(cache: &mut Cache, key: &str, args: Option<&FluentArgs<'_>>) -> String {
     let current = cache.current.clone();
     if let Some(text) = cache.format(&current, key, args) {
         return text;

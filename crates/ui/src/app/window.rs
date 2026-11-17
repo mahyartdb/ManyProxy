@@ -1,4 +1,5 @@
 use crate::*;
+use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 
 /// K12/A1-1: the custom chrome's height, matching the kit title bar the app
@@ -95,9 +96,9 @@ pub fn apply_titlebar_action(action: TitlebarAction, window: &mut Window) {
     }
 }
 
-/// K12/A1-1: flat hairline caption buttons per DESIGN — no shadows, no icon
-/// font (the kit's icon set is not initialized here and rendered blank), a
-/// quiet hover wash for minimize/maximize and the alarm wash for close.
+/// K12/A1-1: flat hairline caption buttons per DESIGN — the kit's bundled
+/// `window-*.svg` glyphs, a quiet hover wash for minimize/maximize and the
+/// alarm wash for close.
 pub fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> AnyElement {
     let close = control == TitlebarControl::Close;
     let theme = cx.theme();
@@ -117,7 +118,7 @@ pub fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> 
         theme.secondary_active
     };
     let glyph_color = theme.foreground;
-    let glyph = titlebar_control_glyph(control, maximized, glyph_color, theme.title_bar);
+    let glyph = titlebar_control_icon(control, maximized);
     let label = control.label(maximized);
     let tip = label.to_string();
     let action = titlebar_control_action(control);
@@ -152,58 +153,25 @@ pub fn titlebar_control(control: TitlebarControl, maximized: bool, cx: &App) -> 
         .into_any_element()
 }
 
-/// Drawn glyphs, not icon-font codepoints: the small-glyph family (A5-1) is
-/// exactly what fails when a font falls back. A line, a square outline, two
-/// offset squares, and a multiplication sign read at any scale.
-pub fn titlebar_control_glyph(
-    control: TitlebarControl,
-    maximized: bool,
-    color: Hsla,
-    band: Hsla,
-) -> AnyElement {
-    match control {
-        TitlebarControl::Minimize => div().w(px(10.)).h(px(1.)).bg(color).into_any_element(),
-        TitlebarControl::Maximize if maximized => div()
-            .relative()
-            .w(px(12.))
-            .h(px(12.))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .right(px(0.))
-                    .w(px(8.))
-                    .h(px(8.))
-                    .border_1()
-                    .border_color(color),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(0.))
-                    .left(px(0.))
-                    .w(px(8.))
-                    .h(px(8.))
-                    .border_1()
-                    .border_color(color)
-                    .bg(band),
-            )
-            .into_any_element(),
-        TitlebarControl::Maximize => div()
-            .w(px(10.))
-            .h(px(10.))
-            .border_1()
-            .border_color(color)
-            .into_any_element(),
-        TitlebarControl::Close => div().text_sm().child("✕").into_any_element(),
-    }
+/// The caption glyph resolves its own color from the ambient text style at
+/// build time, so the cell's hover/active washes recolor the cell but not
+/// the glyph — the kit `Icon` stamps its color eagerly. Same visuals as the
+/// drawn glyph it replaced.
+fn titlebar_control_icon(control: TitlebarControl, maximized: bool) -> Icon {
+    let name = match control {
+        TitlebarControl::Minimize => IconName::WindowMinimize,
+        TitlebarControl::Maximize if maximized => IconName::WindowRestore,
+        TitlebarControl::Maximize => IconName::WindowMaximize,
+        TitlebarControl::Close => IconName::WindowClose,
+    };
+    Icon::new(name).small()
 }
 
 impl AppView {
-    /// K12/A1-1: the app's own title bar. The kit title bar is not rendered
-    /// because its caption glyphs come from an icon font this app never loads
-    /// (they painted blank). The drag region is the whole title area; the
-    /// three cells at the trailing end are real window controls.
+    /// K12/A1-1: the app's own title bar. The kit `TitleBar` was evaluated and
+    /// the app keeps its own chrome: the caption ids are pinned by the UI test
+    /// and the Windows NC hit-test needs one drag region with three real
+    /// window controls, not a reparented widget tree.
     pub fn render_titlebar(&self, title: String, window: &Window, cx: &App) -> AnyElement {
         let maximized = window.is_maximized();
         let drag = div()
