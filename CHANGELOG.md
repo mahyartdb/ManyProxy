@@ -2,9 +2,10 @@
 
 All notable changes to ManyProxy are recorded here. The format follows Keep a Changelog 1.1.0. Ticket boards live by the artifact lifecycle in `AGENTS.md`. A board exists while work is in flight and is deleted when its outcome lands here.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-20
 
-The gpui-kit upgrade lands: 0.6.6 → 0.9.1, the UI migrated onto kit components and off custom replacements, and the paint path taken off the store.
+The gpui-kit 0.9.1 upgrade lands, and the bug hunt closes two render-path
+stalls and a Windows restore data-loss bug.
 
 ### Added
 
@@ -16,6 +17,9 @@ The gpui-kit upgrade lands: 0.6.6 → 0.9.1, the UI migrated onto kit components
 ### Changed
 
 - gpui-kit 0.6.6 → 0.9.1 (gpui-pre 0.3.12): dialogs, sheets and notifications render through the kit's Root plugin layers; theme writes go through `Theme::update`; keystroke refusal under an overlay is a keystroke observer that names the refused key ("Ctrl+N is unavailable while an overlay is open — close the sheet or dialog first"); titlebar controls use the kit's window icons.
+- The console's per-exit traffic bars and the engine bar now use the kit's `Progress` and `StatusBar` components instead of hand-painted glyphs and div layout.
+- The inspector's 90-day probe history is bounded in SQL to the 120 samples the sparkline draws, so a probe batch no longer re-runs an unbounded query during paint.
+- CI cancels superseded runs, uses a read-only token, and skips incremental state and Windows PDB debug info; the live-proof job now reuses the build cache. The stale `ui-audit-fixes` push trigger is gone.
 - Every touched paint path stopped reading the store: the console's log rows, connections exits, traffic totals and runtime figures are reload-time caches keyed on exactly the inputs that can change them (ring sequence, scope, filters, selection revision, health epoch), and the 1-second tick pays nothing while the dock is closed.
 - A paused console thaws on any filter or scope change — the frozen rows belonged to the old view, and a live-looking control that changes nothing reads as broken.
 - Log severity tones only the `[level]` tag; timestamp and message stay ink, so an error burst reads as text with red tags instead of a red block.
@@ -25,6 +29,9 @@ The gpui-kit upgrade lands: 0.6.6 → 0.9.1, the UI migrated onto kit components
 
 ### Fixed
 
+- Restoring a library on Windows no longer silently reverts to the pre-restore rows: the live connection is released before the file swap, so the old `-wal` cannot replay over the restored file. A failed reopen now pins a "cannot save" banner, names the backup and says to restart.
+- The pre-restore backup now folds pending WAL pages into the copy, and refuses to advertise a backup when another reader holds the database busy.
+- Configs bound to `::ffff:127.0.0.1` no longer fail every health probe or trigger the LAN-exposure confirmation: the loopback predicate is shared by the classifier, the probe gate, the collision key and the egress guard.
 - Deleting a config and re-adding one could paint the deleted row's health sparkline: config ids are SQLite rowids, which are reused, so the history cache now drops on any row-list change.
 - Clearing a group's test results (the group manage sheet) left the inspector drawing the deleted history; every history delete path now invalidates the cache.
 - Deleting the active empty group left the library blank until the next search — the scope fallback re-runs the query.
@@ -32,6 +39,8 @@ The gpui-kit upgrade lands: 0.6.6 → 0.9.1, the UI migrated onto kit components
 - Compound quick-filter queries (`error disk`) still match after the console cache refactor; the log search blob carries both `level message` and `[level] message` forms.
 - A failed totals read at boot no longer reports measured zeros; the inspector falls back to `usage unavailable`.
 - Hover no longer erases the nav's active-scope wash; the table's guarded-hover pattern is applied to scope and source rows.
+
+## [Unreleased]
 
 
 ## [0.1.0] - 2026-11-14
@@ -173,6 +182,7 @@ The redesign lands: one workbench shell, one selection model, one endpoint edito
 - UI affordances: port-filter search grammar, click-to-copy cells, connection counters, the window title running marker, header sort pickers, QR encode of listener URLs, traffic dialog top-9 exits, per-shard CPU/RAM mini-charts, log polish with `log_max_lines`, window geometry persistence, and the bind-IP picker.
 - Ops marker: `last_clean_exit` with an unclean-exit startup toast.
 
+[0.2.0]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.1.0
 [0.0.2]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.2
 [0.0.1-beta.1]: https://github.com/mahyartdb/ManyProxy/releases/tag/v0.0.1-beta.1
