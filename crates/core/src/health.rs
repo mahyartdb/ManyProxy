@@ -11,7 +11,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::{inbound_tag, outbound_tag, params_declare_mux};
+use crate::engine::{inbound_tag, is_loopback_ip, outbound_tag, params_declare_mux};
 use crate::store::{now_unix, HealthHistoryEntry, HealthSnapshot, ProxyConfig};
 
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
@@ -245,7 +245,11 @@ fn endpoint_addr(bind: &str, port: u16, timeout: Duration) -> Result<SocketAddr,
         resolve_endpoint_host(trimmed, port, timeout)
             .ok_or_else(|| format!("cannot resolve endpoint {trimmed}:{port}"))?
     };
-    if !addr.ip().is_loopback() {
+    // The shared IpAddr-level predicate, not std's is_loopback(): stored
+    // binds keep the `::ffff:127.0.0.1` spelling, and the engine classifies
+    // it loopback, so a mapped-loopback row must stay probeable or every
+    // Ping/URL test on it reports a false "dead".
+    if !is_loopback_ip(addr.ip()) {
         return Err(format!(
             "refusing non-loopback probe endpoint {addr} (probes dial the local loopback endpoint only)"
         ));
@@ -3865,6 +3869,18 @@ mod tests {
                 .ip()
                 .to_string(),
             "127.0.0.1"
+        );
+        // The editor writes `::ffff:127.0.0.1` binds verbatim; the gate must
+        // classify them loopback like is_loopback_bind does, or every probe
+        // on such a row refuses before dialing (a false "dead").
+        let mapped = endpoint_addr("::ffff:127.0.0.1", 10801, timeout).expect("mapped loopback");
+        assert!(
+            crate::engine::is_loopback_ip(mapped.ip()),
+            "the probe gate accepts the mapped spelling"
+        );
+        assert_eq!(
+            endpoint_addr("::ffff:10.0.0.1", 10801, timeout).expect_err("mapped LAN refused"),
+            "refusing non-loopback probe endpoint [::ffff:10.0.0.1]:10801 (probes dial the local loopback endpoint only)"
         );
         assert!(endpoint_addr("not a host!", 1, timeout).is_err());
         let refused =

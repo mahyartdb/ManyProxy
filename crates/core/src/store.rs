@@ -4525,7 +4525,37 @@ impl Store {
         Ok(quarantined)
     }
 
+    /// A timestamped copy of the database beside itself. When a `-wal`
+    /// sidecar exists, a checked passive checkpoint folds its committed
+    /// pages into the copy first: the backup is the advertised recovery point
+    /// for a restore, and a bare file copy would omit every change still
+    /// sitting in the WAL (on a fresh database, the schema itself). A busy
+    /// checkpoint refuses rather than advertising a stale copy; the
+    /// post-restore reopen is the honest check that the swap took.
     pub fn backup_db_file(db_path: &Path, now: i64) -> Result<PathBuf, StoreError> {
+        if sibling_sidecar(db_path, "-wal").exists() {
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
+            let conn = Connection::open_with_flags(db_path, flags)?;
+            // `busy != 0` means a reader holds an old snapshot: PASSIVE
+            // copied nothing and fs::copy would produce a backup missing
+            // committed frames. Refuse instead of advertising a stale
+            // recovery point — the caller aborts before the swap, so the
+            // live database stays intact.
+            let busy: i64 =
+                match conn.query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| row.get(0)) {
+                    Ok(busy) => busy,
+                    // A corrupt WAL or an unreadable database is NOT a busy
+                    // reader. Propagate the real error instead of inventing a
+                    // cause the user cannot act on.
+                    Err(error) => return Err(StoreError::Sql(error)),
+                };
+            if busy != 0 {
+                return Err(StoreError::Io {
+                    path: db_path.to_path_buf(),
+                    message: "database is busy; cannot take a consistent backup".to_string(),
+                });
+            }
+        }
         let base = db_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -4550,6 +4580,9 @@ impl Store {
         }
     }
 
+    /// The caller must not hold an open connection to `db_path`: on Windows
+    /// SQLite opens files without FILE_SHARE_DELETE, so the rename and
+    /// sidecar cleanup below only take effect when the last handle is gone.
     pub fn restore_library_file(
         db_path: &Path,
         payload: &str,
@@ -7990,6 +8023,14 @@ impl Store {
         Ok(())
     }
 
+    /// The inspector's sparkline window. The since-bounded read below runs
+    /// inside a paint pass, so it must stay bounded; the full read stays
+    /// available through `None`.
+    const PROBE_TAIL_LIMIT: i64 = 120;
+
+    /// Probe history for one config, oldest first. `Some(since)` returns only
+    /// the newest `PROBE_TAIL_LIMIT` url-test/tcp-ping samples at or after
+    /// `since`; `None` returns every stored sample.
     pub fn load_health_history(
         &self,
         config_id: &str,
@@ -7998,13 +8039,18 @@ impl Store {
         if let Some(since) = since {
             let mut stmt = self.conn.prepare(
                 "SELECT config_id, at, kind, latency_ms, error FROM health_history
-                 WHERE config_id = ?1 AND at >= ?2 ORDER BY at",
+                 WHERE config_id = ?1 AND at >= ?2 AND kind != 'speed-test'
+                 ORDER BY at DESC LIMIT ?3",
             )?;
-            let mapped = stmt.query_map(params![config_id, since], map_health_history_row)?;
+            let mapped = stmt.query_map(
+                params![config_id, since, Self::PROBE_TAIL_LIMIT],
+                map_health_history_row,
+            )?;
             let mut out = Vec::new();
             for row in mapped {
                 out.push(row?);
             }
+            out.reverse();
             Ok(out)
         } else {
             let mut stmt = self.conn.prepare(
@@ -16312,6 +16358,81 @@ mod tests {
     }
 
     #[test]
+    fn t85_since_bounded_history_caps_to_the_probe_tail() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let row = store.add(valid_input("Tail")).expect("row seeds");
+        let since = 1_000_000;
+        let mut seeded = Vec::new();
+        for i in 0..130i64 {
+            seeded.push(HealthHistoryEntry {
+                config_id: row.id.clone(),
+                at: since + i * 60,
+                kind: "url-test".to_string(),
+                latency_ms: Some(100 + i as u64),
+                error: None,
+            });
+        }
+        for i in 0..5i64 {
+            seeded.push(HealthHistoryEntry {
+                config_id: row.id.clone(),
+                at: since + 130 * 60 + i,
+                kind: "speed-test".to_string(),
+                latency_ms: Some(4_000),
+                error: None,
+            });
+        }
+        // One sample predates `since`: the SQL `at >= ?2` predicate is
+        // load-bearing and must fail the test if dropped (the 120 cap alone
+        // would still pass every other assertion).
+        seeded.insert(
+            0,
+            HealthHistoryEntry {
+                config_id: row.id.clone(),
+                at: since - 60,
+                kind: "url-test".to_string(),
+                latency_ms: Some(1),
+                error: None,
+            },
+        );
+        store.append_health_history(&seeded).expect("history seeds");
+
+        let tail = store
+            .load_health_history(&row.id, Some(since))
+            .expect("history loads");
+        assert_eq!(
+            tail.len(),
+            120,
+            "since-bounded read caps to the sparkline tail"
+        );
+        assert!(
+            tail.iter().all(|entry| entry.at >= since),
+            "samples before `since` are excluded by the SQL predicate"
+        );
+        assert!(
+            tail.iter().all(|entry| entry.kind != "speed-test"),
+            "speed-test samples never reach the sparkline tail"
+        );
+        assert!(
+            tail.windows(2).all(|pair| pair[0].at <= pair[1].at),
+            "tail stays ascending by at"
+        );
+        assert_eq!(
+            tail[0].at, seeded[11].at,
+            "tail keeps the newest 120 url-tests"
+        );
+        assert_eq!(
+            tail.last().expect("tail is non-empty").at,
+            seeded[130].at,
+            "newest url-test anchors the tail"
+        );
+
+        let all = store
+            .load_health_history(&row.id, None)
+            .expect("history loads");
+        assert_eq!(all.len(), seeded.len(), "None keeps the full history");
+    }
+
+    #[test]
     fn t45_sub_interval_honored_by_due() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
         let sub = store
@@ -16589,22 +16710,44 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir works");
         let path = dir.join("library.db");
-        let payload = {
-            let mut store = Store::open_file(&path).expect("live opens");
-            store
-                .add(NewConfig {
-                    name: "Live".to_string(),
-                    protocol: "vless".to_string(),
-                    params: Secret::default(),
-                    group: String::new(),
-                    bind_ip: String::new(),
-                    port: String::new(),
-                })
-                .expect("live seeds");
-            store.export_library_json().expect("export works")
-        };
+        // The writer stays open across backup_db_file: SQLite folds and
+        // deletes the -wal on the last connection's close, so dropping first
+        // would make the WAL branch here unreachable and the test vacuous.
+        let mut live = Store::open_file(&path).expect("live opens");
+        live.add(NewConfig {
+            name: "Live".to_string(),
+            protocol: "vless".to_string(),
+            params: Secret::default(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: String::new(),
+        })
+        .expect("live seeds");
+        let payload = live.export_library_json().expect("export works");
+        assert!(
+            sibling_sidecar(&path, "-wal").exists(),
+            "the open writer keeps a WAL, so backup_db_file's checkpoint branch runs"
+        );
         let backup = Store::backup_db_file(&path, now_unix()).expect("backup works");
         assert!(backup.exists(), "timestamped backup exists");
+        drop(live);
+
+        // The seeded row was committed with the connection still open (WAL
+        // mode), so the backup must carry it or the advertised recovery point
+        // loses the session's changes.
+        let backup_store = Store::open_file(&backup).expect("backup opens");
+        let backup_names: Vec<String> = backup_store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        drop(backup_store);
+        assert_eq!(
+            backup_names,
+            vec!["Live".to_string()],
+            "backup folds the WAL before copying: {backup_names:?}"
+        );
 
         let empty = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":[],"meta":{}}"#;
         let (_outcome, bak) =

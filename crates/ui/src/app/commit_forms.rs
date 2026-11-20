@@ -949,6 +949,28 @@ impl AppView {
         }
 
         if let Some(live_path) = self.store.db_path() {
+            // The file-level restore swaps the database under whatever holds
+            // it open. The bundled SQLite opens Windows files without
+            // FILE_SHARE_DELETE, so a live connection would defeat the rename,
+            // keep the old -wal sidecars alive, and replay the pre-restore
+            // pages over the restored file. The store leaves as an in-memory
+            // stand-in; every exit below restores a real connection or pins
+            // the write-blocked banner so an empty session never masquerades
+            // as a saving one.
+            let stand_in = match Store::open_in_memory() {
+                Ok(memory) => memory,
+                // No stand-in means no swap; keep the live store and report
+                // the restore as failed rather than dropping the connection
+                // this branch exists to release.
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(t!("restore-failed", error = error.to_string())),
+                        cx,
+                    );
+                    return;
+                }
+            };
+            drop(std::mem::replace(&mut self.store, stand_in));
             match Store::restore_library_file(&live_path, payload, now_unix()) {
                 Ok((outcome, backup)) => {
                     let backup_text = backup.as_deref().map(|path| path.display().to_string());
@@ -957,6 +979,13 @@ impl AppView {
                     match Store::open_file(&live_path) {
                         Ok(fresh) => {
                             self.store = fresh;
+                            // A later restore succeeded: the pin belonged to
+                            // the earlier reopen failure, not to this live
+                            // connection. Leaving it set would show a false
+                            // "cannot save" banner over a working store.
+                            self.write_blocked = None;
+                            self.write_blocked_folder = None;
+                            self.write_blocked_pinned = false;
                             self.reload(window, cx);
                             window.push_notification(
                                 Notification::success(t!(
@@ -968,6 +997,16 @@ impl AppView {
                             );
                         }
                         Err(error) => {
+                            // The restored file is on disk but this session
+                            // cannot open it (a corrupt swap would have
+                            // failed above, so this is a lock or an
+                            // antivirus hold). Stay honest: pin the standing
+                            // banner — the stand-in has no folder, so the
+                            // write probe can never say this on its own —
+                            // and keep the backup path visible.
+                            self.write_blocked_folder = store_folder(&live_path);
+                            self.write_blocked = Some(error.to_string());
+                            self.write_blocked_pinned = true;
                             self.reload(window, cx);
                             window.push_notification(
                                 Notification::error(t!(
@@ -982,6 +1021,21 @@ impl AppView {
                     return;
                 }
                 Err(error) => {
+                    // The live file survived a failed restore (the backup
+                    // step or the swap refused); reopen it so the app keeps
+                    // its real library instead of the in-memory stand-in.
+                    match Store::open_file(&live_path) {
+                        Ok(reopened) => self.store = reopened,
+                        Err(reopen_error) => {
+                            // Neither the restore nor the reopen took: the
+                            // session is on the stand-in, and only the pinned
+                            // banner says so.
+                            self.write_blocked_folder = store_folder(&live_path);
+                            self.write_blocked = Some(reopen_error.to_string());
+                            self.write_blocked_pinned = true;
+                        }
+                    }
+                    self.reload(window, cx);
                     window.push_notification(
                         Notification::error(t!("restore-failed", error = error.to_string())),
                         cx,

@@ -7734,6 +7734,65 @@ fn export_payload_restores_library(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn file_backed_restore_replaces_the_library_even_with_the_store_open(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    // A real file-backed store is open when restore starts. Dropping that
+    // connection before the swap is what keeps the old -wal from replaying
+    // over the restored file on Windows (the bundled SQLite opens without
+    // FILE_SHARE_DELETE, so a copy-over under a live handle would lose).
+    let dir = std::env::temp_dir().join(format!(
+        "manyproxy-restore-open-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock works")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir works");
+    let path = dir.join("library.db");
+    let mut store = Store::open_file(&path).expect("file store opens");
+    store.add(seed_input("Work")).expect("seed works");
+    let payload = store.export_library_json().expect("export works");
+    store.add(seed_input("Extra")).expect("seed works");
+
+    let (view, cx) = mount_view(store, cx);
+    assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.commit_library_restore(&payload, window, cx)
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.config_count(cx)),
+        1,
+        "the restored library replaces the live rows"
+    );
+    let name = view.read_with(cx, |view, _| {
+        view.store.list().expect("list works").remove(0).name
+    });
+    assert_eq!(name, "Work");
+    assert_eq!(notification_count(cx), 1, "restore names its counts");
+
+    // The reopened connection must be the restored file, not a replayed WAL:
+    // a second process reading the same path sees the restored contents.
+    drop(view);
+    let fresh = Store::open_file(&path).expect("restored file reopens");
+    let names: Vec<String> = fresh
+        .list()
+        .expect("list works")
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Work".to_string()],
+        "restored on disk: {names:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
 fn probe_dedupe_second_request_warns(cx: &mut TestAppContext) {
     use manyproxy_ui::engine::EngineController;
     use manyproxy_ui::health::FakeHealthProber;

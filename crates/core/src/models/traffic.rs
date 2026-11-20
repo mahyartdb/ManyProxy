@@ -68,8 +68,8 @@ pub fn traffic_top9_split(exits: &[ExitTraffic]) -> TrafficExitSplit {
     }
 }
 
-/// Bar denominator taken over every row (never the "Other" aggregate), so the
-/// stacked bars keep truthful proportions once the tail is rolled up.
+/// Bar denominator taken over every row (never the "Other" aggregate), so
+/// the per-exit bars keep truthful proportions once the tail is rolled up.
 pub fn traffic_bar_max(exits: &[ExitTraffic]) -> u64 {
     exits
         .iter()

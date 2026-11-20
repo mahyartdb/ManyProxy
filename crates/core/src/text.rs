@@ -847,20 +847,6 @@ pub fn format_uptime(total_secs: u64) -> String {
         format!("{secs}s")
     }
 }
-pub fn traffic_stacked_bar(rx: u64, tx: u64, max_total: u64) -> String {
-    const CELLS: usize = 12;
-    let max = max_total.max(1);
-    let rx_fill = ((rx as f64 / max as f64) * CELLS as f64).round() as usize;
-    let tx_fill = ((tx as f64 / max as f64) * CELLS as f64).round() as usize;
-    let rx_fill = rx_fill.min(CELLS);
-    let tx_fill = tx_fill.min(CELLS.saturating_sub(rx_fill));
-    format!(
-        "{}{}{}",
-        "█".repeat(rx_fill),
-        "▓".repeat(tx_fill),
-        "░".repeat(CELLS.saturating_sub(rx_fill + tx_fill))
-    )
-}
 pub fn traffic_stats_summary_text(
     period: store::TrafficPeriod,
     exits: usize,

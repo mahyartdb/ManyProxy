@@ -3034,11 +3034,13 @@ impl AppView {
             .map(|(rx, tx)| (format_bytes(*rx), format_bytes(*tx)))
     }
 
-    /// The selected row's 90-day probe history for the inspector. The cache
-    /// answers per paint; only a selection change, a row-list change, or a
-    /// persisted snapshot batch (epoch bump) reaches back to the store. A
-    /// store failure is cached as `Unavailable` so the inspector shows the
-    /// honest copy while the failure lasts, not "no probes yet".
+    /// The selected row's probe history, capped to the sparkline tail (the
+    /// newest 120 url-test/tcp-ping samples — the only amount the inspector
+    /// draws). The cache answers per paint; only a selection change, a
+    /// row-list change, or a persisted snapshot batch (epoch bump) reaches
+    /// back to the store. A store failure is cached as `Unavailable` so the
+    /// inspector shows the honest copy while the failure lasts, not "no
+    /// probes yet".
     pub fn health_history_for(&mut self, config_id: &str) -> Rc<HistoryFor> {
         let now = now_unix();
         let since = now.saturating_sub(90 * 86_400);

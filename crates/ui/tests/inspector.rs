@@ -658,6 +658,31 @@ fn console_traffic_scope_totals_and_runtime_lines(cx: &mut TestAppContext) {
     assert_eq!(label_of("console-traffic-tx", cx), "Session TX: 70 B");
     assert_eq!(label_of("console-traffic-rows", cx), "Visible rows: 2");
 
+    for exit in [&alpha, &bravo] {
+        assert_painted(cx, &format!("console-traffic-exit-{}", exit.id));
+    }
+    // Progress reports its value through the a11y tree, which the snapshot
+    // helper reads as role + label only; the label carries the share the value
+    // drives, so a 100% label is a nonzero bar.
+    let heaviest = cx
+        .update(|window, _| window.try_find(format!("console-traffic-bar-{}", bravo.id)))
+        .expect("the busiest exit paints a progress bar");
+    assert_eq!(heaviest.role(), Some(gpui_kit::Role::ProgressIndicator));
+    assert_eq!(
+        heaviest.label(),
+        Some("Bravo · 100% of the busiest exit"),
+        "the busiest exit's bar carries its share"
+    );
+    assert!(heaviest.visible(), "the busiest exit's bar is on screen");
+    let lighter = cx
+        .update(|window, _| window.try_find(format!("console-traffic-bar-{}", alpha.id)))
+        .expect("the lighter exit paints a progress bar");
+    assert_eq!(
+        lighter.label(),
+        Some("Alpha · 50% of the busiest exit"),
+        "the bar's share is proportional to the busiest exit"
+    );
+
     cx.update(|window, cx| window.click("console-scope-selected", cx));
     cx.run_until_parked();
     paint_frame_at(cx, 1400., 900.);

@@ -862,27 +862,49 @@ pub fn render_console_traffic(view: &mut AppView, cx: &mut Context<AppView>) -> 
     }
 
     for exit in &bars {
-        let filled = ((exit.total() as f64 / max as f64) * 12.0).round() as usize;
-        let bar = format!(
-            "{}{}",
-            "█".repeat(filled.min(12)),
-            "░".repeat(12usize.saturating_sub(filled.min(12)))
-        );
+        let percent = if max == 0 {
+            0.0
+        } else {
+            (exit.total() as f32 / max as f32 * 100.0).clamp(0.0, 100.0)
+        };
+        let share = percent.round() as usize;
+        // No `.loading()`: the kit's loading mode loops an idle animation
+        // forever, which the "nothing loops" motion rule forbids. A value
+        // change still runs the kit's one-shot width transition, bounded and
+        // reduce-motion aware — that is intended feedback for a fresh sample.
         body = body.child(
             div()
                 .id(format!("console-traffic-exit-{}", exit.row_id))
                 .test_support()
                 .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
                 .text_sm()
-                .truncate()
-                .child(t!(
-                    "detail-traffic-row",
-                    bar = bar,
-                    name = exit.name.as_str(),
-                    bind = exit.bind.as_str(),
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("{} · {}", exit.name, exit.bind)),
+                )
+                .child(
+                    Progress::new(format!("console-traffic-bar-{}", exit.row_id))
+                        .value(percent)
+                        .small()
+                        .flex_1()
+                        .min_w_0()
+                        .accessibility_label(t!(
+                            "console-traffic-bar-aria",
+                            name = exit.name.as_str(),
+                            percent = share
+                        )),
+                )
+                .child(div().flex_shrink_0().child(t!(
+                    "console-traffic-exit-bytes",
                     down = format_bytes(exit.rx_bytes),
                     up = format_bytes(exit.tx_bytes)
-                )),
+                ))),
         );
     }
 

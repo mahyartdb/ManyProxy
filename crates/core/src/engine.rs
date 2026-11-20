@@ -1585,7 +1585,7 @@ fn check_egress_not_loopback(owner: &str, server: &str, kind: &str) -> Result<()
     let loopback = server
         .trim()
         .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+        .is_ok_and(|ip| is_loopback_ip(ip) || ip.is_unspecified())
         || server.trim().eq_ignore_ascii_case("localhost");
     if loopback {
         return Err(EngineError::XrayLoopback {
@@ -5420,9 +5420,30 @@ fn is_executable(path: &Path) -> bool {
 }
 
 pub fn normalize_bind_key(bind: &str) -> String {
-    match bind.trim().to_ascii_lowercase().as_str() {
-        "" | "localhost" | "127.0.0.1" | "::1" | "::ffff:127.0.0.1" => "loopback".to_string(),
-        other => other.to_string(),
+    let trimmed = bind.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // Match is_loopback_bind's spellings exactly: a trailing dot on
+    // `localhost.` and the mapped form of any IPv4 address are the same
+    // socket as their plain spellings. 127/8 addresses other than .1
+    // stay distinct — they are different sockets, not aliases.
+    let parsed = trimmed.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| v4.to_string())
+            .unwrap_or_else(|| ip.to_string()),
+        _ => ip.to_string(),
+    });
+    let host = parsed
+        .map(|literal| literal.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            let bare = lower.strip_suffix('.').unwrap_or(&lower);
+            bare.to_string()
+        });
+    let no_dot = host.strip_suffix('.').unwrap_or(&host);
+    if matches!(no_dot, "" | "localhost" | "127.0.0.1" | "::1") {
+        "loopback".to_string()
+    } else {
+        no_dot.to_string()
     }
 }
 
@@ -7806,8 +7827,24 @@ pub fn is_loopback_bind(bind: &str) -> bool {
     }
     trimmed
         .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
+        .map(is_loopback_ip)
         .unwrap_or(false)
+}
+
+/// The IpAddr-level predicate `is_loopback_bind`, the probe gate, the LAN
+/// classifier and the egress guard share: IPv4-mapped loopback
+/// (`::ffff:127.0.0.1`) parses to an Ipv6Addr whose std `is_loopback()` is
+/// false. Stored binds KEEP that spelling (the editor only canonicalizes the
+/// address bytes, and Rust's v6 Display preserves the mapped form), so every
+/// check must use this predicate or the same bind reads as loopback in one
+/// path and LAN-exposed in another.
+pub(crate) fn is_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 pub fn lan_exposure_warning(name: &str, bind: &str) -> Option<String> {
@@ -8662,6 +8699,38 @@ mod tests {
         assert!(is_loopback_bind("::1"));
         assert!(is_loopback_bind("localhost"));
         assert!(is_loopback_bind("LocalHost"));
+        // Stored binds keep the mapped spelling, so normalize_bind_key,
+        // this classifier, the probe gate and the egress guard must all
+        // agree or the same bind is loopback in one path and LAN-exposed
+        // in another.
+        assert!(is_loopback_bind("::ffff:127.0.0.1"), "mapped loopback");
+        assert!(
+            is_loopback_bind("::FFFF:7f00:1"),
+            "mapped alternate spelling"
+        );
+        assert!(
+            !is_loopback_bind("::ffff:10.0.0.1"),
+            "mapped LAN is not loopback"
+        );
+        assert!(!is_loopback_bind("2001:db8::1"));
+        assert!(!requires_lan_confirm("::ffff:127.0.0.1"));
+        assert!(lan_exposure_warning("A", "::ffff:127.0.0.1").is_none());
+        // The collision key and the classifier must agree: an alternate
+        // mapped spelling is the same loopback bind as 127.0.0.1.
+        assert_eq!(normalize_bind_key("::FFFF:7f00:1"), "loopback");
+        assert_eq!(
+            normalize_bind_key("::ffff:127.0.0.1"),
+            normalize_bind_key("127.0.0.1")
+        );
+        // Other 127/8 addresses are distinct sockets: a shared key would
+        // invent a port collision and probe the wrong address.
+        assert_ne!(normalize_bind_key("127.0.0.2"), "loopback");
+        assert_eq!(
+            normalize_bind_key("::ffff:127.0.0.2"),
+            normalize_bind_key("127.0.0.2"),
+            "mapped and plain spellings of one socket share a key"
+        );
+        assert_eq!(normalize_bind_key("localhost."), "loopback");
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!requires_lan_confirm("localhost"));
         assert!(!requires_lan_confirm("127.0.0.1"));
@@ -9890,7 +9959,14 @@ mod tests {
 
     #[test]
     fn loopback_hygiene_rejects_loopback_egress() {
-        for server in ["127.0.0.1", "localhost", "0.0.0.0"] {
+        for server in [
+            "127.0.0.1",
+            "localhost",
+            "0.0.0.0",
+            // Same loopback in mapped spelling: check_egress_not_loopback
+            // must use is_loopback_ip too, not std's is_loopback().
+            "::ffff:127.0.0.1",
+        ] {
             let mut params = xray_params();
             params
                 .as_object_mut()

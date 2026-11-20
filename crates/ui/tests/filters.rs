@@ -2058,19 +2058,6 @@ fn t10_format_uptime_units() {
 }
 
 #[test]
-fn t10_traffic_stacked_bar_splits_rx_tx() {
-    use manyproxy_ui::traffic_stacked_bar;
-    let full = traffic_stacked_bar(800, 200, 1000);
-    assert_eq!(full.chars().count(), 12, "{full}");
-    assert!(full.starts_with("██"), "rx leads: {full}");
-    assert!(full.contains('▓'), "tx stacks: {full}");
-    let empty = traffic_stacked_bar(0, 0, 0);
-    assert_eq!(empty, "░".repeat(12), "zero max never divides: {empty}");
-    let heaviest = traffic_stacked_bar(500, 500, 1000);
-    assert!(!heaviest.contains('░'), "heaviest fills: {heaviest}");
-}
-
-#[test]
 fn t10_traffic_stats_summary_labels_all_time() {
     use manyproxy_ui::store::TrafficPeriod;
     use manyproxy_ui::traffic_stats_summary_text;

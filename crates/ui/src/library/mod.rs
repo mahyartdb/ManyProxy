@@ -1012,8 +1012,12 @@ impl ListDelegate for LibraryDelegate {
                                 )
                                 .child(label),
                         );
-                    // The bars keep `ROW_PITCH`, so the first real row lands
-                    // where the skeleton was instead of shoving the list down.
+                    // The kit's own loading surface (component::skeleton::Skeleton)
+                    // runs a 2s repeat() animation, and the motion rule in
+                    // docs/internals/overview.md is "nothing loops", so the
+                    // deviation is static bars. They keep `ROW_PITCH`, so the
+                    // first real row lands where the skeleton was instead of
+                    // shoving the list down.
                     const BAR_W: [f32; 6] = [190., 250., 150., 300., 220., 170.];
                     for (ix, width) in BAR_W.into_iter().enumerate() {
                         column = column.child(

@@ -4,6 +4,7 @@
 //! Belongs: the bar under the content row and the menu behind its `⋯`.
 //! Not here: the console — slice 6 adds it.
 use crate::*;
+use gpui_kit::component::status_bar::StatusBar;
 
 impl AppView {
     /// The engine bar. It sits under the content row, outside the resizable
@@ -54,30 +55,23 @@ impl AppView {
             .aria_label(running_text.clone())
             .child(running_text);
 
-        let mut bar = div()
-            .id("engine-bar")
-            .test_support()
-            .flex()
-            .flex_row()
-            .flex_nowrap()
-            .items_center()
-            .gap_2()
-            .w_full()
+        let mut bar = StatusBar::new()
             .h(px(self.density.engine_bar_height()))
-            .flex_shrink_0()
+            .w_full()
             .min_w_0()
             .px_3()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .aria_label(t!("engine-bar-aria"))
-            .child(status)
-            .child(running_segment);
+            .gap_2()
+            // The kit paints the bar's text muted; these labels keep the
+            // app's foreground, and the usage and error set their own tones.
+            .text_color(cx.theme().foreground)
+            .left(status)
+            .left(running_segment);
 
         if let Some(usage) = usage_text {
             let tip = usage.clone();
             bar = bar
-                .child(div().id("engine-bar-separator").test_support().child("·"))
-                .child(
+                .left(div().id("engine-bar-separator").test_support().child("·"))
+                .left(
                     div()
                         .id("engine-bar-traffic")
                         .test_support()
@@ -92,7 +86,7 @@ impl AppView {
 
         if let Some(error) = engine_error {
             let tip = error.clone();
-            bar = bar.child(
+            bar = bar.left(
                 div()
                     .id("engine-bar-error")
                     .test_support()
@@ -106,29 +100,39 @@ impl AppView {
             );
         }
 
-        bar.child(div().flex_1())
+        // Tests and the aria contract address `engine-bar`; StatusBar renders
+        // once and carries neither an id nor an aria label of its own.
+        div()
+            .id("engine-bar")
+            .test_support()
+            .w_full()
+            .flex_shrink_0()
+            .min_w_0()
+            .aria_label(t!("engine-bar-aria"))
             .child(
-                Button::new("engine-bar-start-all")
-                    .small()
-                    .label(t!("action-start-all"))
-                    .accessibility_label(t!("action-start-all"))
-                    .tooltip(t!("toolbar-start-all-tip"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.start_all_engines(window, cx);
-                    })),
+                bar.right(
+                    Button::new("engine-bar-start-all")
+                        .small()
+                        .label(t!("action-start-all"))
+                        .accessibility_label(t!("action-start-all"))
+                        .tooltip(t!("toolbar-start-all-tip"))
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.start_all_engines(window, cx);
+                        })),
+                )
+                .right(
+                    Button::new("engine-bar-stop-all")
+                        .small()
+                        .label(t!("action-stop-all"))
+                        .accessibility_label(t!("action-stop-all"))
+                        .tooltip(t!("toolbar-stop-all-tip"))
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.stop_all_engines(window, cx);
+                        })),
+                )
+                .right(self.render_console_toggle(cx))
+                .right(self.render_engine_menu(view, testing)),
             )
-            .child(
-                Button::new("engine-bar-stop-all")
-                    .small()
-                    .label(t!("action-stop-all"))
-                    .accessibility_label(t!("action-stop-all"))
-                    .tooltip(t!("toolbar-stop-all-tip"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.stop_all_engines(window, cx);
-                    })),
-            )
-            .child(self.render_console_toggle(cx))
-            .child(self.render_engine_menu(view, testing))
             .into_any_element()
     }
 
