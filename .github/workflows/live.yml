@@ -9,8 +9,18 @@ on:
         required: true
         default: "1.14.2"
 
+concurrency:
+  group: live-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   SINGBOX_VERSION: ${{ inputs.singbox_version }}
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   live-windows:
@@ -22,6 +32,8 @@ jobs:
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Fetch pinned sing-box (no silent downloads in the app itself)
         shell: pwsh

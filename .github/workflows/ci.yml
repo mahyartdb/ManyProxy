@@ -2,9 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [master, ui-audit-fixes]
+    branches: [master]
   pull_request:
     branches: [master]
+
+# A newer push on the same branch or PR supersedes this run; no reason to
+# keep paying for a runner that can only produce a stale result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # CI-specific cargo settings. Incremental state bloats the rust-cache and
+  # costs more to maintain than a clean rebuild on a fresh runner; debug
+  # info is never read here, and Windows PDBs for ~1,500 tests dominate
+  # link time. Neither changes debug_assertions or test behaviour.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 # Windows only: the app links winreg/tray-icon and build.rs embeds Windows
 # resources. A Linux runner would need the full GPUI system dependency set
