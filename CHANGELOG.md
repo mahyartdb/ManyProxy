@@ -42,6 +42,58 @@ stalls and a Windows restore data-loss bug.
 
 ## [Unreleased]
 
+The bug hunt closes recovery, async-completion, and status-reporting defects
+across the store, engine, import, probe, and update paths.
+
+### Changed
+
+- The Settings engine rows resolve each core once when the dialog opens,
+  instead of probing the filesystem on every frame; a failed row's Details
+  names the resolver's real reason.
+- Version stamps come from `Cargo.toml` alone, so a stale local tag can no
+  longer label a build with a version it did not come from.
+
+### Fixed
+
+- A library restore stages the replacement before touching the live file, so
+  a failed swap leaves the original database and WAL intact. When the live
+  file is gone, the app pins a banner naming the newest backup instead of
+  opening an empty library at that path.
+- A subscription whose stored rows cannot be decoded is quarantined as a
+  whole instead of silently losing its configs on the next refresh.
+- `rename_group` rolls every row back when one write fails, and auto-assigned
+  ports probe the row's actual bind address, so `::1` rows no longer receive
+  a port only `127.0.0.1` holds.
+- Exports report the real importable count beside the exported total and warn
+  when unreadable rows were dropped. Clearing traffic zeroes the session
+  mirror too, including the single-row usage reset.
+- Engine status stays honest after a failed apply in every start/stop
+  wrapper, IPv6 loopback binds probe the socket the row actually binds, log
+  reader handles are retained across stops, and removed config files are
+  overwritten before unlink.
+- Multi-file imports keep the text typed before the files, import every item
+  once, and report true failure indices. Decoded hosts reject reserved
+  characters, invalid UTF-8, and unexpected colons.
+- A `port=` token that did not change no longer overwrites a range set in
+  the port popover.
+- Health fetches stop at a deadline even when a resolver hangs, resolve
+  redirects per RFC 3986 (relative, dot-relative, scheme-relative), and
+  saturate console byte counters instead of wrapping.
+- Starting a batch claims its guard at the click, so a second click inside
+  the deferral window is refused; busy refusals, empty selections, and
+  cancelled LAN confirmations settle the batch bar instead of leaving
+  "Starting 0/N" with every verb disabled.
+- A probe hands its worker a clone, so the configured prober is never
+  displaced mid-run. Each run owns its stop token, and a stopped sweep
+  clears the taskbar instead of repainting stale progress.
+- An idle traffic tick no longer consumes the poll gate, and a failed window
+  update check falls through to the headless result instead of wedging.
+- A subscription refresh whose row was deleted or retargeted during the
+  fetch drops the stale body instead of writing it into the reused rowid;
+  quota-save failures are logged.
+- The kebab menu shows its on/off note only on Auto-start, Enter clears the
+  bind-address field after a successful add, and connection copy markers
+  follow the connection rather than its row position.
 
 ## [0.1.0] - 2026-11-14
 
