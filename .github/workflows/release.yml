@@ -96,7 +96,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -294,7 +294,7 @@ jobs:
 
       - name: Upload bundle as build artifact (rehearsal runs deliver here)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: "manyproxy-${{ env.VER }}-windows-amd64"
           path: |
@@ -344,7 +344,7 @@ jobs:
       awg: ${{ steps.probe-awg.outputs.awg }}
       awg_reason: ${{ steps.probe-awg.outputs.awg_reason }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -596,7 +596,7 @@ jobs:
 
       - name: Upload the arm64 bundle as a build artifact (rehearsal runs deliver here; nothing uploads on gate-red or withheld rows)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: "manyproxy-${{ env.VER }}-windows-arm64"
           path: |
@@ -630,7 +630,7 @@ jobs:
 
       - name: Download the arm64 bundle artifact (only when the arm64 row shipped it)
         if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: "manyproxy-${{ env.VER }}-windows-arm64"
           path: arm64-assets
