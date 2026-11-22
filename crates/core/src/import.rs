@@ -154,7 +154,7 @@ pub fn format_import_failures(failures: &[ImportFailure]) -> String {
         .join("; ")
 }
 
-fn percent_decode(raw: &str, plus_as_space: bool) -> String {
+fn percent_decode_bytes(raw: &str, plus_as_space: bool) -> Vec<u8> {
     fn hex_val(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
@@ -190,7 +190,11 @@ fn percent_decode(raw: &str, plus_as_space: bool) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+fn percent_decode(raw: &str, plus_as_space: bool) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(raw, plus_as_space)).into_owned()
 }
 
 const MAX_B64_COMPACT: usize = 1_000_000;
@@ -258,7 +262,7 @@ fn strip_bom(text: &str) -> &str {
     rest
 }
 
-fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> {
+fn split_host_port(text: &str) -> Result<(String, Option<String>, bool), ImportError> {
     if text.is_empty() {
         return Err(bad_host("missing host"));
     }
@@ -275,7 +279,7 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
         }
         let after = &rest[end + 1..];
         if after.is_empty() {
-            return Ok((host, None));
+            return Ok((host, None, true));
         }
         let port = after
             .strip_prefix(':')
@@ -283,7 +287,7 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
         if port.is_empty() {
             return Err(bad_port("bad port ''"));
         }
-        return Ok((host, Some(port.to_string())));
+        return Ok((host, Some(port.to_string()), true));
     }
     match text.rfind(':') {
         Some(i) => {
@@ -293,10 +297,10 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
                     if port.is_empty() {
                         return Err(bad_port("bad port ''"));
                     }
-                    return Ok((host.to_string(), Some(port.to_string())));
+                    return Ok((host.to_string(), Some(port.to_string()), false));
                 }
                 if text.parse::<std::net::Ipv6Addr>().is_ok() {
-                    return Ok((text.to_string(), None));
+                    return Ok((text.to_string(), None, false));
                 }
                 return Err(bad_host("bare IPv6 must use [brackets]"));
             }
@@ -306,24 +310,34 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
             if port.is_empty() {
                 return Err(bad_port("bad port ''"));
             }
-            Ok((host.to_string(), Some(port.to_string())))
+            Ok((host.to_string(), Some(port.to_string()), false))
         }
         None => {
             if text.chars().any(|c| c.is_whitespace() || c.is_control()) {
                 return Err(bad_host("bad host"));
             }
-            Ok((text.to_string(), None))
+            Ok((text.to_string(), None, false))
         }
     }
 }
 
-fn decoded_host(raw: &str) -> Result<String, ImportError> {
-    let host = percent_decode(raw.trim(), false);
+fn decoded_host(raw: &str, bracketed: bool) -> Result<String, ImportError> {
+    let host = String::from_utf8(percent_decode_bytes(raw.trim(), false))
+        .map_err(|_| bad_host("bad host (percent-decoding is not UTF-8)"))?;
     if host.trim().is_empty() {
         return Err(bad_host("missing host"));
     }
     if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(bad_host("bad host"));
+    }
+    if host
+        .chars()
+        .any(|c| matches!(c, '/' | '?' | '#' | '@' | '\\' | '%'))
+    {
+        return Err(bad_host("bad host (reserved character)"));
+    }
+    if host.contains(':') && !bracketed && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(bad_host("bad host (unexpected ':')"));
     }
     Ok(host)
 }
@@ -376,9 +390,9 @@ fn split_uri(_scheme: &str, rest: &str) -> Result<UriParts, ImportError> {
         Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
         None => (None, authority),
     };
-    let (raw_host, port_text) = split_host_port(host_port)?;
+    let (raw_host, port_text, bracketed) = split_host_port(host_port)?;
 
-    let host = decoded_host(&raw_host)?;
+    let host = decoded_host(&raw_host, bracketed)?;
     Ok(UriParts {
         userinfo,
         host,
@@ -821,7 +835,7 @@ fn parse_ss_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
                 )
             };
 
-            let (host, port_text) = split_host_port(host_port.trim_end_matches('/'))?;
+            let (host, port_text, _) = split_host_port(host_port.trim_end_matches('/'))?;
             (method, password, host, require_port(port_text.as_deref())?)
         }
         None => {
@@ -835,7 +849,7 @@ fn parse_ss_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
                 .find(':')
                 .ok_or_else(|| missing_credential("ss link is missing password"))?;
 
-            let (host, port_text) = split_host_port(host_port.trim_end_matches('/'))?;
+            let (host, port_text, _) = split_host_port(host_port.trim_end_matches('/'))?;
             (
                 percent_decode(&userinfo[..j], false),
                 userinfo[j + 1..].to_string(),
@@ -2134,7 +2148,7 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
             if endpoint.trim().is_empty() {
                 return Err(bad_host("wireguard peer is missing Endpoint"));
             }
-            let (host, port_text) = split_host_port(endpoint.trim())?;
+            let (host, port_text, _) = split_host_port(endpoint.trim())?;
             let port = match port_text {
                 Some(text) => parse_port(&text)?,
                 None => return Err(bad_port("wireguard peer Endpoint is missing its port")),
@@ -2782,24 +2796,34 @@ pub fn commit_batch(
     Ok(outcome)
 }
 
-pub fn import_multi_file_contents(files: &[(&str, &str)]) -> BatchResult {
+fn extend_batch(out: &mut BatchResult, mut batch: BatchResult, base: usize) -> usize {
+    let produced = batch.configs.len() + batch.failures.len();
+    for mut failure in batch.failures.drain(..) {
+        failure.index += base;
+        out.failures.push(failure);
+    }
+    out.configs.append(&mut batch.configs);
+    produced
+}
+
+pub fn import_text_and_multi_file_contents(typed: &str, files: &[(&str, &str)]) -> BatchResult {
     let mut out = BatchResult::default();
-    let mut offset = 0usize;
+    let mut base = 0usize;
+    if !typed.trim().is_empty() {
+        let batch = import_text(typed);
+        base += extend_batch(&mut out, batch, base);
+    }
     for (name, content) in files {
-        let mut batch = import_file_content(name, content);
-        for config in batch.configs.drain(..) {
-            out.configs.push(config);
-            offset += 1;
-        }
-        for mut failure in batch.failures.drain(..) {
-            failure.index += offset;
-            out.failures.push(failure);
-            offset += 1;
-        }
+        let batch = import_file_content(name, content);
+        base += extend_batch(&mut out, batch, base);
     }
 
     dedupe_names(&mut out.configs);
     out
+}
+
+pub fn import_multi_file_contents(files: &[(&str, &str)]) -> BatchResult {
+    import_text_and_multi_file_contents("", files)
 }
 
 pub fn effective_hint_for_text(hint: Option<&str>, text: &str) -> Option<String> {
@@ -7006,5 +7030,53 @@ mod tests {
         assert_eq!(params_of(&out.configs[1])["private_key"], "wgprivkey");
         assert_eq!(out.configs[2].protocol, "trojan");
         assert_eq!(out.configs[2].name, "trojan-row");
+    }
+
+    #[test]
+    fn multi_file_failure_indices_count_all_items_in_order() {
+        let first = format!("vless://{UUID}@a.example.com:443#one");
+        let second = format!("vless://{UUID}@b.example.com:443#two");
+        let middle = format!("bogus://before\n{second}\nbogus://after");
+        let out =
+            import_multi_file_contents(&[("a.txt", first.as_str()), ("b.txt", middle.as_str())]);
+
+        assert_eq!(out.configs.len(), 2);
+        let indices: Vec<usize> = out.failures.iter().map(|failure| failure.index).collect();
+        assert_eq!(indices, [1, 3], "failures are items 2 and 4 overall");
+        let text = format_import_failures(&out.failures);
+        assert!(text.starts_with("item 2 (bogus://before)"), "got {text}");
+        assert!(text.contains("item 4 (bogus://after)"), "got {text}");
+    }
+
+    #[test]
+    fn decoded_host_reserved_characters_rejected() {
+        for host in [
+            "evil.com%2Fpath",
+            "evil.com%3Fquery",
+            "evil.com%23frag",
+            "evil.com%40at",
+            "evil.com%5Cpath",
+            "evil.com%25percent",
+            "evil.com%3A443",
+        ] {
+            let error = parse_link(&format!("vless://{UUID}@{host}:443#x"))
+                .expect_err(&format!("reserved decoded host {host} fails"));
+            assert_eq!(error.kind, ImportErrorKind::BadHost, "host {host}");
+        }
+
+        let error = parse_link(&format!("vless://{UUID}@%FF.example.com:443#x"))
+            .expect_err("non-UTF-8 host decode fails");
+        assert_eq!(error.kind, ImportErrorKind::BadHost);
+
+        let bracketed =
+            parse_link(&format!("vless://{UUID}@[::1]:443#v6")).expect("bracketed IPv6 parses");
+        assert_eq!(bracketed.host, "::1");
+        let bare = parse_link(&format!("vless://{UUID}@2001:db8::1:443#v6bare"))
+            .expect("bare IPv6 still parses");
+        assert_eq!(bare.host, "2001:db8::1");
+
+        let remark = parse_link(&format!("vless://{UUID}@a.example.com:443#bad%FFname"))
+            .expect("non-host percent-decoding stays tolerant");
+        assert!(remark.name.contains("bad"), "got {}", remark.name);
     }
 }
