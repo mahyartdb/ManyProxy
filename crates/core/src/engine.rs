@@ -4617,14 +4617,11 @@ pub fn fork_binary_file_name() -> String {
     }
 }
 
-pub fn resolve_fork_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
-    resolve_bundled_in(app_dir, &fork_binary_file_name())
-}
-
-pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
-    let app_dir = current_app_dir();
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    resolve_fork_binary_in(app_dir.as_deref(), &path_env).map_err(|searched| {
+pub fn resolve_fork_binary_in(
+    app_dir: Option<&Path>,
+    _path_env: &str,
+) -> Result<PathBuf, EngineError> {
+    resolve_bundled_in(app_dir, &fork_binary_file_name()).map_err(|searched| {
         EngineError::MissingForkBinary {
             rows: String::new(),
             binary: fork_binary_file_name(),
@@ -4632,6 +4629,12 @@ pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
             xhttp: false,
         }
     })
+}
+
+pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
+    let app_dir = current_app_dir();
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    resolve_fork_binary_in(app_dir.as_deref(), &path_env)
 }
 
 pub fn probe_fork_version(binary: &Path) -> Result<String, String> {
@@ -4714,14 +4717,11 @@ pub fn xray_binary_file_name() -> String {
     }
 }
 
-pub fn resolve_xray_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
-    resolve_bundled_in(app_dir, &xray_binary_file_name())
-}
-
-pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
-    let app_dir = current_app_dir();
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    resolve_xray_binary_in(app_dir.as_deref(), &path_env).map_err(|searched| {
+pub fn resolve_xray_binary_in(
+    app_dir: Option<&Path>,
+    _path_env: &str,
+) -> Result<PathBuf, EngineError> {
+    resolve_bundled_in(app_dir, &xray_binary_file_name()).map_err(|searched| {
         EngineError::MissingXrayBinary {
             rows: String::new(),
             binary: xray_binary_file_name(),
@@ -4730,38 +4730,45 @@ pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
     })
 }
 
-pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<PathBuf, String> {
+pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
+    let app_dir = current_app_dir();
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    resolve_xray_binary_in(app_dir.as_deref(), &path_env)
+}
+
+pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<PathBuf, EngineError> {
     let name = exe.trim();
+    let missing = |searched: String| EngineError::MissingExtraBinary {
+        rows: String::new(),
+        binary: name.to_string(),
+        searched,
+    };
     if is_bad_extra_exe_name(name) {
-        return Err(format!(
+        return Err(missing(format!(
             "bad extra-core exe \"{name}\" (want a plain file name in the app directory)"
-        ));
+        )));
     }
     if std::path::Path::new(name).is_absolute() {
-        return Err(format!(
+        return Err(missing(format!(
             "bad extra-core exe \"{name}\" (want a plain file name in the app directory)"
-        ));
+        )));
     }
     let Some(dir) = app_dir else {
-        return Err("no app directory to resolve the extra-core executable".to_string());
+        return Err(missing(
+            "no app directory to resolve the extra-core executable".to_string(),
+        ));
     };
     let candidate = dir.join(name);
     if is_executable(&candidate) {
         Ok(candidate)
     } else {
-        Err(dir.display().to_string())
+        Err(missing(dir.display().to_string()))
     }
 }
 
 pub fn resolve_extra_binary(exe: &str) -> Result<PathBuf, EngineError> {
     let app_dir = current_app_dir();
-    resolve_extra_binary_in(app_dir.as_deref(), exe).map_err(|searched| {
-        EngineError::MissingExtraBinary {
-            rows: String::new(),
-            binary: exe.trim().to_string(),
-            searched,
-        }
-    })
+    resolve_extra_binary_in(app_dir.as_deref(), exe)
 }
 
 fn truncate_detail(detail: &str) -> String {
@@ -5447,6 +5454,20 @@ pub fn normalize_bind_key(bind: &str) -> String {
     }
 }
 
+/// The socket the ROW binds, as a `ToSocketAddrs` string. `[::1]:port` and
+/// `127.0.0.1:port` are different sockets; probing one while the row binds
+/// the other reports a free port that the bind then refuses.
+fn probe_socket_addr(bind: &str, port: u16) -> String {
+    let trimmed = bind.trim();
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => format!("{v4}:{port}"),
+        Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]:{port}"),
+        // An empty bind is the default loopback; `localhost` keeps its
+        // historical v4 spelling so resolution order cannot pick a v6 socket.
+        Err(_) => format!("127.0.0.1:{port}"),
+    }
+}
+
 /// T-05: the bind probe with an explicit attempt cap.
 ///
 /// The engine's apply path can afford ten tries with a short sleep
@@ -5463,21 +5484,14 @@ pub fn probe_bind_available_with(
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let host = {
-        let key = normalize_bind_key(bind);
-        if key == "loopback" {
-            "127.0.0.1".to_string()
-        } else {
-            bind.trim().to_string()
-        }
-    };
+    let socket = probe_socket_addr(bind, port);
     let attempts = attempts.max(1);
-    let mut last = format!("probe failed for {host}:{port}");
+    let mut last = format!("probe failed for {socket}");
     for attempt in 0..attempts {
-        match std::net::TcpListener::bind(format!("{host}:{port}")) {
+        match std::net::TcpListener::bind(&socket) {
             Ok(listener) => return Ok(listener),
             Err(error) => {
-                last = format!("{host}:{port} is already in use ({error})");
+                last = format!("{socket} is already in use ({error})");
                 if attempt + 1 < attempts {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -5599,7 +5613,11 @@ pub struct RealEngineBackend {
 
     reader_gen: u64,
 
-    reader_handle: Option<std::thread::JoinHandle<()>>,
+    /// One handle per log-reader thread this backend has spawned. A reader
+    /// blocked on a pipe a grandchild inherited never sees EOF; the handle
+    /// stays here so a later stop can join it instead of losing the thread
+    /// and the buffer it clones.
+    reader_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 pub const LOG_PIPE_BUFFER: usize = 2000;
@@ -5646,7 +5664,7 @@ impl RealEngineBackend {
             pinned_binary: None,
             log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
             reader_gen: 0,
-            reader_handle: None,
+            reader_handles: Vec::new(),
         }
     }
 
@@ -5660,7 +5678,7 @@ impl RealEngineBackend {
             pinned_binary: None,
             log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
             reader_gen: 0,
-            reader_handle: None,
+            reader_handles: Vec::new(),
         }
     }
 
@@ -5674,7 +5692,7 @@ impl RealEngineBackend {
             pinned_binary: None,
             log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
             reader_gen: 0,
-            reader_handle: None,
+            reader_handles: Vec::new(),
         }
     }
 
@@ -5688,7 +5706,7 @@ impl RealEngineBackend {
             pinned_binary: None,
             log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
             reader_gen: 0,
-            reader_handle: None,
+            reader_handles: Vec::new(),
         }
     }
 
@@ -5753,26 +5771,31 @@ impl RealEngineBackend {
             }
         }
 
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline {
-            if self
-                .reader_handle
-                .as_ref()
-                .is_some_and(|handle| handle.is_finished())
-            {
-                break;
+        self.join_reader_handles(Duration::from_millis(500));
+    }
+
+    /// Joins every finished reader and keeps the ones that are still blocked,
+    /// retrying them on the next stop or drop. Never blocks longer than
+    /// `budget` in total: a reader stuck on an inherited pipe must not hang the
+    /// caller that is stopping the engine.
+    fn join_reader_handles(&mut self, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        let mut outstanding: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for handle in std::mem::take(&mut self.reader_handles) {
+            while !handle.is_finished() {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if self
-            .reader_handle
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            if let Some(handle) = self.reader_handle.take() {
+            if handle.is_finished() {
                 let _ = handle.join();
+            } else {
+                outstanding.push(handle);
             }
         }
+        self.reader_handles = outstanding;
     }
 }
 
@@ -5855,7 +5878,7 @@ impl EngineBackend for RealEngineBackend {
                         }
                     }
                 });
-                self.reader_handle = Some(handle);
+                self.reader_handles.push(handle);
             }
             None => {
                 push_pipe_line(
@@ -5923,7 +5946,66 @@ impl EngineBackend for RealEngineBackend {
     }
 
     fn remove_config_file(&self) {
-        let _ = std::fs::remove_file(&self.config_path);
+        self.shred_and_remove_config_file();
+    }
+}
+
+impl RealEngineBackend {
+    /// The config carries the row secrets in plaintext. Overwrite it before
+    /// unlinking so a removal that fails (another handle still open) cannot
+    /// leave the credentials readable, then retry the unlink briefly. A
+    /// failure the backend cannot escalate goes to the log buffer the user is
+    /// already watching.
+    fn shred_and_remove_config_file(&self) {
+        const ATTEMPTS: u32 = 5;
+        let mut last: Option<std::io::Error> = None;
+        for attempt in 0..ATTEMPTS {
+            match self.shred_config_file() {
+                Err(error) => last = Some(error),
+                Ok(false) => return,
+                Ok(true) => match std::fs::remove_file(&self.config_path) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => last = Some(error),
+                },
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt + 1)));
+            }
+        }
+        if let Some(error) = last {
+            push_pipe_line(
+                &self.log_buffer,
+                self.reader_gen,
+                format!(
+                    "engine config file left on disk ({}): {error}",
+                    self.config_path.display()
+                ),
+            );
+        }
+    }
+
+    /// `Ok(false)` means the file is already gone.
+    fn shred_config_file(&self) -> Result<bool, std::io::Error> {
+        use std::io::Write as _;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.config_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let len = file.metadata()?.len();
+        let zeros = [0u8; 4096];
+        let mut left = len;
+        while left > 0 {
+            let take = left.min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..take])?;
+            left -= take as u64;
+        }
+        file.sync_all()?;
+        Ok(true)
     }
 }
 
@@ -6578,14 +6660,12 @@ impl EngineController {
         self.generation = self.generation.wrapping_add(1);
         let before = self.active.len();
         let prev = self.active.clone();
-        let prev_status = self.status.clone();
         self.active.retain(|row| row.id != id);
         if self.active.len() == before {
             return (false, None);
         }
         if let Err(error) = self.apply() {
             self.active = prev;
-            self.status = prev_status;
             self.prune_lan_confirmed();
             return (true, Some(error));
         }
@@ -6596,11 +6676,9 @@ impl EngineController {
     pub fn stop_all_result(&mut self) -> Option<EngineError> {
         self.generation = self.generation.wrapping_add(1);
         let prev = self.active.clone();
-        let prev_status = self.status.clone();
         self.active.clear();
         if let Err(error) = self.apply() {
             self.active = prev;
-            self.status = prev_status;
             self.prune_lan_confirmed();
             return Some(error);
         }
@@ -6658,12 +6736,10 @@ impl EngineController {
         outcome.warnings = plan_warnings;
 
         let prev = self.active.clone();
-        let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
         self.active = candidate.clone();
         if let Err(error) = self.enforce_lan_confirm(&candidate, confirmed) {
             self.active = prev;
-            self.status = prev_status;
             self.prune_lan_confirmed();
             outcome.error = Some(error.to_string());
             for row in &candidate {
@@ -6678,7 +6754,6 @@ impl EngineController {
             }
             Err(error) => {
                 self.active = prev;
-                self.status = prev_status;
                 self.prune_lan_confirmed();
                 outcome.error = Some(error.to_string());
                 for row in &candidate {
@@ -6926,7 +7001,6 @@ impl EngineController {
         self.enforce_lan_confirm(&candidate, confirmed)?;
 
         let prev = self.active.clone();
-        let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
         self.active = candidate;
         match self.apply() {
@@ -6936,7 +7010,6 @@ impl EngineController {
             }
             Err(error) => {
                 self.active = prev;
-                self.status = prev_status;
                 self.prune_lan_confirmed();
                 Err(error)
             }
@@ -7008,7 +7081,6 @@ impl EngineController {
         self.enforce_lan_confirm(&candidate, confirmed)?;
 
         let prev = self.active.clone();
-        let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
         self.active = candidate;
         match self.apply() {
@@ -7018,7 +7090,6 @@ impl EngineController {
             }
             Err(error) => {
                 self.active = prev;
-                self.status = prev_status;
                 self.prune_lan_confirmed();
                 Err(error)
             }
@@ -9607,12 +9678,18 @@ mod tests {
         let searched = resolve_fork_binary_in(Some(Path::new("/nonexistent-manyproxy-dir")), "")
             .expect_err("no fork binary anywhere");
         assert!(
-            searched.contains("/nonexistent-manyproxy-dir"),
+            searched.to_string().contains("/nonexistent-manyproxy-dir"),
             "names searched dir: {searched}"
         );
+        let EngineError::MissingForkBinary {
+            binary, searched, ..
+        } = searched
+        else {
+            panic!("missing-fork resolution must stay typed");
+        };
         let error = EngineError::MissingForkBinary {
             rows: "\"AwgOne\"".to_string(),
-            binary: fork_binary_file_name(),
+            binary,
             searched,
             xhttp: true,
         };
@@ -10149,7 +10226,7 @@ mod tests {
             resolve_extra_binary_in(Some(Path::new("/nonexistent-manyproxy-dir")), "core.exe")
                 .expect_err("missing exe fails");
         assert!(
-            searched.contains("/nonexistent-manyproxy-dir"),
+            searched.to_string().contains("/nonexistent-manyproxy-dir"),
             "got {searched}"
         );
 
@@ -10395,7 +10472,7 @@ mod tests {
         let searched = resolve_xray_binary_in(Some(Path::new("/nonexistent-manyproxy-dir")), "")
             .expect_err("no xray binary anywhere");
         assert!(
-            searched.contains("/nonexistent-manyproxy-dir"),
+            searched.to_string().contains("/nonexistent-manyproxy-dir"),
             "names searched dir: {searched}"
         );
     }
@@ -12448,6 +12525,133 @@ Active Connections\r
             &EngineStatus::Stopped,
             "no Running claim when nothing is serving"
         );
+    }
+
+    /// FIX: `apply` sets the honest status after a failed rollback. The
+    /// start/stop wrappers may restore `active`, never the status: a stale
+    /// `Running` would outlive the shard that made it true.
+    #[test]
+    fn failed_rollback_keeps_the_honest_status_in_every_wrapper() {
+        let alpha = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            10851,
+        );
+        let beta = fixture(
+            "2",
+            "Beta",
+            "shadowsocks",
+            ss_params("pass2"),
+            "127.0.0.1",
+            10852,
+        );
+
+        {
+            let (mut controller, stock) = EngineController::fake();
+            controller.start_one(&alpha).expect("alpha starts");
+            assert_eq!(controller.status(), &EngineStatus::Running);
+            stock.fail_start_always("sidecar refused to start");
+            controller.start_one(&beta).expect_err("start fails");
+            assert!(!stock.is_running(), "the failed rollback left no shard");
+            assert_eq!(
+                controller.status(),
+                &EngineStatus::Stopped,
+                "start_one must not restore Running"
+            );
+            assert_eq!(controller.running_ids(), vec!["1".to_string()]);
+        }
+
+        {
+            let (mut controller, stock) = EngineController::fake();
+            controller
+                .start_all(std::slice::from_ref(&alpha))
+                .expect("alpha starts");
+            assert_eq!(controller.status(), &EngineStatus::Running);
+            stock.fail_start_always("sidecar refused to start");
+            controller
+                .start_all(std::slice::from_ref(&beta))
+                .expect_err("start_all fails");
+            assert!(!stock.is_running(), "the failed rollback left no shard");
+            assert_eq!(
+                controller.status(),
+                &EngineStatus::Stopped,
+                "start_all must not restore Running"
+            );
+            assert_eq!(controller.running_ids(), vec!["1".to_string()]);
+        }
+
+        {
+            let (mut controller, stock) = EngineController::fake();
+            controller
+                .start_all(std::slice::from_ref(&alpha))
+                .expect("alpha starts");
+            assert_eq!(controller.status(), &EngineStatus::Running);
+            stock.fail_start_always("sidecar refused to start");
+            let outcome = controller.start_all_subset(std::slice::from_ref(&beta), true);
+            assert!(outcome.error.is_some(), "the apply failed: {outcome:?}");
+            assert!(!stock.is_running(), "the failed rollback left no shard");
+            assert_eq!(
+                controller.status(),
+                &EngineStatus::Stopped,
+                "start_all_subset must not restore Running"
+            );
+            assert_eq!(controller.running_ids(), vec!["1".to_string()]);
+        }
+
+        {
+            let (mut controller, stock) = EngineController::fake();
+            controller
+                .start_all(&[alpha.clone(), beta])
+                .expect("both rows start");
+            assert_eq!(controller.status(), &EngineStatus::Running);
+            stock.fail_start_always("sidecar refused to start");
+            let (removed, error) = controller.stop_one_result("1");
+            assert!(removed, "the row was removed from active");
+            assert!(error.is_some(), "the apply failed");
+            assert!(!stock.is_running(), "the failed rollback left no shard");
+            assert_eq!(
+                controller.status(),
+                &EngineStatus::Stopped,
+                "stop_one_result must not restore Running"
+            );
+            assert_eq!(
+                controller.running_ids(),
+                vec!["1".to_string(), "2".to_string()],
+                "membership is still restored"
+            );
+        }
+    }
+
+    /// FIX: `::1` and `127.0.0.1` are different sockets. The probe must bind
+    /// the row's literal address (bracketed for IPv6) instead of collapsing
+    /// the v6 loopback to v4 and declaring a busy port free.
+    #[test]
+    fn probe_targets_the_literal_ipv6_loopback_socket() {
+        let mut held_v6 = None;
+        let mut port = 0;
+        for _ in 0..20 {
+            let listener =
+                std::net::TcpListener::bind("[::1]:0").expect("IPv6 loopback is available");
+            let candidate = listener.local_addr().expect("bound addr").port();
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                held_v6 = Some(listener);
+                port = candidate;
+                break;
+            }
+        }
+        let held_v6 = held_v6.expect("a port free on both loopback stacks");
+
+        let error = probe_bind_available_with("::1", port, 1)
+            .expect_err("the [::1] socket the row binds is held");
+        assert!(error.contains("[::1]"), "names the probed socket: {error}");
+
+        let free = probe_bind_available_with("127.0.0.1", port, 1)
+            .expect("the v4 loopback socket is a different socket");
+        drop(free);
+        drop(held_v6);
     }
 
     /// FIX: a row can be `active` with a dead shard. It holds no port, so a
