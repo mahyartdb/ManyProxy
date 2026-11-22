@@ -223,8 +223,12 @@ pub fn scope_exits(
         };
         let (delta_rx, delta_tx) = deltas.get(&entry.id).copied().unwrap_or((0, 0));
         let slot = per_row.entry(row_id).or_insert((0, 0));
-        slot.0 = slot.0.saturating_add(entry.rx_bytes + delta_rx);
-        slot.1 = slot.1.saturating_add(entry.tx_bytes + delta_tx);
+        slot.0 = slot
+            .0
+            .saturating_add(entry.rx_bytes.saturating_add(delta_rx));
+        slot.1 = slot
+            .1
+            .saturating_add(entry.tx_bytes.saturating_add(delta_tx));
     }
     per_row
         .into_iter()
@@ -439,6 +443,29 @@ mod tests {
             traffic_poll_due(false, ConsoleTab::Logs, now, now - 5),
             "base cadence fires once elapsed"
         );
+    }
+
+    #[test]
+    fn scope_exits_saturates_bytes_and_deltas() {
+        let conn = |id: &str, rx: u64, tx: u64| crate::health::ClashConn {
+            id: id.to_string(),
+            row_id: Some("a".to_string()),
+            rx_bytes: rx,
+            tx_bytes: tx,
+            dest: "d".to_string(),
+            network: "tcp".to_string(),
+        };
+        let snapshot = vec![
+            ("stock".to_string(), conn("c0", u64::MAX, 1)),
+            ("stock".to_string(), conn("c1", 1, u64::MAX)),
+        ];
+        let mut deltas = HashMap::new();
+        deltas.insert("c0".to_string(), (1u64, 0u64));
+        deltas.insert("c1".to_string(), (0u64, 1u64));
+        let exits = scope_exits(&snapshot, &deltas, &set(&["a"]), ConsoleScope::All);
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].rx_bytes, u64::MAX, "rx saturates");
+        assert_eq!(exits[0].tx_bytes, u64::MAX, "tx saturates");
     }
 
     #[test]
