@@ -62,7 +62,7 @@ on:
         # Must match Cargo.toml's numeric core: the version gate below refuses a
         # tag whose core disagrees with the manifest, so keep this in step with
         # a manifest bump.
-        default: "v0.2.0-test.1"
+        default: "v0.2.1-test.1"
 
 permissions:
   contents: write
