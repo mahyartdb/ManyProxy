@@ -217,7 +217,13 @@ impl AppView {
         self.row_drop_target = None;
         self.clear_selection_for_scope_change(window, cx);
         self.apply_query(cx);
-        self.refresh_scope_index(cx);
+        // The clicked scope can die between paints (its last row left, or a
+        // source was removed). `refresh_scope_index` rewrites the scope to
+        // `All` when it does, but `visible` was already cut for the dead
+        // scope — rebuild it for the fallback in the same click.
+        if self.refresh_scope_index(cx) {
+            self.apply_query(cx);
+        }
         cx.notify();
     }
 
@@ -1022,4 +1028,105 @@ pub fn source_quota_text(quota: SourceQuotaLine, now: i64) -> Option<String> {
         ));
     }
     (!segments.is_empty()).then(|| segments.join(" · "))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::nav_scopes::AppView;
+    use crate::store::{NewConfig, Store};
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext as _, TestAppContext};
+    use manyproxy_core::LibraryScope;
+
+    /// Bug 5: `set_scope` used to discard `refresh_scope_index`'s fallback
+    /// signal. Selecting a scope whose bucket died between paints left the
+    /// table cut to a dead scope until the next unrelated reload; the
+    /// fallback must rewrite the scope AND re-run `apply_query` in the same
+    /// click, so the surviving rows come back.
+    #[gpui_kit::test]
+    fn dead_scope_click_falls_back_to_all_with_a_rebuilt_query(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let grouped = store
+            .add(NewConfig {
+                name: "Grouped".to_string(),
+                protocol: "vless".to_string(),
+                params: Default::default(),
+                group: "g1".to_string(),
+                bind_ip: String::new(),
+                port: "10801".to_string(),
+            })
+            .expect("grouped seed works");
+        let plain = store
+            .add(NewConfig {
+                name: "Plain".to_string(),
+                protocol: "vless".to_string(),
+                params: Default::default(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: "10802".to_string(),
+            })
+            .expect("plain seed works");
+
+        let stash: std::rc::Rc<std::cell::RefCell<Option<gpui_kit::Entity<AppView>>>> =
+            Default::default();
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+        let _ = &stash;
+
+        // The group scope lives and cuts the table to its one row.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_scope(LibraryScope::Group("g1".to_string()), window, cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.visible.len()),
+            1,
+            "the live group scope shows its row only"
+        );
+
+        // Back to All, then the group empties without a reload: the nav row
+        // the click targets is gone, the `plain` row survives.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_scope(LibraryScope::All, window, cx);
+                let remaining: Vec<_> = view
+                    .libraries
+                    .read(cx)
+                    .delegate()
+                    .rows
+                    .iter()
+                    .filter(|row| row.id == plain.id)
+                    .cloned()
+                    .collect();
+                let libraries = view.libraries.clone();
+                libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().set_rows(remaining);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_scope(LibraryScope::Group("g1".to_string()), window, cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.scope.clone()),
+            LibraryScope::All,
+            "a dead scope falls back to All"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.visible_row_ids(cx)),
+            vec![plain.id.clone()],
+            "the fallback rebuilt the query for All: the surviving row is back"
+        );
+        let _ = grouped;
+    }
 }

@@ -116,6 +116,7 @@ pub fn spawn_probe_progress_poller(
     toast: Option<ToastHandle>,
     progress: Arc<std::sync::Mutex<ProbeProgress>>,
     active: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     cx: &mut Context<AppView>,
 ) {
     let weak = cx.entity().downgrade();
@@ -125,11 +126,18 @@ pub fn spawn_probe_progress_poller(
             .await;
         let snapshot = *progress.lock().unwrap_or_else(|poison| poison.into_inner());
         let running = active.load(std::sync::atomic::Ordering::SeqCst);
+        let stopped = stop.load(std::sync::atomic::Ordering::SeqCst);
         let _ = weak.update(cx, |view, cx| {
             if let Some(toast) = toast {
                 update_probe_progress(toast, snapshot.done, snapshot.total, cx);
             }
-            view.set_taskbar_progress(snapshot.done, snapshot.total, snapshot.failed);
+            // A cancelled run must not repaint its stale counts over the
+            // clear that Stop just performed.
+            if stopped {
+                view.clear_taskbar_progress();
+            } else {
+                view.set_taskbar_progress(snapshot.done, snapshot.total, snapshot.failed);
+            }
             if !running {
                 view.clear_taskbar_progress();
             }
@@ -1219,16 +1227,28 @@ impl AppView {
         cx.spawn(async move |_entity, cx| {
             let fetched = fetch_release_feed(client, &feed_url, resolve_subscription_host).await;
             cx.update(|cx| {
-                if let Some(handle) = cx.active_window() {
-                    let _ = handle.update(cx, |_, window, cx| {
+                // The window can close between the check and its completion.
+                // A failed handle update must fall through to the no-window
+                // finish, or the check never ends and the spinner stays up.
+                let mut fetched = Some(fetched);
+                let delivered = cx.active_window().is_some_and(|handle| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            let Some(fetched) = fetched.take() else {
+                                return;
+                            };
+                            let _ = weak.update(cx, |view, cx| {
+                                view.finish_update_check(fetched, window, cx);
+                            });
+                        })
+                        .is_ok()
+                });
+                if !delivered {
+                    if let Some(fetched) = fetched.take() {
                         let _ = weak.update(cx, |view, cx| {
-                            view.finish_update_check(fetched, window, cx);
+                            view.finish_update_check_no_window(fetched, cx);
                         });
-                    });
-                } else {
-                    let _ = weak.update(cx, |view, cx| {
-                        view.finish_update_check_no_window(fetched, cx);
-                    });
+                    }
                 }
             });
         })
@@ -1411,7 +1431,10 @@ impl AppView {
         let count = rows.len();
         let url = self.effective_test_url(&rows);
         self.group_test_in_flight = true;
-        self.probe_stop.store(false, Ordering::SeqCst);
+        // Per-run token, as in `spawn_probe`: Stop cancels the active sweep
+        // and never un-cancels a newer one.
+        let stop = Arc::new(AtomicBool::new(false));
+        self.probe_stop = stop.clone();
         let progress = Arc::new(std::sync::Mutex::new(ProbeProgress {
             done: 0,
             total: count,
@@ -1434,19 +1457,25 @@ impl AppView {
                 .ok()
         });
         if window.is_some() {
-            spawn_probe_progress_poller(probe_toast, progress.clone(), active.clone(), cx);
+            spawn_probe_progress_poller(
+                probe_toast,
+                progress.clone(),
+                active.clone(),
+                stop.clone(),
+                cx,
+            );
         }
-        let stop = self.probe_stop.clone();
-        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
+        // The run borrows a clone: the app keeps its own prober, so a prober
+        // swapped in mid-sweep (settings) is neither taken nor restored over.
+        let prober = self.prober.clone_box();
         let weak = cx.entity().downgrade();
         let retry_group = group.clone();
         cx.spawn(async move |_entity, cx| {
             let sweep_progress = progress;
             let sweep_active = active;
-            let (outcomes, prober, stopped) = cx
+            let (outcomes, stopped) = cx
                 .background_executor()
                 .spawn(async move {
-                    let prober = prober;
                     let counting = FailureCountingProber {
                         inner: &*prober,
                         progress: sweep_progress.clone(),
@@ -1460,12 +1489,11 @@ impl AppView {
                     });
                     let stopped = stop.load(Ordering::SeqCst);
                     sweep_active.store(false, Ordering::SeqCst);
-                    (outcomes, prober, stopped)
+                    (outcomes, stopped)
                 })
                 .await;
             cx.update(|cx| {
                 let recorded = weak.update(cx, |view, _| {
-                    view.prober = prober;
                     view.group_test_in_flight = false;
                     view.record_and_persist(&outcomes);
                     // T-19: the sweep's outcomes are already persisted by
@@ -1737,11 +1765,12 @@ impl AppView {
         } else {
             self.probe_url_in_flight = true;
         }
-        // The batch reads the shared stop flag, so it starts from a clean one:
-        // a cancelled sweep must not cancel the next run.
-        self.probe_stop
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let stop = self.probe_stop.clone();
+        // Per-run cancellation token: replacing the Arc means a new probe can
+        // never un-cancel the sweep a Stop already cancelled, and Stop keeps
+        // cancelling exactly the active run. The UI-facing `probe_stop` stays
+        // the cancel handle; its flag now reads as "the live run is stopped".
+        let stop = Arc::new(AtomicBool::new(false));
+        self.probe_stop = stop.clone();
         // K5: batched runs say once that they started. Single-row runs keep
         // the established one-shot result toast, so the editor's own Health
         // tab stays the per-row detail surface.
@@ -1771,20 +1800,27 @@ impl AppView {
             None
         };
         if window.is_some() {
-            spawn_probe_progress_poller(probe_toast, progress.clone(), active.clone(), cx);
+            spawn_probe_progress_poller(
+                probe_toast,
+                progress.clone(),
+                active.clone(),
+                stop.clone(),
+                cx,
+            );
         }
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
+        // See `spawn_group_probe`: the run works on a clone so the app's
+        // prober is never displaced for the duration of the probe.
+        let prober = self.prober.clone_box();
         let weak = cx.entity().downgrade();
 
         let toast_ping = ping;
         cx.spawn(async move |_entity, cx| {
             let sweep_progress = progress;
             let sweep_active = active;
-            let (outcomes, prober) = cx
+            let outcomes = cx
                 .background_executor()
                 .spawn(async move {
-                    let prober = prober;
                     let counting = CountingProber {
                         inner: &*prober,
                         progress: sweep_progress,
@@ -1795,12 +1831,11 @@ impl AppView {
                         test_all_stoppable(&rows, &url, &counting, &stop)
                     };
                     sweep_active.store(false, std::sync::atomic::Ordering::SeqCst);
-                    (outcomes, prober)
+                    outcomes
                 })
                 .await;
             cx.update(|cx| {
                 let recorded = weak.update(cx, |view, _| {
-                    view.prober = prober;
                     if ping {
                         view.probe_ping_in_flight = false;
                     } else {
@@ -2975,11 +3010,14 @@ impl AppView {
         ) {
             return 0;
         }
-        self.conn.last_poll_at = now;
         let targets = self.engine.live_clash_targets();
         if targets.is_empty() {
             return 0;
         }
+        // The gate records a poll that actually ran; an idle tick must leave
+        // the due timestamp alone or the next due check starts from it and
+        // the base cadence starves.
+        self.conn.last_poll_at = now;
         self.ensure_traffic_mirror(cx);
         self.traffic_tick_in_flight = true;
         let exclusions = self.traffic_probe_exclusions();
@@ -3341,5 +3379,111 @@ impl AppView {
     pub fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
             || self.health_store.row_summary(&config.id).trim() == "dead"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::state::AppView;
+    use crate::store::{NewConfig, Store};
+    use crate::{FakeHealthProber, Secret, DEFAULT_TEST_URL};
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext as _, TestAppContext};
+
+    /// Bug 6 regression: the poll gate must not consume the due timestamp
+    /// when the tick has nothing to poll. With no live cores an idle tick
+    /// used to write `last_poll_at = now`, so the next due check started from
+    /// a fresh clock and the base-cadence poll starved.
+    #[gpui_kit::test]
+    fn idle_tick_leaves_the_poll_gate_unconsumed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+
+        let stash: std::rc::Rc<std::cell::RefCell<Option<gpui_kit::Entity<AppView>>>> =
+            Default::default();
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+        let _ = &stash;
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                // No engine running: `live_clash_targets()` is empty.
+                view.conn.last_poll_at = 0;
+            });
+        });
+
+        let started = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
+        assert_eq!(started, 0, "no targets, no poll");
+
+        let gate = view.read_with(cx, |view, _| view.conn.last_poll_at);
+        assert_eq!(
+            gate, 0,
+            "the empty-target early return never burns the due timestamp"
+        );
+    }
+
+    /// Bug 3 regression: the worker gets a clone that shares the configured
+    /// prober's state. The old handoff swapped in a default prober for the
+    /// whole run, so any overlapping probe path probed with the wrong settings.
+    #[gpui_kit::test]
+    fn probe_handoff_keeps_the_configured_prober(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let config = store
+            .add(NewConfig {
+                name: "Alpha".to_string(),
+                protocol: "vless".to_string(),
+                params: Secret::default(),
+                group: "default".to_string(),
+                bind_ip: "127.0.0.1".to_string(),
+                port: String::new(),
+            })
+            .expect("seed works");
+
+        let stash: std::rc::Rc<std::cell::RefCell<Option<gpui_kit::Entity<AppView>>>> =
+            Default::default();
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_latency(&config.id, 77);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.prober = Box::new(prober));
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let started = view.spawn_probe(vec![config.clone()], false, false, None, cx);
+                assert_eq!(started, 1, "the probe started");
+            });
+        });
+
+        let installed = view.read_with(cx, |view, _| {
+            view.prober
+                .url_test(&config, "127.0.0.1", config.port, DEFAULT_TEST_URL)
+                .map(|success| success.latency_ms)
+        });
+        assert_eq!(
+            installed,
+            Ok(77),
+            "the app's prober is still the configured fake while the run is in flight"
+        );
+
+        cx.run_until_parked();
+        let calls = handle.calls_for(&config.id).len();
+        assert!(
+            calls >= 2,
+            "the sweep itself probed through the fake: {calls} calls"
+        );
     }
 }

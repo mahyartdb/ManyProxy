@@ -317,6 +317,7 @@ impl AppView {
         let description = lan_confirm_text(&config.name, &config.bind_ip);
         open_app_alert_dialog(window, cx, move |alert, _, _| {
             let view = view.clone();
+            let cancel_view = view.clone();
             let id = id.clone();
             let description = description.clone();
             alert
@@ -330,6 +331,13 @@ impl AppView {
                 .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_start_selected(&id, window, cx));
+                    true
+                })
+                // A cancelled confirm abandons the batch the Start click
+                // created; settling here keeps the bar from reading
+                // "Starting 0/N" with every verb disabled.
+                .on_cancel(move |_, _, cx| {
+                    cancel_view.update(cx, |view, _| view.settle_batch_start(&[]));
                     true
                 })
         });

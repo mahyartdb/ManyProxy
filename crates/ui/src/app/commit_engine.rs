@@ -34,6 +34,20 @@ impl AppView {
         match self.store.clear_all_traffic() {
             Ok(count) => {
                 self.traffic_last_seen.clear();
+                // The table is authoritative on disk, but `health_store` is
+                // the session mirror the list sorts and paints from. Zero it
+                // too or the cleared columns keep their old totals.
+                let ids: Vec<String> = self
+                    .libraries
+                    .read(cx)
+                    .delegate()
+                    .rows
+                    .iter()
+                    .map(|row| row.id.clone())
+                    .collect();
+                for id in ids {
+                    self.health_store.set_data_traffic(&id, 0, 0);
+                }
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(t!("cleared-traffic-toast", count = count)),
@@ -90,9 +104,26 @@ impl AppView {
     pub fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
+            // A busy refusal must not leave the caller's batch stuck at
+            // "Starting 0/N" with its verbs disabled.
+            self.settle_batch_start(&[]);
             return;
         }
         self.start_in_flight = true;
+        self.commit_start_selected_claimed(id, window, cx);
+    }
+
+    /// The deferred entry points call this with `start_in_flight` already
+    /// claimed synchronously at the click, so a second click inside the
+    /// deferral window is refused by the entry point's own check. Direct
+    /// callers go through `commit_start_selected`, which claims. Every exit
+    /// clears the claim.
+    pub fn commit_start_selected_claimed(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Ok(Some(config)) = self.store.get(id) else {
             self.start_in_flight = false;
             self.settle_batch_start(&[]);
@@ -156,10 +187,15 @@ impl AppView {
     pub fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
+            self.settle_batch_start(&[]);
             return;
         }
         self.start_in_flight = true;
+        self.commit_start_all_claimed(window, cx);
+    }
 
+    /// See `commit_start_selected_claimed`: the caller claims the guard.
+    pub fn commit_start_all_claimed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(rows) = self.list_or_notify(window, cx) else {
             self.start_in_flight = false;
             return;

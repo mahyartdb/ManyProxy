@@ -263,12 +263,55 @@ impl AppView {
         }
     }
 
+    /// The URL-less entry point: direct callers and the shared tests finish a
+    /// refresh without a fetch identity. The fetch path uses
+    /// `finish_subscription_refresh_for_url` so a completion that outlived
+    /// its row's URL cannot overwrite the row.
     pub fn finish_subscription_refresh(
         &mut self,
         sub_id: &str,
         label: &str,
         fetched: Result<FetchedSubscription, String>,
         now: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_subscription_refresh_impl(sub_id, label, fetched, now, None, window, cx);
+    }
+
+    /// The fetch entry point. `expected_url` is the URL this body was fetched
+    /// from; a different current URL means the row was deleted and its rowid
+    /// reused (or edited), so the body must not be applied to it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_subscription_refresh_for_url(
+        &mut self,
+        sub_id: &str,
+        label: &str,
+        fetched: Result<FetchedSubscription, String>,
+        now: i64,
+        expected_url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_subscription_refresh_impl(
+            sub_id,
+            label,
+            fetched,
+            now,
+            Some(expected_url),
+            window,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_subscription_refresh_impl(
+        &mut self,
+        sub_id: &str,
+        label: &str,
+        fetched: Result<FetchedSubscription, String>,
+        now: i64,
+        expected_url: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -305,6 +348,16 @@ impl AppView {
                     window,
                     cx,
                 );
+                return;
+            }
+            // The URL was edited while this fetch was in flight: its body
+            // belongs to the old row, so drop it instead of overwriting the
+            // new URL's configs.
+            Ok(Some(sub)) if expected_url.is_some_and(|expected| sub.url.expose() != expected) => {
+                self.reload(window, cx);
+                self.settle_library_load(cx);
+                self.close_batch_slot(sub_id, window, cx);
+                self.reopen_subscriptions_if_open(window, cx);
                 return;
             }
             Ok(Some(_)) => {}
@@ -349,7 +402,13 @@ impl AppView {
                                 cx,
                             );
                         } else {
-                            let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
+                            if let Err(error) =
+                                self.store.set_subscription_quota(sub_id, fetched.userinfo)
+                            {
+                                self.push_refresh_log(&format!(
+                                    "warning subscription \"{label}\" quota not saved: {error}"
+                                ));
+                            }
                             let failed = outcome.failures.len();
                             let (added_names, updated_names, removed_names, kept_in_use_names) =
                                 if named {
@@ -512,10 +571,25 @@ impl AppView {
         sub_id: &str,
         fetched: Result<FetchedSubscription, String>,
         now: i64,
+        expected_url: &str,
         cx: &mut Context<Self>,
     ) {
         self.refresh.inflight.remove(sub_id);
         let named = self.refresh.inflight_named.remove(sub_id);
+
+        // See `finish_subscription_refresh_for_url`: a fetch whose row now
+        // points at another URL must not write its body into that row.
+        if matches!(
+            self.store.get_subscription(sub_id),
+            Ok(Some(sub)) if sub.url.expose() != expected_url
+        ) {
+            if self.refresh.members.is_empty() {
+                self.take_batch_counts();
+            }
+            self.settle_library_load(cx);
+            self.reload_quiet(cx);
+            return;
+        }
 
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
@@ -525,9 +599,6 @@ impl AppView {
                     .refresh_with_body_running(sub_id, &fetched.body, now, &running)
                 {
                     Ok(outcome) => {
-                        if outcome.error.is_none() {
-                            let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
-                        }
                         let label = self
                             .store
                             .get_subscription(sub_id)
@@ -535,6 +606,15 @@ impl AppView {
                             .flatten()
                             .map(|sub| sub.label)
                             .unwrap_or_else(|| sub_id.to_string());
+                        if outcome.error.is_none() {
+                            if let Err(error) =
+                                self.store.set_subscription_quota(sub_id, fetched.userinfo)
+                            {
+                                self.push_refresh_log(&format!(
+                                    "warning subscription \"{label}\" quota not saved: {error}"
+                                ));
+                            }
+                        }
                         let failed = outcome.failures.len();
                         if let Some(error) = outcome.error {
                             self.refresh.last_error = Some(t!(

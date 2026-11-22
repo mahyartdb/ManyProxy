@@ -2068,6 +2068,14 @@ fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
         .expect("traffic accrues");
     let (view, cx) = mount_view(store, cx);
     paint_frame(cx);
+    // Hydrate the session mirror the list paints from, so the reset has stale
+    // totals to clear rather than an absent entry.
+    cx.update(|_, cx| view.update(cx, |view, cx| view.ensure_traffic_mirror(cx)));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.health_store.data_traffic(&row.id)),
+        Some((2_048, 1_024)),
+        "the mirror starts at the seeded totals"
+    );
     // The engine bar reads the cached copy, not the store; assert through it
     // so a cache that misses a mid-session mutation stays red here.
     let bar_before = label_of("engine-bar-traffic", cx);
@@ -2105,6 +2113,11 @@ fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
         after.1,
         Some("out 0 B · in 0 B".to_string()),
         "the summed copy reads exactly zero, not a substring of a larger figure"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.health_store.data_traffic(&row_id)),
+        Some((0, 0)),
+        "the session mirror zeroes with the stored counters"
     );
     assert_eq!(notification_count(cx), 1, "reset notifies");
 }

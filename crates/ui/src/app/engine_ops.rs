@@ -219,6 +219,9 @@ impl AppView {
 
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
+            // The batch bar snapshots before calling, so a busy refusal must
+            // still settle its "Starting 0/N" run.
+            self.settle_batch_start(&[]);
             return;
         }
         if requires_lan_confirm(&config.bind_ip) {
@@ -646,14 +649,14 @@ impl AppView {
                 if let Some(handle) = cx.active_window() {
                     let _ = handle.update(cx, |_, window, cx| {
                         let _ = weak.update(cx, |view, cx| {
-                            view.finish_subscription_refresh(
-                                &sub_id, &label, fetched, now, window, cx,
+                            view.finish_subscription_refresh_for_url(
+                                &sub_id, &label, fetched, now, &url, window, cx,
                             );
                         });
                     });
                 } else {
                     let _ = weak.update(cx, |view, cx| {
-                        view.finish_subscription_refresh_no_window(&sub_id, fetched, now, cx);
+                        view.finish_subscription_refresh_no_window(&sub_id, fetched, now, &url, cx);
                     });
                 }
             });

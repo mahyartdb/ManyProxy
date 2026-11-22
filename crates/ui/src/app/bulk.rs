@@ -556,6 +556,7 @@ impl AppView {
     ) {
         if rows.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
+            self.settle_batch_start(&[]);
             return;
         }
         if self.start_in_flight {
@@ -574,6 +575,7 @@ impl AppView {
             let description = lan_confirm_description(&lan);
             open_app_alert_dialog(window, cx, move |alert, _, _| {
                 let view = view.clone();
+                let cancel_view = view.clone();
                 let ids = ids.clone();
                 let description = description.clone();
                 alert
@@ -588,6 +590,13 @@ impl AppView {
                     .on_ok(move |_, window, cx| {
                         let ids = ids.clone();
                         view.update(cx, |view, cx| view.commit_bulk_start_ids(&ids, window, cx));
+                        true
+                    })
+                    // A cancelled confirm abandons the batch the Start click
+                    // created; settling here keeps the bar from reading
+                    // "Starting 0/N" with every verb disabled.
+                    .on_cancel(move |_, _, cx| {
+                        cancel_view.update(cx, |view, _| view.settle_batch_start(&[]));
                         true
                     })
             });
@@ -630,6 +639,16 @@ impl AppView {
             return;
         }
         self.start_in_flight = true;
+        self.commit_bulk_start_ids_claimed(ids, window, cx);
+    }
+
+    /// See `commit_start_selected_claimed`: the caller claims the guard.
+    pub fn commit_bulk_start_ids_claimed(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
             window.push_notification(Notification::error(t!("cannot-start", reason = reason)), cx);
@@ -718,12 +737,20 @@ impl AppView {
         }
     }
 
+    /// The 1ms-deferred apply behind `start_row`/`start_selected_rows`. The
+    /// guard is claimed HERE, synchronously, so a second click inside the
+    /// deferral window is refused by the entry point instead of queueing a
+    /// second engine apply. The claimed commit clears it on every exit.
     pub fn spawn_commit_start_selected(
         &mut self,
         id: String,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.start_in_flight {
+            return;
+        }
+        self.start_in_flight = true;
         let handle = window.window_handle();
         let view = cx.entity().clone();
         cx.spawn(async move |_, cx| {
@@ -732,14 +759,19 @@ impl AppView {
                 .await;
             let _ = handle.update(cx, |_, window, cx| {
                 view.update(cx, |view, cx| {
-                    view.commit_start_selected(&id, window, cx);
+                    view.commit_start_selected_claimed(&id, window, cx);
                 });
             });
         })
         .detach();
     }
 
+    /// See `spawn_commit_start_selected`: claim synchronously, defer the apply.
     pub fn spawn_commit_start_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.start_in_flight {
+            return;
+        }
+        self.start_in_flight = true;
         let handle = window.window_handle();
         let view = cx.entity().clone();
         cx.spawn(async move |_, cx| {
@@ -747,18 +779,23 @@ impl AppView {
                 .timer(Duration::from_millis(1))
                 .await;
             let _ = handle.update(cx, |_, window, cx| {
-                view.update(cx, |view, cx| view.commit_start_all(window, cx));
+                view.update(cx, |view, cx| view.commit_start_all_claimed(window, cx));
             });
         })
         .detach();
     }
 
+    /// See `spawn_commit_start_selected`: claim synchronously, defer the apply.
     pub fn spawn_commit_bulk_start_ids(
         &mut self,
         ids: Vec<String>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.start_in_flight {
+            return;
+        }
+        self.start_in_flight = true;
         let handle = window.window_handle();
         let view = cx.entity().clone();
         cx.spawn(async move |_, cx| {
@@ -767,7 +804,7 @@ impl AppView {
                 .await;
             let _ = handle.update(cx, |_, window, cx| {
                 view.update(cx, |view, cx| {
-                    view.commit_bulk_start_ids(&ids, window, cx);
+                    view.commit_bulk_start_ids_claimed(&ids, window, cx);
                 });
             });
         })
@@ -1473,5 +1510,105 @@ impl AppView {
                     false
                 })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::bulk::AppView;
+    use crate::store::{NewConfig, Store};
+    use crate::{BatchKind, BatchRun};
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext as _, TestAppContext};
+
+    fn one_row(store: &mut Store) -> crate::store::ProxyConfig {
+        let seed = NewConfig {
+            name: "Solo".to_string(),
+            protocol: "vless".to_string(),
+            params: Default::default(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: "10801".to_string(),
+        };
+        store.add(seed).expect("seed works")
+    }
+
+    /// Bug 1/2 regression: the batch bar snapshots before dispatch, so a busy
+    /// refusal (the guard claimed by an earlier click's deferred apply) must
+    /// settle the snapshot instead of leaving "Starting 0/N" with the verbs
+    /// disabled. The synchronous claim lives in the `spawn_commit_*` entry
+    /// points; the commit's own busy branch settles whatever batch exists.
+    #[gpui_kit::test]
+    fn busy_start_refusal_settles_the_snapshotted_batch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = one_row(&mut store);
+
+        let stash: std::rc::Rc<std::cell::RefCell<Option<gpui_kit::Entity<AppView>>>> =
+            Default::default();
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+        let _ = &stash;
+
+        // The bar snapshots its ids before dispatch; stand in for that
+        // snapshot directly so only the busy commit below can settle it.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.batch = Some(BatchRun::new(BatchKind::Start, vec![row.id.clone()]));
+                view.start_in_flight = true;
+                view.commit_start_selected(&row.id, window, cx);
+            });
+        });
+        assert!(
+            !view.read_with(cx, |view, _| view.batch_running()),
+            "the busy refusal settled the batch: no stuck Starting 0/1"
+        );
+    }
+
+    /// Bug 1 regression: the deferred entry point claims the guard
+    /// synchronously, so a second click inside the deferral window is refused
+    /// instead of queueing a second engine apply.
+    #[gpui_kit::test]
+    fn spawn_start_claims_the_guard_before_the_deferred_apply(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = one_row(&mut store);
+
+        let stash: std::rc::Rc<std::cell::RefCell<Option<gpui_kit::Entity<AppView>>>> =
+            Default::default();
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+        let _ = &stash;
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.spawn_commit_start_selected(row.id.clone(), window, cx);
+            });
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.start_in_flight),
+            "the guard is claimed before the 1ms timer fires"
+        );
+
+        // The queued apply still runs and clears the claim. Advance the test
+        // clock past the 1ms timer, then drive the dispatcher: `VisualTestContext`
+        // only drains the background executor, not foreground tasks.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(2));
+        cx.cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |view, _| view.start_in_flight),
+            "the claimed commit cleared the guard on completion"
+        );
     }
 }
