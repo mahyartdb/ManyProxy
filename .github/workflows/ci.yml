@@ -28,16 +28,30 @@ env:
 # resources. A Linux runner would need the full GPUI system dependency set
 # (x11/wayland/vulkan) before it could compile anything, so the matrix stays
 # cheap instead of pretending to cover it.
+#
+# Clippy and test are separate jobs, not steps of one: clippy compiles
+# through clippy-driver, whose artifacts never mix with cargo test's, so in
+# the old single job the two phases simply queued (55s + 177s). Parallel
+# jobs make the gate's wall-clock the slower job instead of the sum.
 jobs:
-  check:
+  lint:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Same key as test so the dependency layer (rusqlite's bundled C,
+          # the GUI stack) is built once. Only fingerprints match per-crate:
+          # clippy still compiles every workspace crate itself.
+          shared-key: windows
+          # Read-only: the test job owns writes to this key; concurrent
+          # writers make every loser log a conflict.
+          save-if: false
+          cache-on-failure: true
       - name: Doc paths
         shell: pwsh
         run: |
@@ -68,5 +82,17 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
       - name: Test
         run: cargo test --locked
