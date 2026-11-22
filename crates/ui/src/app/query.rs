@@ -148,8 +148,11 @@ impl AppView {
         self.query_edited(cx);
     }
 
-    /// The two port fields and a `port=` token are views of one value. Invalid
-    /// text keeps the previous filter and shows the inline error.
+    /// The two port fields and a `port=` token are views of one value. The
+    /// search bytes are left alone: the input widget owns them, and
+    /// `FilterQuery::set_search` ignores a token whose value did not change,
+    /// so a stale token cannot undo this range. Invalid text keeps the
+    /// previous filter and shows the inline error.
     pub fn set_port_range(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let from = from.trim();
         let to = to.trim();

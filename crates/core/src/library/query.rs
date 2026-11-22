@@ -101,14 +101,18 @@ pub enum Facet {
 
 impl FilterQuery {
     /// Write the search text. A `port=` token is the compatibility shortcut:
-    /// it seeds the port facet and stays in the field bytes. Typing a name
-    /// while a popover-set port is live leaves that port alone; removing the
-    /// token (or clearing the field) releases it.
+    /// it seeds the port facet and stays in the field bytes. Only a token
+    /// that parses differently from the previous text's token moves the
+    /// facet: typing a name leaves a popover-set port alone, and removing
+    /// the token (or clearing a field that holds one) releases it.
     pub fn set_search(&mut self, text: impl Into<String>) {
         let text = text.into();
         let (next_port, _) = split_port_query(&text);
         let (current_port, _) = split_port_query(&self.search);
-        if next_port.is_some() || current_port.is_some() {
+        // The popover writes `port` directly and never touches the field, so
+        // an unchanged token is already represented: re-adopting it would
+        // undo the popover's range on the next keystroke.
+        if next_port != current_port {
             self.port = next_port;
         }
         self.search = text;
@@ -548,6 +552,37 @@ mod tests {
             filter(&rows, &index, &facts, &LibraryScope::All, &query),
             Vec::<usize>::new(),
             "the remaining text still ANDs with the port"
+        );
+    }
+
+    #[test]
+    fn popover_port_survives_an_unchanged_token() {
+        let mut query = FilterQuery::default();
+        query.set_search("port=1080");
+        assert_eq!(query.port, Some(PortPredicate { lo: 1080, hi: 1080 }));
+
+        // The popover writes the facet directly; the field bytes still hold
+        // the token that seeded it.
+        query.port = Some(PortPredicate { lo: 2000, hi: 3000 });
+        query.set_search("port=1080 alpha");
+        assert_eq!(
+            query.port,
+            Some(PortPredicate { lo: 2000, hi: 3000 }),
+            "an unchanged token cannot resurrect the old range"
+        );
+        assert_eq!(query.search_text(), "alpha");
+
+        query.set_search("port=2200 alpha");
+        assert_eq!(
+            query.port,
+            Some(PortPredicate { lo: 2200, hi: 2200 }),
+            "a token the user retargets still wins"
+        );
+
+        query.set_search("");
+        assert_eq!(
+            query.port, None,
+            "clearing a field that held a token releases the port"
         );
     }
 
