@@ -1430,6 +1430,7 @@ cannot-load-presets = Cannot load routing presets: { $error }
 cannot-load-rule-sets = Cannot load rule sets: { $error }
 export-failed = Export failed: { $error }
 restore-failed = Restore failed: { $error } A backup copy (library.db.bak-*) may sit beside the database if the library looks empty.
+restore-failed-backup = Restore failed: { $error } Recovery point: { $backup }
 restore-failed-clear = Restore failed: cannot clear the library ({ $error })
 restore-failed-after-clear = Restore failed after clearing the library: { $error }
 restore-reopen-failed = Restore swapped but reopen failed ({ $error }); backup at { $backup }. Restart the app to open the restored library.

@@ -354,19 +354,32 @@ pub const AUTO_PORT_PROBE_ATTEMPTS: u32 = 1;
 /// another process holds is skipped, so a new row never lands on a port
 /// that is already busy.
 ///
+/// The auto-assignment probes the address the row will actually bind, so a
+/// port held on that interface is skipped. A blank bind means loopback.
+fn auto_port_bind(bind_ip: &str) -> &str {
+    let trimmed = bind_ip.trim();
+    if trimmed.is_empty() {
+        DEFAULT_BIND
+    } else {
+        trimmed
+    }
+}
+
 /// `taken` carries the ports the DB already assigns (the picked port joins
 /// it). The walk is bounded by the auto range itself, and every candidate
 /// costs one bind attempt.
 fn take_free_auto_port(
     candidates: impl Iterator<Item = u16>,
+    bind_ip: &str,
     taken: &mut HashSet<i64>,
 ) -> Result<u16, &'static str> {
+    let bind_ip = auto_port_bind(bind_ip);
     let mut held = false;
     for port in candidates {
         if taken.contains(&(port as i64)) {
             continue;
         }
-        if crate::engine::probe_bind_available_with(DEFAULT_BIND, port, AUTO_PORT_PROBE_ATTEMPTS)
+        if crate::engine::probe_bind_available_with(bind_ip, port, AUTO_PORT_PROBE_ATTEMPTS)
             .is_err()
         {
             held = true;
@@ -461,7 +474,12 @@ fn subscription_url_parts(trimmed: &str) -> Option<(&'static str, &str)> {
             _ => return None,
         },
     };
-    let authority = after.split('/').next().unwrap_or(after);
+    // The authority ends at the first path, query or fragment delimiter.
+    // Stopping only at `/` let `https://127.0.0.1:8080?@evil.com` pass the
+    // policy as `evil.com` while the fetch went to loopback.
+    let authority = after
+        .find(['/', '?', '#'])
+        .map_or(after, |end| &after[..end]);
     let host_part = authority.rsplit('@').next().unwrap_or(authority);
     let host = if let Some(rest) = host_part.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
@@ -559,10 +577,17 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
     v4.is_loopback()
         || v4.is_unspecified()
         || v4.is_link_local()
+        || octets[0] == 0
         || octets[0] == 10
         || (octets[0] == 172 && (16..=31).contains(&octets[1]))
         || (octets[0] == 192 && octets[1] == 168)
         || octets[0] == 127
+        // Shared address space (carrier-grade NAT).
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        // Benchmarking range.
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        // Reserved and broadcast space.
+        || octets[0] >= 240
 }
 
 fn parse_bare_ipv4(host: &str) -> Option<Ipv4Addr> {
@@ -4052,6 +4077,19 @@ pub struct RestoreOutcome {
     pub presets: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportOutcome {
+    pub path: PathBuf,
+    /// Rows that made it into the payload.
+    pub exported: usize,
+    /// Exported rows whose params are import-shaped; the rest restore but
+    /// cannot be re-imported elsewhere.
+    pub importable: usize,
+    /// Row ids omitted because they could not be read (or had an unreadable
+    /// sync baseline). Empty when the export is complete.
+    pub skipped: Vec<String>,
+}
+
 fn paths_equal(a: &Path, b: &Path) -> bool {
     if let (Ok(canonical_a), Ok(canonical_b)) = (a.canonicalize(), b.canonicalize()) {
         return canonical_a == canonical_b;
@@ -4306,25 +4344,106 @@ pub struct Store {
 static WRITE_PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn swap_tmp_over_live(tmp: &Path, db_path: &Path) -> std::io::Result<()> {
-    if std::fs::rename(tmp, db_path).is_ok() {
-        return Ok(());
+    let stage = match db_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(format!(
+            ".{}.staged-{}",
+            db_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("library.db"),
+            unique_name_suffix(now_unix())
+        )),
+        _ => PathBuf::from(format!(
+            ".library.staged-{}",
+            unique_name_suffix(now_unix())
+        )),
+    };
+
+    // Stage a verified replacement and flush it before the live path is
+    // touched. A failed swap below can then always leave a complete file at
+    // `db_path` instead of an empty one.
+    let staged = (|| -> std::io::Result<()> {
+        std::fs::copy(tmp, &stage)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stage)?
+            .sync_all()
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&stage);
+        return Err(error);
     }
+
+    let replace_error = match std::fs::rename(&stage, db_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+
     #[cfg(windows)]
     {
-        let _ = std::fs::remove_file(db_path);
+        // Windows rename cannot replace a file another process holds open.
+        // Move the live file aside rather than deleting it, and put it back
+        // when the staged replacement cannot land.
+        if !db_path.exists() {
+            let _ = std::fs::remove_file(&stage);
+            return Err(replace_error);
+        }
+        let base = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("library.db");
+        let aside = match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                parent.join(format!("{base}.bak-{}", unique_name_suffix(now_unix())))
+            }
+            _ => PathBuf::from(format!("{base}.bak-{}", unique_name_suffix(now_unix()))),
+        };
+        if let Err(error) = std::fs::rename(db_path, &aside) {
+            let _ = std::fs::remove_file(&stage);
+            return Err(error);
+        }
         for suffix in ["-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(sibling_sidecar(db_path, suffix));
         }
-        if std::fs::rename(tmp, db_path).is_ok() {
-            return Ok(());
+        match std::fs::rename(&stage, db_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&aside);
+                let _ = std::fs::remove_file(tmp);
+                Ok(())
+            }
+            Err(error) => {
+                let restored = std::fs::rename(&aside, db_path)
+                    .or_else(|_| std::fs::copy(&aside, db_path).map(|_| ()));
+                let _ = std::fs::remove_file(&stage);
+                match restored {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&aside);
+                        Err(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{error}; the previous library was put back at {}",
+                                db_path.display()
+                            ),
+                        ))
+                    }
+                    Err(restore_error) => Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; cannot put the previous library back ({restore_error}); it is preserved at {}",
+                            aside.display()
+                        ),
+                    )),
+                }
+            }
         }
-        std::fs::copy(tmp, db_path)?;
-        let _ = std::fs::remove_file(tmp);
-        Ok(())
     }
     #[cfg(not(windows))]
     {
-        std::fs::rename(tmp, db_path)
+        let _ = std::fs::remove_file(&stage);
+        Err(replace_error)
     }
 }
 
@@ -4573,6 +4692,29 @@ impl Store {
         Ok(backup)
     }
 
+    /// The newest timestamped backup beside `db_path` (same naming as
+    /// [`Self::backup_db_file`]). A failed restore uses this to point the user
+    /// at the recovery point instead of reopening a missing live path, which
+    /// would silently create an empty library.
+    pub fn latest_db_backup(db_path: &Path) -> Option<PathBuf> {
+        let base = db_path.file_name()?.to_str()?;
+        let prefix = format!("{base}.bak-");
+        let parent = match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        std::fs::read_dir(parent)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .max()
+    }
+
     fn remove_restore_temp(tmp: &Path) {
         let _ = std::fs::remove_file(tmp);
         for suffix in ["-wal", "-shm", "-journal"] {
@@ -4637,12 +4779,21 @@ impl Store {
         })()
         .inspect_err(|_| Self::remove_restore_temp(&tmp))?;
         swap_tmp_over_live(&tmp, db_path).map_err(|error| {
-            Self::remove_restore_temp(&tmp);
+            // A swap that failed before touching the live path leaves the
+            // restored bytes redundant, but one that already removed it must
+            // keep them: the temp is the only complete replacement on disk.
+            let message = if db_path.exists() {
+                Self::remove_restore_temp(&tmp);
+                error.to_string()
+            } else {
+                format!("{error}; restore file kept at {}", tmp.display())
+            };
             StoreError::Io {
                 path: db_path.to_path_buf(),
-                message: error.to_string(),
+                message,
             }
         })?;
+        Self::remove_restore_temp(&tmp);
 
         for suffix in ["-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(sibling_sidecar(db_path, suffix));
@@ -5066,12 +5217,14 @@ impl Store {
         for item in fields {
             let port = match item.port {
                 Some(port) => port,
-                None => match take_free_auto_port(auto_port_candidates(), &mut taken) {
-                    Ok(port) => port,
-                    Err(reason) => {
-                        return Err(StoreError::Invalid(vec![FieldError::new("port", reason)]));
+                None => {
+                    match take_free_auto_port(auto_port_candidates(), &item.bind_ip, &mut taken) {
+                        Ok(port) => port,
+                        Err(reason) => {
+                            return Err(StoreError::Invalid(vec![FieldError::new("port", reason)]));
+                        }
                     }
-                },
+                }
             };
             taken.insert(port as i64);
             assigned.push(ValidatedConfig {
@@ -5182,17 +5335,28 @@ impl Store {
     }
 
     pub fn export_library_json_with_quarantine(&self) -> Result<(String, Vec<String>), StoreError> {
+        let (payload, skipped, _, _) = self.export_library_payload()?;
+        Ok((payload, skipped))
+    }
+
+    fn export_library_payload(&self) -> Result<(String, Vec<String>, usize, usize), StoreError> {
         let (rows, quarantined) = self.list_with_quarantine()?;
-        let mut skipped: Vec<String> = quarantined.iter().map(|q| q.id.clone()).collect();
+        let mut skipped: Vec<String> = quarantined.into_iter().map(|q| q.id).collect();
         let (rows, mut bad_synced) = self.without_unreadable_synced(rows);
         skipped.append(&mut bad_synced);
 
-        let subs = self.list_subscriptions()?;
+        let (subs, bad_subs) = self.list_subscriptions_with_quarantine()?;
+        skipped.extend(bad_subs.into_iter().map(|q| q.id));
+        skipped.sort();
+        skipped.dedup();
+        let exported = rows.len();
+        let importable = count_importable(&rows);
+
         let tombstones = self.list_tombstones_raw()?;
         let payload = export_payload_full(&rows, &subs, &tombstones);
 
         let enriched = self.enrich_export_payload(&payload, &rows)?;
-        Ok((enriched, skipped))
+        Ok((enriched, skipped, exported, importable))
     }
 
     fn list_tombstones_raw(&self) -> Result<Vec<(String, String)>, StoreError> {
@@ -5284,10 +5448,10 @@ impl Store {
                 params![id],
             )?;
 
-            let _ = tx.execute(
+            tx.execute(
                 "DELETE FROM health_history WHERE config_id = ?1",
                 params![id],
-            );
+            )?;
         }
         tx.commit()?;
         Ok(removed > 0)
@@ -5316,32 +5480,33 @@ impl Store {
                 "Group name cannot be empty",
             )]));
         }
-        let changed = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
             "UPDATE proxy_configs SET grp = ?1 WHERE grp = ?2",
             params![new, old],
         )?;
 
-        let moved_subs = self.conn.execute(
+        let moved_subs = tx.execute(
             "UPDATE subscriptions SET grp = ?1 WHERE grp = ?2",
             params![new, old],
         )?;
 
         if old != new {
             let old_key = Self::group_skip_key(&old);
-            if let Some(value) = self.get_meta(&old_key)? {
-                self.set_meta(&Self::group_skip_key(&new), &value)?;
-                self.conn
-                    .execute("DELETE FROM meta WHERE key = ?1", params![old_key])?;
+            if let Some(value) = Self::meta_value(&tx, &old_key)? {
+                Self::meta_write(&tx, &Self::group_skip_key(&new), &value)?;
+                tx.execute("DELETE FROM meta WHERE key = ?1", params![old_key])?;
             }
             // T-19: the auto-clear flag follows the renamed group; when the
             // new name already carries its own entry it wins, and the stale
             // old key never lingers.
-            let mut auto_clear_groups = self.auto_clear_groups_map();
+            let mut auto_clear_groups = Self::auto_clear_groups_map_from(&tx);
             if let Some(migrated) = auto_clear_groups.remove(&old) {
                 auto_clear_groups.entry(new.clone()).or_insert(migrated);
-                self.auto_clear_groups_write(&auto_clear_groups)?;
+                Self::auto_clear_groups_write_to(&tx, &auto_clear_groups)?;
             }
         }
+        tx.commit()?;
         Ok(GroupRenameOutcome {
             rows: changed,
             subscriptions: moved_subs,
@@ -5523,11 +5688,11 @@ impl Store {
               (SELECT id FROM proxy_configs WHERE grp = ?1)",
             params![group],
         )?;
-        let _ = self.conn.execute(
+        self.conn.execute(
             "DELETE FROM health_history WHERE config_id IN
               (SELECT id FROM proxy_configs WHERE grp = ?1)",
             params![group],
-        );
+        )?;
         Ok(cleared)
     }
 
@@ -6302,15 +6467,45 @@ impl Store {
     }
 
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs,
-                     quota_used, quota_total, quota_expire
-             FROM subscriptions ORDER BY id",
-        )?;
-        let rows = stmt
-            .query_map([], map_subscription_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let (good, _) = self.list_subscriptions_with_quarantine()?;
+        Ok(good)
+    }
+
+    /// The tolerant list: one row whose URL cannot be unsealed must not take
+    /// the whole subscription list down. `list_subscriptions` returns the
+    /// readable rows; this names the skipped ones so the UI and export can
+    /// still surface the diagnosis.
+    pub fn list_subscriptions_with_quarantine(
+        &self,
+    ) -> Result<(Vec<Subscription>, Vec<QuarantinedRow>), StoreError> {
+        let ids: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM subscriptions ORDER BY id")?;
+            let mapped = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            out
+        };
+        let mut good = Vec::with_capacity(ids.len());
+        let mut quarantined = Vec::new();
+        for id in ids {
+            let mut per_stmt = self.conn.prepare(
+                "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs,
+                         quota_used, quota_total, quota_expire
+                 FROM subscriptions WHERE id = ?1",
+            )?;
+            match per_stmt.query_row(params![id], map_subscription_row) {
+                Ok(row) => good.push(row),
+                Err(error) => quarantined.push(QuarantinedRow {
+                    id: id.to_string(),
+                    cause: format!("subscription {id} unreadable ({error}); remove or re-add it"),
+                }),
+            }
+        }
+        Ok((good, quarantined))
     }
 
     pub fn get_subscription(&self, id: &str) -> Result<Option<Subscription>, StoreError> {
@@ -6400,7 +6595,14 @@ impl Store {
             Ok(rowid) => rowid,
             Err(_) => return Ok(false),
         };
-        if self.get_subscription(id)?.is_none() {
+        // A corrupt URL must not keep its row undeletable: existence is a
+        // count, never an unseal of the row this call is about to drop.
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM subscriptions WHERE id = ?1",
+            params![rowid],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
             return Ok(false);
         }
         let tx = self.conn.transaction()?;
@@ -6839,7 +7041,7 @@ impl Store {
             .map(|row| row.port as i64)
             .collect();
         let mut next_free_port = || -> Result<u16, &'static str> {
-            take_free_auto_port(auto_port_candidates(), &mut taken)
+            take_free_auto_port(auto_port_candidates(), DEFAULT_BIND, &mut taken)
         };
         for (key, index, config) in &candidates {
             if consumed.contains(key) {
@@ -6948,10 +7150,10 @@ impl Store {
                         "DELETE FROM health_snapshots WHERE config_id = ?1",
                         params![id],
                     )?;
-                    let _ = tx.execute(
+                    tx.execute(
                         "DELETE FROM health_history WHERE config_id = ?1",
                         params![id],
-                    );
+                    )?;
                 }
             }
         }
@@ -7280,7 +7482,7 @@ impl Store {
         &self,
         path: &Path,
         confirmed: bool,
-    ) -> Result<Option<PathBuf>, StoreError> {
+    ) -> Result<Option<ExportOutcome>, StoreError> {
         if !confirmed {
             return Ok(None);
         }
@@ -7293,7 +7495,7 @@ impl Store {
                 )]));
             }
         }
-        let payload = self.export_library_json()?;
+        let (payload, skipped, exported, importable) = self.export_library_payload()?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|error| StoreError::Io {
@@ -7307,21 +7509,31 @@ impl Store {
             path: path.to_path_buf(),
             message: error.to_string(),
         };
-        if let Err(error) = std::fs::write(&tmp, payload).map_err(io_error) {
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(payload.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(error) = written {
             let _ = std::fs::remove_file(&tmp);
-            return Err(error);
+            return Err(io_error(error));
         }
         // T-34/arms: the rename must not depend on an external `icacls` call
         // succeeding — hardening the transient temp file first could strip its
         // inherited ACLs and leave it un-renameable (ACCESS_DENIED), which
         // lost the whole export on the windows-arm64 runner. The shipped file
         // is hardened right after it lands in place.
-        if let Err(error) = std::fs::rename(&tmp, path).map_err(io_error) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
         harden_file_permissions(path);
-        Ok(Some(path.to_path_buf()))
+        Ok(Some(ExportOutcome {
+            path: path.to_path_buf(),
+            exported,
+            importable,
+            skipped,
+        }))
     }
 
     pub fn restore_library_json(&mut self, payload: &str) -> Result<RestoreOutcome, StoreError> {
@@ -8100,8 +8312,8 @@ impl Store {
 
     pub const META_TEST_URL: &str = "test_url";
 
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    fn meta_value(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
+        let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
         let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -8109,13 +8321,21 @@ impl Store {
         }
     }
 
-    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+    fn meta_write(conn: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
+        conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Self::meta_value(&self.conn, key)
+    }
+
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        Self::meta_write(&self.conn, key, value)
     }
 
     pub fn restore_running(&self) -> bool {
@@ -8182,8 +8402,8 @@ impl Store {
 
     /// T-19: normalized group name → opt-in config; absent or malformed meta
     /// reads as off everywhere.
-    fn auto_clear_groups_map(&self) -> BTreeMap<String, AutoClearGroupConfig> {
-        match self.get_meta(Self::META_AUTO_CLEAR_GROUPS) {
+    fn auto_clear_groups_map_from(conn: &Connection) -> BTreeMap<String, AutoClearGroupConfig> {
+        match Self::meta_value(conn, Self::META_AUTO_CLEAR_GROUPS) {
             Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
                 .ok()
                 .and_then(|value| value.as_object().cloned())
@@ -8207,8 +8427,12 @@ impl Store {
         }
     }
 
-    fn auto_clear_groups_write(
-        &mut self,
+    fn auto_clear_groups_map(&self) -> BTreeMap<String, AutoClearGroupConfig> {
+        Self::auto_clear_groups_map_from(&self.conn)
+    }
+
+    fn auto_clear_groups_write_to(
+        conn: &Connection,
         map: &BTreeMap<String, AutoClearGroupConfig>,
     ) -> Result<(), StoreError> {
         let entries: serde_json::Map<String, serde_json::Value> = map
@@ -8224,10 +8448,18 @@ impl Store {
                 )
             })
             .collect();
-        self.set_meta(
+        Self::meta_write(
+            conn,
             Self::META_AUTO_CLEAR_GROUPS,
             &serde_json::Value::Object(entries).to_string(),
         )
+    }
+
+    fn auto_clear_groups_write(
+        &mut self,
+        map: &BTreeMap<String, AutoClearGroupConfig>,
+    ) -> Result<(), StoreError> {
+        Self::auto_clear_groups_write_to(&self.conn, map)
     }
 
     pub fn auto_clear_group(&self, group: &str) -> Option<AutoClearGroupConfig> {
@@ -8648,6 +8880,8 @@ impl Store {
             Ok(Some(raw)) => raw
                 .trim()
                 .parse::<f32>()
+                .ok()
+                .filter(|width| width.is_finite())
                 .map(|width| width.clamp(Self::INSPECTOR_WIDTH_MIN, Self::INSPECTOR_WIDTH_MAX))
                 .unwrap_or(Self::INSPECTOR_WIDTH_DEFAULT),
             _ => Self::INSPECTOR_WIDTH_DEFAULT,
@@ -8951,7 +9185,7 @@ impl Store {
         ids.into_iter().filter(|id| known.contains(id)).collect()
     }
 
-    fn auto_port_excluding(&self, exclude: Option<u16>) -> Result<u16, StoreError> {
+    fn auto_port_excluding(&self, bind_ip: &str, exclude: Option<u16>) -> Result<u16, StoreError> {
         let mut stmt = self.conn.prepare("SELECT port FROM proxy_configs")?;
         let mut taken: HashSet<i64> = stmt
             .query_map([], |row| row.get(0))?
@@ -8959,7 +9193,7 @@ impl Store {
         if let Some(own) = exclude {
             taken.remove(&(own as i64));
         }
-        take_free_auto_port(auto_port_candidates(), &mut taken)
+        take_free_auto_port(auto_port_candidates(), bind_ip, &mut taken)
             .map_err(|reason| StoreError::Invalid(vec![FieldError::new("port", reason)]))
     }
 
@@ -8996,7 +9230,10 @@ impl Store {
         };
         let port = match &patch.port {
             Some(raw) => match parse_port_field(raw) {
-                Ok(None) => match self.auto_port_excluding(Some(current.port)) {
+                Ok(None) => match self.auto_port_excluding(
+                    bind_ip.as_deref().unwrap_or(DEFAULT_BIND),
+                    Some(current.port),
+                ) {
                     Ok(port) => Some(port),
                     Err(StoreError::Invalid(mut auto_errors)) => {
                         errors.append(&mut auto_errors);
@@ -9095,6 +9332,63 @@ mod tests {
             2,
             "failed rename writes nothing"
         );
+    }
+
+    #[test]
+    fn rename_group_rolls_back_rows_when_a_later_write_fails() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut row = valid_input("A");
+        row.group = "old".to_string();
+        store.add(row).expect("row seeds");
+        let sub = add_sub(&mut store, "old");
+        store
+            .set_group_skip_refresh("old", true)
+            .expect("flag seeds");
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_sub_rename BEFORE UPDATE OF grp ON subscriptions
+                 BEGIN SELECT RAISE(ABORT, 'nope'); END;",
+            )
+            .expect("trigger seeds");
+
+        let error = store
+            .rename_group("old", "new")
+            .expect_err("the later write aborts the rename");
+        assert!(
+            error.to_string().contains("nope"),
+            "the real cause survives: {error}"
+        );
+        assert!(
+            store
+                .list()
+                .expect("list works")
+                .iter()
+                .all(|row| row.group == "old"),
+            "row updates roll back with the failed transaction"
+        );
+        assert_eq!(
+            store
+                .get_subscription(&sub.id)
+                .expect("get works")
+                .expect("sub kept")
+                .group,
+            "old"
+        );
+        assert!(
+            store.group_skip_refresh("old"),
+            "the skip flag did not move on a failed rename"
+        );
+        assert!(!store.group_skip_refresh("new"));
+
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_sub_rename;")
+            .expect("trigger drops");
+        let renamed = store.rename_group("old", "new").expect("rename works");
+        assert_eq!(renamed.rows, 1);
+        assert_eq!(renamed.subscriptions, 1);
+        assert!(store.group_skip_refresh("new"), "flag follows the retry");
     }
 
     #[test]
@@ -9773,6 +10067,7 @@ mod tests {
         let mut taken: HashSet<i64> = HashSet::new();
         let picked = take_free_auto_port(
             std::iter::once(held_port).chain(std::iter::once(free_port)),
+            DEFAULT_BIND,
             &mut taken,
         )
         .expect("a free port is still picked");
@@ -9785,6 +10080,26 @@ mod tests {
             !taken.contains(&(held_port as i64)),
             "the held port is never handed out"
         );
+    }
+
+    #[test]
+    fn auto_port_probes_the_rows_bind_address() {
+        let spare = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = spare.local_addr().expect("addr").port();
+        drop(spare);
+        let mut taken: HashSet<i64> = HashSet::new();
+
+        // 203.0.113.254 is TEST-NET-3; a row bound there cannot listen, so
+        // the candidate must be skipped. A probe hard-coded to loopback would
+        // wrongly hand this port out.
+        let reason = take_free_auto_port(std::iter::once(port), "203.0.113.254", &mut taken)
+            .expect_err("unbindable row address skips the candidate");
+        assert!(reason.contains("held"), "names the socket cause: {reason}");
+        assert!(taken.is_empty(), "a skipped port is never reserved");
+
+        let picked = take_free_auto_port(std::iter::once(port), "", &mut taken)
+            .expect("blank bind falls back to loopback");
+        assert_eq!(picked, port);
     }
 
     /// T-05: the add path skips a held port too — the row lands on the
@@ -10744,6 +11059,99 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_subscription_quarantines_without_hiding_good_rows() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let good = add_sub(&mut store, "good");
+        store
+            .conn
+            .execute(
+                "INSERT INTO subscriptions (label, url, grp, auto_refresh)
+                 VALUES ('bad', ?1, 'default', 1)",
+                rusqlite::params![format!("{}not-base64", crate::secret::MARKER)],
+            )
+            .expect("corrupt subscription plants");
+        let bad_id = store.conn.last_insert_rowid().to_string();
+
+        let rows = store
+            .list_subscriptions()
+            .expect("one bad row must not take the list down");
+        assert_eq!(rows.len(), 1, "the readable row still loads");
+        assert_eq!(rows[0].id, good.id);
+
+        let (rows, quarantined) = store
+            .list_subscriptions_with_quarantine()
+            .expect("tolerant list works");
+        assert_eq!(rows.len(), 1, "good rows load");
+        assert_eq!(quarantined.len(), 1, "the bad row is named");
+        assert_eq!(quarantined[0].id, bad_id);
+        assert!(
+            quarantined[0].cause.contains("unreadable"),
+            "diagnosis survives: {}",
+            quarantined[0].cause
+        );
+
+        let (_payload, skipped) = store
+            .export_library_json_with_quarantine()
+            .expect("tolerant export works");
+        assert!(
+            skipped.contains(&bad_id),
+            "export names the unreadable subscription: {skipped:?}"
+        );
+
+        assert!(
+            store
+                .remove_subscription(&bad_id)
+                .expect("bad row deletes without unsealing"),
+            "corrupt URL must not pin the row"
+        );
+        assert_eq!(
+            store.list_subscriptions().expect("list works").len(),
+            1,
+            "the good subscription survived the deletion"
+        );
+    }
+
+    #[test]
+    fn health_history_cleanup_failures_are_reported() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("A")).expect("row seeds");
+        store
+            .conn
+            .execute(
+                "INSERT INTO health_history (config_id, at) VALUES (?1, 1)",
+                rusqlite::params![row.id],
+            )
+            .expect("history seeds");
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_history_delete BEFORE DELETE ON health_history
+                 BEGIN SELECT RAISE(ABORT, 'history locked'); END;",
+            )
+            .expect("trigger seeds");
+
+        let error = store
+            .clear_tests_in_group("default")
+            .expect_err("a failed history delete is an error, not silence");
+        assert!(
+            error.to_string().contains("history locked"),
+            "the real cause survives: {error}"
+        );
+
+        let error = store
+            .remove(&row.id)
+            .expect_err("remove reports the history delete failure");
+        assert!(
+            error.to_string().contains("history locked"),
+            "the real cause survives: {error}"
+        );
+        assert!(
+            store.get(&row.id).expect("get works").is_some(),
+            "the failed remove rolled back"
+        );
+    }
+
+    #[test]
     fn export_io_error_names_path_never_database() {
         let store = Store::open_in_memory().expect("in-memory store opens");
 
@@ -10961,8 +11369,11 @@ mod tests {
 
         let written = store
             .commit_export(&path, true)
-            .expect("confirmed export works");
-        assert_eq!(written, Some(path.clone()));
+            .expect("confirmed export works")
+            .expect("confirmed export returns the outcome");
+        assert_eq!(written.path, path);
+        assert_eq!(written.exported, 3);
+        assert!(written.skipped.is_empty());
         let on_disk = std::fs::read_to_string(&path).expect("export file was written");
         let value: serde_json::Value =
             serde_json::from_str(&on_disk).expect("export file parses as JSON");
@@ -12589,7 +13000,7 @@ mod tests {
             .commit_export(&path, true)
             .expect("export writes")
             .expect("confirm returns the path");
-        assert_eq!(written, path);
+        assert_eq!(written.path, path);
         assert!(path.is_file(), "export file exists");
         let payload: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("export reads"))
@@ -12823,6 +13234,72 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(subscription_url_host("ftp://example.com/x"), None);
+    }
+
+    #[test]
+    fn internal_filter_covers_cgnat_benchmark_and_reserved_ranges() {
+        for url in [
+            "https://100.64.0.1/x",
+            "https://100.127.255.254/x",
+            "https://198.18.0.1/x",
+            "https://198.19.255.254/x",
+            "https://0.1.2.3/x",
+            "https://240.0.0.1/x",
+            "https://255.255.255.254/x",
+        ] {
+            assert!(
+                matches!(
+                    subscription_fetch_policy(url),
+                    SubscriptionFetchPolicy::Block { .. }
+                ),
+                "internal range still blocked: {url}"
+            );
+        }
+        for url in [
+            "https://100.128.0.1/x",
+            "https://198.20.0.1/x",
+            "https://1.1.1.1/x",
+        ] {
+            assert!(
+                matches!(
+                    subscription_fetch_policy(url),
+                    SubscriptionFetchPolicy::Allow
+                ),
+                "public address stays allowed: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_authority_ends_at_query_or_fragment() {
+        // The fetch follows the literal loopback address; policy must judge
+        // that same address, not the text after the query delimiter.
+        for url in [
+            "https://127.0.0.1:8080?@evil.com",
+            "https://127.0.0.1:8080#@evil.com",
+            "https://user@127.0.0.1:8080?next=@evil.com",
+        ] {
+            assert_eq!(
+                subscription_url_host(url).as_deref(),
+                Some("127.0.0.1"),
+                "authority for {url}"
+            );
+            assert!(
+                matches!(
+                    subscription_fetch_policy(url),
+                    SubscriptionFetchPolicy::Block { .. }
+                ),
+                "policy blocks {url}"
+            );
+        }
+        let public: std::net::IpAddr = "93.184.216.34".parse().expect("ip parses");
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://127.0.0.1:8080?@evil.com", &[public]),
+                SubscriptionFetchPolicy::Block { .. }
+            ),
+            "the resolved-IP guard sees the loopback literal too"
+        );
     }
 
     #[test]
@@ -15546,7 +16023,17 @@ mod tests {
         let (_payload, skipped) = store
             .export_library_json_with_quarantine()
             .expect("tolerant export works");
-        assert_eq!(skipped, vec![bad_id], "export names the skip");
+        assert_eq!(skipped, vec![bad_id.clone()], "export names the skip");
+
+        let dir = t52_temp_root("t48export");
+        let path = dir.join("export.json");
+        let outcome = store
+            .commit_export(&path, true)
+            .expect("export writes")
+            .expect("confirmed export returns the outcome");
+        assert_eq!(outcome.exported, 1, "only the readable row is counted");
+        assert_eq!(outcome.skipped, vec![bad_id], "the toast can name the skip");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -16859,6 +17346,47 @@ mod tests {
     }
 
     #[test]
+    fn restore_swap_stages_before_touching_the_live_file() {
+        let dir = t52_temp_root("restore-stage");
+        let live = dir.join("library.db");
+        std::fs::write(&live, b"live bytes").expect("live writes");
+        let missing_tmp = dir.join(".library.restore-missing");
+
+        let error = swap_tmp_over_live(&missing_tmp, &live)
+            .expect_err("staging an absent restore must fail");
+        assert!(
+            error.to_string().contains("cannot find")
+                || error.to_string().contains("No such file")
+                || error.to_string().contains("The system cannot find"),
+            "the copy cause is reported: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&live).expect("live still reads"),
+            b"live bytes",
+            "a failed stage never removes or truncates the live file"
+        );
+        assert!(!missing_tmp.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn latest_db_backup_names_the_newest_bak_sibling() {
+        let dir = t52_temp_root("latest-bak");
+        let live = dir.join("library.db");
+        std::fs::write(&live, b"live").expect("live writes");
+        std::fs::write(dir.join("library.db.bak-100-1-0"), b"old").expect("old backup");
+        std::fs::write(dir.join("library.db.bak-200-1-0"), b"new").expect("new backup");
+        std::fs::write(dir.join("library.db.corrupt-300-1-0"), b"noise").expect("noise");
+
+        let latest = Store::latest_db_backup(&live).expect("a backup is found");
+        assert_eq!(
+            latest.file_name().and_then(|name| name.to_str()),
+            Some("library.db.bak-200-1-0")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn bug22_rejected_restore_leaves_no_restore_temp() {
         let dir = std::env::temp_dir().join(format!(
             "manyproxy-bug22store-{}-{}",
@@ -18036,6 +18564,16 @@ mod tests {
             Store::INSPECTOR_WIDTH_DEFAULT,
             "junk reads as the default"
         );
+        for non_finite in ["NaN", "inf", "-inf"] {
+            store
+                .set_meta(Store::META_INSPECTOR_WIDTH, non_finite)
+                .expect("non-finite writes");
+            assert_eq!(
+                store.inspector_width(),
+                Store::INSPECTOR_WIDTH_DEFAULT,
+                "{non_finite} must not survive clamp"
+            );
+        }
     }
 
     /// T-32: the window rectangle rides the meta family as

@@ -901,22 +901,21 @@ impl AppView {
     ) {
         let target = std::path::PathBuf::from(path.trim());
         match self.store.commit_export(&target, true) {
-            Ok(Some(path)) => {
-                let rendered = path.display().to_string();
-
-                match self.store.list() {
-                    Ok(rows) => window.push_notification(
-                        Notification::success(export_count_message(
-                            rows.len(),
-                            count_importable(&rows),
-                            &rendered,
-                        )),
+            Ok(Some(outcome)) => {
+                let rendered = outcome.path.display().to_string();
+                window.push_notification(
+                    Notification::success(export_count_message(
+                        outcome.exported,
+                        outcome.importable,
+                        &rendered,
+                    )),
+                    cx,
+                );
+                if !outcome.skipped.is_empty() {
+                    window.push_notification(
+                        Notification::warning(unreadable_drop_message(&outcome.skipped)),
                         cx,
-                    ),
-                    Err(_) => window.push_notification(
-                        Notification::success(t!("exported-to", path = rendered)),
-                        cx,
-                    ),
+                    );
                 }
             }
             Ok(None) => {}
@@ -1021,6 +1020,26 @@ impl AppView {
                     return;
                 }
                 Err(error) => {
+                    if !live_path.exists() {
+                        // A failed swap must not be "recovered" by opening a
+                        // missing path: Store::open_file would create a fresh,
+                        // empty library where the backup should be. Stay on
+                        // the stand-in and name the recovery point.
+                        let backup_text = Store::latest_db_backup(&live_path)
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| t!("restore-no-backup"));
+                        let message = t!(
+                            "restore-failed-backup",
+                            error = error.to_string(),
+                            backup = backup_text
+                        );
+                        self.write_blocked_folder = store_folder(&live_path);
+                        self.write_blocked = Some(message.clone());
+                        self.write_blocked_pinned = true;
+                        self.reload(window, cx);
+                        window.push_notification(Notification::error(message), cx);
+                        return;
+                    }
                     // The live file survived a failed restore (the backup
                     // step or the swap refused); reopen it so the app keeps
                     // its real library instead of the in-memory stand-in.
@@ -1072,6 +1091,7 @@ impl AppView {
     pub fn commit_usage_reset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.reset_traffic_counters(id) {
             Ok(()) => {
+                self.health_store.set_data_traffic(id, 0, 0);
                 self.reload(window, cx);
                 window.push_notification(Notification::success(t!("usage-reset")), cx);
             }
