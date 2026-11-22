@@ -43,7 +43,16 @@ stalls and a Windows restore data-loss bug.
 ## [Unreleased]
 
 The bug hunt closes recovery, async-completion, and status-reporting defects
-across the store, engine, import, probe, and update paths.
+across the store, engine, import, probe, and update paths. CI's auto-port
+test family stops racing itself for the same sockets.
+
+### Fixed
+
+- CI no longer flakes on the auto-port tests: `edit_to_auto_keeps_own_port`
+  seeds a pinned neighbor so the walk's first candidate is never free by
+  machine luck, and `t05_add_auto_port_skips_the_held_first_candidate`
+  claims its hold through the probe's critical section, so a parallel
+  walk's transient probe-hold on `AUTO_PORT_START` cannot defeat it.
 
 ### Changed
 

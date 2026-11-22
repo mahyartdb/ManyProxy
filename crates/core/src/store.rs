@@ -10104,10 +10104,26 @@ mod tests {
 
     /// T-05: the add path skips a held port too — the row lands on the
     /// next free auto port, never on the one the socket holds.
+    ///
+    /// The hold is claimed THROUGH the probe: each attempt binds inside the
+    /// probe's critical section, so a parallel walk's transient probe-hold
+    /// on AUTO_PORT_START can never overlap the claim (a plain
+    /// `TcpListener::bind` here raced that window and the row landed on the
+    /// port this test was supposed to hold). A persistent holder outside
+    /// the suite leaves `held` empty — and the skip under test happens
+    /// anyway, because the walk probes the socket before assigning.
     #[test]
     fn t05_add_auto_port_skips_the_held_first_candidate() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
-        let held = std::net::TcpListener::bind(format!("127.0.0.1:{AUTO_PORT_START}")).ok();
+        let mut held = None;
+        for _ in 0..40 {
+            if let Ok(listener) =
+                crate::engine::probe_bind_available_with(DEFAULT_BIND, AUTO_PORT_START, 1)
+            {
+                held = Some(listener);
+                break;
+            }
+        }
         let created = store
             .add(valid_input("Auto"))
             .expect("the auto port still assigns");
@@ -17276,10 +17292,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Edit-to-auto reuses the row's own port (never burns a fresh port
+    /// per edit toward exhaustion).
+    ///
+    /// A pinned neighbor holds AUTO_PORT_START in the DB, so the walk's first
+    /// candidate is never free to hand out: the row keeps its own port
+    /// because it IS the first free candidate, not by luck of an empty
+    /// machine — a parallel test holding the port on a socket (or any
+    /// process on it) cannot flip the outcome.
     #[test]
     fn edit_to_auto_keeps_own_port() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let neighbor = store
+            .add(NewConfig {
+                port: AUTO_PORT_START.to_string(),
+                ..valid_input("Neighbor")
+            })
+            .expect("add works");
+        assert_eq!(neighbor.port, AUTO_PORT_START);
         let created = store.add(valid_input("Solo")).expect("add works");
+        assert_eq!(created.port, AUTO_PORT_START + 1, "first free candidate");
         let before = created.port;
         let updated = store
             .update(
