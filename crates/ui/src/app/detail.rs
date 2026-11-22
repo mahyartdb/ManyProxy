@@ -996,7 +996,11 @@ impl AppView {
                 ["auto-start", "ping", "logs", "copy-urls", "copy-proxy"]
                     .into_iter()
                     .fold(menu, |menu, id| {
-                        menu.item(Self::selection_menu_item(id, Some(note.clone()), &view))
+                        menu.item(Self::selection_menu_item(
+                            id,
+                            selection_note(id, &note),
+                            &view,
+                        ))
                     })
             })
     }
@@ -1059,6 +1063,13 @@ impl AppView {
                 .grid(false),
         )
     }
+}
+
+/// K1/A4-8: only the auto-start row's label carries the on/off suffix. The
+/// other four kebab rows are verbs; a state note on them reads as if Ping or
+/// Copy had an on/off switch of its own.
+fn selection_note(id: &str, note: &str) -> Option<String> {
+    (id == "auto-start").then(|| note.to_string())
 }
 
 impl AppView {
@@ -1271,5 +1282,27 @@ impl AppView {
                 .text_color(cx.theme().muted_foreground)
                 .child(t!("inspector-use-selection-bar")),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selection_note;
+
+    #[test]
+    fn only_auto_start_carries_the_state_note() {
+        assert_eq!(
+            selection_note("auto-start", "On").as_deref(),
+            Some("On"),
+            "the launch flag still names its state"
+        );
+        for id in ["ping", "logs", "copy-urls", "copy-proxy"] {
+            assert_eq!(
+                selection_note(id, "On"),
+                None,
+                "{id} is a verb and carries no on/off suffix"
+            );
+        }
+        assert_eq!(selection_note("auto-start", "Off").as_deref(), Some("Off"));
     }
 }

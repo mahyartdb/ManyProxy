@@ -235,10 +235,16 @@ pub struct SettingsState {
     /// the top of `render_body`; every row reads it instead of re-reading the
     /// field, because the column is rebuilt every frame.
     pub query: Rc<RefCell<String>>,
-    /// K9/A7-5: the three cores as `(row id, name, exe)`, resolved once when the
-    /// dialog opens. The dialog is rebuilt every frame and the binaries cannot
-    /// change under it, so resolving them per frame was pure I/O in a paint.
-    pub engines: Vec<(&'static str, &'static str, Option<std::path::PathBuf>)>,
+    /// K9/A7-5: the three cores as `(row id, name, resolution)`, resolved once
+    /// when the dialog opens. The dialog is rebuilt every frame and the
+    /// binaries cannot change under it, so resolving them per frame was pure
+    /// I/O in a paint. The typed error is kept so the row's Details names the
+    /// real reason instead of every failure reading "not found".
+    pub engines: Vec<(
+        &'static str,
+        &'static str,
+        Result<std::path::PathBuf, EngineError>,
+    )>,
     /// T-04: the two folder paths Maintenance shows, resolved at open for the
     /// same reason: `app_data_dir` asks the OS for the exe path.
     pub data_folder: String,
@@ -1006,11 +1012,11 @@ impl SettingsState {
             .flex_col()
             .gap_4();
 
-        for (id, name, path) in &self.engines {
+        for (id, name, resolved) in &self.engines {
             // K9/A7-5: the row is the summary (`sing-box · ready`) and the
             // full path lives behind ONE `Details` tooltip. A path is noise at
             // rest and truncates mid-directory in the row.
-            let ready = path.is_some();
+            let ready = resolved.is_ok();
             let status_color = if ready {
                 muted
             } else {
@@ -1042,7 +1048,7 @@ impl SettingsState {
                                 .small()
                                 .ghost()
                                 .label(t!("settings-engine-details"))
-                                .tooltip(engine_details_tooltip(name, path.as_deref())),
+                                .tooltip(engine_resolution_tooltip(name, resolved)),
                         ),
                 ),
             );
@@ -1237,18 +1243,7 @@ impl SettingsState {
                 let cell = cell.clone();
                 let error = error.clone();
                 view.update(cx, |view, cx| {
-                    match view.commit_add_bind_host(&raw, window, cx) {
-                        Ok(hosts) => {
-                            input
-                                .update(cx, |state, cx| state.set_value(String::new(), window, cx));
-                            *error.borrow_mut() = None;
-                            *cell.borrow_mut() = hosts;
-                        }
-                        Err(message) => {
-                            *error.borrow_mut() = Some(message);
-                        }
-                    }
-                    cx.notify();
+                    commit_add_bind_host_ui(view, &raw, &input, &cell, &error, window, cx);
                 });
             })
             .into_any_element()
@@ -1418,6 +1413,29 @@ impl SettingsState {
     }
 }
 
+/// T-04: one add-address commit for both entry points. The button and the
+/// field's Enter both land here, so a successful add clears the typed address
+/// (a second Enter must not re-submit it) and a refusal lands inline.
+fn commit_add_bind_host_ui(
+    view: &mut AppView,
+    raw: &str,
+    input: &Entity<InputState>,
+    hosts: &Rc<RefCell<Vec<String>>>,
+    error: &Rc<RefCell<Option<String>>>,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) {
+    match view.commit_add_bind_host(raw, window, cx) {
+        Ok(next) => {
+            input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+            *error.borrow_mut() = None;
+            *hosts.borrow_mut() = next;
+        }
+        Err(message) => *error.borrow_mut() = Some(message),
+    }
+    cx.notify();
+}
+
 /// T-04: what the close button does, given the stored choice and whether a
 /// tray exists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1463,6 +1481,20 @@ pub fn engine_details_tooltip(name: &str, path: Option<&std::path::Path>) -> Str
             path = path.display().to_string()
         ),
         None => t!("settings-engine-details-missing", name = name),
+    }
+}
+
+/// K9/A7-5: the Engine row's Details tooltip. A resolved core names its exe;
+/// a failed one renders the resolver's typed reason, so the real failure
+/// (no app folder, blocked file, missing binary) is never flattened into the
+/// generic "not found" summary.
+pub fn engine_resolution_tooltip(
+    name: &str,
+    resolved: &Result<std::path::PathBuf, EngineError>,
+) -> String {
+    match resolved {
+        Ok(path) => engine_details_tooltip(name, Some(path)),
+        Err(error) => format!("{name}: {error}"),
     }
 }
 
@@ -2253,18 +2285,14 @@ impl AppView {
             (
                 "settings-row-engine-sing-box",
                 "sing-box",
-                resolve_engine_binary().ok(),
+                resolve_engine_binary(),
             ),
             (
                 "settings-row-engine-sing-box-awg",
                 "sing-box-awg",
-                resolve_fork_binary().ok(),
+                resolve_fork_binary(),
             ),
-            (
-                "settings-row-engine-xray",
-                "xray",
-                resolve_xray_binary().ok(),
-            ),
+            ("settings-row-engine-xray", "xray", resolve_xray_binary()),
         ];
 
         let current_test_url = self.store.test_url().unwrap_or_default();
@@ -2299,6 +2327,8 @@ impl AppView {
         // while it is typed and leaves every stored value alone.
         let filter_state =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("settings-filter-placeholder")));
+        let bind_hosts_cell = Rc::new(RefCell::new(self.store.bind_hosts()));
+        let bind_host_error_cell: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // T-04/K9: Enter commits a text field; the dialog's one footer `Save`
         // commits the same value. A field never commits on blur.
@@ -2365,6 +2395,9 @@ impl AppView {
         }
         {
             let weak = weak.clone();
+            let input = bind_host_input.clone();
+            let hosts = bind_hosts_cell.clone();
+            let error = bind_host_error_cell.clone();
             subscriptions.push(window.subscribe(
                 &bind_host_input,
                 cx,
@@ -2374,7 +2407,7 @@ impl AppView {
                     }
                     let raw = emitter.read(cx).value().to_string();
                     let _ = weak.update(cx, |view, cx| {
-                        let _ = view.commit_add_bind_host(&raw, window, cx);
+                        commit_add_bind_host_ui(view, &raw, &input, &hosts, &error, window, cx);
                     });
                 },
             ));
@@ -2424,9 +2457,6 @@ impl AppView {
         }
         self.settings_subscriptions = subscriptions;
         self.settings_last_check = Some(last_check_state.clone());
-
-        let bind_hosts_cell = Rc::new(RefCell::new(self.store.bind_hosts()));
-        let bind_host_error_cell: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // K9: the one footer `Save` reads every text field the dialog owns.
         let save_view = view.clone();
@@ -2581,4 +2611,30 @@ pub fn open_folder_in_shell(folder: &std::path::Path) -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn open_folder_in_shell(_folder: &std::path::Path) -> Result<(), String> {
     Err(t!("folder-open-unsupported"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::engine_resolution_tooltip;
+    use manyproxy_core::EngineError;
+
+    #[test]
+    fn engine_details_carry_the_resolver_reason() {
+        let missing = EngineError::MissingBinary {
+            binary: "sing-box.exe".to_string(),
+            searched: "no app directory".to_string(),
+        };
+        let text = engine_resolution_tooltip("sing-box", &Err(missing));
+        assert!(text.contains("no app directory"), "{text}");
+        assert!(text.contains("sing-box.exe"), "{text}");
+        assert!(
+            text.contains("never downloads executables silently"),
+            "the install hint survives: {text}"
+        );
+        let ready = engine_resolution_tooltip(
+            "xray",
+            &Ok(std::path::PathBuf::from(r"C:\Apps\ManyProxy\xray.exe")),
+        );
+        assert!(ready.contains(r"C:\Apps\ManyProxy\xray.exe"), "{ready}");
+    }
 }

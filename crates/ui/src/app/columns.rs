@@ -1,7 +1,6 @@
 use crate::*;
 
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::Disableable as _;
 
 /// R17: fit measures the name style at its default 14px, independent of the
@@ -59,8 +58,9 @@ impl AppView {
         let mut layout = self.column_layout;
         layout.reset_width(column);
         self.commit_column_layout(layout, window, cx);
-        window.push_notification(
-            Notification::info(t!("column-restored", column = library_column_label(column))),
+        self.push_toast(
+            ToastSpec::info(t!("column-restored", column = library_column_label(column))),
+            window,
             cx,
         );
     }
@@ -71,28 +71,28 @@ impl AppView {
         let mut layout = self.column_layout;
         layout.reset_widths();
         self.commit_column_layout(layout, window, cx);
-        window.push_notification(Notification::info(t!("columns-reset")), cx);
+        self.push_toast(ToastSpec::info(t!("columns-reset")), window, cx);
     }
 
     pub fn reset_column_order(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset_order();
         self.commit_column_layout(layout, window, cx);
-        window.push_notification(Notification::info(t!("columns-reset")), cx);
+        self.push_toast(ToastSpec::info(t!("columns-reset")), window, cx);
     }
 
     pub fn reset_column_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset_visibility();
         self.commit_column_layout(layout, window, cx);
-        window.push_notification(Notification::info(t!("columns-reset")), cx);
+        self.push_toast(ToastSpec::info(t!("columns-reset")), window, cx);
     }
 
     pub fn reset_all_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut layout = self.column_layout;
         layout.reset();
         self.commit_column_layout(layout, window, cx);
-        window.push_notification(Notification::info(t!("columns-reset")), cx);
+        self.push_toast(ToastSpec::info(t!("columns-reset")), window, cx);
     }
 
     pub fn commit_column_layout(
@@ -121,8 +121,9 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if let Err(error) = self.store.set_library_column_layout(layout) {
-            window.push_notification(
-                Notification::error(t!("column-layout-save-failed", error = error.to_string())),
+            self.push_toast(
+                ToastSpec::error(t!("column-layout-save-failed", error = error.to_string())),
+                window,
                 cx,
             );
         }

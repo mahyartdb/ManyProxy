@@ -26,6 +26,20 @@ pub fn console_height(density: Density) -> f32 {
 pub const CONSOLE_FILTER_MIN_PX: f32 = 80.;
 pub const CONSOLE_FILTER_MAX_PX: f32 = 180.;
 
+/// The Connections `Copied!` marker outlives the render that set it, so its
+/// slot keys the connection's stable `(core, id)` identity — hashed into the
+/// existing `usize` payload — instead of an index into the per-frame row list.
+/// A poll, a sort flip or a filter change then cannot move the marker to a
+/// different row.
+fn conn_copy_key(core: &str, id: &str) -> usize {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    core.hash(&mut hasher);
+    id.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
 /// The one entry point render.rs calls. A collapsed dock is no element at
 /// all: the engine bar never moves because nothing above it changed height.
 pub fn render_console_slot(
@@ -627,6 +641,7 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                 let Some(row) = rows.get(rows_ix) else {
                     return div().into_any_element();
                 };
+                let copy_key = conn_copy_key(&row.core, &row.id);
                 let (name, bind, protocol) = view.conn.exit_of(row.row_id.as_deref());
                 let dest = row.dest.clone();
                 let dest_display = if dest.is_empty() {
@@ -653,14 +668,14 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                             .tooltip(t!("detail-copy-destination"))
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 view.copy_conn_cell(
-                                    ConnCopyTarget::Dest(rows_ix),
+                                    ConnCopyTarget::Dest(copy_key),
                                     &dest_value,
                                     window,
                                     cx,
                                 );
                             })),
                     );
-                if view.conn.copied == Some(ConnCopyTarget::Dest(rows_ix)) {
+                if view.conn.copied == Some(ConnCopyTarget::Dest(copy_key)) {
                     dest_cell = dest_cell.child(
                         div()
                             .id(format!("console-conn-copied-dest-{rows_ix}"))
@@ -679,7 +694,7 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                         .tooltip(t!("detail-copy-endpoint"))
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.copy_conn_cell(
-                                ConnCopyTarget::Endpoint(rows_ix),
+                                ConnCopyTarget::Endpoint(copy_key),
                                 &endpoint_value,
                                 window,
                                 cx,
@@ -699,7 +714,7 @@ pub fn render_console_connections(view: &mut AppView, cx: &mut Context<AppView>)
                     .child(name)
                     .child("·")
                     .child(endpoint_button);
-                if view.conn.copied == Some(ConnCopyTarget::Endpoint(rows_ix)) {
+                if view.conn.copied == Some(ConnCopyTarget::Endpoint(copy_key)) {
                     meta = meta.child(
                         div()
                             .id(format!("console-conn-copied-endpoint-{rows_ix}"))
@@ -1045,4 +1060,28 @@ pub fn render_console_runtime(view: &mut AppView, cx: &mut Context<AppView>) -> 
             ),
     );
     runtime.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::conn_copy_key;
+
+    #[test]
+    fn copy_key_follows_the_connection_not_its_row_position() {
+        assert_eq!(
+            conn_copy_key("sing-box", "flow-0"),
+            conn_copy_key("sing-box", "flow-0"),
+            "the same connection keeps its marker across renders"
+        );
+        assert_ne!(
+            conn_copy_key("sing-box", "flow-0"),
+            conn_copy_key("sing-box", "flow-1"),
+            "a neighbouring row never inherits the marker"
+        );
+        assert_ne!(
+            conn_copy_key("sing-box", "flow-0"),
+            conn_copy_key("xray", "flow-0"),
+            "connection ids are namespaced by core"
+        );
+    }
 }
