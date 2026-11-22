@@ -40,11 +40,12 @@ stalls and a Windows restore data-loss bug.
 - A failed totals read at boot no longer reports measured zeros; the inspector falls back to `usage unavailable`.
 - Hover no longer erases the nav's active-scope wash; the table's guarded-hover pattern is applied to scope and source rows.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-22
 
 The bug hunt closes recovery, async-completion, and status-reporting defects
 across the store, engine, import, probe, and update paths. CI's auto-port
-test family stops racing itself for the same sockets.
+test family stops racing itself for the same sockets, and the gate runs
+lint and test in parallel.
 
 ### Fixed
 
@@ -56,6 +57,9 @@ test family stops racing itself for the same sockets.
 
 ### Changed
 
+- CI's gate splits into parallel lint and test jobs sharing one build cache,
+  so the wall-clock is the slower job instead of the sum; checkout moves to
+  v6 for the node24 runtime.
 - The Settings engine rows resolve each core once when the dialog opens,
   instead of probing the filesystem on every frame; a failed row's Details
   names the resolver's real reason.
