@@ -147,9 +147,54 @@ pub async fn resolve_subscription_addresses(
 ) -> Vec<std::net::IpAddr> {
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(resolver(&host).unwrap_or_default());
+        let resolved = resolve_host_within(&host, resolver, SUBSCRIPTION_RESOLVE_TIMEOUT);
+        let _ = tx.send(resolved);
     });
     rx.await.unwrap_or_default()
+}
+
+/// A lookup that has not answered by now is treated as unresolved, which the
+/// fetch policy turns into a refusal; a black-holed resolver must never hold
+/// a subscription refresh open.
+const SUBSCRIPTION_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn resolve_host_within(
+    host: &str,
+    resolver: SubscriptionHostResolver,
+    timeout: std::time::Duration,
+) -> Vec<std::net::IpAddr> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if resolver_worker()
+        .send((host.to_string(), resolver, tx))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    rx.recv_timeout(timeout).unwrap_or_default()
+}
+
+type ResolveRequest = (
+    String,
+    SubscriptionHostResolver,
+    std::sync::mpsc::Sender<Vec<std::net::IpAddr>>,
+);
+
+/// std's resolver cannot be cancelled, so the thread inside a hung lookup
+/// would never exit. One shared worker owns every lookup and the per-call
+/// waiter stops at its deadline, so a stall costs no threads.
+fn resolver_worker() -> &'static std::sync::mpsc::Sender<ResolveRequest> {
+    static WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<ResolveRequest>> =
+        std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ResolveRequest>();
+        std::thread::spawn(move || {
+            while let Ok((host, resolver, reply)) = rx.recv() {
+                let addrs = resolver(&host).unwrap_or_default();
+                let _ = reply.send(addrs);
+            }
+        });
+        tx
+    })
 }
 
 /// Every outbound fetch-layer request carries `User-Agent: ManyProxy/<APP_VERSION>`.
@@ -165,30 +210,138 @@ pub fn is_fetch_redirect(status: http_client::http::StatusCode) -> bool {
 }
 
 pub fn resolve_fetch_redirect(current_url: &str, location: &str) -> Option<String> {
-    let location = location.trim();
-    if location.is_empty() {
+    let base = parse_http_url(current_url.trim())?;
+    // HTTP never sends the fragment, and `http::Uri` rejects one on the next
+    // request, so the reference is resolved without it.
+    let reference = location.trim().split('#').next().unwrap_or("");
+    if reference.is_empty() {
         return None;
     }
-    if location.starts_with('/') {
-        let scheme_end = current_url.find("://")?;
-        let after_scheme = &current_url[scheme_end + 3..];
-        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-        let origin = &current_url[..scheme_end + 3 + authority_end];
-        if origin.ends_with("://") {
+
+    if let Some(scheme) = reference_scheme(reference) {
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return None;
         }
-        return Some(format!("{origin}{location}"));
+        // Keep the server's original spelling for absolute references.
+        return parse_http_url(reference).map(|_| reference.to_string());
     }
-    if location
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        || location
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-    {
-        return Some(location.to_string());
+
+    if let Some(network_path) = reference.strip_prefix("//") {
+        let (authority, path, query) = split_authority(network_path)?;
+        let path = remove_dot_segments(path);
+        return Some(build_url(base.scheme, authority, &path, query));
     }
-    None
+
+    if reference.starts_with('/') {
+        let (path, query) = split_path_query(reference);
+        let path = remove_dot_segments(path);
+        return Some(build_url(base.scheme, base.authority, &path, query));
+    }
+
+    if let Some(query) = reference.strip_prefix('?') {
+        return Some(build_url(
+            base.scheme,
+            base.authority,
+            base.path,
+            Some(query),
+        ));
+    }
+
+    let (path, query) = split_path_query(reference);
+    let base_dir = match base.path.rfind('/') {
+        Some(slash) => &base.path[..=slash],
+        None => "/",
+    };
+    let merged = format!("{base_dir}{path}");
+    let path = remove_dot_segments(&merged);
+    Some(build_url(base.scheme, base.authority, &path, query))
+}
+
+struct HttpUrl<'a> {
+    scheme: &'a str,
+    authority: &'a str,
+    path: &'a str,
+}
+
+fn parse_http_url(url: &str) -> Option<HttpUrl<'_>> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or("");
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() {
+        return None;
+    }
+    let path = rest[end..].split('?').next().unwrap_or("");
+    Some(HttpUrl {
+        scheme,
+        authority,
+        path,
+    })
+}
+
+fn reference_scheme(reference: &str) -> Option<&str> {
+    let scheme = &reference[..reference.find(':')?];
+    let mut chars = scheme.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn split_authority(value: &str) -> Option<(&str, &str, Option<&str>)> {
+    let end = value.find(['/', '?']).unwrap_or(value.len());
+    let authority = &value[..end];
+    if authority.is_empty() {
+        return None;
+    }
+    let (path, query) = split_path_query(&value[end..]);
+    Some((authority, path, query))
+}
+
+fn split_path_query(value: &str) -> (&str, Option<&str>) {
+    match value.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (value, None),
+    }
+}
+
+fn build_url(scheme: &str, authority: &str, path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(query) => format!("{scheme}://{authority}{path}?{query}"),
+        None => format!("{scheme}://{authority}{path}"),
+    }
+}
+
+/// RFC 3986 §5.2.4. Extra empty segments normalize away; percent-encoded
+/// dots are not segments and stay literal.
+fn remove_dot_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let trailing_slash = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut resolved = String::new();
+    if absolute {
+        resolved.push('/');
+    }
+    resolved.push_str(&segments.join("/"));
+    if trailing_slash && !resolved.ends_with('/') {
+        resolved.push('/');
+    }
+    resolved
 }
 
 pub fn fetch_redirect_location(
@@ -293,4 +446,64 @@ pub async fn fetch_release_feed(
         return parse_release_feed(&body, list_endpoint, APP_VERSION);
     }
     Err("update feed fetch failed (too many redirects)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_fetch_redirect, resolve_host_within};
+
+    #[test]
+    fn redirects_resolve_dot_relative_and_protocol_relative_locations() {
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a/sub.txt", "./latest"),
+            Some("https://example.com/a/latest".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a/sub.txt", "latest"),
+            Some("https://example.com/a/latest".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a/b", "../c"),
+            Some("https://example.com/c".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "//cdn.host/file"),
+            Some("https://cdn.host/file".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a?x=1", "?y=2"),
+            Some("https://example.com/a?y=2".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "/b/d/../c?y=2"),
+            Some("https://example.com/b/c?y=2".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "javascript:alert(1)"),
+            None
+        );
+    }
+
+    #[test]
+    fn hanging_resolver_stops_at_the_resolve_deadline() {
+        fn hanging(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(vec!["93.184.216.34".parse().expect("ip parses")])
+        }
+        let started = std::time::Instant::now();
+        let resolved = resolve_host_within(
+            "slow.example.com",
+            hanging,
+            std::time::Duration::from_millis(50),
+        );
+        assert!(
+            resolved.is_empty(),
+            "the deadline abandons the lookup: {resolved:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "bounded wait, took {:?}",
+            started.elapsed()
+        );
+    }
 }

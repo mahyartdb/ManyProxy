@@ -4414,9 +4414,20 @@ fn t48_resolve_fetch_redirect_table() {
         Some("https://example.com:8443/b".to_string())
     );
 
+    assert_eq!(
+        resolve_fetch_redirect("https://example.com/a/sub.txt", "./latest"),
+        Some("https://example.com/a/latest".to_string())
+    );
+    assert_eq!(
+        resolve_fetch_redirect("https://example.com/a", "b/sub.txt"),
+        Some("https://example.com/b/sub.txt".to_string())
+    );
+    assert_eq!(
+        resolve_fetch_redirect("https://example.com/a", "../sub.txt"),
+        Some("https://example.com/sub.txt".to_string())
+    );
+
     for (current, location) in [
-        ("https://example.com/a", "b/sub.txt"),
-        ("https://example.com/a", "../sub.txt"),
         ("https://example.com/a", "ftp://example.com/sub.txt"),
         ("https://example.com/a", "file:///etc/passwd"),
         ("https://example.com/a", ""),
@@ -4490,7 +4501,7 @@ fn t48_resolve_fetch_redirect_edges() {
     );
     assert_eq!(
         resolve_fetch_redirect("https://example.com/a", "//evil.com/x"),
-        Some("https://example.com//evil.com/x".to_string())
+        Some("https://evil.com/x".to_string())
     );
     assert_eq!(
         resolve_fetch_redirect("https://example.com/a", "https:/cdn.example.com/x"),

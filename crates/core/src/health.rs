@@ -157,6 +157,45 @@ pub trait HealthProber {
 
     fn tcp_ping(&self, config: &ProxyConfig, bind: &str, port: u16)
         -> Result<ProbeSuccess, String>;
+
+    /// Owned copy for callers that hand one probe to a worker while keeping
+    /// the original. Stateful probers must share their state, not fork it.
+    /// Borrowed adapters cannot produce an owned clone; they fail closed
+    /// rather than silently swapping in unrelated probe settings.
+    fn clone_box(&self) -> Box<dyn HealthProber + Send + Sync> {
+        Box::new(UncloneableProber)
+    }
+}
+
+struct UncloneableProber;
+
+impl HealthProber for UncloneableProber {
+    fn supports(&self, _config: &ProxyConfig) -> bool {
+        false
+    }
+
+    fn url_test(
+        &self,
+        _config: &ProxyConfig,
+        _bind: &str,
+        _port: u16,
+        _url: &str,
+    ) -> Result<ProbeSuccess, String> {
+        Err("health prober adapter cannot be cloned".to_string())
+    }
+
+    fn tcp_ping(
+        &self,
+        _config: &ProxyConfig,
+        _bind: &str,
+        _port: u16,
+    ) -> Result<ProbeSuccess, String> {
+        Err("health prober adapter cannot be cloned".to_string())
+    }
+
+    fn clone_box(&self) -> Box<dyn HealthProber + Send + Sync> {
+        Box::new(UncloneableProber)
+    }
 }
 
 pub fn is_probeable_protocol(protocol: &str) -> bool {
@@ -258,16 +297,34 @@ fn endpoint_addr(bind: &str, port: u16, timeout: Duration) -> Result<SocketAddr,
 }
 
 fn resolve_endpoint_host(host: &str, port: u16, timeout: Duration) -> Option<SocketAddr> {
-    let text = format!("{host}:{port}");
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let first = text
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addrs| addrs.next());
-        let _ = tx.send(first);
-    });
+    endpoint_lookup_tx()
+        .send((format!("{host}:{port}"), tx))
+        .ok()?;
     rx.recv_timeout(timeout).ok().flatten()
+}
+
+type EndpointLookup = (String, std::sync::mpsc::Sender<Option<SocketAddr>>);
+
+/// std's resolver cannot be cancelled, so a hung lookup would leak whatever
+/// thread owns it. One long-lived worker keeps that exposure to a single
+/// thread; callers stop waiting at their own deadline.
+fn endpoint_lookup_tx() -> &'static std::sync::mpsc::Sender<EndpointLookup> {
+    static LOOKUP: std::sync::OnceLock<std::sync::mpsc::Sender<EndpointLookup>> =
+        std::sync::OnceLock::new();
+    LOOKUP.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<EndpointLookup>();
+        std::thread::spawn(move || {
+            while let Ok((text, reply)) = rx.recv() {
+                let first = text
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut addrs| addrs.next());
+                let _ = reply.send(first);
+            }
+        });
+        tx
+    })
 }
 
 fn split_http_url(url: &str) -> Result<(&str, &str), String> {
@@ -284,6 +341,12 @@ fn split_http_url(url: &str) -> Result<(&str, &str), String> {
 impl HealthProber for RealHealthProber {
     fn supports(&self, config: &ProxyConfig) -> bool {
         is_probeable_protocol(&config.protocol)
+    }
+
+    fn clone_box(&self) -> Box<dyn HealthProber + Send + Sync> {
+        Box::new(Self {
+            timeout: self.timeout,
+        })
     }
 
     fn url_test(
@@ -1133,10 +1196,15 @@ fn fetch_clash_body(
     let addr: std::net::SocketAddr = endpoint
         .parse()
         .map_err(|_| format!("clash poll: bad controller port {port}"))?;
+    let started = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, timeout)
         .map_err(|error| format!("clash dial {endpoint}: {error}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(format!("clash poll {endpoint}: timed out connecting"));
+    }
+    stream.set_read_timeout(Some(remaining)).ok();
+    stream.set_write_timeout(Some(remaining)).ok();
     let request = format!(
         "GET /connections HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {secret}\r\nConnection: close\r\nUser-Agent: ManyProxy-traffic\r\n\r\n"
     );
@@ -1147,6 +1215,11 @@ fn fetch_clash_body(
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(format!("clash poll {endpoint}: timed out reading response"));
+        }
+        stream.set_read_timeout(Some(timeout - elapsed)).ok();
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -1156,6 +1229,9 @@ fn fetch_clash_body(
                 }
             }
             Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    return Err(format!("clash poll {endpoint}: timed out reading response"));
+                }
                 return Err(format!("clash poll {endpoint}: read failed ({error})"));
             }
         }
@@ -2477,6 +2553,13 @@ impl HealthProber for FakeHealthProber {
             .contains(&config.protocol.trim().to_ascii_lowercase())
     }
 
+    fn clone_box(&self) -> Box<dyn HealthProber + Send + Sync> {
+        Box::new(Self {
+            state: self.state.clone(),
+            default_latency: self.default_latency,
+        })
+    }
+
     fn url_test(
         &self,
         config: &ProxyConfig,
@@ -2529,6 +2612,23 @@ mod tests {
             identity_key: None,
             preset_id: None,
         }
+    }
+
+    #[test]
+    fn fake_prober_clone_box_shares_scripted_state() {
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_latency("1", 77);
+        let cloned = prober.clone_box();
+        let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
+        let success = cloned
+            .url_test(&config, "127.0.0.1", 10801, DEFAULT_TEST_URL)
+            .expect("the clone probes");
+        assert_eq!(success.latency_ms, 77, "scripted latency crosses the clone");
+        assert_eq!(
+            handle.calls_for("1").len(),
+            1,
+            "the clone records into the shared state"
+        );
     }
 
     #[test]
@@ -4581,6 +4681,39 @@ mod tests {
             "total deadline caps the round, took {wall:?}"
         );
         let _ = server;
+    }
+
+    #[test]
+    fn t47_clash_slow_drip_hits_the_per_core_deadline() {
+        use std::io::{Read as _, Write as _};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let _server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept works");
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+            for _ in 0..500 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        let error = poll_clash_entries(port, "s", Duration::from_millis(200))
+            .expect_err("a slow drip cannot hold the poll open");
+        assert!(
+            error.contains("timed out"),
+            "deadline names the cause: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded by the per-core deadline, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
