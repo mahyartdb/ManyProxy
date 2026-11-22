@@ -9,11 +9,6 @@ fn main() {
             println!("cargo:rerun-if-changed={}", git.join(target).display());
         }
     }
-    println!("cargo:rerun-if-changed={}", git.join("refs/tags").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        git.join("packed-refs").display()
-    );
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(&root)

@@ -9,7 +9,9 @@ pub enum ReleaseCompare {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemverIdent {
-    Numeric(u64),
+    /// Normalized decimal digits with no leading zeros. Arbitrary length, so
+    /// numeric order is `(length, lexicographic)`.
+    Numeric(String),
     Alnum(String),
 }
 
@@ -23,6 +25,8 @@ pub struct ParsedTag {
 
 /// Strips the leading `v`, splits `major.minor.patch` from the optional
 /// `-prerelease` suffix, and ignores `+build` metadata per semver rule 10.
+/// A missing `minor`/`patch` pads with 0; leading zeros in core components are
+/// rejected (rule 9).
 pub fn parse_release_tag(tag: &str) -> Option<ParsedTag> {
     let trimmed = tag.trim();
     let no_v = trimmed
@@ -35,9 +39,15 @@ pub fn parse_release_tag(tag: &str) -> Option<ParsedTag> {
         None => (no_build, ""),
     };
     let mut parts = core.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    let patch = parts.next()?.parse::<u64>().ok()?;
+    let major = parse_core_component(parts.next()?)?;
+    let minor = match parts.next() {
+        Some(raw) => parse_core_component(raw)?,
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(raw) => parse_core_component(raw)?,
+        None => 0,
+    };
     if parts.next().is_some() {
         return None;
     }
@@ -57,8 +67,13 @@ pub fn parse_release_tag(tag: &str) -> Option<ParsedTag> {
         if ident.is_empty() {
             return None;
         }
-        if ident.bytes().all(|b| b.is_ascii_digit()) {
-            idents.push(SemverIdent::Numeric(ident.parse::<u64>().ok()?));
+        let digits = ident.bytes().all(|b| b.is_ascii_digit());
+        // Rule 9 forbids leading zeros in numeric identifiers. Keeping such a
+        // tag parseable as alphanumeric means `01` never equals `1` without
+        // discarding the whole release tag.
+        let leading_zero = ident.len() > 1 && ident.starts_with('0');
+        if digits && !leading_zero {
+            idents.push(SemverIdent::Numeric(ident.to_string()));
         } else {
             idents.push(SemverIdent::Alnum(ident.to_string()));
         }
@@ -69,6 +84,16 @@ pub fn parse_release_tag(tag: &str) -> Option<ParsedTag> {
         patch,
         idents,
     })
+}
+
+fn parse_core_component(raw: &str) -> Option<u64> {
+    if raw.is_empty() || (raw.len() > 1 && raw.starts_with('0')) {
+        return None;
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<u64>().ok()
 }
 
 /// Compares two parsed tags. Equal triples rank the plain release above its
@@ -90,7 +115,9 @@ pub fn compare_parsed_tags(a: &ParsedTag, b: &ParsedTag) -> std::cmp::Ordering {
 pub fn compare_pre_identifiers(a: &[SemverIdent], b: &[SemverIdent]) -> std::cmp::Ordering {
     for (left, right) in a.iter().zip(b.iter()) {
         let ordering = match (left, right) {
-            (SemverIdent::Numeric(left), SemverIdent::Numeric(right)) => left.cmp(right),
+            (SemverIdent::Numeric(left), SemverIdent::Numeric(right)) => {
+                left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+            }
             (SemverIdent::Numeric(_), SemverIdent::Alnum(_)) => std::cmp::Ordering::Less,
             (SemverIdent::Alnum(_), SemverIdent::Numeric(_)) => std::cmp::Ordering::Greater,
             (SemverIdent::Alnum(left), SemverIdent::Alnum(right)) => left.cmp(right),
@@ -116,10 +143,10 @@ pub fn compare_release_to_running(tag_name: &str, running: &str) -> ReleaseCompa
     }
 }
 
-/// The running binary only sees prerelease tags when it itself carries a
-/// prerelease suffix (the brief: `APP_VERSION` rides the channel).
+/// The running binary only sees prerelease tags when its own tag carries a
+/// prerelease suffix; `+build` metadata containing a dash does not count.
 pub fn running_is_prerelease(running: &str) -> bool {
-    running.contains('-')
+    parse_release_tag(running).is_some_and(|parsed| !parsed.idents.is_empty())
 }
 
 pub fn newest_tag_among(
@@ -143,4 +170,75 @@ pub fn newest_tag_among(
         }
     }
     best.map(|(_, entry)| entry.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn huge_numeric_prerelease_identifiers_keep_numeric_order() {
+        let smaller = parse_release_tag("1.0.0-18446744073709551616")
+            .expect("an identifier above u64::MAX still parses");
+        let larger = parse_release_tag("1.0.0-18446744073709551617")
+            .expect("an identifier above u64::MAX still parses");
+        assert_eq!(compare_parsed_tags(&smaller, &larger), Ordering::Less);
+        assert_eq!(compare_parsed_tags(&larger, &smaller), Ordering::Greater);
+        assert_eq!(compare_parsed_tags(&smaller, &smaller), Ordering::Equal);
+
+        let shorter = parse_release_tag("1.0.0-99999999999999999999999").expect("parses");
+        let longer = parse_release_tag("1.0.0-100000000000000000000000").expect("parses");
+        assert_eq!(compare_parsed_tags(&shorter, &longer), Ordering::Less);
+    }
+
+    #[test]
+    fn leading_zeros_reject_core_and_never_equal_a_canonical_prerelease() {
+        for tag in ["01.2.3", "1.02.3", "1.2.03", "v00.2.3"] {
+            assert!(
+                parse_release_tag(tag).is_none(),
+                "{tag} has a leading zero in a core component"
+            );
+        }
+
+        let canonical = parse_release_tag("1.2.3-rc.1").expect("canonical tag parses");
+        let zeroed = parse_release_tag("1.2.3-rc.01").expect("the tag stays parseable");
+        assert_ne!(compare_parsed_tags(&zeroed, &canonical), Ordering::Equal);
+    }
+
+    #[test]
+    fn build_metadata_never_marks_the_running_version_prerelease() {
+        assert!(!running_is_prerelease("1.2.3"));
+        assert!(!running_is_prerelease("1.2.3+build-5"));
+        assert!(running_is_prerelease("1.2.3-rc.1+build-5"));
+        assert_eq!(
+            compare_release_to_running("v1.2.3+build-5", "1.2.3"),
+            ReleaseCompare::UpToDate
+        );
+    }
+
+    #[test]
+    fn two_component_tags_pad_the_missing_patch() {
+        assert_eq!(
+            parse_release_tag("v1.3"),
+            Some(ParsedTag {
+                major: 1,
+                minor: 3,
+                patch: 0,
+                idents: Vec::new(),
+            })
+        );
+        assert_eq!(
+            compare_release_to_running("v1.3", "1.3.0"),
+            ReleaseCompare::UpToDate
+        );
+        assert_eq!(
+            compare_release_to_running("v1.4", "1.3.9"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("v1.2", "1.3.0"),
+            ReleaseCompare::Older
+        );
+    }
 }

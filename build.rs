@@ -1,17 +1,12 @@
 fn main() {
-    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
-    println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     println!("cargo:rerun-if-changed=.git/HEAD");
-
     if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
         if let Some(target) = head.trim().strip_prefix("ref: ") {
             println!("cargo:rerun-if-changed=.git/{target}");
         }
     }
-    // `git describe` output changes when tags appear, so watch the tag refs too.
-    println!("cargo:rerun-if-changed=.git/refs/tags");
-    println!("cargo:rerun-if-changed=.git/packed-refs");
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -22,9 +17,9 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=MANYPROXY_GIT_HASH={hash}");
 
-    let (version, version_source) = resolve_app_version();
+    let version = app_version();
     println!("cargo:rustc-env=MANYPROXY_APP_VERSION={version}");
-    println!("cargo:warning=ManyProxy app version {version} (from {version_source})");
+    println!("cargo:warning=ManyProxy app version {version} (from CARGO_PKG_VERSION)");
 
     let resource = write_version_resource(&version);
     if let Err(error) = embed_resource::compile(&resource, embed_resource::NONE).manifest_optional()
@@ -33,67 +28,15 @@ fn main() {
     }
 }
 
-/// Resolve the app version without ever failing the build.
-///
-/// Order: a tag-shaped `GITHUB_REF_NAME` (GitHub Actions sets it on tag pushes),
-/// then the closest reachable git tag, then `CARGO_PKG_VERSION`, then a
-/// hardcoded dev fallback. Every probe is best-effort: a missing git binary or a
-/// non-repo directory falls through silently to the next source.
-fn resolve_app_version() -> (String, &'static str) {
-    let ref_is_tag = std::env::var("GITHUB_REF_TYPE")
-        .map(|kind| kind.trim() == "tag")
-        .unwrap_or(true);
-    let ref_name = std::env::var("GITHUB_REF_NAME").ok();
-    if ref_is_tag {
-        if let Some(version) = ref_name.as_deref().and_then(tag_version) {
-            return (version, "GITHUB_REF_NAME");
-        }
-    }
-    if let Some(version) = git_describe_tag().as_deref().and_then(tag_version) {
-        return (version, "git describe --tags --abbrev=0");
-    }
-    if let Some(version) = std::env::var("CARGO_PKG_VERSION")
+/// The Cargo manifest is authoritative for the app version: the release
+/// workflow refuses a tag whose numeric core disagrees with it. The fallback
+/// only covers an environment without Cargo's package variables.
+fn app_version() -> String {
+    std::env::var("CARGO_PKG_VERSION")
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-    {
-        return (version, "CARGO_PKG_VERSION");
-    }
-    ("0.0.0-dev".to_owned(), "hardcoded fallback")
-}
-
-fn git_describe_tag() -> Option<String> {
-    if !std::path::Path::new(".git").exists() {
-        return None;
-    }
-    let output = std::process::Command::new("git")
-        .args(["describe", "--tags", "--abbrev=0"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let tag = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!tag.is_empty()).then_some(tag)
-}
-
-/// Accept only tag-shaped strings (`v0.1.2`, `v0.0.0-test.1`) and normalize them
-/// to a version string (leading `v` dropped). Branch names and paths fail the
-/// shape test, so they fall through to the next version source.
-fn tag_version(raw: &str) -> Option<String> {
-    let version = raw.trim().strip_prefix('v')?;
-    if version.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    if !version
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
-    {
-        return None;
-    }
-    Some(version.to_owned())
+        .unwrap_or_else(|| "0.0.0-dev".to_owned())
 }
 
 /// Four numeric Windows version components. The part before any `-`/`+` suffix
