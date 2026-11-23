@@ -1,0 +1,7 @@
+# Directory scans resolve exclude patterns relative to the scan root and
+# require a ./ prefix; keep build output, git metadata, and staged release
+# bundles out of the SBOM.
+exclude:
+  - "./target/**"
+  - "./.git/**"
+  - "./manyproxy-v*-windows-*/**"

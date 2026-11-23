@@ -12,8 +12,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
   # CI-specific cargo settings. Incremental state bloats the rust-cache and
@@ -37,8 +36,12 @@ jobs:
   lint:
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -71,7 +74,7 @@ jobs:
           # stamp palette values. dialog/qr.rs is the documented scanner
           # exception (real black on real white).
           $hits = Get-ChildItem crates/ui/src,src -Recurse -Filter *.rs |
-            Where-Object { $_.Name -ne 'tests.rs' -and ($_.FullName -replace '\\', '/') -notmatch '/crates/ui/src/(dialog/qr|skin)\.rs$' } |
+            Where-Object { $_.Name -ne 'tests.rs' -and ($_.FullName -replace '\\', '/') -notmatch '/crates/ui/src/(dialog/qr|skin)\.rs$' -and ($_.FullName -replace '\\', '/') -notmatch '/crates/ui/tests/' } |
             Select-String -Pattern $pattern
           if ($hits) {
             $hits | ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
@@ -86,13 +89,54 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows
           save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-on-failure: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # profile.ci (fail-fast = false) reports every failing test in one run
+      # instead of stopping at the first.
       - name: Test
-        run: cargo test --locked
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo nextest run --locked --profile ci
+          if ($LASTEXITCODE -ne 0) { throw "cargo nextest run --locked --profile ci failed (exit $LASTEXITCODE) — the CI gate is red" }
+      # nextest does not run doctests, so they gate separately here.
+      - name: Doctests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --locked --doc
+          if ($LASTEXITCODE -ne 0) { throw "cargo test --locked --doc failed (exit $LASTEXITCODE) — nextest does not run doctests, so they must pass here" }
+
+  # Supply chain is its own job because fmt/clippy/test never read the advisory
+  # database: a lockfile can be clean at review time and vulnerable later. The
+  # Linux audit also must not wait on the Windows build cache.
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # rustsec/audit-check publishes a check run; fork PRs fall back to stdout.
+      checks: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # Fails on any known RustSec vulnerability in Cargo.lock.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      # Enforces deny.toml policy: advisories, bans, licenses, sources.
+      - uses: EmbarkStudios/cargo-deny-action@v2

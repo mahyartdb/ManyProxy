@@ -64,8 +64,13 @@ on:
         # a manifest bump.
         default: "v0.2.1-test.1"
 
-permissions:
-  contents: write
+permissions: {}
+
+# Never cancel a publishing run: a stale `gh release create` or a half-uploaded
+# asset set is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   SINGBOX_VERSION: "1.14.2"
@@ -92,19 +97,56 @@ env:
   XRAY_ARM64_DGST_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-arm64-v8a.zip.dgst"
 
 jobs:
-  windows-amd64:
-    runs-on: windows-latest
-    timeout-minutes: 60
+  # A tag can point at a commit whose advisory database has since changed, so
+  # the release re-runs the gate rather than trusting the CI run from that
+  # commit. Both build rows wait on it: a red gate publishes nothing.
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # rustsec/audit-check publishes a check run; fork PRs fall back to stdout.
+      checks: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # Fails on any known RustSec vulnerability in Cargo.lock.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      # Enforces deny.toml policy: advisories, bans, licenses, sources.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # H1 restructure: untrusted code (cargo build scripts from ~916 crates and
+  # the three third-party sidecar binaries) executes in this job, so it holds
+  # ONLY `contents: read`. Attestation signing, SHA256SUMS regeneration over
+  # the published set, and release creation moved to the `publish-amd64` job,
+  # which never compiles or executes third-party code.
+  windows-amd64:
+    needs: [supply-chain]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Resolve bundle version from tag
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
-          $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
+          # Both come in through env so the expressions never interpolate into
+          # the script body (L1).
+          $ref = if ($env:REF_TYPE -eq "tag") { $env:REF_NAME } else { $env:DISPATCH_TAG }
           "TAG=$ref" >> $env:GITHUB_ENV
           "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
 
@@ -124,29 +166,11 @@ jobs:
             throw "version gate: release tag '$env:TAG' has numeric core $tagCore but Cargo.toml says $manifest — bump Cargo.toml's [package] version to $tagCore before tagging (the About dialog and update feed read the manifest version, so the tag alone cannot version the app)"
           }
 
-      # Release gates (same three commands as ci.yml). They run BEFORE the
-      # release build and throw on a non-zero exit, so a tag pushed on an
-      # un-gated commit can never produce a bundle or a GitHub release.
-      - name: Gate 1/3 — cargo fmt --check
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          cargo fmt --check
-          if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE) — a tag on an un-gated commit must not ship" }
-
-      - name: Gate 2/3 — cargo clippy --all-targets --locked -- -D warnings
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          cargo clippy --all-targets --locked -- -D warnings
-          if ($LASTEXITCODE -ne 0) { throw "cargo clippy --all-targets --locked -- -D warnings failed (exit $LASTEXITCODE) — a tag on an un-gated commit must not ship" }
-
-      - name: Gate 3/3 — cargo test --locked
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          cargo test --locked
-          if ($LASTEXITCODE -ne 0) { throw "cargo test --locked failed (exit $LASTEXITCODE) — a tag on an un-gated commit must not ship" }
+      # Release gates via the shared composite action (fmt → clippy → test,
+      # the same commands as ci.yml). They run BEFORE the release build and
+      # throw on a non-zero exit, so a tag pushed on an un-gated commit can
+      # never produce a bundle or a GitHub release.
+      - uses: ./.github/actions/rust-gate
 
       - name: Build (release, locked)
         shell: pwsh
@@ -166,6 +190,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
           Write-Output "Pin: sing-box $version | URL: $url"
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+      - name: Verify sing-box amd64 zip against the committed pin
+        uses: ./.github/actions/verify-sidecar
+        with:
+          file: ${{ runner.temp }}\sing-box-${{ env.SINGBOX_VERSION }}-windows-amd64.zip
+          name: sing-box-1.14.2-windows-amd64.zip
+      - name: Fetch pinned sing-box (extract and probe the pinned version)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:SINGBOX_VERSION
+          $url = $env:SINGBOX_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64"
+          # Downloaded and digest-pinned above; upstream publishes no checksum
+          # asset, so the committed pin IS the authenticity check here.
           Expand-Archive -Path $zip -DestinationPath $dir -Force
           $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
           if (-not $exe) {
@@ -189,6 +228,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
           Write-Output "Pin: sing-box-awg (Leadaxe/sing-box-lx fork) $version | URL: $url"
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+      - name: Verify sing-box-awg amd64 zip against the committed pin
+        uses: ./.github/actions/verify-sidecar
+        with:
+          file: ${{ runner.temp }}\sing-box-awg-${{ env.AWG_FORK_VERSION }}-windows-amd64.zip
+          name: sing-box-1.14.3-lx.21-windows-amd64.zip
+
+      - name: Fetch pinned sing-box-awg fork (verify against upstream SHA256SUMS, extract and probe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:AWG_FORK_VERSION
+          $url = $env:AWG_FORK_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-amd64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-amd64"
+          # Downloaded and digest-pinned above; the upstream SHA256SUMS check
+          # below is corroboration only (same origin as the asset itself).
           # Verify against the SAME release's own SHA256SUMS manifest.
           $sums = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:AWG_FORK_SUMS_URL -UseBasicParsing).Content)
           $line = ($sums -split "`r?`n") | Where-Object { $_.EndsWith("  sing-box-$version-windows-amd64.zip") } | Select-Object -First 1
@@ -225,6 +281,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
           Write-Output "Pin: xray $version | URL: $url"
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+      - name: Verify xray amd64 zip against the committed pin
+        uses: ./.github/actions/verify-sidecar
+        with:
+          file: ${{ runner.temp }}\Xray-windows-64-${{ env.XRAY_VERSION }}.zip
+          name: Xray-windows-64.zip
+
+      - name: Fetch pinned xray (verify against upstream .dgst checksum, extract and probe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:XRAY_VERSION
+          $url = $env:XRAY_URL
+          $zip = "$env:RUNNER_TEMP\Xray-windows-64-$version.zip"
+          $dir = "$env:RUNNER_TEMP\xray-$version-windows-amd64"
+          # Downloaded and digest-pinned above; the upstream .dgst check below
+          # is corroboration only (same origin as the asset itself).
           # Verify against the SAME release's .dgst sidecar (SHA2-256= line).
           $dgst = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:XRAY_DGST_URL -UseBasicParsing).Content)
           $line = ($dgst -split "`r?`n") | Where-Object { $_ -match "^SHA2-256=" } | Select-Object -First 1
@@ -282,8 +355,10 @@ jobs:
           }
           Write-Output ("Staged the exact bundle layout: " + (@($actualFiles) -join ", ") + " | licenses: " + (@($actualLicenses) -join ", "))
           Compress-Archive -Path $stage -DestinationPath $zip
-          # SHA256SUMS.txt: the zip + each staged binary (no signature this beta —
-          # hashes are the honesty floor).
+          # SHA256SUMS.txt: the zip + each staged binary (first pass). The
+          # publish-amd64 job later regenerates this file to also cover the
+          # SBOM and both attestation bundles; the zip/binary lines keep
+          # these same hashes.
           $hashItems = @($zip, "$stage\manyproxy.exe", "$stage\sing-box.exe", "$stage\sing-box-awg.exe", "$stage\xray.exe")
           $hashes = $hashItems | ForEach-Object {
             "{0}  {1}" -f ((Get-FileHash -Path $_ -Algorithm SHA256).Hash).ToLowerInvariant(), (Split-Path $_ -Leaf)
@@ -292,14 +367,152 @@ jobs:
           Write-Output "SHA256SUMS.txt:"
           Write-Output (Get-Content -Path "SHA256SUMS.txt")
 
-      - name: Upload bundle as build artifact (rehearsal runs deliver here)
-        if: always()
+      # SPDX SBOM over the Rust dependency graph: Cargo.lock and the workspace
+      # crates. The action uploads nothing; the publish-amd64 job publishes
+      # the file.
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          config: .syft.yaml
+          output-file: manyproxy-v${{ env.VER }}-windows-amd64.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # M6: no `if: always()` — a failed job must not upload a stale first-pass
+      # SHA256SUMS.txt for the publish job to attest and release.
+      - name: Upload bundle as build artifact (input to publish-amd64; rehearsal runs deliver here)
         uses: actions/upload-artifact@v7
         with:
           name: "manyproxy-${{ env.VER }}-windows-amd64"
           path: |
             manyproxy-v${{ env.VER }}-windows-amd64.zip
             SHA256SUMS.txt
+            manyproxy-v${{ env.VER }}-windows-amd64.spdx.json
+          if-no-files-found: error
+
+  # H1: publishing happens in a job that never compiles or executes
+  # third-party code — the untrusted sidecars were extracted and probed in
+  # windows-amd64, which holds only `contents: read`. This job alone carries
+  # the write/OIDC permissions, downloads the trusted artifact, and attests,
+  # sums, and publishes from those files.
+  publish-amd64:
+    needs: [windows-amd64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+      artifact-metadata: write
+    steps:
+      - name: Resolve release tag names
+        shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
+          # GITHUB_ENV writes only reach later steps, so VER is computed from a
+          # shell variable, and the dispatch input arrives via env (L1).
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="$DISPATCH_TAG"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VER=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Download the amd64 bundle artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-amd64"
+          path: amd64-assets
+
+      # Attestation subjects are hashed from the downloaded artifact's files
+      # (byte-identical to the build job's outputs), so provenance still
+      # describes exactly what ships. The staging tree is reconstructed by
+      # re-downloading the bundle zip and unpacking it — publish never
+      # executes anything it attests.
+      - name: Unpack the bundle zip for attestation subjects
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem -Path "amd64-assets" -Filter "manyproxy-v*-windows-amd64.zip" | Select-Object -First 1
+          if (-not $zip) { throw "amd64 bundle zip missing from the downloaded artifact" }
+          Expand-Archive -Path $zip.FullName -DestinationPath "." -Force
+
+      # Build provenance over the zip and the four staged binaries. NOT over
+      # SHA256SUMS.txt: that file is regenerated below to cover this
+      # attestation, so attesting it would make the subject depend on its own
+      # output.
+      - name: Attest build provenance (zip + staged binaries)
+        id: attest-provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            amd64-assets/manyproxy-v${{ env.VER }}-windows-amd64.zip
+            manyproxy-v${{ env.VER }}-windows-amd64/manyproxy.exe
+            manyproxy-v${{ env.VER }}-windows-amd64/sing-box.exe
+            manyproxy-v${{ env.VER }}-windows-amd64/sing-box-awg.exe
+            manyproxy-v${{ env.VER }}-windows-amd64/xray.exe
+
+      - name: Save the provenance bundle under its release asset name
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "${{ steps.attest-provenance.outputs.bundle-path }}"
+          if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) {
+            throw "provenance attestation produced no bundle (bundle-path: '$src') — refusing to publish a release without provenance"
+          }
+          Copy-Item -LiteralPath $src -Destination "amd64-assets/manyproxy-v$env:VER-windows-amd64.intoto.jsonl" -Force
+
+      - name: Attest the SPDX SBOM
+        id: attest-sbom
+        uses: actions/attest@v4
+        with:
+          subject-path: amd64-assets/manyproxy-v${{ env.VER }}-windows-amd64.zip
+          sbom-path: amd64-assets/manyproxy-v${{ env.VER }}-windows-amd64.spdx.json
+
+      - name: Save the SBOM attestation bundle under its release asset name
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "${{ steps.attest-sbom.outputs.bundle-path }}"
+          if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) {
+            throw "SBOM attestation produced no bundle (bundle-path: '$src') — refusing to publish a release without an SBOM attestation"
+          }
+          Copy-Item -LiteralPath $src -Destination "amd64-assets/manyproxy-v$env:VER-windows-amd64.sbom.intoto.jsonl" -Force
+
+      # Final sums over every published file. The zip and the binaries are
+      # untouched since the first pass, so their lines keep the same hashes.
+      - name: Regenerate SHA256SUMS.txt over every published file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "manyproxy-v$env:VER-windows-amd64"
+          $hashItems = @(
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.zip",
+            "$stage/manyproxy.exe", "$stage/sing-box.exe", "$stage/sing-box-awg.exe", "$stage/xray.exe",
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.spdx.json",
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.intoto.jsonl",
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.sbom.intoto.jsonl"
+          )
+          $hashes = $hashItems | ForEach-Object {
+            "{0}  {1}" -f ((Get-FileHash -Path $_ -Algorithm SHA256).Hash).ToLowerInvariant(), (Split-Path $_ -Leaf)
+          }
+          Set-Content -Path "amd64-assets/SHA256SUMS.txt" -Value $hashes -Encoding utf8NoBOM
+          Write-Output "SHA256SUMS.txt:"
+          Write-Output (Get-Content -Path "amd64-assets/SHA256SUMS.txt")
+
+      # Re-upload so the artifact every consumer sees (release-body uses the
+      # arm64 twin; rehearsal runs deliver here) carries the attestation
+      # bundles and the final sums, not the first pass.
+      - name: Upload the attested bundle as build artifact (rehearsal runs deliver here)
+        uses: actions/upload-artifact@v7
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-amd64-published"
+          path: amd64-assets
           if-no-files-found: error
 
       - name: Create the GitHub release (tag pushes only; rehearsals skip this)
@@ -309,50 +522,69 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "manyproxy-v$env:VER-windows-amd64.zip"
+          $zip = "amd64-assets/manyproxy-v$env:VER-windows-amd64.zip"
           $prereleaseFlag = @()
           if ($env:TAG -match "-") { $prereleaseFlag += "--prerelease" }
           $notes = @"
           ManyProxy $env:TAG — portable windows-amd64 bundle.
 
-          - Unzip anywhere; `manyproxy.exe` + the three sidecar engines sit beside it; no installer, no admin needed (loopback defaults).
-          - Also in the ZIP: `README.md`, `THIRD-PARTY-NOTICES.md`, and the engine license texts under `licenses/` (`GPL-3.0.txt`, `MPL-2.0.txt`).
+          - Unzip anywhere; ``manyproxy.exe`` + the three sidecar engines sit beside it; no installer, no admin needed (loopback defaults).
+          - Also in the ZIP: ``README.md``, ``THIRD-PARTY-NOTICES.md``, and the engine license texts under ``licenses/`` (``GPL-3.0.txt``, ``MPL-2.0.txt``).
           - Sidecar pins shipped as-is: sing-box $env:SINGBOX_VERSION (SagerNet), sing-box-awg $env:AWG_FORK_VERSION (Leadaxe/sing-box-lx AmneziaWG fork), xray $env:XRAY_VERSION (XTLS/Xray-core).
           - windows-amd64 gate: fmt → clippy → test run in this workflow BEFORE the release build (and per commit in ci.yml), so a tag on an un-gated commit ships nothing; sidecar pins shipped as listed above; live proofs stay opt-in in live.yml and out of the release path (amd64-only — accepted asymmetry).
-          - ``SHA256SUMS.txt`` covers the zip and the four binaries (this build has no code-signing story; hashes are the honesty floor).
+          - Signed attestations: build provenance and an SPDX SBOM attestation for the zip are signed by GitHub Actions (Sigstore). Verify with ``gh attestation verify --owner mahyartdb manyproxy-v$env:VER-windows-amd64.zip``.
+          - ``SHA256SUMS.txt`` covers every published file — the zip, the four binaries, the SBOM, and both attestation bundles (this build has no code-signing story; hashes are the honesty floor).
           - No auto-update: the app never downloads or replaces executables. It checks the release feed once a week; Settings → Updates can turn that off. Updating = replacing the folder by hand. Data lives in ``data\`` beside the exe; deleting the folder uninstalls cleanly.
           "@
           Set-Content -Path "release-notes.md" -Value $notes -Encoding utf8NoBOM
-          gh release create $env:TAG $zip "SHA256SUMS.txt" `
+          # --notes-file is authoritative: --generate-notes would append
+          # GitHub's auto-generated list on top of these custom notes.
+          gh release create $env:TAG "$zip" "amd64-assets/SHA256SUMS.txt" `
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.spdx.json" `
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.intoto.jsonl" `
+            "amd64-assets/manyproxy-v$env:VER-windows-amd64.sbom.intoto.jsonl" `
             --repo "${{ github.repository }}" `
             --title "ManyProxy $env:TAG" `
             --notes-file "release-notes.md" `
-            --generate-notes `
             @prereleaseFlag
 
   # T-04 — ARM64 release row (gated): the full fmt → clippy → test gate runs
   # on the windows-11-arm runner UN-SKIPPABLY and never behind
   # continue-on-error; the arm64 zip is produced ONLY when (a) the gate is
-  # green and (b) every pinned arm64 sidecar verifies against its official
-  # upstream release asset. A red gate ships no arm64 asset and the release
-  # still ships (amd64 unaffected); an unverifiable fork pin skips the asset
-  # row with an explicit step summary line instead of a partial bundle.
+  # green and (b) every pinned arm64 sidecar verifies against its committed
+  # pin (plus upstream corroboration). A red gate ships no arm64 asset and the
+  # release still ships (amd64 unaffected); a fork pin that answers 404
+  # withholds the asset row with an explicit step summary line instead of a
+  # partial bundle, while any other probe failure fails the job loudly.
+  # H1: like windows-amd64, this job executes untrusted code, so it holds only
+  # `contents: read`; attestation moved to publish-arm64.
   windows-arm64:
+    needs: [supply-chain]
     runs-on: windows-11-arm
     timeout-minutes: 60
+    permissions:
+      contents: read
     outputs:
-      awg: ${{ steps.probe-awg.outputs.awg }}
+      awg: ${{ steps.probe-awg-verify.outputs.awg || steps.probe-awg.outputs.awg }}
       awg_reason: ${{ steps.probe-awg.outputs.awg_reason }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Resolve bundle version from tag
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
-          $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
+          # Both come in through env so the expressions never interpolate into
+          # the script body (L1).
+          $ref = if ($env:REF_TYPE -eq "tag") { $env:REF_NAME } else { $env:DISPATCH_TAG }
           "TAG=$ref" >> $env:GITHUB_ENV
           "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
 
@@ -380,44 +612,26 @@ jobs:
           if ($hostTriple -eq "aarch64-pc-windows-msvc") {
             Write-Output "Runner defaults to the NATIVE arm64 toolchain — building in native form (no --target override; nothing installed)."
             "RUST_TARGET_FLAG=" >> $env:GITHUB_ENV
+            "RUST_TARGET_TRIPLE=" >> $env:GITHUB_ENV
             "RUST_OUT_DIR=target/release" >> $env:GITHUB_ENV
           } elseif ($hostTriple -eq "x86_64-pc-windows-msvc") {
             Write-Output "Pre-installed toolchain host is x86_64-pc-windows-msvc — using the ticket's cross form (--target aarch64-pc-windows-msvc). This adds only the std TARGET for the EXISTING toolchain (rustup target add), not a second toolchain."
             rustup target add aarch64-pc-windows-msvc
             if ($LASTEXITCODE -ne 0) { throw "rustup target add aarch64-pc-windows-msvc failed (exit $LASTEXITCODE); the pre-installed toolchain cannot support the arm64 target — failing loudly" }
             "RUST_TARGET_FLAG=--target aarch64-pc-windows-msvc" >> $env:GITHUB_ENV
+            "RUST_TARGET_TRIPLE=aarch64-pc-windows-msvc" >> $env:GITHUB_ENV
             "RUST_OUT_DIR=target/aarch64-pc-windows-msvc/release" >> $env:GITHUB_ENV
           } else {
             throw "arm64 toolchain probe: pre-installed toolchain reports host '$hostTriple' — expected aarch64-pc-windows-msvc (native form) or x86_64-pc-windows-msvc (cross form). Failing loudly; no second toolchain will be installed."
           }
 
-      - name: Gate 1/3 — cargo fmt --check (un-skippable; Q29)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          cargo fmt --check
-          if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE) — the arm64 row ships no asset when the full gate is red" }
-
-      - name: Gate 2/3 — cargo clippy --all-targets --locked -- -D warnings (arm64 target)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargs = @("clippy", "--all-targets", "--locked")
-          if ($env:RUST_TARGET_FLAG) { $cargs += ($env:RUST_TARGET_FLAG -split "\s+") }
-          $cargs += @("--", "-D", "warnings")
-          Write-Output ("Run: cargo " + ($cargs -join " "))
-          & cargo @cargs
-          if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed for the arm64 target (exit $LASTEXITCODE) — the arm64 row ships no asset when the full gate is red" }
-
-      - name: Gate 3/3 — cargo test --locked (arm64 target)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargs = @("test", "--locked")
-          if ($env:RUST_TARGET_FLAG) { $cargs += ($env:RUST_TARGET_FLAG -split "\s+") }
-          Write-Output ("Run: cargo " + ($cargs -join " "))
-          & cargo @cargs
-          if ($LASTEXITCODE -ne 0) { throw "cargo test failed for the arm64 target (exit $LASTEXITCODE) — the arm64 row ships no asset when the full gate is red" }
+      # Un-skippable and never behind continue-on-error: the composite action
+      # throws on a non-zero exit, so a red gate ships no arm64 asset. The
+      # target triple is empty in native form and aarch64-pc-windows-msvc in
+      # cross form (set by the probe above).
+      - uses: ./.github/actions/rust-gate
+        with:
+          target: ${{ env.RUST_TARGET_TRIPLE }}
 
       - name: Build (release, locked, arm64 target — only after the full gate)
         shell: pwsh
@@ -442,6 +656,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
           Write-Output "Pin: sing-box $version windows-arm64 | URL: $url"
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+      - name: Verify sing-box arm64 zip against the committed pin
+        uses: ./.github/actions/verify-sidecar
+        with:
+          file: ${{ runner.temp }}\sing-box-${{ env.SINGBOX_VERSION }}-windows-arm64.zip
+          name: sing-box-1.14.2-windows-arm64.zip
+
+      - name: Fetch pinned sing-box arm64 (extract and probe the pinned version)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:SINGBOX_VERSION
+          $url = $env:SINGBOX_ARM64_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-$version-windows-arm64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-arm64"
+          # Downloaded and digest-pinned above; upstream publishes no checksum
+          # asset, so the committed pin IS the authenticity check here.
           Expand-Archive -Path $zip -DestinationPath $dir -Force
           $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
           if (-not $exe) {
@@ -454,7 +685,7 @@ jobs:
           }
           Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box.exe" -Force
 
-      - name: Probe pinned sing-box-awg arm64 (same checks as amd64; loud skip of the asset row if the fork stops shipping arm64)
+      - name: Download pinned sing-box-awg arm64 (HTTP 404 = loud withhold of the asset row; any other failure fails the job)
         id: probe-awg
         shell: pwsh
         run: |
@@ -462,43 +693,70 @@ jobs:
           $version = $env:AWG_FORK_VERSION
           $url = $env:AWG_FORK_ARM64_URL
           $zip = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-arm64.zip"
-          $dir = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-arm64"
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
           Write-Output "Pin: sing-box-awg (Leadaxe/sing-box-lx fork) $version windows-arm64 | URL: $url"
           try {
             Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-            # Verify against the SAME release's SHA256SUMS manifest (arm64 line).
-            $sums = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:AWG_FORK_SUMS_URL -UseBasicParsing).Content)
-            $line = ($sums -split "`r?`n") | Where-Object { $_.EndsWith("  sing-box-$version-windows-arm64.zip") } | Select-Object -First 1
-            if (-not $line) {
-              throw ("upstream SHA256SUMS ($env:AWG_FORK_SUMS_URL) has no line for sing-box-$version-windows-arm64.zip")
-            }
-            $expected = ($line -split " " | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
-            $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
-            if ($actual -ne $expected) {
-              throw ("downloaded zip sha256 $actual does not match the upstream SHA256SUMS line $expected")
-            }
-            Expand-Archive -Path $zip -DestinationPath $dir -Force
-            $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
-            if (-not $exe) {
-              throw ("pinned URL $url returned a zip without sing-box.exe")
-            }
-            $probe = (& $exe.FullName version) -join " "
-            Write-Output "sing-box-awg version output: $probe"
-            # Identity has already been proven by the checksum above; the version
-            # probe is print evidence (fork version spellings may vary per build).
-            if ([string]::IsNullOrWhiteSpace($probe)) {
-              throw ("pinned binary produced no version output")
-            }
-            Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box-awg.exe" -Force
-            "awg=present" >> $env:GITHUB_OUTPUT
+            "downloaded=true" >> $env:GITHUB_OUTPUT
           } catch {
+            # M4: a genuine HTTP 404 means the fork stopped shipping the arm64
+            # asset — the loud withhold below records it. ANY other failure
+            # (timeout, 429, TLS reset, ...) is infrastructure noise, not
+            # evidence of absence, and must fail the job instead of silently
+            # degrading the release.
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -ne 404) { throw }
             $detail = (((("{0}" -f $_.Exception.Message)) -replace "\r?\n", " ")).Trim()
-            $reason = "pinned sing-box-awg $version has no verifiable upstream windows-arm64 asset (probed URL: $url; probe failure: $detail) — the pin discipline refuses stock-sing-box substitution and fork faking, so the arm64 zip is not produced"
-            Write-Output "sing-box-awg arm64 pin unverifiable — loud skip (never a silent partial bundle): $reason"
+            "downloaded=false" >> $env:GITHUB_OUTPUT
             "awg=absent" >> $env:GITHUB_OUTPUT
-            "awg_reason=$reason" >> $env:GITHUB_OUTPUT
+            "awg_reason=pinned sing-box-awg $version has no verifiable upstream windows-arm64 asset (probed URL: $url; upstream answered HTTP 404: $detail) — the pin discipline refuses stock-sing-box substitution and fork faking, so the arm64 zip is not produced" >> $env:GITHUB_OUTPUT
+            Write-Output "sing-box-awg arm64 asset absent upstream (HTTP 404) — loud withhold of the asset row"
           }
+
+      - name: Verify sing-box-awg arm64 zip against the committed pin
+        if: steps.probe-awg.outputs.downloaded == 'true'
+        uses: ./.github/actions/verify-sidecar
+        with:
+          file: ${{ runner.temp }}\sing-box-awg-${{ env.AWG_FORK_VERSION }}-windows-arm64.zip
+          name: sing-box-1.14.3-lx.21-windows-arm64.zip
+
+      - name: Probe pinned sing-box-awg arm64 (upstream SHA256SUMS corroboration, extract, version probe)
+        id: probe-awg-verify
+        if: steps.probe-awg.outputs.downloaded == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:AWG_FORK_VERSION
+          $url = $env:AWG_FORK_ARM64_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-arm64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-arm64"
+          # Downloaded and digest-pinned above; the upstream SHA256SUMS check
+          # below is corroboration only (same origin as the asset itself).
+          # Verify against the SAME release's SHA256SUMS manifest (arm64 line).
+          $sums = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:AWG_FORK_SUMS_URL -UseBasicParsing).Content)
+          $line = ($sums -split "`r?`n") | Where-Object { $_.EndsWith("  sing-box-$version-windows-arm64.zip") } | Select-Object -First 1
+          if (-not $line) {
+            throw ("sing-box-awg arm64 pin unverifiable: upstream SHA256SUMS ($env:AWG_FORK_SUMS_URL) has no line for sing-box-$version-windows-arm64.zip (asset EXISTS upstream but failed verification — failing loudly instead of degrading the release)")
+          }
+          $expected = ($line -split " " | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
+          $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw ("sing-box-awg arm64 pin unverifiable: downloaded zip sha256 $actual does not match the upstream SHA256SUMS line $expected (asset EXISTS upstream but failed verification — failing loudly instead of degrading the release)")
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("sing-box-awg arm64 pin unverifiable: pinned URL $url returned a zip without sing-box.exe (asset EXISTS upstream but failed verification — failing loudly instead of degrading the release)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "sing-box-awg version output: $probe"
+          # Identity has already been proven by the checksums above; the version
+          # probe is print evidence (fork version spellings may vary per build).
+          if ([string]::IsNullOrWhiteSpace($probe)) {
+            throw ("sing-box-awg arm64 pin unverifiable: pinned binary produced no version output (asset EXISTS upstream but failed verification — failing loudly instead of degrading the release)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box-awg.exe" -Force
+          "awg=present" >> $env:GITHUB_OUTPUT
 
       - name: Fetch pinned xray arm64 (print URL, download, verify against upstream .dgst checksum)
         shell: pwsh
@@ -511,6 +769,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
           Write-Output "Pin: xray $version windows-arm64-v8a | URL: $url"
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+      - name: Verify xray arm64 zip against the committed pin
+        uses: ./.github/actions/verify-sidecar
+        with:
+          file: ${{ runner.temp }}\Xray-windows-arm64-v8a-${{ env.XRAY_VERSION }}.zip
+          name: Xray-windows-arm64-v8a.zip
+
+      - name: Fetch pinned xray arm64 (verify against upstream .dgst checksum, extract and probe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:XRAY_VERSION
+          $url = $env:XRAY_ARM64_URL
+          $zip = "$env:RUNNER_TEMP\Xray-windows-arm64-v8a-$version.zip"
+          $dir = "$env:RUNNER_TEMP\xray-$version-windows-arm64"
+          # Downloaded and digest-pinned above; the upstream .dgst check below
+          # is corroboration only (same origin as the asset itself).
           # Verify against the SAME release's .dgst sidecar (SHA2-256= line).
           $dgst = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:XRAY_ARM64_DGST_URL -UseBasicParsing).Content)
           $line = ($dgst -split "`r?`n") | Where-Object { $_ -match "^SHA2-256=" } | Select-Object -First 1
@@ -540,7 +815,9 @@ jobs:
       - name: Assemble the arm64 bundle (exact layout) and guard it; withhold loudly when sing-box-awg arm64 is absent upstream
         shell: pwsh
         env:
-          AWG_PRESENT: ${{ steps.probe-awg.outputs.awg }}
+          # The 404-withhold path sets awg on probe-awg; the shipped path sets
+          # it on probe-awg-verify (after the committed-pin verification).
+          AWG_PRESENT: ${{ steps.probe-awg-verify.outputs.awg || steps.probe-awg.outputs.awg }}
         run: |
           $ErrorActionPreference = "Stop"
           $stage = "manyproxy-v$env:VER-windows-arm64"
@@ -583,8 +860,10 @@ jobs:
           Write-Output ("Staged the exact bundle layout: " + (@($actualFiles) -join ", ") + " | licenses: " + (@($actualLicenses) -join ", "))
           Compress-Archive -Path $stage -DestinationPath $zip
           # SHA256SUMS-windows-arm64.txt: the arm64 row's own per-arch sums file
-          # (its own block: zip + each staged arm64 binary). NOT merged into the
-          # amd64 SHA256SUMS.txt — one sums file per arch keeps each arch's sums
+          # (its own block: zip + each staged arm64 binary — the first pass).
+          # The publish-arm64 job later regenerates it to also cover the SBOM
+          # and both attestation bundles. NOT merged into the amd64
+          # SHA256SUMS.txt — one sums file per arch keeps each arch's sums
           # unambiguous, and the generic exe names would collide across arches.
           $hashItems = @($zip, "$stage\manyproxy.exe", "$stage\sing-box.exe", "$stage\sing-box-awg.exe", "$stage\xray.exe")
           $hashes = $hashItems | ForEach-Object {
@@ -594,40 +873,84 @@ jobs:
           Write-Output "SHA256SUMS-windows-arm64.txt:"
           Write-Output (Get-Content -Path "SHA256SUMS-windows-arm64.txt")
 
-      - name: Upload the arm64 bundle as a build artifact (rehearsal runs deliver here; nothing uploads on gate-red or withheld rows)
-        if: always()
+      # Withheld rows publish nothing: every SBOM/sums step below is gated on
+      # the arm64 bundle actually being produced (the probe-awg/-verify pair
+      # is the same shipped/withheld signal the publish/release-body jobs use).
+      - name: Generate SPDX SBOM (arm64)
+        if: steps.probe-awg-verify.outputs.awg == 'present'
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          config: .syft.yaml
+          output-file: manyproxy-v${{ env.VER }}-windows-arm64.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # M6: no `if: always()` — a failed job must not upload a stale first-pass
+      # SHA256SUMS-windows-arm64.txt for the publish job to attest and release.
+      # On a withheld row nothing here matches, so the artifact is simply not
+      # created (if-no-files-found: ignore is the withheld-row behavior).
+      - name: Upload the arm64 bundle as a build artifact (input to publish-arm64; rehearsal runs deliver here)
         uses: actions/upload-artifact@v7
         with:
           name: "manyproxy-${{ env.VER }}-windows-arm64"
           path: |
             manyproxy-v${{ env.VER }}-windows-arm64.zip
             SHA256SUMS-windows-arm64.txt
+            manyproxy-v${{ env.VER }}-windows-arm64.spdx.json
           if-no-files-found: ignore
 
-  # T-04 — coordination job: the amd64 job creates the release (T-03), the
-  # arm64 job runs its gate/bundle in parallel, and THIS job (needs: both)
-  # attaches the arm64 bundle to the release and appends the arm64 green/red
-  # gate line to the body — race-free, and it states the arm64 row's red
-  # result even when the arm64 job failed (that statement cannot come from
-  # inside a failed job). Rehearsal dispatches never reach it.
-  release-body:
-    name: release-body (attach arm64 asset + arm64 gate line)
-    needs: [windows-amd64, windows-arm64]
-    if: ${{ always() && github.ref_type == 'tag' }}
+  # H1: the arm64 twin of publish-amd64 — it never compiles or executes
+  # third-party code; it only attests and re-sums files downloaded from the
+  # build artifact. Its `contents: read` keeps even the artifact download out
+  # of the write scope; only the attest/release actions need their scopes.
+  # The awg guard travels with the moved steps: a withheld row attests
+  # nothing, publishes nothing, and reports `awg=absent` to release-body.
+  publish-arm64:
+    needs: [windows-arm64]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # T-04 note: this job checks out NOTHING (it only downloads the arm64
-    # artifact), so every `gh release` call here must name the repository
-    # explicitly — `gh` infers the target from the git remote, and without a
-    # checkout it fails with "not a git repository" and drops the arm64 asset
-    # and the gate line. Hence `--repo "${{ github.repository }}"` on each call.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+      artifact-metadata: write
+    outputs:
+      awg: ${{ steps.awg-signal.outputs.awg }}
+      awg_reason: ${{ steps.awg-signal.outputs.awg_reason }}
     steps:
       - name: Resolve release tag names
         shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
-          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
-          echo "VER=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
+          # GITHUB_ENV writes only reach later steps, so VER is computed from a
+          # shell variable, and the dispatch input arrives via env (L1).
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="$DISPATCH_TAG"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VER=${TAG#v}" >> "$GITHUB_ENV"
 
+      # Empty on a withheld row: every attest/save step below keys off it, and
+      # the final signal step surfaces the build job's verdict verbatim.
+      - name: Record the arm64 shipped/withheld verdict
+        id: awg-signal
+        env:
+          BUILD_AWG: ${{ needs.windows-arm64.outputs.awg }}
+          BUILD_AWG_REASON: ${{ needs.windows-arm64.outputs.awg_reason }}
+        run: |
+          "awg=${BUILD_AWG}" >> "$GITHUB_OUTPUT"
+          "awg_reason=${BUILD_AWG_REASON}" >> "$GITHUB_OUTPUT"
+          echo "windows-arm64 verdict from the build job: awg=${BUILD_AWG}"
+
+      # The whole publish path is guarded by the same shipped/withheld signal
+      # as before: a withheld row downloads nothing, attests nothing, and the
+      # published artifact is never created.
       - name: Download the arm64 bundle artifact (only when the arm64 row shipped it)
         if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
         uses: actions/download-artifact@v8
@@ -635,8 +958,127 @@ jobs:
           name: "manyproxy-${{ env.VER }}-windows-arm64"
           path: arm64-assets
 
-      - name: Attach the arm64 zip and its sums to the release
+      - name: Unpack the bundle zip for attestation subjects
         if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Get-ChildItem -Path "arm64-assets" -Filter "manyproxy-v*-windows-arm64.zip" | Select-Object -First 1
+          if (-not $zip) { throw "arm64 bundle zip missing from the downloaded artifact" }
+          Expand-Archive -Path $zip.FullName -DestinationPath "." -Force
+
+      # Provenance over the arm64 zip and its four staged binaries; not over
+      # the sums file, which is regenerated below to cover this attestation.
+      - name: Attest build provenance (arm64 zip + staged binaries)
+        id: attest-provenance
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            arm64-assets/manyproxy-v${{ env.VER }}-windows-arm64.zip
+            manyproxy-v${{ env.VER }}-windows-arm64/manyproxy.exe
+            manyproxy-v${{ env.VER }}-windows-arm64/sing-box.exe
+            manyproxy-v${{ env.VER }}-windows-arm64/sing-box-awg.exe
+            manyproxy-v${{ env.VER }}-windows-arm64/xray.exe
+
+      - name: Save the arm64 provenance bundle under its release asset name
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "${{ steps.attest-provenance.outputs.bundle-path }}"
+          if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) {
+            throw "arm64 provenance attestation produced no bundle (bundle-path: '$src') — refusing to publish an arm64 asset without provenance"
+          }
+          Copy-Item -LiteralPath $src -Destination "arm64-assets/manyproxy-v$env:VER-windows-arm64.intoto.jsonl" -Force
+
+      - name: Attest the arm64 SPDX SBOM
+        id: attest-sbom
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        uses: actions/attest@v4
+        with:
+          subject-path: arm64-assets/manyproxy-v${{ env.VER }}-windows-arm64.zip
+          sbom-path: arm64-assets/manyproxy-v${{ env.VER }}-windows-arm64.spdx.json
+
+      - name: Save the arm64 SBOM attestation bundle under its release asset name
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "${{ steps.attest-sbom.outputs.bundle-path }}"
+          if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) {
+            throw "arm64 SBOM attestation produced no bundle (bundle-path: '$src') — refusing to publish an arm64 asset without an SBOM attestation"
+          }
+          Copy-Item -LiteralPath $src -Destination "arm64-assets/manyproxy-v$env:VER-windows-arm64.sbom.intoto.jsonl" -Force
+
+      # Final sums over every published arm64 file; the zip and binaries keep
+      # the same hashes as the first pass.
+      - name: Regenerate SHA256SUMS-windows-arm64.txt over every published file
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "manyproxy-v$env:VER-windows-arm64"
+          $hashItems = @(
+            "arm64-assets/manyproxy-v$env:VER-windows-arm64.zip",
+            "$stage/manyproxy.exe", "$stage/sing-box.exe", "$stage/sing-box-awg.exe", "$stage/xray.exe",
+            "arm64-assets/manyproxy-v$env:VER-windows-arm64.spdx.json",
+            "arm64-assets/manyproxy-v$env:VER-windows-arm64.intoto.jsonl",
+            "arm64-assets/manyproxy-v$env:VER-windows-arm64.sbom.intoto.jsonl"
+          )
+          $hashes = $hashItems | ForEach-Object {
+            "{0}  {1}" -f ((Get-FileHash -Path $_ -Algorithm SHA256).Hash).ToLowerInvariant(), (Split-Path $_ -Leaf)
+          }
+          Set-Content -Path "arm64-assets/SHA256SUMS-windows-arm64.txt" -Value $hashes -Encoding utf8NoBOM
+          Write-Output "SHA256SUMS-windows-arm64.txt:"
+          Write-Output (Get-Content -Path "arm64-assets/SHA256SUMS-windows-arm64.txt")
+
+      - name: Upload the attested arm64 bundle as build artifact (rehearsal runs deliver here)
+        if: needs.windows-arm64.result == 'success' && needs.windows-arm64.outputs.awg == 'present'
+        uses: actions/upload-artifact@v7
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-arm64-published"
+          path: arm64-assets
+          if-no-files-found: error
+
+  # T-04 — coordination job: the publish-amd64 job creates the release (T-03),
+  # the publish-arm64 job attests its bundle in parallel, and THIS job (needs:
+  # both publish jobs) attaches the arm64 bundle to the release and appends
+  # the arm64 green/red gate line to the body — race-free, and it states the
+  # arm64 row's red result even when an earlier job failed (that statement
+  # cannot come from inside a failed job). Rehearsal dispatches never reach it.
+  release-body:
+    name: release-body (attach arm64 asset + arm64 gate line)
+    needs: [publish-amd64, publish-arm64]
+    if: ${{ always() && github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      # gh attestation verify reads the repository's attestations.
+      attestations: read
+    # T-04 note: this job checks out NOTHING (it only downloads the arm64
+    # artifact and release assets), so every `gh release` call here must name
+    # the repository explicitly — `gh` infers the target from the git remote,
+    # and without a checkout it fails with "not a git repository" and drops
+    # the arm64 asset and the gate line. Hence `--repo "${{ github.repository }}"`
+    # on each call.
+    steps:
+      - name: Resolve release tag names
+        shell: bash
+        run: |
+          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "VER=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Download the attested arm64 bundle artifact (only when the arm64 row shipped it)
+        if: needs.publish-arm64.result == 'success' && needs.publish-arm64.outputs.awg == 'present'
+        uses: actions/download-artifact@v8
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-arm64-published"
+          path: arm64-assets
+
+      - name: Attach the arm64 zip, its sums, SBOM and attestation bundles to the release
+        if: needs.publish-arm64.result == 'success' && needs.publish-arm64.outputs.awg == 'present'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -645,8 +1087,34 @@ jobs:
           gh release upload "$TAG" \
             "arm64-assets/manyproxy-v${TAG#v}-windows-arm64.zip" \
             "arm64-assets/SHA256SUMS-windows-arm64.txt" \
+            "arm64-assets/manyproxy-v${TAG#v}-windows-arm64.spdx.json" \
+            "arm64-assets/manyproxy-v${TAG#v}-windows-arm64.intoto.jsonl" \
+            "arm64-assets/manyproxy-v${TAG#v}-windows-arm64.sbom.intoto.jsonl" \
             --repo "${{ github.repository }}" \
             --clobber
+
+      # A broken attestation fails the release loudly. amd64 must verify; the
+      # arm64 zip is verified only when this run actually published it, so an
+      # arm64 red/withheld row still leaves the amd64 release intact.
+      - name: Verify the published attestations
+        if: needs.publish-amd64.result == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ARM_RESULT: ${{ needs.publish-arm64.result }}
+          ARM_PRESENT: ${{ needs.publish-arm64.outputs.awg }}
+        run: |
+          set -euo pipefail
+          mkdir -p verify
+          gh release download "$TAG" --repo "${{ github.repository }}" --dir verify --pattern "manyproxy-v*-windows-amd64.zip"
+          gh attestation verify verify/manyproxy-v*-windows-amd64.zip --repo "${{ github.repository }}"
+          if [ "$ARM_RESULT" = "success" ] && [ "$ARM_PRESENT" = "present" ]; then
+            gh release download "$TAG" --repo "${{ github.repository }}" --dir verify --pattern "manyproxy-v*-windows-arm64.zip"
+            gh attestation verify verify/manyproxy-v*-windows-arm64.zip --repo "${{ github.repository }}"
+          else
+            echo "windows-arm64 asset not published this run — nothing to verify"
+          fi
 
       - name: Append the windows-arm64 green/red gate line to the release body
         if: always()
@@ -654,9 +1122,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-          ARM_RESULT: ${{ needs.windows-arm64.result }}
-          AWG_PRESENT: ${{ needs.windows-arm64.outputs.awg }}
-          AWG_REASON: ${{ needs.windows-arm64.outputs.awg_reason }}
+          ARM_RESULT: ${{ needs.publish-arm64.result }}
+          AWG_PRESENT: ${{ needs.publish-arm64.outputs.awg }}
+          AWG_REASON: ${{ needs.publish-arm64.outputs.awg_reason }}
           SBV: ${{ env.SINGBOX_VERSION }}
           AWGV: ${{ env.AWG_FORK_VERSION }}
           XRV: ${{ env.XRAY_VERSION }}
@@ -664,13 +1132,17 @@ jobs:
           set -euo pipefail
           gh release view "$TAG" --repo "${{ github.repository }}" --json body --jq .body > body-pre.md
           if [ -z "$(cat body-pre.md | tr -d '[:space:]')" ]; then
-            echo "release body is empty — the amd64 release step likely never ran (amd64 job failed); failing loudly" >&2
+            echo "release body is empty — the amd64 release step likely never ran (the publish-amd64 job failed); failing loudly" >&2
             exit 1
           fi
+          # M3 idempotency: a re-run (or a re-run of a failed attempt) must not
+          # append the gate line twice — drop any existing arm64 row first.
+          grep -v '^- windows-arm64 row:' body-pre.md > body-pre.tmp || true
+          mv body-pre.tmp body-pre.md
           if [ "$ARM_RESULT" != "success" ]; then
             LINE="- windows-arm64 row: **gate red** (the full fmt → clippy → test gate on the windows-11-arm runner did not pass un-skipped) — no arm64 asset is published for $TAG and the windows-amd64 release is unaffected. Pinned arm64 references for this row: sing-box $SBV (SagerNet), sing-box-awg $AWGV (Leadaxe/sing-box-lx fork), xray $XRV (XTLS/Xray-core)."
           elif [ "$AWG_PRESENT" = "present" ]; then
-            LINE="- windows-arm64 row: **gate green** (fmt → clippy → test, un-skipped, on the windows-11-arm runner) and the asset is published with pinned sidecars — sing-box $SBV (SagerNet official windows-arm64 zip), sing-box-awg $AWGV (Leadaxe/sing-box-lx windows-arm64 zip, verified against the same release's SHA256SUMS), xray $XRV (Xray-windows-arm64-v8a.zip, verified against the same release's .dgst). Hashes: SHA256SUMS-windows-arm64.txt."
+            LINE="- windows-arm64 row: **gate green** (fmt → clippy → test, un-skipped, on the windows-11-arm runner) and the asset is published with pinned sidecars — sing-box $SBV (SagerNet official windows-arm64 zip), sing-box-awg $AWGV (Leadaxe/sing-box-lx windows-arm64 zip, verified against the committed pin and the same release's SHA256SUMS), xray $XRV (Xray-windows-arm64-v8a.zip, verified against the committed pin and the same release's .dgst). Hashes: SHA256SUMS-windows-arm64.txt."
           else
             LINE="- windows-arm64 row: **gate green, asset withheld** — $AWG_REASON"
           fi

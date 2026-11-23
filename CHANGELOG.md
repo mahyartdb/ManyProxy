@@ -2,6 +2,12 @@
 
 All notable changes to ManyProxy are recorded here. The format follows Keep a Changelog 1.1.0. Ticket boards live by the artifact lifecycle in `AGENTS.md`. A board exists while work is in flight and is deleted when its outcome lands here.
 
+## [Unreleased]
+
+### Changed
+
+- Dependency vulnerabilities are fixed and gated by `cargo-audit`/`cargo-deny`, the test suite runs under `cargo-nextest`, and release artifacts now carry signed provenance/SBOM attestations produced by least-privilege jobs with committed sidecar digests.
+
 ## [0.2.0] - 2026-11-20
 
 The gpui-kit 0.9.1 upgrade lands, and the bug hunt closes two render-path

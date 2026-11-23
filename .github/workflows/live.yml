@@ -13,11 +13,9 @@ concurrency:
   group: live-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
-  SINGBOX_VERSION: ${{ inputs.singbox_version }}
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
@@ -26,9 +24,13 @@ jobs:
   live-windows:
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - name: Check out
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -37,15 +39,24 @@ jobs:
 
       - name: Fetch pinned sing-box (no silent downloads in the app itself)
         shell: pwsh
+        env:
+          SINGBOX_VERSION: ${{ inputs.singbox_version }}
         run: |
-          $version = "${{ inputs.singbox_version }}"
+          $ErrorActionPreference = "Stop"
+          $version = $env:SINGBOX_VERSION
           $zip = "sing-box-$version-windows-amd64.zip"
           $url = "https://github.com/SagerNet/sing-box/releases/download/v$version/$zip"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\$zip"
           $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64"
-          Expand-Archive -Path "$env:RUNNER_TEMP\$zip" -DestinationPath "$env:RUNNER_TEMP"
-          Copy-Item "$dir\sing-box.exe" -Destination "target\debug\sing-box.exe" -Force
-          & "target\debug\sing-box.exe" version
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\$zip"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Expand-Archive -Path "$env:RUNNER_TEMP\$zip" -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter sing-box.exe | Select-Object -First 1
+          if (-not $exe) { throw "sing-box.exe not found under $dir after extracting $zip" }
+          New-Item -ItemType Directory -Path "target\debug" -Force | Out-Null
+          Copy-Item $exe.FullName -Destination "target\debug\sing-box.exe" -Force
+          $reported = (& "target\debug\sing-box.exe" version | Out-String).Trim()
+          Write-Host $reported
+          if ($LASTEXITCODE -ne 0 -or $reported -notlike "*$version*") { throw "target\debug\sing-box.exe reports '$reported' (exit $LASTEXITCODE), expected the pinned $version" }
 
       - name: Live proofs (gated; hermetic suite runs first un-gated)
         shell: pwsh

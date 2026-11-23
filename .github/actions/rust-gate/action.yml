@@ -1,0 +1,69 @@
+name: Rust gate
+description: >-
+  Run the repository's fmt → clippy → test gate once, for both release
+  architectures (one invocation per architecture). The caller checks the
+  repository out first and keeps the job env (CARGO_INCREMENTAL etc.); this
+  action only installs nextest and runs the four gate commands.
+
+inputs:
+  target:
+    description: >-
+      Optional Rust target triple (for example aarch64-pc-windows-msvc) passed
+      to clippy, nextest and the doctest run. Empty means the host toolchain.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Official nextest binaries exist for both release architectures
+    # (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc).
+    - name: Install nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+
+    - name: Gate 1/4 — cargo fmt --check
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        cargo fmt --check
+        if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE) — the gate is red; a tag on an un-gated commit must not ship" }
+
+    - name: Gate 2/4 — cargo clippy --all-targets --locked -- -D warnings
+      shell: pwsh
+      env:
+        RUST_GATE_TARGET: ${{ inputs.target }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cargs = @("clippy", "--all-targets", "--locked")
+        if ($env:RUST_GATE_TARGET) { $cargs += @("--target", $env:RUST_GATE_TARGET) }
+        $cargs += @("--", "-D", "warnings")
+        Write-Output ("Run: cargo " + ($cargs -join " "))
+        & cargo @cargs
+        if ($LASTEXITCODE -ne 0) { throw "cargo clippy --all-targets --locked -- -D warnings failed (exit $LASTEXITCODE) — the gate is red; a tag on an un-gated commit must not ship" }
+
+    - name: Gate 3/4 — cargo nextest run --locked --profile ci
+      shell: pwsh
+      env:
+        RUST_GATE_TARGET: ${{ inputs.target }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cargs = @("nextest", "run", "--locked", "--profile", "ci")
+        if ($env:RUST_GATE_TARGET) { $cargs += @("--target", $env:RUST_GATE_TARGET) }
+        Write-Output ("Run: cargo " + ($cargs -join " "))
+        & cargo @cargs
+        if ($LASTEXITCODE -ne 0) { throw "cargo nextest run --locked --profile ci failed (exit $LASTEXITCODE) — the gate is red; a tag on an un-gated commit must not ship" }
+
+    # nextest does not run doctests, so they gate separately here.
+    - name: Gate 4/4 — doctests (cargo test --locked --doc)
+      shell: pwsh
+      env:
+        RUST_GATE_TARGET: ${{ inputs.target }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cargs = @("test", "--locked", "--doc")
+        if ($env:RUST_GATE_TARGET) { $cargs += @("--target", $env:RUST_GATE_TARGET) }
+        Write-Output ("Run: cargo " + ($cargs -join " "))
+        & cargo @cargs
+        if ($LASTEXITCODE -ne 0) { throw "cargo test --locked --doc failed (exit $LASTEXITCODE) — nextest does not run doctests, so they must pass here" }

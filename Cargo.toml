@@ -1,11 +1,15 @@
 [package]
 name = "manyproxy"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
+publish = false
 
 [workspace]
 members = ["crates/core", "crates/ui"]
 default-members = [".", "crates/core", "crates/ui"]
+
+[workspace.package]
+version = "0.2.1"
 
 [dependencies]
 manyproxy-core = { path = "crates/core" }
@@ -13,3 +17,9 @@ manyproxy-ui = { path = "crates/ui" }
 
 [build-dependencies]
 embed-resource = "3"
+
+# Thin LTO and one codegen unit per crate trade a slower release build for a
+# smaller, faster binary; diagnostics and unwinding stay enabled on purpose.
+[profile.release]
+lto = "thin"
+codegen-units = 1

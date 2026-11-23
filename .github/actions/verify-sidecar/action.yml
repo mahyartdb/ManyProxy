@@ -1,0 +1,47 @@
+name: "Verify sidecar digest against the committed pin"
+description: >
+  Compares a downloaded sidecar asset's SHA-256 against its committed pin in
+  pins/sidecars.sha256. Must run BEFORE any extraction or execution of the
+  asset: the pin is repo-owned and changes only through reviewed PRs, while
+  upstream manifests fetched at build time are same-origin corroboration, not
+  proof of authenticity.
+
+inputs:
+  file:
+    description: "Path to the downloaded zip to hash"
+    required: true
+  name:
+    description: "Filename key to look up in pins/sidecars.sha256"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - shell: pwsh
+      env:
+        SIDECAR_FILE: ${{ inputs.file }}
+        SIDECAR_NAME: ${{ inputs.name }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        # Exact-name lookup: field 0 must be a full 64-hex digest and field 1
+        # must equal the requested filename. Comment lines fail the hex field;
+        # an unlined filename is a loud failure, never a free pass. The split
+        # runs per line in a loop — a piped ForEach-Object would flatten the
+        # per-line arrays and turn $_[0] into a single character.
+        $entry = $null
+        foreach ($line in (Get-Content -Path (Join-Path $env:GITHUB_WORKSPACE "pins\sidecars.sha256") -ErrorAction Stop)) {
+          $fields = $line -split "\s+"
+          if ($fields[0] -match "^[0-9a-fA-F]{64}$" -and $fields[1] -ceq $env:SIDECAR_NAME) {
+            $entry = $fields
+            break
+          }
+        }
+        if (-not $entry) {
+          throw ("verify-sidecar: no pin for '$($env:SIDECAR_NAME)' in pins/sidecars.sha256 — add a reviewed pin before this asset may be downloaded, let alone executed")
+        }
+        $expected = $entry[0].ToLowerInvariant()
+        $actual = ((Get-FileHash -LiteralPath $env:SIDECAR_FILE -Algorithm SHA256).Hash).ToLowerInvariant()
+        Write-Output "verify-sidecar: $($env:SIDECAR_NAME) sha256 $actual (pin: $expected)"
+        if ($actual -ne $expected) {
+          throw ("verify-sidecar: digest mismatch for '$($env:SIDECAR_NAME)' — downloaded zip sha256 $actual does not match the committed pin $expected (pins/sidecars.sha256). Failing loudly; no extraction, no execution, no substitution.")
+        }

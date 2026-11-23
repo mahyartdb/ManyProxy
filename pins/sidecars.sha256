@@ -1,0 +1,18 @@
+# Sidecar digest pins — repo-owned, committed to git.
+# Every line pins one downloaded sidecar release asset by its SHA-256 digest.
+# Bumps are reviewed in PRs: changing a digest here changes what the release
+# workflow is allowed to extract and execute, so the diff must name the new
+# upstream version and cite the asset it came from.
+# Upstream manifests (the fork's SHA256SUMS, Xray's .dgst files) are fetched at
+# build time and kept as CORROBORATION ONLY — they prove upstream consistency
+# but ship from the same origin as the asset, so they cannot vouch for it.
+# These digests were computed from the pinned upstream assets and
+# cross-checked against the upstream SHA256SUMS/.dgst files where those exist.
+#
+# Format: <lowercase hex sha256>  <filename>
+c2d8bfff918755808781dfdeeb8581b6c91eb3a243d9a7b55483cfc0c0684d32  sing-box-1.14.2-windows-amd64.zip
+2bb467039310452380958b821983d5bb4f78fb70a2583914e4bea8b011582b64  sing-box-1.14.2-windows-arm64.zip
+2a07b66b2e18a67a066bc38c838fbe665a0acd312f2bf6ecf35df36b275adbc1  sing-box-1.14.3-lx.21-windows-amd64.zip
+1d9fe7e6c956cf6438046eeb608952a0a8ad948ef4b0b360593768de8d3f3243  sing-box-1.14.3-lx.21-windows-arm64.zip
+d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad  Xray-windows-64.zip
+35d4ed6ec21224fb22b07c2c3f672e2350cd536f2c74d309150175a76365ea88  Xray-windows-arm64-v8a.zip

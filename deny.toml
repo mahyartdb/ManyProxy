@@ -1,0 +1,48 @@
+[graph]
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "workspace"
+# No advisory ignores: every vulnerability reported in this lockfile was
+# fixed by a version bump, and no transitive advisory needs suppression.
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies in workspace crates need `publish = false` before this
+# exemption applies; crates.io rejects path dependencies in published crates.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+confidence-threshold = 0.9
+# The workspace crates are not published, but they need `publish = false` in
+# their manifests before cargo-deny treats them as private and skips them.
+private = { ignore = true }
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

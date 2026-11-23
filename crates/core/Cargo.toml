@@ -1,10 +1,11 @@
 [package]
 name = "manyproxy-core"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
+publish = false
 
 [dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 base64 = "0.22"
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
