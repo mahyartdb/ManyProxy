@@ -371,7 +371,7 @@ jobs:
       # crates. The action uploads nothing; the publish-amd64 job publishes
       # the file.
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@v0.24.3
         with:
           path: .
           format: spdx-json
@@ -878,7 +878,7 @@ jobs:
       # is the same shipped/withheld signal the publish/release-body jobs use).
       - name: Generate SPDX SBOM (arm64)
         if: steps.probe-awg-verify.outputs.awg == 'present'
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@v0.24.3
         with:
           path: .
           format: spdx-json
