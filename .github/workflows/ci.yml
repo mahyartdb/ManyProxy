@@ -128,15 +128,17 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      # rustsec/audit-check publishes a check run; fork PRs fall back to stdout.
-      checks: write
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      # Fails on any known RustSec vulnerability in Cargo.lock.
-      - uses: rustsec/audit-check@v2
+      # Prebuilt binaries: rustsec/audit-check compiles cargo-audit from
+      # source every run (~3 min) and then dies trying to publish a check
+      # run, which Dependabot's read-only token forbids.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit,cargo-deny
+      # Fails on any known RustSec vulnerability in Cargo.lock.
+      - run: cargo audit
       # Enforces deny.toml policy: advisories, bans, licenses, sources.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - run: cargo deny check
