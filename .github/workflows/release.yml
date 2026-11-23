@@ -917,8 +917,8 @@ jobs:
       id-token: write
       artifact-metadata: write
     outputs:
-      awg: ${{ steps.awg-signal.outputs.awg }}
-      awg_reason: ${{ steps.awg-signal.outputs.awg_reason }}
+      awg: ${{ needs.windows-arm64.outputs.awg }}
+      awg_reason: ${{ needs.windows-arm64.outputs.awg_reason }}
     steps:
       - name: Resolve release tag names
         shell: bash
@@ -935,18 +935,6 @@ jobs:
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "VER=${TAG#v}" >> "$GITHUB_ENV"
-
-      # Empty on a withheld row: every attest/save step below keys off it, and
-      # the final signal step surfaces the build job's verdict verbatim.
-      - name: Record the arm64 shipped/withheld verdict
-        id: awg-signal
-        env:
-          BUILD_AWG: ${{ needs.windows-arm64.outputs.awg }}
-          BUILD_AWG_REASON: ${{ needs.windows-arm64.outputs.awg_reason }}
-        run: |
-          "awg=${BUILD_AWG}" >> "$GITHUB_OUTPUT"
-          "awg_reason=${BUILD_AWG_REASON}" >> "$GITHUB_OUTPUT"
-          echo "windows-arm64 verdict from the build job: awg=${BUILD_AWG}"
 
       # The whole publish path is guarded by the same shipped/withheld signal
       # as before: a withheld row downloads nothing, attests nothing, and the
