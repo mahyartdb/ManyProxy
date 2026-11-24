@@ -8,7 +8,6 @@ publish = false
 manyproxy-core = { path = "../core" }
 gpui-kit = "0.11.0"
 tray-icon = "0.25"
-winreg = "0.55"
 raw-window-handle = "0.6"
 qrcodegen = "1.8.0"
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -20,6 +19,7 @@ futures = "0.3"
 web-time = "1"
 
 [target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
