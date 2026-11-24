@@ -8,7 +8,7 @@ publish = false
 manyproxy-core = { path = "../core" }
 gpui-kit = "0.9.1"
 tray-icon = "0.25"
-winreg = "0.55"
+winreg = "0.56"
 raw-window-handle = "0.6"
 qrcodegen = "1.8.0"
 serde_json = { version = "1", features = ["preserve_order"] }
