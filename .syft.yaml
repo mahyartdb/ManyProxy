@@ -5,3 +5,10 @@ exclude:
   - "./target/**"
   - "./.git/**"
   - "./manyproxy-v*-windows-*/**"
+# The SBOM is the Rust dependency graph. Syft's directory scan also runs two
+# GitHub Actions catalogers, which list every workflow and composite action as
+# a package and bury ~900 crates under workflow noise.
+select-catalogers:
+  - "-github-actions"
+source:
+  name: manyproxy
