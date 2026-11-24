@@ -5,6 +5,11 @@ name: port-probe
 
 on:
   workflow_dispatch:
+  # The workflow file must be on the default branch to be dispatchable; on a
+  # feature branch, pushing fires the probe instead.
+  push:
+    branches:
+      - "gpui-kit-0-11"
 
 permissions: {}
 
