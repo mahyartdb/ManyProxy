@@ -1,0 +1,96 @@
+name: port-probe
+
+# Throwaway probe: does the workspace type-check on Linux and macOS, and what
+# exactly breaks? Runs on a branch only; never on master. No permissions.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: port-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # gpui-kit's documented Linux system dependencies (installation.md),
+      # verified on Ubuntu 24.04. libasound2-dev is only for the speech
+      # feature and is left out.
+      - name: Linux system libraries for GPUI
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+            libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libssl-dev libzstd-dev libvulkan1 pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: probe-${{ matrix.target }}
+
+      - name: Resolve dependencies for the target
+        run: cargo metadata --format-version 1 --locked > /dev/null
+
+      # Each package is checked on its own so one broken crate does not hide
+      # the next: core first (no GUI), then ui, then the bin.
+      - name: check manyproxy-core
+        continue-on-error: true
+        run: cargo check --locked -p manyproxy-core --target ${{ matrix.target }} 2>&1 | tee core.log
+
+      - name: check manyproxy-ui
+        continue-on-error: true
+        run: cargo check --locked -p manyproxy-ui --target ${{ matrix.target }} 2>&1 | tee ui.log
+
+      - name: check manyproxy (bin)
+        continue-on-error: true
+        run: cargo check --locked --workspace --target ${{ matrix.target }} 2>&1 | tee bin.log
+
+      - name: Summarize what broke
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.name }}"
+            echo ''
+            for log in core.log ui.log bin.log; do
+              [ -f "$log" ] || continue
+              errors=$(grep -cE '^error(\[E[0-9]+\])?: ' "$log" || true)
+              echo "### $log — $errors error(s)"
+              echo ''
+              echo '```'
+              grep -E '^error(\[E[0-9]+\])?: |^\s+--> ' "$log" | head -80 || true
+              echo '```'
+              echo ''
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-${{ matrix.name }}
+          path: '*.log'
+          if-no-files-found: ignore
+          retention-days: 7

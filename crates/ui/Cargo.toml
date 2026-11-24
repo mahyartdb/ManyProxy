@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 manyproxy-core = { path = "../core" }
-gpui-kit = "0.9.1"
+gpui-kit = "0.11.0"
 tray-icon = "0.25"
 winreg = "0.55"
 raw-window-handle = "0.6"
@@ -33,7 +33,7 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 manyproxy-core = { path = "../core", features = ["test-support"] }
-gpui-kit = { version = "0.9.1", features = ["test-support"] }
+gpui-kit = { version = "0.11.0", features = ["test-support"] }
 base64 = "0.22"
 
 # The split integration-test binaries under tests/ drive the app's own
