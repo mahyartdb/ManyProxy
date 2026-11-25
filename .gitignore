@@ -7,3 +7,6 @@
 
 # Local live-test sandbox (app + throwaway db).
 .sandbox-run/
+
+# Planning/board artifacts live only while work is in flight (AGENTS.md).
+/tasks/
