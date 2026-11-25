@@ -1199,6 +1199,7 @@ impl AppView {
                 id: row.id.clone(),
                 name: row.name.clone(),
                 protocol: row.protocol.clone(),
+                rule: chain_hop_rule(row),
             })
             .collect();
         form.chain_library = Rc::new(RefCell::new(library.clone()));
@@ -1285,6 +1286,7 @@ impl AppView {
                 id: row.id.clone(),
                 name: row.name.clone(),
                 protocol: row.protocol.clone(),
+                rule: chain_hop_rule(row),
             })
             .collect();
         form.chain_library = Rc::new(RefCell::new(library.clone()));

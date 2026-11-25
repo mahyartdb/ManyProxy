@@ -5,6 +5,10 @@ pub struct ChainLibraryEntry {
     pub id: String,
     pub name: String,
     pub protocol: String,
+    /// The store's verdict on this row as a chain hop, with the refusal text
+    /// when it can never be one. Classified once from the full row where the
+    /// picker is built, so params-based rules (XHTTP, VLESS encryption) apply.
+    pub rule: Result<ChainHopRule, String>,
 }
 
 pub fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
@@ -23,40 +27,24 @@ pub fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
     panel_choices("chain-pick-option", &items)
 }
 
-pub fn chain_slot_kind(protocol: &str) -> ChainHopSlot {
-    use crate::engine::{is_chain_protocol, is_extra_core_protocol};
-    if protocol.trim().eq_ignore_ascii_case("autoselector") {
-        return ChainHopSlot::Autoselector;
-    }
-    if is_chain_protocol(protocol) {
-        ChainHopSlot::Chain
-    } else if is_extra_core_protocol(protocol) {
-        ChainHopSlot::Extra
-    } else {
-        ChainHopSlot::Other
-    }
-}
-
-pub fn chain_existing_kinds(
+/// The rule each hop already in the chain falls under, in order. A reference
+/// takes its row's rule from the library; hand-written JSON is classified by
+/// the store the same way, so a replace can never leave a refused hop behind.
+pub fn chain_existing_rules(
     hops: &[serde_json::Value],
     library: &[ChainLibraryEntry],
-) -> Vec<ChainHopSlot> {
+) -> Vec<ChainHopRule> {
     hops.iter()
         .map(|node| match node {
             serde_json::Value::String(id) => library
                 .iter()
                 .find(|entry| entry.id == id.trim())
-                .map(|entry| chain_slot_kind(&entry.protocol))
-                .unwrap_or(ChainHopSlot::Other),
+                .and_then(|entry| entry.rule.clone().ok())
+                .unwrap_or(ChainHopRule::NeverAHop),
             serde_json::Value::Object(map) => {
-                let marker = map
-                    .get("type")
-                    .or_else(|| map.get("protocol"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                chain_slot_kind(marker)
+                chain_inline_hop_rule(map).unwrap_or(ChainHopRule::NeverAHop)
             }
-            _ => ChainHopSlot::Other,
+            _ => ChainHopRule::NeverAHop,
         })
         .collect()
 }

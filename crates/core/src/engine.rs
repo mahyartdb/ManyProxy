@@ -1294,7 +1294,7 @@ fn truthy(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
     })
 }
 
-fn inline_hop_kind(
+pub fn inline_hop_kind(
     name: &str,
     label: &str,
     map: &serde_json::Map<String, serde_json::Value>,

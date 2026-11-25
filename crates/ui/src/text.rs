@@ -1098,17 +1098,18 @@ pub fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> Stri
 }
 pub fn chain_hop_rejection_message(rule: String) -> String {
     match rule.as_str() {
-        "chain hops cannot nest a chain (v1 chains are flat — pick a non-chain row)" => {
+        "chain hops cannot nest a chain (chains are flat — pick a non-chain row)" => {
             t!("chain-reject-nested")
         }
-        "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)" => {
+        "chain hops cannot take an autoselector (chains are flat — pick a concrete row)" => {
             t!("chain-reject-autoselector")
         }
-        "hop index is out of range (pick the hop to replace)" => t!("chain-reject-index"),
-        "extracore hops must sit at index 0 (first hop only — off-index-0 rejected)" => {
-            t!("chain-reject-extra-index")
+        "that row runs outside the main engine and is never a chain hop" => {
+            t!("chain-reject-outside")
         }
-        "at most one extracore hop per chain" => t!("chain-reject-extra-count"),
+        "hop index is out of range (pick the hop to replace)" => t!("chain-reject-index"),
+        "that hop is egress-only and must be the last hop" => t!("chain-reject-extra-index"),
+        "at most one extra-core hop per chain" => t!("chain-reject-extra-count"),
         _ => rule,
     }
 }

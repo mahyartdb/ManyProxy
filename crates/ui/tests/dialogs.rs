@@ -4527,69 +4527,270 @@ fn t07_chain_page_paints_empty_and_rules(cx: &mut TestAppContext) {
     assert_absent(cx, "chain-hops-list".to_string());
     cx.update(|window, cx| window.close_all_dialogs(cx));
 
-    let (landed, refused_chain, refused_off_index, refused_second, replaced) =
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                let library = vec![
-                    manyproxy_ui::ChainLibraryEntry {
-                        id: "a".to_string(),
-                        name: "VlessOne".to_string(),
-                        protocol: "vless".to_string(),
-                    },
-                    manyproxy_ui::ChainLibraryEntry {
-                        id: "b".to_string(),
-                        name: "ChainOne".to_string(),
-                        protocol: "chain".to_string(),
-                    },
-                    manyproxy_ui::ChainLibraryEntry {
-                        id: "c".to_string(),
-                        name: "CoreOne".to_string(),
-                        protocol: "extra-core".to_string(),
-                    },
-                ];
-                let library = Rc::new(RefCell::new(library));
-                let hops: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(Vec::new()));
-                let pick = ConfigForm::panel_select(
-                    window,
-                    cx,
-                    manyproxy_ui::chain_pick_choices(&library.borrow()),
-                    "",
-                );
+    // Rows are classified from the full row, exactly as the picker builds
+    // its library, so a refusal at pick time is the store's rule and not a
+    // second copy of it.
+    let library: Vec<manyproxy_ui::ChainLibraryEntry> = [
+        t07_chain_row(
+            "a",
+            "VlessOne",
+            "vless",
+            r#"{"server":"198.51.100.9","server_port":443}"#,
+        ),
+        t07_chain_row("b", "ChainOne", "chain", r#"{"nodes":["a"]}"#),
+        t07_chain_row(
+            "c",
+            "CoreOne",
+            "extra-core",
+            r#"{"exe":"core.exe","config":{}}"#,
+        ),
+        t07_chain_row("d", "AwgOne", "amneziawg", r#"{"awg_version":"2.0"}"#),
+        t07_chain_row(
+            "e",
+            "XrayOne",
+            "xray",
+            r#"{"server":"198.51.100.9","server_port":443}"#,
+        ),
+        t07_chain_row(
+            "f",
+            "SsOne",
+            "shadowsocks",
+            r#"{"server":"198.51.100.9","server_port":8388}"#,
+        ),
+    ]
+    .into_iter()
+    .map(|row| manyproxy_ui::ChainLibraryEntry {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        protocol: row.protocol.clone(),
+        rule: manyproxy_ui::chain_hop_rule(&row),
+    })
+    .collect();
+    let library = Rc::new(RefCell::new(library));
+    let hops: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(Vec::new()));
 
-                let refused_chain = view.chain_add_hop(&hops, &library, &pick, "b", window, cx);
-                let landed_extra = view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
-                let refused_second = view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
-                let landed = view.chain_add_hop(&hops, &library, &pick, "a", window, cx);
-                let refused_off_index =
-                    view.chain_replace_hop(&hops, &library, &pick, 1, "c", window, cx);
-                let refused_replace_chain =
-                    view.chain_replace_hop(&hops, &library, &pick, 1, "b", window, cx);
-                let replaced = hops.borrow().clone();
-                assert_eq!(
-                    manyproxy_ui::chain_hop_label(&replaced[0], 0, &library.borrow()),
-                    "1. CoreOne (extra-core)"
-                );
-                assert_eq!(
-                    manyproxy_ui::chain_existing_kinds(&replaced, &library.borrow()),
-                    vec![
-                        manyproxy_ui::store::ChainHopSlot::Extra,
-                        manyproxy_ui::store::ChainHopSlot::Other
-                    ]
-                );
-                (
-                    landed_extra && landed,
-                    !refused_chain,
-                    !refused_off_index,
-                    !refused_second,
-                    !refused_replace_chain && replaced.len() == 2,
-                )
+    // `pick` needs the view's context; toasts are counted from the test
+    // context. Each pick is one synchronous update, so no toast timer can
+    // run between a pick and its count.
+    let pick = cx.update(|window, cx| {
+        view.update(cx, |_, cx| {
+            ConfigForm::panel_select(
+                window,
+                cx,
+                manyproxy_ui::chain_pick_choices(&library.borrow()),
+                "",
+            )
+        })
+    });
+    let mut outcomes: Vec<(String, bool, usize)> = Vec::new();
+    let mut pick_row = |what: &str, id: &str, replace_at: Option<usize>| {
+        let before = notification_count(cx);
+        let accepted = cx.update(|window, cx| {
+            view.update(cx, |view, cx| match replace_at {
+                Some(index) => {
+                    view.chain_replace_hop(&hops, &library, &pick, index, id, window, cx)
+                }
+                None => view.chain_add_hop(&hops, &library, &pick, id, window, cx),
             })
         });
-    assert!(landed, "legal hops land (extra at 0, vless after)");
-    assert!(refused_chain, "chain→chain add refused");
-    assert!(refused_off_index, "off-index-0 extracore replace refused");
-    assert!(refused_second, "second extracore add refused");
-    assert!(replaced, "chain replace refused, hops unchanged");
+        outcomes.push((what.to_string(), accepted, notification_count(cx) - before));
+    };
+    for id in ["b", "c", "d"] {
+        pick_row(&format!("add {id}"), id, None);
+    }
+    for id in ["a", "f"] {
+        pick_row(&format!("add {id}"), id, None);
+    }
+    pick_row("replace 1 with c", "c", Some(1));
+    pick_row("replace 0 with e", "e", Some(0));
+    pick_row("add e", "e", None);
+
+    let accepted: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, ok, _)| *ok)
+        .map(|(what, _, _)| what.as_str())
+        .collect();
+    let refused: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, ok, _)| !*ok)
+        .map(|(what, _, _)| what.as_str())
+        .collect();
+    assert_eq!(
+        accepted,
+        vec!["add a", "add f", "add e"],
+        "an ordinary row lands anywhere; an Xray-served row lands as the last hop"
+    );
+    assert_eq!(
+        refused,
+        vec![
+            "add b",
+            "add c",
+            "add d",
+            "replace 1 with c",
+            "replace 0 with e"
+        ],
+        "chain, extra-core and AmneziaWG rows are never hops; an Xray-served row is last-only"
+    );
+    for (what, _, toasts) in &outcomes {
+        assert_eq!(
+            *toasts, 1,
+            "{what}: exactly one toast, so a refusal is never silent"
+        );
+    }
+    let final_hops = hops.borrow().clone();
+    assert_eq!(
+        final_hops,
+        vec![
+            serde_json::json!("a"),
+            serde_json::json!("f"),
+            serde_json::json!("e"),
+        ],
+        "only the legal hops reached the chain"
+    );
+    assert_eq!(
+        manyproxy_ui::chain_existing_rules(&final_hops, &library.borrow()),
+        vec![
+            manyproxy_ui::ChainHopRule::AnyPosition,
+            manyproxy_ui::ChainHopRule::AnyPosition,
+            manyproxy_ui::ChainHopRule::MustBeLast,
+        ],
+        "existing hops carry the same rule the candidate was judged by"
+    );
+    assert_eq!(
+        manyproxy_ui::chain_hop_label(&final_hops[0], 0, &library.borrow()),
+        "1. VlessOne (vless)"
+    );
+}
+
+fn t07_chain_row(id: &str, name: &str, protocol: &str, params: &str) -> ProxyConfig {
+    let mut row = t77_row(id, name, protocol, "default", 10801);
+    row.params = params.to_string().into();
+    row
+}
+
+#[test]
+fn chain_refusal_toasts_say_why_in_the_users_language() {
+    use manyproxy_ui::chain_hop_rejection_message as message;
+    // Every string the store can hand the UI, each mapped to its Fluent key.
+    for (store, key) in [
+        (
+            "chain hops cannot nest a chain (chains are flat — pick a non-chain row)",
+            "chain-reject-nested",
+        ),
+        (
+            "chain hops cannot take an autoselector (chains are flat — pick a concrete row)",
+            "chain-reject-autoselector",
+        ),
+        (
+            "that row runs outside the main engine and is never a chain hop",
+            "chain-reject-outside",
+        ),
+        (
+            "hop index is out of range (pick the hop to replace)",
+            "chain-reject-index",
+        ),
+        (
+            "that hop is egress-only and must be the last hop",
+            "chain-reject-extra-index",
+        ),
+        (
+            "at most one extra-core hop per chain",
+            "chain-reject-extra-count",
+        ),
+    ] {
+        let translated = manyproxy_ui::translate(key, None);
+        assert_ne!(
+            translated, key,
+            "{key} must exist in the catalogue, not leak its key name"
+        );
+        assert_eq!(
+            message(store.to_string()),
+            translated,
+            "the store message {store:?} must reach the user as {key}"
+        );
+    }
+    assert_eq!(
+        message("something no classifier says".to_string()),
+        "something no classifier says",
+        "an unknown message is shown as-is, never swallowed"
+    );
+}
+
+#[gpui_kit::test]
+fn chain_fork_served_rows_are_refused_as_hops_with_a_warning(cx: &mut TestAppContext) {
+    use manyproxy_ui::{ChainHopRule, ChainLibraryEntry};
+    cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = Store::open_in_memory().expect("in-memory store opens");
+    let (view, cx) = mount_view(store, cx);
+    let awg = t07_chain_row("awg", "AwgOne", "amneziawg", r#"{"awg_version":"2.0"}"#);
+    // A plain `vless` protocol string: only its transport says it runs on the fork.
+    let xhttp = t07_chain_row(
+        "xhttp",
+        "XhttpOne",
+        "vless",
+        r#"{"server":"198.51.100.9","server_port":443,"network":"xhttp"}"#,
+    );
+    let plain = t07_chain_row("plain", "SsOne", "shadowsocks", "{}");
+    let entry = |row: &ProxyConfig| ChainLibraryEntry {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        protocol: row.protocol.clone(),
+        rule: manyproxy_ui::chain_hop_rule(row),
+    };
+    let library = Rc::new(RefCell::new(vec![
+        entry(&awg),
+        entry(&xhttp),
+        entry(&plain),
+    ]));
+    let hops: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(Vec::new()));
+
+    for entry in library.borrow().iter().take(2) {
+        assert!(
+            entry
+                .rule
+                .as_ref()
+                .is_err_and(|rule| rule.contains("never a chain hop")),
+            "{} ({}) is never a hop: {:?}",
+            entry.name,
+            entry.protocol,
+            entry.rule
+        );
+    }
+    let pick = cx.update(|window, cx| {
+        view.update(cx, |_, cx| {
+            ConfigForm::panel_select(
+                window,
+                cx,
+                manyproxy_ui::chain_pick_choices(&library.borrow()),
+                "",
+            )
+        })
+    });
+    let mut refused_toasts = Vec::new();
+    for id in ["awg", "xhttp"] {
+        let before = notification_count(cx);
+        let accepted = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.chain_add_hop(&hops, &library, &pick, id, window, cx)
+            })
+        });
+        refused_toasts.push((id, accepted, notification_count(cx) - before));
+    }
+    assert_eq!(
+        refused_toasts,
+        vec![("awg", false, 1), ("xhttp", false, 1)],
+        "each fork-served row is refused as a hop with exactly one warning toast"
+    );
+    assert!(
+        hops.borrow().is_empty(),
+        "a refused pick leaves the chain untouched: {:?}",
+        hops.borrow()
+    );
+    assert_eq!(
+        manyproxy_ui::chain_existing_rules(&hops.borrow(), &library.borrow()),
+        Vec::<ChainHopRule>::new()
+    );
 }
 
 #[gpui_kit::test]

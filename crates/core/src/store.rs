@@ -3147,52 +3147,109 @@ pub fn validate_extra_params(params_raw: &str) -> Result<(), String> {
     }
 }
 
+/// What a chain hop may do, decided by where its row runs. The names are the
+/// rule; `chain_hop_rejection` enforces them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChainHopSlot {
-    Chain,
-    Autoselector,
-    Extra,
-    Other,
+pub enum ChainHopRule {
+    AnyPosition,
+    MustBeLast,
+    LastAndOnlyOne,
+    NeverAHop,
 }
 
+/// Classifies a row used as a chain hop by reference. The engine's own
+/// predicates decide, so the editor can never offer a row Start refuses.
+/// `Err` is the refusal a `NeverAHop` carries, naming why.
+pub fn chain_hop_rule(row: &ProxyConfig) -> Result<ChainHopRule, String> {
+    use crate::engine::{
+        is_chain_protocol, is_custom_config_protocol, is_egress_only_protocol,
+        is_extra_core_protocol, needs_fork, needs_xray,
+    };
+    if is_chain_protocol(&row.protocol) {
+        return Err(
+            "chain hops cannot nest a chain (chains are flat — pick a non-chain row)".to_string(),
+        );
+    }
+    if is_extra_core_protocol(&row.protocol)
+        || is_custom_config_protocol(&row.protocol)
+        || needs_fork(row)
+    {
+        return Err("that row runs outside the main engine and is never a chain hop".to_string());
+    }
+    // `validate_chain_nodes` files a referenced row as egress-only from its
+    // protocol alone, so a custom outbound is last-only whichever core owns it.
+    if is_egress_only_protocol(&row.protocol) || needs_xray(row) {
+        return Ok(ChainHopRule::MustBeLast);
+    }
+    Ok(ChainHopRule::AnyPosition)
+}
+
+/// Classifies a hand-written (inline) hop already sitting in a chain. An
+/// inline extra-core hop is the one case with no row behind it; anything the
+/// engine files as Xray or Custom is last-only like the rows it bridges to.
+/// The engine refuses an inline autoselector only after filing it as plain,
+/// so that one flat-rule check is made here.
+pub fn chain_inline_hop_rule(
+    node: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ChainHopRule, String> {
+    use crate::engine::{inline_hop_kind, ChainHopKind, EngineError};
+    let marker = node
+        .get("type")
+        .or_else(|| node.get("protocol"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|marker| marker.trim().eq_ignore_ascii_case("autoselector"));
+    if marker {
+        return Err(
+            "chain hops cannot take an autoselector (chains are flat — pick a concrete row)"
+                .to_string(),
+        );
+    }
+    match inline_hop_kind("chain", "inline hop", node) {
+        Ok(ChainHopKind::Standard) => Ok(ChainHopRule::AnyPosition),
+        Ok(ChainHopKind::Extra) => Ok(ChainHopRule::LastAndOnlyOne),
+        Ok(ChainHopKind::Xray | ChainHopKind::Custom) => Ok(ChainHopRule::MustBeLast),
+        Err(error) => match error {
+            EngineError::BadCustom { detail, .. } => Err(detail),
+            other => Err(other.to_string()),
+        },
+    }
+}
+
+/// `candidate` is the rule the candidate hop falls under, with its refusal
+/// when it is a `NeverAHop`.
 pub fn chain_hop_rejection(
-    existing: &[ChainHopSlot],
-    candidate: ChainHopSlot,
+    existing: &[ChainHopRule],
+    candidate: Result<ChainHopRule, String>,
     index: usize,
     replacing: bool,
 ) -> Option<String> {
-    if candidate == ChainHopSlot::Chain {
-        return Some(
-            "chain hops cannot nest a chain (v1 chains are flat — pick a non-chain row)"
-                .to_string(),
-        );
-    }
-    if candidate == ChainHopSlot::Autoselector {
-        return Some(
-            "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)"
-                .to_string(),
-        );
-    }
     let len = existing.len();
     if (!replacing && index > len) || (replacing && index >= len) {
         return Some("hop index is out of range (pick the hop to replace)".to_string());
     }
-    if candidate == ChainHopSlot::Extra {
-        if index != 0 {
-            return Some(
-                "extracore hops must sit at index 0 (first hop only — off-index-0 rejected)"
-                    .to_string(),
-            );
-        }
-        let surviving = existing
-            .iter()
-            .enumerate()
-            .any(|(slot, kind)| *kind == ChainHopSlot::Extra && (!replacing || slot != index));
-        if surviving {
-            return Some("at most one extracore hop per chain".to_string());
+    let candidate = match candidate {
+        Ok(rule) => rule,
+        Err(refusal) => return Some(refusal),
+    };
+    let last = len.checked_sub(usize::from(replacing));
+    match candidate {
+        ChainHopRule::NeverAHop => Some("that row is never a chain hop".to_string()),
+        ChainHopRule::AnyPosition => None,
+        ChainHopRule::MustBeLast | ChainHopRule::LastAndOnlyOne => {
+            if Some(index) != last {
+                return Some("that hop is egress-only and must be the last hop".to_string());
+            }
+            if candidate == ChainHopRule::LastAndOnlyOne {
+                let surviving = existing.iter().enumerate().any(|(slot, rule)| {
+                    *rule == ChainHopRule::LastAndOnlyOne && (!replacing || slot != index)
+                });
+                if surviving {
+                    return Some("at most one extra-core hop per chain".to_string());
+                }
+            }
+            None
         }
     }
-    None
 }
 
 pub fn chain_nodes_of(params_raw: &str) -> Vec<serde_json::Value> {
@@ -15310,46 +15367,415 @@ mod tests {
         assert_eq!(fold_xray_into_params("{{{", &full), "{{{");
     }
 
+    /// Shared fixtures for the chain-hop rule tests: one row per kind the
+    /// picker can offer, with params the engine accepts on their own.
+    fn chain_rule_row(protocol: &str, params: serde_json::Value) -> ProxyConfig {
+        ProxyConfig {
+            id: protocol.to_string(),
+            name: protocol.to_string(),
+            protocol: protocol.to_string(),
+            params: Secret::new(params.to_string()),
+            group: "default".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 0,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn chain_rule_rows() -> Vec<ProxyConfig> {
+        use serde_json::json;
+        const UUID: &str = "11111111-2222-4333-8444-555555555555";
+        [
+            ("vless", json!({"server": "198.51.100.9", "server_port": 443, "uuid": UUID, "encryption": "none"})),
+            ("vless-encryption", json!({"server": "198.51.100.9", "server_port": 443, "uuid": UUID, "encryption": "mlkem768x25519plus-rtt0"})),
+            ("vless-xhttp", json!({"server": "198.51.100.9", "server_port": 443, "uuid": UUID, "encryption": "none", "network": "xhttp", "path": "/split", "mode": "stream-one"})),
+            ("vmess-xhttp", json!({"server": "198.51.100.9", "server_port": 443, "uuid": UUID, "network": "xhttp"})),
+            ("vmess", json!({"server": "198.51.100.9", "server_port": 443, "uuid": UUID})),
+            ("trojan", json!({"server": "198.51.100.9", "server_port": 443, "password": "p"})),
+            ("shadowsocks", json!({"server": "198.51.100.9", "server_port": 8388, "method": "aes-128-gcm", "password": "p"})),
+            ("hysteria2", json!({"server": "192.0.2.13", "server_port": 443, "password": "pw", "up_mbps": 200, "down_mbps": 100})),
+            ("hysteria", json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443, "auth": "secret", "up": "100", "down": "50 Mbps"})),
+            ("tuic", json!({"type": "tuic", "server": "192.0.2.12", "server_port": 443, "uuid": UUID, "password": "pass1"})),
+            ("wireguard", json!({"type": "wireguard", "server": "192.0.2.44", "server_port": 51820, "private_key": "LOCAL-PRIVATE", "public_key": "REMOTE-PUBLIC"})),
+            ("amneziawg", json!({"type": "amneziawg", "server": "192.0.2.90", "server_port": 51820, "private_key": "LOCAL-PRIVATE", "public_key": "REMOTE-PUBLIC", "awg_version": "2.0"})),
+            ("socks", json!({"server": "198.51.100.9", "server_port": 1080})),
+            ("snell", json!({"server": "198.51.100.9", "server_port": 443, "psk": "p"})),
+            ("shadowtls", json!({"server": "198.51.100.9", "server_port": 443, "password": "p"})),
+            ("anytls", json!({"server": "198.51.100.9", "server_port": 443, "password": "p"})),
+            ("ssh", json!({"server": "198.51.100.9", "server_port": 22, "user": "u", "password": "p"})),
+            ("noise", json!({"type": "noise", "server": "192.0.2.44", "server_port": 51820, "password": "NOISE-KEY", "key": "NOISE-KEY"})),
+            ("http", json!({"server": "198.51.100.9", "server_port": 8080})),
+            ("https", json!({"server": "198.51.100.9", "server_port": 443})),
+            ("naive", json!({"server": "198.51.100.9", "server_port": 443, "username": "u", "password": "p"})),
+            ("xray", json!({"server": "198.51.100.9", "server_port": 443, "uuid": UUID, "flow": "xtls-rprx-vision", "network": "tcp", "security": "tls"})),
+            ("custom-outbound", json!({"type": "vless", "server": "203.0.113.9", "server_port": 443, "uuid": UUID})),
+            ("custom-config", json!({"outbounds": [{"type": "direct", "tag": "a"}]})),
+            ("extra-core", json!({"exe": "user-core.exe", "config": {"listen": "127.0.0.1"}})),
+            ("chain", json!({"nodes": ["vless"]})),
+            ("direct", json!({})),
+        ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (kind, params))| {
+                let row_protocol = match kind {
+                    "vless-encryption" | "vless-xhttp" => "vless",
+                    "vmess-xhttp" => "vmess",
+                    other => other,
+                };
+                let mut row = chain_rule_row(kind, params);
+                row.protocol = row_protocol.to_string();
+                row.port = 11000 + index as u16;
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chain_hop_rules_agree_with_the_engine_for_every_row_kind() {
+        use crate::engine::{generate, validate_activation, validate_chain_nodes, EngineError};
+        use serde_json::json;
+        let rows = chain_rule_rows();
+        let standard = rows
+            .iter()
+            .find(|row| row.id == "shadowsocks")
+            .expect("ordinary first hop");
+        let inline_extra = json!({"type": "extra-core", "exe": "x", "config": {}});
+        let chain_row = |nodes: serde_json::Value| {
+            let mut row = chain_rule_row("chain", json!({"nodes": nodes}));
+            row.id = "chain-under-test".to_string();
+            row.port = 10808;
+            row
+        };
+        // The engine's verdict on a chain's hops, read the way Start reads it:
+        // `validate_activation` runs first over the active set and its error
+        // is the one the user sees. The active set is the chain plus the rows
+        // it references; the unrelated fixture rows stay out, because a
+        // full-config row refuses to coexist with any other row and would
+        // fail every case for a reason that is not a hop rule.
+        let engine_verdict = |hops: &[&ProxyConfig],
+                              nodes: &[serde_json::Value]|
+         -> Result<(), EngineError> {
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "nodes".to_string(),
+                serde_json::Value::Array(nodes.to_vec()),
+            );
+            validate_chain_nodes("chain-under-test", &params, &|id| {
+                hops.iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.protocol.clone())
+            })?;
+            let mut set: Vec<ProxyConfig> = Vec::new();
+            for row in hops {
+                if set.iter().any(|seen| seen.id == row.id) {
+                    continue;
+                }
+                set.push((*row).clone());
+            }
+            set.push(chain_row(json!(nodes)));
+            match validate_activation(&set) {
+                Ok(_) => Ok(()),
+                Err(
+                    error @ (EngineError::ChainViolation { .. } | EngineError::BadCustom { .. }),
+                ) => Err(error),
+                Err(other) => panic!("fixture is not a hop-rule refusal: {other}"),
+            }
+        };
+        // The two edits the chain editor makes: `chain_add_hop` appends (the
+        // candidate becomes the last hop), `chain_replace_hop` overwrites one
+        // hop. "Before a later hop" replaces the first of two hops, so a
+        // later hop really survives the edit.
+        let store_verdict =
+            |existing: &[&ProxyConfig], candidate: &ProxyConfig, index: usize, replacing: bool| {
+                let rules: Vec<ChainHopRule> = existing
+                    .iter()
+                    .map(|row| chain_hop_rule(row).unwrap_or(ChainHopRule::NeverAHop))
+                    .collect();
+                chain_hop_rejection(&rules, chain_hop_rule(candidate), index, replacing)
+            };
+
+        let mut checked = 0;
+        let mut disagreements: Vec<String> = Vec::new();
+        fn compare(
+            disagreements: &mut Vec<String>,
+            what: &str,
+            candidate: &str,
+            store: &Option<String>,
+            engine: &Result<(), EngineError>,
+        ) {
+            if store.is_none() == engine.is_ok() {
+                return;
+            }
+            let engine = match engine {
+                Ok(()) => "accepted by the engine".to_string(),
+                Err(error) => format!("refused by the engine: {error}"),
+            };
+            let store = match store {
+                None => "accepted by the store".to_string(),
+                Some(rule) => format!("refused by the store: {rule:?}"),
+            };
+            disagreements.push(format!("{what} {candidate}: {store}, {engine}"));
+        }
+        for candidate in &rows {
+            let second_hop = rows
+                .iter()
+                .find(|row| row.id == "vless")
+                .expect("a second ordinary hop");
+            let expected = engine_verdict(
+                &[standard, candidate],
+                &[json!(standard.id), json!(candidate.id)],
+            );
+            let earlier = engine_verdict(
+                &[candidate, second_hop],
+                &[json!(candidate.id), json!(second_hop.id)],
+            );
+            let last = store_verdict(&[standard], candidate, 1, false);
+            let first = store_verdict(&[standard, second_hop], candidate, 0, true);
+            compare(
+                &mut disagreements,
+                "last hop",
+                &candidate.id,
+                &last,
+                &expected,
+            );
+            compare(
+                &mut disagreements,
+                "before a later hop",
+                &candidate.id,
+                &first,
+                &earlier,
+            );
+            let outside_main_engine = [
+                "extra-core",
+                "custom-config",
+                "amneziawg",
+                "noise",
+                "vless-xhttp",
+                "vmess-xhttp",
+            ];
+            let must_be_last = ["xray", "custom-outbound", "vless-encryption"];
+            let expected_word = if outside_main_engine.contains(&candidate.id.as_str()) {
+                Some("never a chain hop")
+            } else if must_be_last.contains(&candidate.id.as_str()) {
+                Some("last")
+            } else if candidate.id == "chain" {
+                Some("flat")
+            } else {
+                None
+            };
+            if let (Some(word), Some(rule)) = (expected_word, last.as_deref().or(first.as_deref()))
+            {
+                if !rule.contains(word) {
+                    disagreements.push(format!(
+                        "{} refusal must name its rule ({word}): {rule}",
+                        candidate.id
+                    ));
+                }
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 27, "every row kind in the table was exercised");
+        assert!(
+            disagreements.is_empty(),
+            "store and engine disagree on chain hops:\n  {}",
+            disagreements.join("\n  ")
+        );
+
+        let inline_last = engine_verdict(&[standard], &[json!(standard.id), inline_extra.clone()]);
+        let inline_first = engine_verdict(&[standard], &[inline_extra.clone(), json!(standard.id)]);
+        assert!(
+            inline_last.is_ok(),
+            "engine starts a standard hop then an inline extra-core hop: {:?}",
+            inline_last
+        );
+        assert!(
+            inline_first.is_err(),
+            "engine refuses an inline extra-core hop before a later hop"
+        );
+        let generated =
+            |nodes: serde_json::Value| generate(&[standard.clone(), chain_row(nodes)]).map(|_| ());
+        assert!(
+            generated(json!([standard.id, inline_extra.clone()])).is_ok(),
+            "the generator itself accepts the inline extra-core hop last"
+        );
+        let refused =
+            generated(json!([inline_extra.clone(), standard.id])).expect_err("generator refuses");
+        assert!(
+            refused.to_string().contains("must be last"),
+            "generator names the last-hop rule: {refused}"
+        );
+        let inline_rule = |node: serde_json::Value| {
+            chain_inline_hop_rule(node.as_object().expect("inline hop is an object"))
+        };
+        assert_eq!(
+            inline_rule(inline_extra.clone()),
+            Ok(ChainHopRule::LastAndOnlyOne),
+            "the store files an inline extra-core hop exactly as the engine does"
+        );
+        let one_hop = [ChainHopRule::AnyPosition];
+        let two_hops = [ChainHopRule::AnyPosition, ChainHopRule::AnyPosition];
+        assert!(
+            chain_hop_rejection(&one_hop, inline_rule(inline_extra.clone()), 1, false).is_none(),
+            "store must accept the inline extra-core hop last"
+        );
+        let mid = chain_hop_rejection(&two_hops, inline_rule(inline_extra.clone()), 0, true);
+        assert!(
+            mid.as_deref().is_some_and(|rule| rule.contains("last")),
+            "store must refuse an inline extra-core hop that a later hop would follow: {mid:?}"
+        );
+        let twice = chain_hop_rejection(
+            &[ChainHopRule::LastAndOnlyOne],
+            inline_rule(inline_extra.clone()),
+            1,
+            false,
+        );
+        assert!(
+            twice
+                .as_deref()
+                .is_some_and(|rule| rule.contains("at most one")),
+            "store must refuse a second extra-core hop: {twice:?}"
+        );
+        let inline_autoselector = json!({"type": "autoselector", "outbounds": []});
+        assert!(
+            engine_verdict(&[], std::slice::from_ref(&inline_autoselector)).is_err(),
+            "engine refuses an inline autoselector hop"
+        );
+        let refused = inline_rule(inline_autoselector.clone()).expect_err("store refuses it too");
+        assert!(
+            refused.contains("autoselector"),
+            "store names the autoselector rule: {refused}"
+        );
+    }
+
     #[test]
     fn t07_chain_hop_rules_name_throne_rejections() {
-        use ChainHopSlot::{Autoselector, Chain, Extra, Other};
-        let none: &[ChainHopSlot] = &[];
-        let one_other: &[ChainHopSlot] = &[Other];
-        let extra_first: &[ChainHopSlot] = &[Extra, Other];
+        use ChainHopRule::{AnyPosition, LastAndOnlyOne, MustBeLast, NeverAHop};
+        let ok = Ok::<_, String>;
+        let refused = |rule: String| Err::<ChainHopRule, _>(rule);
+        let none: &[ChainHopRule] = &[];
+        let one_other: &[ChainHopRule] = &[AnyPosition];
+        let extra_last: &[ChainHopRule] = &[AnyPosition, LastAndOnlyOne];
 
-        for candidate in [Chain, Autoselector] {
-            let rule = chain_hop_rejection(none, candidate, 0, false).expect("rejected");
-            assert!(
-                rule.contains("chain") || rule.contains("autoselector"),
-                "refusal names the flat-chain rule: {rule}"
-            );
-            assert!(chain_hop_rejection(one_other, candidate, 1, false).is_some());
+        for never in [
+            refused("chain hops cannot nest a chain".to_string()),
+            refused("chain hops cannot take an autoselector".to_string()),
+            refused("that row runs outside the main engine".to_string()),
+            ok(NeverAHop),
+        ] {
+            for (existing, index, replacing) in [
+                (none, 0, false),
+                (one_other, 1, false),
+                (one_other, 0, true),
+            ] {
+                assert!(
+                    chain_hop_rejection(existing, never.clone(), index, replacing).is_some(),
+                    "a never-a-hop candidate is refused at {index} in {existing:?}: {never:?}"
+                );
+            }
         }
-
-        let off_index = chain_hop_rejection(one_other, Extra, 1, false).expect("rejected");
-        assert!(
-            off_index.contains("index 0"),
-            "off-index-0 extracore refusal names the rule: {off_index}"
+        assert_eq!(
+            chain_hop_rejection(one_other, refused("why".to_string()), 1, false),
+            Some("why".to_string()),
+            "the classifier's reason is the refusal the user reads"
         );
-        assert!(chain_hop_rejection(none, Extra, 0, false).is_none());
-        assert!(chain_hop_rejection(one_other, Extra, 0, false).is_none());
 
-        let second = chain_hop_rejection(extra_first, Extra, 0, false).expect("rejected");
+        // An egress-only hop is legal exactly as the last hop. The old test
+        // pinned the opposite (first hop only) while the engine refused it.
+        assert!(chain_hop_rejection(none, ok(LastAndOnlyOne), 0, false).is_none());
+        assert!(chain_hop_rejection(one_other, ok(LastAndOnlyOne), 1, false).is_none());
+        assert!(chain_hop_rejection(extra_last, ok(LastAndOnlyOne), 1, true).is_none());
+        let not_last =
+            chain_hop_rejection(extra_last, ok(LastAndOnlyOne), 0, true).expect("rejected");
         assert!(
-            second.contains("at most one"),
-            "second extracore refusal names the rule: {second}"
+            not_last.contains("last"),
+            "extra-core hop replacing a hop that a later hop follows names the last-hop rule: {not_last}"
         );
-        assert!(chain_hop_rejection(extra_first, Extra, 0, true).is_none());
-        assert!(chain_hop_rejection(extra_first, Other, 1, true).is_none());
+        let append_after =
+            chain_hop_rejection(extra_last, ok(LastAndOnlyOne), 2, false).expect("rejected");
+        assert!(
+            append_after.contains("at most one"),
+            "a second extra-core hop names the one-per-chain rule: {append_after}"
+        );
 
-        let oob = chain_hop_rejection(one_other, Other, 1, true).expect("rejected");
+        let two_hops: &[ChainHopRule] = &[AnyPosition, AnyPosition];
+        for must_be_last in [MustBeLast, LastAndOnlyOne] {
+            assert!(chain_hop_rejection(none, ok(must_be_last), 0, false).is_none());
+            assert!(
+                chain_hop_rejection(two_hops, ok(must_be_last), 2, false).is_none(),
+                "appended last"
+            );
+            assert!(
+                chain_hop_rejection(two_hops, ok(must_be_last), 1, true).is_none(),
+                "replaced into the last slot"
+            );
+            let mid = chain_hop_rejection(two_hops, ok(must_be_last), 0, true).expect("rejected");
+            assert!(
+                mid.contains("last"),
+                "{must_be_last:?} mid-chain names the rule: {mid}"
+            );
+        }
+        let second_extra =
+            chain_hop_rejection(extra_last, ok(LastAndOnlyOne), 2, false).expect("rejected");
+        assert!(
+            second_extra.contains("at most one"),
+            "second extra-core hop names the rule: {second_extra}"
+        );
+        assert!(
+            chain_hop_rejection(extra_last, ok(MustBeLast), 2, false).is_none(),
+            "only extra-core hops are capped at one"
+        );
+        let two_must_be_last = [MustBeLast, MustBeLast];
+        assert!(chain_hop_rejection(&two_must_be_last, ok(MustBeLast), 2, false).is_none());
+
+        let oob = chain_hop_rejection(two_hops, ok(AnyPosition), 2, true).expect("rejected");
         assert!(
             oob.contains("out of range"),
             "out-of-range replace names the rule: {oob}"
         );
+        assert!(
+            chain_hop_rejection(two_hops, refused("why".to_string()), 2, true)
+                .unwrap_or_default()
+                .contains("out of range"),
+            "an impossible index is reported before the candidate's rule"
+        );
 
-        assert!(chain_hop_rejection(none, Other, 0, false).is_none());
-        assert!(chain_hop_rejection(extra_first, Other, 2, false).is_none());
+        assert!(chain_hop_rejection(none, ok(AnyPosition), 0, false).is_none());
+        assert!(chain_hop_rejection(extra_last, ok(AnyPosition), 2, false).is_none());
+        // Replacing a hop ahead of an egress-only last hop leaves that hop last.
+        assert!(chain_hop_rejection(extra_last, ok(AnyPosition), 0, true).is_none());
+
+        let rows = chain_rule_rows();
+        let rule_of = |id: &str| chain_hop_rule(rows.iter().find(|row| row.id == id).expect(id));
+        assert_eq!(rule_of("shadowsocks"), ok(AnyPosition));
+        assert_eq!(rule_of("vless"), ok(AnyPosition));
+        assert_eq!(rule_of("xray"), ok(MustBeLast));
+        assert_eq!(rule_of("custom-outbound"), ok(MustBeLast));
+        assert_eq!(rule_of("vless-encryption"), ok(MustBeLast));
+        assert_eq!(
+            rule_of("extra-core"),
+            refused("that row runs outside the main engine and is never a chain hop".to_string())
+        );
+        assert_eq!(
+            rule_of("custom-config"),
+            refused("that row runs outside the main engine and is never a chain hop".to_string())
+        );
+        for id in ["amneziawg", "noise", "vless-xhttp", "vmess-xhttp"] {
+            assert_eq!(
+                rule_of(id),
+                refused(
+                    "that row runs outside the main engine and is never a chain hop".to_string()
+                ),
+                "{id} is served by the fork sidecar"
+            );
+        }
+        let chain_refusal = rule_of("chain").expect_err("a chain row is never a hop");
+        assert!(
+            chain_refusal.contains("flat"),
+            "names the flat rule: {chain_refusal}"
+        );
 
         let params = "{\"type\":\"chain\",\"nodes\":[\"a\",\"b\"]}";
         assert_eq!(

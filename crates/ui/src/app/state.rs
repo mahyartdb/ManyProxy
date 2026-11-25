@@ -2272,10 +2272,8 @@ impl AppView {
             window.push_notification(Notification::warning(t!("pick-library-row-first")), cx);
             return false;
         };
-        let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
-        if let Some(rule) =
-            chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), kinds.len(), false)
-        {
+        let rules = chain_existing_rules(&hops.borrow(), &library.borrow());
+        if let Some(rule) = chain_hop_rejection(&rules, entry.rule.clone(), rules.len(), false) {
             window.push_notification(Notification::warning(chain_hop_rejection_message(rule)), cx);
             return false;
         }
@@ -2312,10 +2310,8 @@ impl AppView {
             window.push_notification(Notification::warning(t!("pick-library-row-first")), cx);
             return false;
         };
-        let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
-        if let Some(rule) =
-            chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), index, true)
-        {
+        let rules = chain_existing_rules(&hops.borrow(), &library.borrow());
+        if let Some(rule) = chain_hop_rejection(&rules, entry.rule.clone(), index, true) {
             window.push_notification(Notification::warning(chain_hop_rejection_message(rule)), cx);
             return false;
         }
