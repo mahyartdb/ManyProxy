@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 
+use crate::protocol::Protocol;
 use crate::secret::Secret;
 use crate::store::{NewConfig, Store, StoreError, DEFAULT_GROUP};
 
@@ -1675,45 +1676,25 @@ pub const VALID_LINK_SCHEMES: &[&str] = &[
 ];
 fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
-    match lower.as_str() {
-        "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-        | "wireguard" | "amneziawg" | "socks" | "snell" | "shadowtls" | "anytls" | "ssh"
-        | "noise" | "http" | "https" | "naive" => Ok(lower),
+    let canonical = Protocol::parse(&lower)
+        .map(Protocol::as_str)
+        .filter(|canonical| VALID_OUTBOUND_TYPES.contains(canonical));
+    match canonical {
+        Some(protocol) => Ok(protocol.to_string()),
+        None => match lower.as_str() {
+            // Link grammars, not protocols: each is filed under its protocol.
+            "v2rayn" => Ok("vmess".to_string()),
+            "hysteria2+realm" => Ok("hysteria2".to_string()),
+            "naive+https" | "naive_https" => Ok("naive".to_string()),
 
-        "ss" => Ok("shadowsocks".to_string()),
-        "socks5" => Ok("socks".to_string()),
+            "" => Err(invalid_json("item is missing outbound \"type\"")),
 
-        "v2rayn" => Ok("vmess".to_string()),
-        "shadow-tls" | "shadow_tls" => Ok("shadowtls".to_string()),
-
-        "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
-        "hy2" | "hysteria2+realm" => Ok("hysteria2".to_string()),
-        "wg" => Ok("wireguard".to_string()),
-        "naive+https" | "naive_https" => Ok("naive".to_string()),
-
-        "mieru" => Ok("mieru".to_string()),
-        "juicity" => Ok("juicity".to_string()),
-        "trusttunnel" => Ok("trusttunnel".to_string()),
-
-        "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Ok("xray".to_string()),
-        "custom"
-        | "custom-out"
-        | "custom-outbound"
-        | "custom_outbound"
-        | "custom-outbound-json" => Ok("custom-outbound".to_string()),
-        "custom-config" | "custom_config" | "custom-full" | "custom_full"
-        | "custom-full-config" => Ok("custom-config".to_string()),
-        "extra" | "extra-core" | "extra_core" | "extracore" => Ok("extra-core".to_string()),
-        "chain" | "chained" | "chain-outbound" | "chain_outbound" => Ok("chain".to_string()),
-
-        "direct" => Ok("direct".to_string()),
-        "" => Err(invalid_json("item is missing outbound \"type\"")),
-
-        _ => Err(unknown_scheme(format!(
-            "unknown outbound type '{}' (valid: {})",
-            raw.trim().chars().take(64).collect::<String>(),
-            VALID_OUTBOUND_TYPES.join(", ")
-        ))),
+            _ => Err(unknown_scheme(format!(
+                "unknown outbound type '{}' (valid: {})",
+                raw.trim().chars().take(64).collect::<String>(),
+                VALID_OUTBOUND_TYPES.join(", ")
+            ))),
+        },
     }
 }
 
@@ -3385,37 +3366,11 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             ));
         }
         match lower.as_str() {
-            "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-            | "wireguard" | "amneziawg" | "socks" | "snell" | "shadowtls" | "anytls" | "ssh"
-            | "noise" | "http" | "https" | "naive" => Ok(lower),
-            "ss" => Ok("shadowsocks".to_string()),
-            "socks5" => Ok("socks".to_string()),
-
-            "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
-
-            "hy2" | "hysteria2+realm" => Ok("hysteria2".to_string()),
-            "wg" => Ok("wireguard".to_string()),
+            // Link grammars and clash-only type names, not protocols: each is
+            // filed under the protocol that serves it.
+            "hysteria2+realm" => Ok("hysteria2".to_string()),
             "naive+https" | "naive_https" => Ok("naive".to_string()),
-
-            "shadow-tls" | "shadow_tls" => Ok("shadowtls".to_string()),
-
-            "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Ok("xray".to_string()),
-
             "xhttp" => Ok("xray".to_string()),
-            "mieru" => Ok("mieru".to_string()),
-            "juicity" => Ok("juicity".to_string()),
-            "trusttunnel" => Ok("trusttunnel".to_string()),
-            "custom"
-            | "custom-out"
-            | "custom-outbound"
-            | "custom_outbound"
-            | "custom-outbound-json" => Ok("custom-outbound".to_string()),
-            "custom-config" | "custom_config" | "custom-full" | "custom_full"
-            | "custom-full-config" => Ok("custom-config".to_string()),
-            "extra" | "extra-core" | "extra_core" | "extracore" => Ok("extra-core".to_string()),
-            "chain" | "chained" | "chain-outbound" | "chain_outbound" => Ok("chain".to_string()),
-
-            "direct" => Ok("direct".to_string()),
 
             "openvpn" | "masque" | "tailscale" | "openconnect" | "autoselector" => {
                 Err(unknown_scheme(format!(
@@ -3425,10 +3380,16 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             }
             "" => Err(invalid_json("clash entry is missing \"type\"")),
 
-            _ => Err(unknown_scheme(format!(
-                "unknown clash type '{}'",
-                raw.trim().chars().take(64).collect::<String>()
-            ))),
+            _ => match Protocol::parse(&lower)
+                .map(Protocol::as_str)
+                .filter(|canonical| VALID_OUTBOUND_TYPES.contains(canonical))
+            {
+                Some(protocol) => Ok(protocol.to_string()),
+                None => Err(unknown_scheme(format!(
+                    "unknown clash type '{}'",
+                    raw.trim().chars().take(64).collect::<String>()
+                ))),
+            },
         }
     }
     fn clash_value(raw: &str) -> String {

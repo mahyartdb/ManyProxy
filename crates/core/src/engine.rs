@@ -13,6 +13,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::protocol::Protocol;
 use crate::secret::Secret;
 use crate::store::ProxyConfig;
 
@@ -197,55 +198,24 @@ pub const XRAY_BRIDGE_PORT_END: u16 = 11999;
 pub const CHAIN_EGRESS_RULE: &str = "Cannot use Extracore or Custom or Xray configs in a chain";
 pub const XRAY_BRIDGE_COUNT_SIGNATURE: &str = "xray ingress tags size does not match bridge count!";
 
-fn matches_protocol_aliases(protocol: &str, aliases: &[&str]) -> bool {
-    aliases.contains(&protocol.trim().to_ascii_lowercase().as_str())
-}
-
 pub fn is_xray_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(
-        protocol,
-        &["xray", "xray-vless", "xray_vless", "vless-xray"],
-    )
+    Protocol::parse(protocol) == Some(Protocol::Xray)
 }
 
 pub fn is_custom_outbound_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(
-        protocol,
-        &[
-            "custom",
-            "custom-out",
-            "custom-outbound",
-            "custom_outbound",
-            "custom-outbound-json",
-        ],
-    )
+    Protocol::parse(protocol) == Some(Protocol::CustomOutbound)
 }
 
 pub fn is_custom_config_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(
-        protocol,
-        &[
-            "custom-config",
-            "custom_config",
-            "custom-full",
-            "custom_full",
-            "custom-full-config",
-        ],
-    )
+    Protocol::parse(protocol) == Some(Protocol::CustomConfig)
 }
 
 pub fn is_extra_core_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(
-        protocol,
-        &["extra", "extra-core", "extra_core", "extracore"],
-    )
+    Protocol::parse(protocol) == Some(Protocol::ExtraCore)
 }
 
 pub fn is_chain_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(
-        protocol,
-        &["chain", "chained", "chain-outbound", "chain_outbound"],
-    )
+    Protocol::parse(protocol) == Some(Protocol::Chain)
 }
 
 pub fn is_egress_only_protocol(protocol: &str) -> bool {
@@ -256,7 +226,7 @@ pub fn is_egress_only_protocol(protocol: &str) -> bool {
 }
 
 pub fn is_direct_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(protocol, &["direct"])
+    Protocol::parse(protocol) == Some(Protocol::Direct)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,36 +270,43 @@ fn owning_core_of(
     }
 }
 
+/// The outbound `type` the translator serves for a row's protocol, or `None`
+/// when no arm of `translate_outbound` serves it. That is not the same set
+/// as `Protocol`: `https` is served as an `http` outbound with TLS, while
+/// `amneziawg`, `noise`, `direct`, `chain` and the custom kinds are served by
+/// their own code paths and the rest not at all. `validate_activation` reads
+/// `None` as "refuse to start", so widening this to every `Protocol` would
+/// let rows Start cannot serve pass validation.
 fn canonical_type(protocol: &str) -> Option<&'static str> {
-    match protocol.trim().to_ascii_lowercase().as_str() {
-        "shadowsocks" | "ss" => Some("shadowsocks"),
-        "trojan" => Some("trojan"),
-        "vmess" => Some("vmess"),
-        "vless" => Some("vless"),
-        "hysteria" => Some("hysteria"),
-        "hysteria2" | "hy2" => Some("hysteria2"),
-        "tuic" => Some("tuic"),
-        "wireguard" | "wg" => Some("wireguard"),
-
-        "anytls" => Some("anytls"),
-        "ssh" => Some("ssh"),
-
-        "socks" | "socks5" => Some("socks"),
-        "http" | "https" => Some("http"),
-        "naive" => Some("naive"),
-        "snell" => Some("snell"),
-        "shadowtls" | "shadow-tls" | "shadow_tls" => Some("shadowtls"),
-        _ => None,
-    }
+    let parsed = Protocol::parse(protocol)?;
+    Some(match parsed {
+        Protocol::Https => "http",
+        Protocol::Vless
+        | Protocol::Vmess
+        | Protocol::Trojan
+        | Protocol::Shadowsocks
+        | Protocol::Hysteria2
+        | Protocol::Hysteria
+        | Protocol::Tuic
+        | Protocol::Wireguard
+        | Protocol::Socks
+        | Protocol::Snell
+        | Protocol::Shadowtls
+        | Protocol::AnyTls
+        | Protocol::Ssh
+        | Protocol::Http
+        | Protocol::Naive => parsed.as_str(),
+        _ => return None,
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn is_ssh_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(protocol, &["ssh"])
+    Protocol::parse(protocol) == Some(Protocol::Ssh)
 }
 
 pub fn is_noise_protocol(protocol: &str) -> bool {
-    matches_protocol_aliases(protocol, &["noise"])
+    Protocol::parse(protocol) == Some(Protocol::Noise)
 }
 
 pub fn inbound_tag(id: &str) -> String {
@@ -656,10 +633,7 @@ impl std::fmt::Display for EngineError {
 }
 
 pub fn is_awg_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "amneziawg" | "awg" | "amnezia-wg"
-    )
+    Protocol::parse(protocol) == Some(Protocol::Amneziawg)
 }
 
 const AWG_V2_KEYS: &[&str] = &[
@@ -8037,6 +8011,108 @@ mod tests {
             fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802),
             fixture("3", "Gamma", "wireguard", wg_params(), "127.0.0.1", 10803),
         ]
+    }
+
+    #[test]
+    fn canonical_type_keeps_the_table_start_reads() {
+        // The old literal table, entry for entry. `validate_activation`
+        // refuses a row when this returns `None`, so the served set must not
+        // move: widening it lets a row Start cannot translate pass, narrowing
+        // it stops a row that starts today.
+        for (raw, expected) in [
+            ("shadowsocks", Some("shadowsocks")),
+            ("ss", Some("shadowsocks")),
+            ("trojan", Some("trojan")),
+            ("vmess", Some("vmess")),
+            ("vless", Some("vless")),
+            ("hysteria", Some("hysteria")),
+            ("hysteria2", Some("hysteria2")),
+            ("hy2", Some("hysteria2")),
+            ("tuic", Some("tuic")),
+            ("wireguard", Some("wireguard")),
+            ("wg", Some("wireguard")),
+            ("anytls", Some("anytls")),
+            ("ssh", Some("ssh")),
+            ("socks", Some("socks")),
+            ("socks5", Some("socks")),
+            ("http", Some("http")),
+            ("https", Some("http")),
+            ("naive", Some("naive")),
+            ("snell", Some("snell")),
+            ("shadowtls", Some("shadowtls")),
+            ("shadow-tls", Some("shadowtls")),
+            ("shadow_tls", Some("shadowtls")),
+        ] {
+            assert_eq!(canonical_type(raw), expected, "{raw}");
+            assert_eq!(
+                canonical_type(&format!("  {}  ", raw.to_ascii_uppercase())),
+                expected,
+                "{raw} trimmed and lowercased"
+            );
+        }
+        let outbound_type = |protocol: Protocol| match protocol {
+            Protocol::Vless
+            | Protocol::Vmess
+            | Protocol::Trojan
+            | Protocol::Shadowsocks
+            | Protocol::Hysteria2
+            | Protocol::Hysteria
+            | Protocol::Tuic
+            | Protocol::Wireguard
+            | Protocol::Socks
+            | Protocol::Snell
+            | Protocol::Shadowtls
+            | Protocol::AnyTls
+            | Protocol::Ssh
+            | Protocol::Http
+            | Protocol::Https
+            | Protocol::Naive => Some(if protocol == Protocol::Https {
+                "http"
+            } else {
+                protocol.as_str()
+            }),
+            _ => None,
+        };
+        for protocol in Protocol::ALL {
+            assert_eq!(
+                canonical_type(protocol.as_str()),
+                outbound_type(*protocol),
+                "{}",
+                protocol.as_str()
+            );
+        }
+        let refused = Protocol::ALL
+            .iter()
+            .filter(|protocol| canonical_type(protocol.as_str()).is_none())
+            .count();
+        assert_eq!(
+            refused,
+            Protocol::ALL.len() - 16,
+            "exactly sixteen go through the translator"
+        );
+        for raw in [
+            "amneziawg",
+            "noise",
+            "direct",
+            "chain",
+            "xray",
+            "custom",
+            "extra",
+            "mieru",
+            "juicity",
+            "trusttunnel",
+            "openvpn",
+            "tailscale",
+            "masque",
+            "vles",
+            "",
+        ] {
+            assert_eq!(
+                canonical_type(raw),
+                None,
+                "{raw} is served elsewhere or not at all"
+            );
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! Belongs: every row/subscription/settings read and write plus their error types.
 //! Not here: UI state, engine processes, dialog strings.
 use crate::library::{ColumnLayout, Density, LatencyFacet};
+use crate::protocol::Protocol;
 use crate::secret::Secret;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1590,46 +1591,12 @@ fn decode_bind_host_extras(raw: &str) -> Vec<String> {
 }
 
 fn canonical_protocol(raw: &str) -> Option<String> {
-    let lower = raw.trim().to_ascii_lowercase();
-    match lower.as_str() {
-        "vless" => Some("vless".to_string()),
-        "vmess" => Some("vmess".to_string()),
-        "trojan" => Some("trojan".to_string()),
-        "shadowsocks" | "ss" => Some("shadowsocks".to_string()),
-        "hysteria2" => Some("hysteria2".to_string()),
-        "hysteria" => Some("hysteria".to_string()),
-        "tuic" => Some("tuic".to_string()),
-        "wireguard" | "wg" => Some("wireguard".to_string()),
-        "amneziawg" | "awg" | "amnezia-wg" => Some("amneziawg".to_string()),
-        "socks" | "socks5" => Some("socks".to_string()),
-
-        "snell" => Some("snell".to_string()),
-        "shadowtls" | "shadow-tls" | "shadow_tls" => Some("shadowtls".to_string()),
-        "anytls" => Some("anytls".to_string()),
-
-        "ssh" => Some("ssh".to_string()),
-        "noise" => Some("noise".to_string()),
-
-        "mieru" => Some("mieru".to_string()),
-        "juicity" => Some("juicity".to_string()),
-        "trusttunnel" => Some("trusttunnel".to_string()),
-        "http" => Some("http".to_string()),
-        "https" => Some("https".to_string()),
-        "naive" => Some("naive".to_string()),
-        "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Some("xray".to_string()),
-        "custom"
-        | "custom-out"
-        | "custom-outbound"
-        | "custom_outbound"
-        | "custom-outbound-json" => Some("custom-outbound".to_string()),
-        "custom-config" | "custom_config" | "custom-full" | "custom_full"
-        | "custom-full-config" => Some("custom-config".to_string()),
-        "extra" | "extra-core" | "extra_core" | "extracore" => Some("extra-core".to_string()),
-        "chain" | "chained" | "chain-outbound" | "chain_outbound" => Some("chain".to_string()),
-
-        "direct" => Some("direct".to_string()),
-        _ => None,
-    }
+    // The enum knows openvpn, tailscale and masque; the store does not offer
+    // them yet, and an unstorable protocol must stay an "unknown protocol".
+    Protocol::parse(raw)
+        .map(Protocol::as_str)
+        .filter(|protocol| VALID_PROTOCOLS.contains(protocol))
+        .map(str::to_string)
 }
 
 pub fn protocol_params_template(protocol: &str) -> String {
@@ -13961,6 +13928,19 @@ mod tests {
         assert!(is_pristine_template(&vless_starter, "vless"));
         assert!(!is_pristine_template(&format!("{vless_starter} "), "vless"));
         assert!(!is_pristine_template(&vless_starter, "chain"));
+
+        // `hy2` is hysteria2 in the engine, the importer and the prober; the
+        // store must agree or a row stored as `hy2` keeps the alias.
+        assert_eq!(
+            canonical_protocol("hy2").as_deref(),
+            Some("hysteria2"),
+            "the store canonicalises hy2 like every other layer"
+        );
+        assert_eq!(
+            canonical_protocol("openvpn"),
+            None,
+            "enum-only protocols are not storable yet"
+        );
 
         assert_eq!(
             pristine_template_rewrite(&vless_starter, "vless", "chain"),

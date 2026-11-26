@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{inbound_tag, is_loopback_ip, outbound_tag, params_declare_mux};
+use crate::protocol::is_probeable_protocol;
 use crate::store::{now_unix, HealthHistoryEntry, HealthSnapshot, ProxyConfig};
 
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
@@ -196,51 +197,6 @@ impl HealthProber for UncloneableProber {
     fn clone_box(&self) -> Box<dyn HealthProber + Send + Sync> {
         Box::new(UncloneableProber)
     }
-}
-
-pub fn is_probeable_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "shadowsocks"
-            | "ss"
-            | "trojan"
-            | "vmess"
-            | "vless"
-            | "tuic"
-            | "hysteria"
-            | "hysteria2"
-            | "hy2"
-            | "wireguard"
-            | "wg"
-            | "amneziawg"
-            | "awg"
-            | "amnezia-wg"
-            | "anytls"
-            | "ssh"
-            | "noise"
-            | "xray"
-            | "xray-vless"
-            | "xray_vless"
-            | "vless-xray"
-            | "custom"
-            | "custom-out"
-            | "custom-outbound"
-            | "custom_outbound"
-            | "custom-outbound-json"
-            | "custom-config"
-            | "custom_config"
-            | "custom-full"
-            | "custom_full"
-            | "custom-full-config"
-            | "extra"
-            | "extra-core"
-            | "extra_core"
-            | "extracore"
-            | "chain"
-            | "chained"
-            | "chain-outbound"
-            | "chain_outbound"
-    )
 }
 
 pub struct RealHealthProber {
@@ -3511,9 +3467,15 @@ mod tests {
 
         let real = RealHealthProber::default();
         assert!(real.supports(&configs[0]));
-        assert!(!real.supports(&configs[1]), "real driver denies naive");
+        assert!(
+            real.supports(&configs[1]),
+            "naive is served, so the real driver probes it"
+        );
+        let unservable = fixture("10", "Mieru", "mieru", "127.0.0.1", 10810);
+        assert!(!real.supports(&unservable), "real driver denies mieru");
         assert!(is_probeable_protocol("ss"));
-        assert!(!is_probeable_protocol("naive"));
+        assert!(is_probeable_protocol("naive"));
+        assert!(!is_probeable_protocol("mieru"));
     }
 
     #[test]
@@ -3538,10 +3500,7 @@ mod tests {
 
         let real = RealHealthProber::default();
         assert!(real.supports(&configs[0]), "real driver probes AWG");
-        assert!(
-            !real.supports(&configs[1]),
-            "real driver still denies naive"
-        );
+        assert!(real.supports(&configs[1]), "real driver probes naive too");
     }
 
     #[test]
