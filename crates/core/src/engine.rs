@@ -28,14 +28,19 @@ pub const XRAY_BINARY_BASE: &str = "xray";
 pub const CLASH_PORT_START: u16 = 18501;
 pub const CLASH_PORT_END: u16 = 18999;
 
-pub const CLASH_RESERVED_NAME: &str = "clash-controller range 18501-18999";
-pub const XRAY_RESERVED_NAME: &str = "xray-bridge range 11801-11999";
+pub fn clash_reserved_name() -> String {
+    format!("clash-controller range {CLASH_PORT_START}-{CLASH_PORT_END}")
+}
 
-pub fn reserved_range_of(port: u16) -> Option<&'static str> {
+pub fn xray_reserved_name() -> String {
+    format!("xray-bridge range {XRAY_BRIDGE_PORT_START}-{XRAY_BRIDGE_PORT_END}")
+}
+
+pub fn reserved_range_of(port: u16) -> Option<String> {
     if (CLASH_PORT_START..=CLASH_PORT_END).contains(&port) {
-        Some(CLASH_RESERVED_NAME)
+        Some(clash_reserved_name())
     } else if (XRAY_BRIDGE_PORT_START..=XRAY_BRIDGE_PORT_END).contains(&port) {
-        Some(XRAY_RESERVED_NAME)
+        Some(xray_reserved_name())
     } else {
         None
     }
@@ -492,7 +497,7 @@ pub enum EngineError {
     ReservedPort {
         name: String,
         port: u16,
-        range: &'static str,
+        range: String,
     },
 
     BadBind {
@@ -5364,11 +5369,11 @@ pub fn is_row_local_error(error: &EngineError) -> bool {
 pub struct StartAllOutcome {
     pub applied: Vec<String>,
 
-    pub failed: Vec<(String, String)>,
+    pub failed: Vec<(String, EngineError)>,
 
     pub warnings: Vec<String>,
 
-    pub error: Option<String>,
+    pub error: Option<EngineError>,
 }
 
 /// T-05: the outcome of the ADDITIVE batch start (`Start checked`).
@@ -5380,9 +5385,9 @@ pub struct StartAllOutcome {
 pub struct StartManyOutcome {
     pub applied: Vec<String>,
 
-    pub failed: Vec<(String, String)>,
+    pub failed: Vec<(String, EngineError)>,
 
-    pub error: Option<String>,
+    pub error: Option<EngineError>,
 }
 
 static CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6698,7 +6703,7 @@ impl EngineController {
             let result = self.apply();
             self.prune_lan_confirmed();
             if let Err(error) = result {
-                outcome.error = Some(error.to_string());
+                outcome.error = Some(error);
             }
             return outcome;
         }
@@ -6708,7 +6713,7 @@ impl EngineController {
             match validate_activation(std::slice::from_ref(row)) {
                 Ok(_) => candidate.push(row.clone()),
                 Err(error) => {
-                    outcome.failed.push((row.name.clone(), error.to_string()));
+                    outcome.failed.push((row.name.clone(), error));
                 }
             }
         }
@@ -6724,11 +6729,10 @@ impl EngineController {
             }
         }
         if let Some(error) = union_error {
-            let text = error.to_string();
             for row in &candidate {
-                outcome.failed.push((row.name.clone(), text.clone()));
+                outcome.failed.push((row.name.clone(), error.clone()));
             }
-            outcome.error = Some(text);
+            outcome.error = Some(error);
             return outcome;
         }
         if candidate.is_empty() {
@@ -6742,9 +6746,9 @@ impl EngineController {
         if let Err(error) = self.enforce_lan_confirm(&candidate, confirmed) {
             self.active = prev;
             self.prune_lan_confirmed();
-            outcome.error = Some(error.to_string());
+            outcome.error = Some(error.clone());
             for row in &candidate {
-                outcome.failed.push((row.name.clone(), error.to_string()));
+                outcome.failed.push((row.name.clone(), error.clone()));
             }
             return outcome;
         }
@@ -6756,9 +6760,9 @@ impl EngineController {
             Err(error) => {
                 self.active = prev;
                 self.prune_lan_confirmed();
-                outcome.error = Some(error.to_string());
+                outcome.error = Some(error.clone());
                 for row in &candidate {
-                    outcome.failed.push((row.name.clone(), error.to_string()));
+                    outcome.failed.push((row.name.clone(), error.clone()));
                 }
             }
         }
@@ -6820,7 +6824,7 @@ impl EngineController {
         for row in configs {
             // 1. the row on its own.
             if let Err(error) = validate_activation(std::slice::from_ref(row)) {
-                outcome.failed.push((row.name.clone(), error.to_string()));
+                outcome.failed.push((row.name.clone(), error));
                 continue;
             }
             // 2. the socket: the DB knows which ports are ASSIGNED, the
@@ -6834,7 +6838,7 @@ impl EngineController {
                 && !self.serves_this_endpoint(row)
                 && probe_bind_available(&row.bind_ip, row.port).is_err()
             {
-                let reason = match self.own_port_holder(row.port) {
+                let error = match self.own_port_holder(row.port) {
                     // Our own sidecar holds it under another bind: that
                     // is a conflict with a serving row, not a stranger.
                     Some(first) => EngineError::PortConflict {
@@ -6842,16 +6846,14 @@ impl EngineController {
                         port: row.port,
                         first: first.to_string(),
                         second: row.name.clone(),
-                    }
-                    .to_string(),
+                    },
                     None => EngineError::RowPortUnavailable {
                         bind: row.bind_ip.clone(),
                         port: row.port,
                         name: row.name.clone(),
-                    }
-                    .to_string(),
+                    },
                 };
-                outcome.failed.push((row.name.clone(), reason));
+                outcome.failed.push((row.name.clone(), error));
                 continue;
             }
             // 3. the port another row already serves.
@@ -6863,7 +6865,7 @@ impl EngineController {
                     first: first.clone(),
                     second: row.name.clone(),
                 };
-                outcome.failed.push((row.name.clone(), error.to_string()));
+                outcome.failed.push((row.name.clone(), error));
                 continue;
             }
             taken.insert(key, row.name.clone());
@@ -6887,12 +6889,12 @@ impl EngineController {
 
         // The union is validated once, and the LAN confirm is asked once.
         if let Err(error) = validate_activation(&union) {
-            self.last_error = Some(error.to_string());
-            outcome.error = Some(error.to_string());
+            let error = self.record_error(error);
+            outcome.error = Some(error);
             return outcome;
         }
         if let Err(error) = self.enforce_lan_confirm(&union, confirmed) {
-            outcome.error = Some(error.to_string());
+            outcome.error = Some(error);
             return outcome;
         }
 
@@ -6908,8 +6910,8 @@ impl EngineController {
             Err(error) => {
                 self.active = prev;
                 self.prune_lan_confirmed();
-                self.last_error = Some(error.to_string());
-                outcome.error = Some(error.to_string());
+                let error = self.record_error(error);
+                outcome.error = Some(error);
             }
         }
         outcome
@@ -6996,9 +6998,7 @@ impl EngineController {
             candidate.push(config.clone());
         }
 
-        validate_activation(&candidate).inspect_err(|error| {
-            self.last_error = Some(error.to_string());
-        })?;
+        validate_activation(&candidate).map_err(|error| self.record_error(error))?;
         self.enforce_lan_confirm(&candidate, confirmed)?;
 
         let prev = self.active.clone();
@@ -7043,14 +7043,13 @@ impl EngineController {
         let error = EngineError::LanConfirmRequired {
             names: names.join(", "),
         };
-        self.last_error = Some(error.to_string());
-        Err(error)
+        Err(self.record_error(error))
     }
 
     pub fn stop_one(&mut self, id: &str) -> bool {
         let (removed, error) = self.stop_one_result(id);
         if let Some(error) = error {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
         }
         removed
     }
@@ -7076,9 +7075,7 @@ impl EngineController {
             self.prune_lan_confirmed();
             return result;
         }
-        validate_activation(&candidate).inspect_err(|error| {
-            self.last_error = Some(error.to_string());
-        })?;
+        validate_activation(&candidate).map_err(|error| self.record_error(error))?;
         self.enforce_lan_confirm(&candidate, confirmed)?;
 
         let prev = self.active.clone();
@@ -7099,7 +7096,7 @@ impl EngineController {
 
     pub fn stop_all(&mut self) {
         if let Some(error) = self.stop_all_result() {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
         }
     }
 
@@ -7129,13 +7126,10 @@ impl EngineController {
             return Ok(());
         }
 
-        let plan = validate_activation(&self.active).inspect_err(|error| {
-            self.last_error = Some(error.to_string());
-        })?;
+        let plan = validate_activation(&self.active).map_err(|error| self.record_error(error))?;
 
         if let Err(error) = validate_egress_resolution(&self.active) {
-            self.last_error = Some(error.to_string());
-            return Err(error);
+            return Err(self.record_error(error));
         }
 
         let needs_stock = !plan.main_rows.is_empty()
@@ -7147,8 +7141,7 @@ impl EngineController {
             match (self.stock_probe)() {
                 Ok(path) => self.backend.pin_binary(path),
                 Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                    return Err(self.record_error(error));
                 }
             }
         }
@@ -7157,8 +7150,7 @@ impl EngineController {
                 Ok(path) => self.fork_backend.pin_binary(path),
                 Err(error) => {
                     let error = missing_fork_for(error, &plan.fork_names, plan.fork_xhttp);
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                    return Err(self.record_error(error));
                 }
             }
         }
@@ -7167,8 +7159,7 @@ impl EngineController {
                 Ok(path) => self.xray_backend.pin_binary(path),
                 Err(error) => {
                     let error = missing_xray_for(error, &plan.xray_names);
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                    return Err(self.record_error(error));
                 }
             }
         }
@@ -7180,15 +7171,12 @@ impl EngineController {
         }
         let mut extra_paths: Vec<Option<PathBuf>> = Vec::with_capacity(plan.extras.len());
         for row in &plan.extras {
-            let (exe, _) = validate_extra_row(row).inspect_err(|error| {
-                self.last_error = Some(error.to_string());
-            })?;
+            let (exe, _) = validate_extra_row(row).map_err(|error| self.record_error(error))?;
             match (self.extra_probe)(&exe) {
                 Ok(path) => extra_paths.push(Some(path)),
                 Err(error) => {
                     let error = missing_extra_for(error, &plan.extra_names);
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                    return Err(self.record_error(error));
                 }
             }
         }
@@ -7214,9 +7202,7 @@ impl EngineController {
                     &self.preset_rules,
                     &self.rule_set_files,
                 )
-                .inspect_err(|error| {
-                    self.last_error = Some(error.to_string());
-                })?
+                .map_err(|error| self.record_error(error))?
                 .json,
             ),
         };
@@ -7225,9 +7211,7 @@ impl EngineController {
             None if plan.fork_rows.is_empty() => None,
             None => Some(
                 generate_with_rule_sets(&plan.fork_rows, &self.preset_rules, &self.rule_set_files)
-                    .inspect_err(|error| {
-                        self.last_error = Some(error.to_string());
-                    })?
+                    .map_err(|error| self.record_error(error))?
                     .json,
             ),
         };
@@ -7256,13 +7240,11 @@ impl EngineController {
                     port: CLASH_PORT_START,
                     name: format!("clash controller ({}, range exhausted)", core.as_str()),
                 };
-                self.last_error = Some(error.to_string());
-                error
+                self.record_error(error)
             })?;
             let secret = clash_secret(core.as_str());
-            *json = inject_clash_api(json, port, secret.expose()).inspect_err(|error| {
-                self.last_error = Some(error.to_string());
-            })?;
+            *json = inject_clash_api(json, port, secret.expose())
+                .map_err(|error| self.record_error(error))?;
             clash.push(ClashTarget {
                 core: core.as_str().to_string(),
                 port,
@@ -7274,18 +7256,16 @@ impl EngineController {
             None if plan.egresses.is_empty() => None,
             None => Some(
                 generate_xray_config(&plan.egresses)
-                    .inspect_err(|error| {
-                        self.last_error = Some(error.to_string());
-                    })?
+                    .map_err(|error| self.record_error(error))?
                     .json,
             ),
         };
 
         let mut extra_gens: Vec<Option<String>> = Vec::with_capacity(plan.extras.len());
         for row in &plan.extras {
-            extra_gens.push(Some(extra_config_json(row).inspect_err(|error| {
-                self.last_error = Some(error.to_string());
-            })?));
+            extra_gens.push(Some(
+                extra_config_json(row).map_err(|error| self.record_error(error))?,
+            ));
         }
 
         if !plan.egresses.is_empty() {
@@ -7323,18 +7303,15 @@ impl EngineController {
                 })
                 .unwrap_or(0);
             validate_bridge_counts(ingress, egress_hits, plan.egresses.len(), "xray sidecar")
-                .inspect_err(|error| {
-                    self.last_error = Some(error.to_string());
-                })?;
+                .map_err(|error| self.record_error(error))?;
             let main_json =
                 stock_gen
                     .as_deref()
                     .ok_or_else(|| EngineError::XrayBridgeMismatch {
                         detail: "main sidecar has no config for active bridges".to_string(),
                     })?;
-            validate_bridges_present(main_json, &plan.egresses).inspect_err(|error| {
-                self.last_error = Some(error.to_string());
-            })?;
+            validate_bridges_present(main_json, &plan.egresses)
+                .map_err(|error| self.record_error(error))?;
         }
 
         for (core, json) in &plan.replacements {
@@ -7352,8 +7329,7 @@ impl EngineController {
                         "custom full config must not carry \"{key}\" at {path} (no system network mutation)"
                     ),
                 };
-                self.last_error = Some(error.to_string());
-                return Err(error);
+                return Err(self.record_error(error));
             }
         }
 
@@ -7372,7 +7348,7 @@ impl EngineController {
                             port: egress.bridge_port,
                             name: format!("xray bridge ({})", egress.owner),
                         };
-                        self.last_error = Some(format!("{failure} (bridge hold failed: {error})"));
+                        self.record_error(format!("{failure} (bridge hold failed: {error})"));
                         return Err(failure);
                     }
                 }
@@ -7451,30 +7427,32 @@ impl EngineController {
                             port: *port,
                             name: name.clone(),
                         };
-                        self.last_error = Some(error.to_string());
-                        return Err(error);
+                        return Err(self.record_error(error));
                     }
                 }
             }
         }
-        for (label, backend, gen) in [
-            ("stock", &mut self.backend, &stock_gen),
-            ("fork", &mut self.fork_backend, &fork_gen),
-            ("xray", &mut self.xray_backend, &xray_gen),
-        ] {
-            if let Some(json) = gen {
-                if let Err(mut detail) = backend.check_config(json) {
-                    if label == "fork" && plan.fork_xhttp {
-                        detail = format!("{detail} ({XHTTP_KNOWN_BUGS})");
-                    }
+        let check_failure = (|| -> Result<(), EngineError> {
+            for (label, backend, gen) in [
+                ("stock", &mut self.backend, &stock_gen),
+                ("fork", &mut self.fork_backend, &fork_gen),
+                ("xray", &mut self.xray_backend, &xray_gen),
+            ] {
+                if let Some(json) = gen {
+                    if let Err(mut detail) = backend.check_config(json) {
+                        if label == "fork" && plan.fork_xhttp {
+                            detail = format!("{detail} ({XHTTP_KNOWN_BUGS})");
+                        }
 
-                    detail = strip_ansi_codes(&detail);
-                    let error = EngineError::CheckFailed { detail };
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                        return Err(EngineError::CheckFailed {
+                            detail: strip_ansi_codes(&detail),
+                        });
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
+        check_failure.map_err(|error| self.record_error(error))?;
 
         for (slot, gen) in self.extra_backends.iter_mut().zip(extra_gens.iter()) {
             if let Some(json) = gen {
@@ -7482,8 +7460,7 @@ impl EngineController {
                     let error = EngineError::CheckFailed {
                         detail: strip_ansi_codes(&detail),
                     };
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                    return Err(self.record_error(error));
                 }
             } else {
                 continue;
@@ -7630,7 +7607,7 @@ impl EngineController {
             if !rollback_errors.is_empty() {
                 detail = format!("{detail}; {}", rollback_errors.join("; "));
             }
-            self.last_error = Some(detail);
+            self.record_error(detail);
             let (_, first) = failures.into_iter().next().expect("failures non-empty");
 
             self.sync_clash_from_served();
@@ -7699,7 +7676,7 @@ impl EngineController {
         self.status = EngineStatus::Crashed {
             cause: cause.clone(),
         };
-        self.last_error = Some(format!("engine crashed ({cause})"));
+        self.record_error(format!("engine crashed ({cause})"));
         self.pending_crash = Some(Self::crash_detail(&labelled));
         labelled
     }
@@ -7829,6 +7806,11 @@ impl EngineController {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    fn record_error<T: ToString>(&mut self, error: T) -> T {
+        self.last_error = Some(error.to_string());
+        error
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -12553,13 +12535,15 @@ Active Connections\r
             "only the occupied row is named, not every row: {outcome:?}"
         );
         assert_eq!(outcome.failed[0].0, "Squatter");
-        let reason = &outcome.failed[0].1;
-        assert!(
-            reason.contains("port unavailable"),
-            "names the port: {reason}"
+        assert_eq!(
+            outcome.failed[0].1,
+            EngineError::RowPortUnavailable {
+                bind: "127.0.0.1".to_string(),
+                port,
+                name: "Squatter".to_string(),
+            },
+            "the occupied row is named with its own port, typed"
         );
-        assert!(reason.contains(&port.to_string()), "names it: {reason}");
-        assert!(reason.contains("Squatter"), "names the row: {reason}");
         assert_eq!(controller.running_count(), 2, "the free rows serve");
         assert_eq!(stock.check_calls(), 1, "one apply for the batch");
         drop(held);
@@ -12775,8 +12759,11 @@ Active Connections\r
         );
         assert_eq!(outcome.failed[0].0, "Squatter");
         assert!(
-            outcome.failed[0].1.contains("port unavailable"),
-            "a stranger holds it, not a serving row: {}",
+            matches!(
+                &outcome.failed[0].1,
+                EngineError::RowPortUnavailable { port: taken, .. } if *taken == port
+            ),
+            "a stranger holds it, not a serving row: {:?}",
             outcome.failed[0].1
         );
         assert_eq!(outcome.applied, vec!["3".to_string()], "{outcome:?}");
@@ -12944,7 +12931,7 @@ Active Connections\r
             EngineError::ReservedPort {
                 name: "R".to_string(),
                 port: 18501,
-                range: CLASH_RESERVED_NAME,
+                range: clash_reserved_name(),
             },
             EngineError::DnsFailure {
                 name: "R".to_string(),

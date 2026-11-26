@@ -707,18 +707,18 @@ impl AppView {
         let failed: Vec<(String, String)> = outcome
             .failed
             .iter()
-            .map(|(name, reason)| (name.clone(), redact_secrets(reason).to_string()))
+            .map(|(name, reason)| (name.clone(), redact_secrets(&reason.to_string())))
             .collect();
-        match outcome.error.as_deref() {
+        match outcome
+            .error
+            .as_ref()
+            .map(|error| redact_secrets(&error.to_string()))
+        {
             // The one apply refused the batch: nothing new started, and the
             // refusal names the row (or the shared port) that caused it.
             Some(reason) => {
                 window.push_notification(
-                    Notification::error(bulk_start_refused_message(
-                        requested,
-                        &redact_secrets(reason),
-                        &failed,
-                    )),
+                    Notification::error(bulk_start_refused_message(requested, &reason, &failed)),
                     cx,
                 );
             }

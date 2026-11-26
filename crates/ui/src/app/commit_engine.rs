@@ -270,10 +270,13 @@ impl AppView {
                 }
 
                 let outcome = self.engine.start_all_subset(&rows, true);
-                if let Some(error) = outcome.error.as_deref() {
+                if let Some(error) = outcome.error.as_ref() {
                     self.reload(window, cx);
                     self.start_in_flight = false;
-                    window.push_notification(Notification::error(redact_secrets(error)), cx);
+                    window.push_notification(
+                        Notification::error(redact_secrets(&error.to_string())),
+                        cx,
+                    );
                     return;
                 }
                 let started: Vec<ProxyConfig> = rows
@@ -292,7 +295,7 @@ impl AppView {
                     let reason = outcome
                         .failed
                         .first()
-                        .map(|(_, cause)| cause.clone())
+                        .map(|(_, cause)| cause.to_string())
                         .unwrap_or_else(|| fast_error.to_string());
                     window.push_notification(Notification::error(redact_secrets(&reason)), cx);
                     return;

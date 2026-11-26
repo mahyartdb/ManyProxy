@@ -1904,6 +1904,32 @@ fn copy_urls_carry_binds_not_secrets() {
     }
 }
 
+#[test]
+fn c9_start_failures_stay_typed_for_the_ui() {
+    use manyproxy_ui::engine::EngineController;
+    use manyproxy_ui::store::ProxyConfig;
+    let (mut engine, _) = EngineController::fake();
+    let broken = ProxyConfig {
+        id: "1".to_string(),
+        name: "Broken".to_string(),
+        protocol: "vless".to_string(),
+        params: Secret::new("{}"),
+        group: "default".to_string(),
+        enabled: true,
+        bind_ip: "127.0.0.1".to_string(),
+        port: 10801,
+        subscription_id: None,
+        identity_key: None,
+        preset_id: None,
+    };
+    let outcome = engine.start_many_additive(std::slice::from_ref(&broken), true);
+    assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+    let (name, error) = &outcome.failed[0];
+    assert_eq!(name, "Broken");
+    assert!(manyproxy_ui::is_row_local_start_error(error), "{error}");
+    assert!(outcome.error.is_none(), "{outcome:?}");
+}
+
 #[gpui_kit::test]
 fn lan_single_start_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

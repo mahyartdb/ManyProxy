@@ -711,6 +711,8 @@ pub enum StoreError {
     Io { path: PathBuf, message: String },
 
     Crypto { message: String },
+    Schema(String),
+    Preset(String),
     Sql(rusqlite::Error),
 }
 
@@ -731,6 +733,8 @@ impl std::fmt::Display for StoreError {
             StoreError::Crypto { message } => {
                 write!(f, "cannot protect secrets ({message}; nothing was written)")
             }
+            StoreError::Schema(message) => write!(f, "{message}"),
+            StoreError::Preset(message) => write!(f, "{message}"),
             StoreError::Sql(error) => write!(f, "database error: {error}"),
         }
     }
@@ -1526,12 +1530,9 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     if trimmed.is_empty() {
         return Some(DEFAULT_BIND.to_string());
     }
-    if trimmed.eq_ignore_ascii_case("localhost") {
-        return Some("localhost".to_string());
-    }
-    match trimmed.parse::<IpAddr>() {
-        Ok(_) => Some(trimmed.to_string()),
-        Err(_) => {
+    match crate::library::normalize_bind(trimmed) {
+        Some(bind) => Some(bind),
+        None => {
             errors.push(FieldError::new(
                 "bind_ip",
                 format!("bind address must be an IP literal or localhost, got '{trimmed}'"),
@@ -4546,16 +4547,17 @@ impl Store {
         let store = match Self::open_with_path(conn, Some(path.to_path_buf())) {
             Ok(store) => store,
             Err(error) => {
-                let text = error.to_string();
-                let looks_corrupt = text.contains("not a database")
-                    || text.contains("file is not a database")
-                    || text.contains("malformed")
-                    || text.contains("integrity check failed")
-                    || text.contains("corrupt");
+                let looks_corrupt = match &error {
+                    StoreError::Sql(rusqlite::Error::SqliteFailure(failure, _)) => matches!(
+                        failure.code,
+                        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                    ),
+                    _ => false,
+                };
                 if looks_corrupt && path.exists() {
                     if let Ok(quarantined) = Self::quarantine_corrupt_file(path) {
                         return Err(Self::schema_error(format!(
-                            "{text} (bad file preserved as {})",
+                            "{error} (bad file preserved as {})",
                             quarantined.display()
                         )));
                     }
@@ -4658,8 +4660,12 @@ impl Store {
             }
             _ => PathBuf::from(format!("{base}.corrupt-{}", unique_name_suffix(ts))),
         };
-        std::fs::rename(path, &quarantined).map_err(|error| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        std::fs::rename(path, &quarantined).map_err(|error| StoreError::Io {
+            path: path.to_path_buf(),
+            message: format!(
+                "cannot move the bad file aside to {}: {error}",
+                quarantined.display()
+            ),
         })?;
 
         for suffix in ["-wal", "-shm", "-journal"] {
@@ -4709,8 +4715,9 @@ impl Store {
             }
             _ => PathBuf::from(format!("{base}.bak-{}", unique_name_suffix(now))),
         };
-        std::fs::copy(db_path, &backup).map_err(|error| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        std::fs::copy(db_path, &backup).map_err(|error| StoreError::Io {
+            path: db_path.to_path_buf(),
+            message: format!("backup to {} failed: {error}", backup.display()),
         })?;
         harden_file_permissions(&backup);
         Ok(backup)
@@ -4840,7 +4847,7 @@ impl Store {
         Ok(())
     }
 
-    const SCHEMA_VERSION: i64 = 6;
+    const SCHEMA_VERSION: i64 = 7;
 
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
@@ -4861,9 +4868,7 @@ impl Store {
     }
 
     fn schema_error(message: String) -> StoreError {
-        StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-        )))
+        StoreError::Schema(message)
     }
 
     fn assert_sqlite_version(&self) -> Result<(), StoreError> {
@@ -5142,6 +5147,26 @@ impl Store {
             tx.commit()?;
         }
 
+        if version < 7 {
+            // Rows saved before the bind was validated stored the default bind
+            // as `''`. Rewrite them to the column's default, the same literal
+            // the DDL declares, with a recovery point taken first.
+            let empty_binds: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM proxy_configs WHERE bind_ip = ''",
+                [],
+                |row| row.get(0),
+            )?;
+            if empty_binds > 0 {
+                if let Some(path) = self.db_path.clone() {
+                    Self::backup_db_file(&path, now_unix())?;
+                }
+                self.conn.execute(
+                    "UPDATE proxy_configs SET bind_ip = '127.0.0.1' WHERE bind_ip = ''",
+                    [],
+                )?;
+            }
+        }
+
         for (table, column) in [
             ("proxy_configs", "subscription_id"),
             ("proxy_configs", "identity_key"),
@@ -5250,6 +5275,14 @@ impl Store {
                     }
                 }
             };
+            if let Err(error) =
+                crate::engine::validate_listen_for_save(&item.name, &item.bind_ip, port)
+            {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "port",
+                    error.to_string(),
+                )]));
+            }
             taken.insert(port as i64);
             assigned.push(ValidatedConfig {
                 name: item.name,
@@ -5843,11 +5876,7 @@ impl Store {
     pub fn preset_rules_map(&self) -> Result<HashMap<String, Vec<serde_json::Value>>, StoreError> {
         let mut map = HashMap::new();
         for preset in self.list_presets()? {
-            let rules = preset.rules().map_err(|message| {
-                StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-                )))
-            })?;
+            let rules = preset.rules().map_err(StoreError::Preset)?;
             map.insert(preset.id, rules);
         }
         Ok(map)
@@ -5997,11 +6026,7 @@ impl Store {
         let mut preset = self
             .get_preset(id)?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-        let mut rules = preset.rules().map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
-        })?;
+        let mut rules = preset.rules().map_err(StoreError::Preset)?;
         rules.push(rule);
         if let Err(error) = crate::preset::validate_preset_rules(&rules) {
             return Err(StoreError::Invalid(vec![FieldError::new(
@@ -6025,11 +6050,7 @@ impl Store {
         let preset = self
             .get_preset(id)?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-        let mut rules = preset.rules().map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
-        })?;
+        let mut rules = preset.rules().map_err(StoreError::Preset)?;
         if index >= rules.len() {
             return Err(StoreError::Invalid(vec![FieldError::new(
                 "rule",
@@ -6256,11 +6277,7 @@ impl Store {
         let Some(preset) = self.get_preset(preset_id)? else {
             return Ok(Vec::new());
         };
-        let rules = preset.rules().map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
-        })?;
+        let rules = preset.rules().map_err(StoreError::Preset)?;
         Ok(crate::preset::collect_rule_set_refs(&rules))
     }
 
@@ -7658,20 +7675,13 @@ impl Store {
             }
             let bind_ip_raw = get_str(entry, "bind_ip")
                 .ok_or_else(|| invalid(format!("{what} needs a bind_ip")))?;
+            let mut bind_errors = Vec::new();
+            let bind_ip = validated_bind(&bind_ip_raw, &mut bind_errors)
+                .ok_or_else(|| invalid(format!("{what} has a bad bind_ip")))?;
+            if let Err(error) =
+                crate::engine::validate_listen_for_save(&name, &bind_ip, port as u16)
             {
-                let trimmed = bind_ip_raw.trim();
-                let bind_ok = trimmed.is_empty()
-                    || trimmed.eq_ignore_ascii_case("localhost")
-                    || trimmed.parse::<std::net::IpAddr>().is_ok();
-                if !bind_ok {
-                    return Err(invalid(format!("{what} has a bad bind_ip")));
-                }
-            }
-
-            if let Some(range) = crate::engine::reserved_range_of(port as u16) {
-                return Err(invalid(format!(
-                    "{what} uses reserved port {port} ({range})"
-                )));
+                return Err(invalid(format!("{what}: {error}")));
             }
             rows.push(LibraryRow {
                 id,
@@ -7683,7 +7693,7 @@ impl Store {
                     .get("enabled")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
-                bind_ip: bind_ip_raw,
+                bind_ip,
                 port,
                 subscription_id: get_str(entry, "subscription_id"),
                 identity_key: get_str(entry, "identity_key"),
@@ -9280,14 +9290,32 @@ impl Store {
             current.protocol.clone(),
             Secret::new(current.params.expose()),
         ));
-        Ok(ValidatedConfig {
+        let config = ValidatedConfig {
             name: name.unwrap_or_else(|| current.name.clone()),
             protocol,
             params,
             group: group.unwrap_or_else(|| current.group.clone()),
             bind_ip: bind_ip.unwrap_or_else(|| current.bind_ip.clone()),
             port: port.unwrap_or(current.port),
-        })
+        };
+        // A row that predates the save gate may sit on a port it would now be
+        // refused for; it stays editable for everything but its listen.
+        let listen_supplied = patch.port.is_some()
+            || patch
+                .bind_ip
+                .as_deref()
+                .is_some_and(|raw| !raw.trim().is_empty());
+        if listen_supplied {
+            if let Err(error) =
+                crate::engine::validate_listen_for_save(&config.name, &config.bind_ip, config.port)
+            {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "port",
+                    error.to_string(),
+                )]));
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -12693,6 +12721,12 @@ mod tests {
         let mut reserved = valid_entry();
         reserved["port"] = serde_json::json!(18600);
         cases.push(("reserved port", reserved));
+        let mut reserved_edge = valid_entry();
+        reserved_edge["port"] = serde_json::json!(18501);
+        cases.push(("reserved port edge", reserved_edge));
+        let mut privileged = valid_entry();
+        privileged["port"] = serde_json::json!(80);
+        cases.push(("privileged port", privileged));
         for (label, entry) in cases {
             let mut store = Store::open_in_memory().expect("in-memory store opens");
             let payload = payload_with(vec![entry]);
@@ -12748,6 +12782,27 @@ mod tests {
                 .restore_library_json(&payload_with(vec![entry]))
                 .expect("localhost bind restores");
             assert_eq!(outcome.configs, 1);
+        }
+
+        // An export written before schema 7 carries `""` for the default
+        // bind. It must restore, and it must not put `""` back.
+        for legacy in ["", "  ", "[::1]"] {
+            let mut entry = valid_entry();
+            entry["bind_ip"] = serde_json::Value::String(legacy.to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            store
+                .restore_library_json(&payload_with(vec![entry]))
+                .unwrap_or_else(|error| panic!("bind {legacy:?} restores, got {error}"));
+            let rows = store.list().expect("list works");
+            assert_eq!(rows.len(), 1, "bind {legacy:?}");
+            assert_eq!(
+                rows[0].bind_ip,
+                match legacy {
+                    "[::1]" => "::1",
+                    _ => DEFAULT_BIND,
+                },
+                "bind {legacy:?} is stored in its one spelling"
+            );
         }
     }
 
@@ -12912,8 +12967,8 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("999"), "names the version, got {text}");
         assert!(
-            matches!(error, StoreError::Sql(_)),
-            "loud database error, never a silent empty: {text}"
+            matches!(error, StoreError::Schema(_)),
+            "loud schema refusal, never a silent empty: {text}"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -17594,6 +17649,10 @@ mod tests {
         };
         let text = err.to_string();
         assert!(
+            matches!(err, StoreError::Schema(_)),
+            "loud typed guidance, got {err}"
+        );
+        assert!(
             text.contains("corrupt") || text.contains("integrity"),
             "loud guidance, got {text}"
         );
@@ -17605,6 +17664,51 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1, "one quarantined file, got {kept:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file can carry the SQLite magic and still be unreadable. That case
+    /// gets past the header check and is detected by the error code SQLite
+    /// reports, never by the wording of its English message.
+    #[test]
+    fn t40_corrupt_body_with_a_valid_header_is_quarantined_by_code() {
+        let source = t52_temp_root("t40body").join("library.db");
+        {
+            let mut store = Store::open_file(&source).expect("opens");
+            store.add(valid_input("Real")).expect("adds");
+        }
+        let whole = std::fs::read(&source).expect("reads");
+
+        let mut header_and_zeros = b"SQLite format 3\0".to_vec();
+        header_and_zeros.resize(4096, 0);
+        for (label, body) in [
+            ("valid header, empty body", header_and_zeros),
+            ("real file, cut in half", whole[..whole.len() / 2].to_vec()),
+        ] {
+            let dir = t52_temp_root("t40body-broken");
+            let path = dir.join("library.db");
+            std::fs::write(&path, &body).expect("body writes");
+
+            let error = match Store::open_file(&path) {
+                Ok(_) => panic!("{label}: a broken body must not open"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, StoreError::Schema(_)),
+                "{label}: quarantined with guidance, got {error}"
+            );
+            let quarantined: Vec<_> = std::fs::read_dir(&dir)
+                .expect("dir reads")
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+                .filter(|name| name.contains("corrupt"))
+                .collect();
+            assert_eq!(quarantined.len(), 1, "{label}: one bad file kept");
+            assert!(
+                Store::open_file(&path).is_ok(),
+                "{label}: the damaged file is out of the way, so a fresh library opens"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        std::fs::remove_dir_all(source.parent().expect("source has a parent")).ok();
     }
 
     #[test]
@@ -17758,6 +17862,28 @@ mod tests {
             store.list_presets().expect("list works").is_empty(),
             "explicit empty array wipes"
         );
+    }
+
+    #[test]
+    fn c9_backup_copy_failure_is_io_with_the_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-c9-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let missing = dir.join("library.db");
+        let error = Store::backup_db_file(&missing, now_unix())
+            .expect_err("a missing source cannot be copied");
+        assert!(matches!(error, StoreError::Io { .. }), "Io, got {error:?}");
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "names the path: {error}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -19389,5 +19515,194 @@ mod tests {
             "a failed probe never deletes anything it did not create"
         );
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// C7: the port rule is the engine's, and the store refuses at save what
+    /// Start would refuse later. The refusal names the `port` field, so the
+    /// form can focus it, and carries the engine's own message.
+    #[test]
+    fn c7_save_refuses_privileged_and_reserved_ports() {
+        let rules = [
+            ("80", "privileged"),
+            ("18501", "clash-controller range 18501-18999"),
+            ("11801", "xray-bridge range 11801-11999"),
+        ];
+        let refused_on_port = |error: StoreError, rule: &str, what: &str| {
+            let StoreError::Invalid(fields) = error else {
+                panic!("{what}: Invalid, got {error}");
+            };
+            assert_eq!(fields.len(), 1, "{what}: one field, got {fields:?}");
+            assert_eq!(fields[0].field, "port", "{what}: {fields:?}");
+            assert!(
+                fields[0].message.contains(rule),
+                "{what}: the engine's rule, got {}",
+                fields[0].message
+            );
+        };
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for (port, rule) in rules {
+            let mut input = valid_input(&format!("Row {port}"));
+            input.port = port.to_string();
+            let error = store
+                .add(input)
+                .expect_err(&format!("add on port {port} must be refused"));
+            refused_on_port(error, rule, &format!("add port {port}"));
+            assert!(
+                store.list().expect("list works").is_empty(),
+                "{port} wrote a row"
+            );
+        }
+
+        let row = store.add(valid_input("Kept")).expect("row seeds");
+        for (port, rule) in rules {
+            let error = store
+                .update(
+                    &row.id,
+                    ConfigPatch {
+                        port: Some(port.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .expect_err(&format!("patch to port {port} must be refused"));
+            refused_on_port(error, rule, &format!("patch port {port}"));
+        }
+        let kept = store.get(&row.id).expect("get works").expect("row kept");
+        assert_eq!(kept.port, 10801, "refused patches wrote nothing");
+
+        // A row that predates the gate stays editable for everything but its
+        // listen: refusing a rename would make it impossible to fix.
+        store
+            .conn
+            .execute(
+                "UPDATE proxy_configs SET port = 80 WHERE id = ?1",
+                params![row.id],
+            )
+            .expect("a legacy port is seeded");
+        store
+            .update(
+                &row.id,
+                ConfigPatch {
+                    name: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("a rename does not re-judge the port");
+        assert_eq!(
+            store
+                .get(&row.id)
+                .expect("get works")
+                .expect("row kept")
+                .name,
+            "Renamed"
+        );
+        let error = store
+            .update(
+                &row.id,
+                ConfigPatch {
+                    port: Some("80".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("re-stating the bad port is a save and is refused");
+        refused_on_port(error, "privileged", "re-stating the legacy port");
+    }
+
+    #[test]
+    fn c8_bind_normalisation_is_one_spelling() {
+        let mut errors = Vec::new();
+        for (raw, stored) in [
+            ("localhost", "localhost"),
+            ("  LOCALHOST ", "localhost"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::1", "::1"),
+            ("[::1]", "::1"),
+            (" ::0001 ", "::1"),
+        ] {
+            errors.clear();
+            assert_eq!(
+                validated_bind(raw, &mut errors),
+                Some(stored.to_string()),
+                "{raw}"
+            );
+            assert!(errors.is_empty(), "{raw}: {errors:?}");
+            assert_eq!(
+                crate::library::parse_endpoint(raw, "10801")
+                    .expect("editor parses")
+                    .bind,
+                stored,
+                "{raw}: editor and store agree"
+            );
+        }
+        errors.clear();
+        assert_eq!(
+            validated_bind("", &mut errors),
+            Some(DEFAULT_BIND.to_string())
+        );
+        assert!(errors.is_empty());
+        assert!(
+            crate::library::parse_endpoint("", "10801").is_err(),
+            "the editor still requires a concrete bind"
+        );
+    }
+
+    #[test]
+    fn c8_v6_empty_bind_migrates_with_a_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-c8-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        {
+            let store = Store::open_file(&path).expect("file store opens");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO proxy_configs
+                       (name, protocol, params, grp, enabled, bind_ip, port)
+                     VALUES ('Legacy','vless','{}','default',0,'',10801)",
+                    [],
+                )
+                .expect("v6 row inserts");
+            store
+                .conn
+                .execute_batch("PRAGMA user_version = 6;")
+                .expect("v6 stamp");
+        }
+
+        let store = Store::open_file(&path).expect("v6 file migrates");
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bind_ip, DEFAULT_BIND, "empty bind rewritten");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version reads");
+        assert_eq!(version, 7, "schema advanced to the bind migration");
+        let backup = std::fs::read_dir(&dir)
+            .expect("dir reads")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("library.db.bak-"))
+            })
+            .expect("the rewrite backed the database up first");
+        let old: String = rusqlite::Connection::open(&backup)
+            .expect("the backup opens")
+            .query_row("SELECT bind_ip FROM proxy_configs", [], |row| row.get(0))
+            .expect("the backup holds the pre-rewrite row");
+        assert_eq!(
+            old, "",
+            "the backup is the undo point, taken before the rewrite"
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -52,29 +52,26 @@ pub struct EndpointCollision {
 /// caller runs `validate_listen_for_save` next and keeps this parser honest for
 /// tests that prove port 1 parses.
 pub fn parse_endpoint(bind: &str, port: &str) -> Result<EndpointValue, EndpointError> {
-    let bind = parse_bind(bind)?;
+    let bind = normalize_bind(bind).ok_or_else(EndpointError::bind)?;
     let port = parse_port(port)?;
     Ok(EndpointValue { bind, port })
 }
 
-fn parse_bind(raw: &str) -> Result<String, EndpointError> {
+/// The one bind spelling the store and the editor share: `localhost` (lower
+/// case), a canonical IP literal, or `None`. Brackets are syntax, not data.
+/// `localhost` and `127.0.0.1` stay distinct on purpose: the row chip prints
+/// `:port` only for the default bind, so folding one into the other would
+/// change what a stored row displays and what the engine listens on.
+pub fn normalize_bind(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let literal = trimmed
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
         .unwrap_or(trimmed);
     if literal.eq_ignore_ascii_case("localhost") {
-        return Ok("localhost".to_string());
+        return Some("localhost".to_string());
     }
-    if literal.parse::<IpAddr>().is_ok() {
-        // Canonicalize so `::0001` collides with `::1` and brackets never
-        // reach `bind_ip`.
-        return Ok(literal
-            .parse::<IpAddr>()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|_| literal.to_string()));
-    }
-    Err(EndpointError::bind())
+    literal.parse::<IpAddr>().ok().map(|ip| ip.to_string())
 }
 
 fn parse_port(raw: &str) -> Result<u16, EndpointError> {
@@ -138,16 +135,6 @@ pub fn next_free_port(
     None
 }
 
-/// The display form: `host:port`, with an IPv6 literal bracketed.
-pub fn format_endpoint(bind: &str, port: u16) -> String {
-    let bind = bind.trim();
-    if bind.contains(':') && !bind.starts_with('[') {
-        format!("[{bind}]:{port}")
-    } else {
-        format!("{bind}:{port}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,8 +180,8 @@ mod tests {
             parse_endpoint("localhost", "10801").map(|value| value.bind),
             Ok("localhost".to_string())
         );
-        assert_eq!(format_endpoint("::1", 10801), "[::1]:10801");
-        assert_eq!(format_endpoint("127.0.0.1", 10801), "127.0.0.1:10801");
+        assert_eq!(endpoint_full("::1", 10801), "[::1]:10801");
+        assert_eq!(endpoint_full("127.0.0.1", 10801), "127.0.0.1:10801");
     }
 
     #[test]
