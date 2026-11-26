@@ -16,6 +16,7 @@ pub struct RowSearchIndex {
     pub state_word: String,
     pub serve_word: String,
     pub health_text: String,
+    pub dead: bool,
 }
 
 impl RowSearchIndex {
@@ -39,6 +40,7 @@ impl RowSearchIndex {
             },
             serve_word: "stopped".to_string(),
             health_text: String::new(),
+            dead: false,
         }
     }
 
@@ -48,7 +50,7 @@ impl RowSearchIndex {
         sub_labels: &HashMap<String, String>,
         preset_names: &HashMap<String, String>,
         running: &HashSet<String>,
-        health: &HashMap<String, String>,
+        health: &HashMap<String, RowHealth>,
     ) {
         // R10: a config with no subscription is `Manual`, so the source label
         // in the search index is the same word the inspector and nav use.
@@ -69,9 +71,10 @@ impl RowSearchIndex {
         } else {
             "stopped".to_string()
         };
-        self.health_text = health
-            .get(&row.id)
-            .map(|summary| summary.trim().to_lowercase())
+        let status = health.get(&row.id);
+        self.dead = status.is_some_and(RowHealth::is_dead);
+        self.health_text = status
+            .map(|status| status.summary().to_lowercase())
             .unwrap_or_default();
     }
 
@@ -100,11 +103,7 @@ impl RowSearchIndex {
         if self.health_text.contains(lowered) {
             return true;
         }
-        let health_word = if self.health_text == "dead" {
-            "dead"
-        } else {
-            "live"
-        };
+        let health_word = if self.dead { "dead" } else { "live" };
         health_word.contains(lowered)
     }
 }

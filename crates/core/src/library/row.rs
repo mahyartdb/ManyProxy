@@ -22,8 +22,8 @@ pub struct RowViewInputs<'a> {
     /// Whether a start is in flight. A row that is not serving yet reads as
     /// starting.
     pub starting: bool,
-    /// The probe's last summary per row (`123ms`, `live`, `dead`).
-    pub health: &'a HashMap<String, String>,
+    /// The probe's last result per row.
+    pub health: &'a HashMap<String, RowHealth>,
     /// The probe's last failure cause per row.
     pub health_errors: &'a HashMap<String, String>,
     /// The latest latency sample per row, in milliseconds.
@@ -43,6 +43,8 @@ impl RowViewInputs<'_> {
             std::sync::LazyLock::new(HashSet::new);
         static EMPTY_MAP: std::sync::LazyLock<HashMap<String, String>> =
             std::sync::LazyLock::new(HashMap::new);
+        static EMPTY_HEALTH: std::sync::LazyLock<HashMap<String, RowHealth>> =
+            std::sync::LazyLock::new(HashMap::new);
         static EMPTY_LATENCY: std::sync::LazyLock<HashMap<String, u64>> =
             std::sync::LazyLock::new(HashMap::new);
         static EMPTY_PAIRS: std::sync::LazyLock<HashMap<String, (u64, u64)>> =
@@ -51,7 +53,7 @@ impl RowViewInputs<'_> {
             running: &EMPTY_SET,
             crashed: &EMPTY_SET,
             starting: false,
-            health: &EMPTY_MAP,
+            health: &EMPTY_HEALTH,
             health_errors: &EMPTY_MAP,
             latency: &EMPTY_LATENCY,
             traffic: &EMPTY_PAIRS,
@@ -95,18 +97,15 @@ impl RowView {
     pub fn of(config: &ProxyConfig, inputs: &RowViewInputs<'_>) -> Self {
         let id = config.id.clone();
         let running = inputs.running.contains(&id);
-        let failed = inputs.crashed.contains(&id)
-            || inputs
-                .health
-                .get(&id)
-                .is_some_and(|sum| sum.trim() == "dead");
+        let failed =
+            inputs.crashed.contains(&id) || inputs.health.get(&id).is_some_and(RowHealth::is_dead);
         let starting = inputs.starting && !running;
         let state = RowPhase::of(running, starting, failed);
         let latency = inputs.latency.get(&id).copied();
         let health_text = row_health_text(
             state,
             latency,
-            inputs.health.get(&id).map(String::as_str),
+            inputs.health.get(&id),
             inputs.health_errors.get(&id).map(String::as_str),
         );
         let traffic = inputs.traffic.get(&id).copied();
@@ -183,20 +182,21 @@ pub fn row_source(config: &ProxyConfig, sub_labels: &HashMap<String, String>) ->
 fn row_health_text(
     state: RowPhase,
     latency: Option<u64>,
-    summary: Option<&str>,
+    health: Option<&RowHealth>,
     cause: Option<&str>,
 ) -> String {
     match state {
-        RowPhase::Failed => cause
-            .map(failure_label)
-            .unwrap_or_else(|| summary.and_then(failure_label_opt).unwrap_or("Failed"))
-            .to_string(),
+        RowPhase::Failed => cause.map(failure_label).unwrap_or("Failed").to_string(),
         RowPhase::Running => match latency {
             Some(ms) => format!("{ms} ms"),
             None => "Unprobed".to_string(),
         },
-        RowPhase::Starting | RowPhase::Stopped => match summary {
-            Some(sum) if !sum.trim().is_empty() && sum.trim() != "live" => sum.trim().to_string(),
+        RowPhase::Starting | RowPhase::Stopped => match health {
+            Some(health) if health.is_dead() => "dead".to_string(),
+            Some(RowHealth {
+                latency_ms: Some(ms),
+                ..
+            }) => format!("{ms}ms"),
             _ => String::new(),
         },
     }

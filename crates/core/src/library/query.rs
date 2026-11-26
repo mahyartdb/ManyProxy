@@ -53,24 +53,31 @@ impl StatusFacet {
     ];
 
     pub fn matches(self, row: &ProxyConfig, facts: &QueryFacts<'_>) -> bool {
-        let running = facts.running.contains(&row.id);
-        let dead = facts.crashed.contains(&row.id)
-            || facts.health.get(&row.id).map(|text| text.trim()) == Some("dead");
         match self {
             Self::Enabled => row.enabled,
             Self::Disabled => !row.enabled,
-            Self::Running => running && !dead,
-            Self::Dead => running && dead,
-            Self::Stopped => !running,
+            Self::Running => phase_of(row, facts) == RowPhase::Running,
+            Self::Dead => phase_of(row, facts) == RowPhase::Failed,
+            Self::Stopped => phase_of(row, facts) == RowPhase::Stopped,
         }
     }
+}
+
+/// The phase a row paints, read from the same mirrors the filters use.
+/// `Starting` is layered on top by [`RowView`]: the query mirrors do not
+/// carry the in-flight start.
+pub fn phase_of(row: &ProxyConfig, facts: &QueryFacts<'_>) -> RowPhase {
+    let running = facts.running.contains(&row.id);
+    let failed = facts.crashed.contains(&row.id)
+        || facts.health.get(&row.id).is_some_and(RowHealth::is_dead);
+    RowPhase::of(running, false, failed)
 }
 
 /// The read-only mirrors matching and counting need. The app keeps these
 /// fresh on its normal ticks; the query never polls and never writes.
 pub struct QueryFacts<'a> {
     pub running: &'a HashSet<String>,
-    pub health: &'a HashMap<String, String>,
+    pub health: &'a HashMap<String, RowHealth>,
     pub crashed: &'a HashSet<String>,
     pub latency: &'a HashMap<String, u64>,
 }
@@ -393,7 +400,7 @@ mod tests {
 
     fn facts<'a>(
         running: &'a HashSet<String>,
-        health: &'a HashMap<String, String>,
+        health: &'a HashMap<String, RowHealth>,
         crashed: &'a HashSet<String>,
         latency: &'a HashMap<String, u64>,
     ) -> QueryFacts<'a> {
@@ -411,7 +418,7 @@ mod tests {
 
     type EmptyFacts = (
         HashSet<String>,
-        HashMap<String, String>,
+        HashMap<String, RowHealth>,
         HashSet<String>,
         HashMap<String, u64>,
     );
@@ -464,9 +471,17 @@ mod tests {
         rows[0].preset_id = Some("preset-1".to_string());
         let mut index = indexes(&rows);
         let running: HashSet<String> = ["1".to_string()].into_iter().collect();
-        let health: HashMap<String, String> = [("1".to_string(), "live".to_string())]
-            .into_iter()
-            .collect();
+        let health: HashMap<String, RowHealth> = [(
+            "1".to_string(),
+            RowHealth {
+                state: RowState::Live,
+                latency_ms: None,
+                cause: None,
+                cause_kind: None,
+            },
+        )]
+        .into_iter()
+        .collect();
         let crashed = HashSet::new();
         let latency = HashMap::new();
         index[0].enrich(
@@ -584,6 +599,88 @@ mod tests {
             query.port, None,
             "clearing a field that held a token releases the port"
         );
+    }
+
+    #[test]
+    fn c5_status_facets_agree_with_the_painted_phase() {
+        fn health(state: RowState, latency_ms: Option<u64>) -> RowHealth {
+            RowHealth {
+                state,
+                latency_ms,
+                cause: None,
+                cause_kind: None,
+            }
+        }
+
+        let mut row = row("1", "alpha", "vless", "", "127.0.0.1", 10801);
+        let empty_latency: HashMap<String, u64> = HashMap::new();
+        let cases = [
+            ("stopped", false, None, false, RowPhase::Stopped),
+            (
+                "running live",
+                true,
+                Some(health(RowState::Live, Some(33))),
+                false,
+                RowPhase::Running,
+            ),
+            (
+                "running dead",
+                true,
+                Some(health(RowState::Dead, None)),
+                false,
+                RowPhase::Failed,
+            ),
+            ("crashed", true, None, true, RowPhase::Failed),
+            (
+                "stopped after a dead verdict",
+                false,
+                Some(health(RowState::Dead, None)),
+                false,
+                RowPhase::Failed,
+            ),
+            ("disabled", false, None, false, RowPhase::Stopped),
+        ];
+        for (name, running, health, crashed, expected) in cases {
+            if name == "disabled" {
+                row.enabled = false;
+            }
+            let running_set: HashSet<String> =
+                running.then(|| row.id.clone()).into_iter().collect();
+            let crashed_set: HashSet<String> =
+                crashed.then(|| row.id.clone()).into_iter().collect();
+            let health_map: HashMap<String, RowHealth> = health
+                .map(|health| (row.id.clone(), health))
+                .into_iter()
+                .collect();
+            let facts = facts(&running_set, &health_map, &crashed_set, &empty_latency);
+            let phase = phase_of(&row, &facts);
+            assert_eq!(phase, expected, "{name}: painted phase");
+            assert_eq!(
+                StatusFacet::Running.matches(&row, &facts),
+                phase == RowPhase::Running,
+                "{name}: the Running filter follows the phase"
+            );
+            assert_eq!(
+                StatusFacet::Dead.matches(&row, &facts),
+                phase == RowPhase::Failed,
+                "{name}: the Dead filter follows the Failed glyph"
+            );
+            assert_eq!(
+                StatusFacet::Stopped.matches(&row, &facts),
+                phase == RowPhase::Stopped,
+                "{name}: the Stopped filter follows the phase"
+            );
+            assert_eq!(
+                StatusFacet::Enabled.matches(&row, &facts),
+                row.enabled,
+                "{name}: the Enabled filter is the flag"
+            );
+            assert_eq!(
+                StatusFacet::Disabled.matches(&row, &facts),
+                !row.enabled,
+                "{name}: the Disabled filter is the flag"
+            );
+        }
     }
 
     #[test]

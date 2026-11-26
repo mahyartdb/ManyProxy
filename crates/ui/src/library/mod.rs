@@ -70,7 +70,7 @@ pub struct LibraryDelegate {
     /// lands on the list.
     pub list_focus: Option<FocusHandle>,
 
-    pub health: HashMap<String, String>,
+    pub health: HashMap<String, RowHealth>,
 
     /// The probe's last failure cause per row. The health cell folds it into
     /// the two words it knows: `timeout` and `refused`.
@@ -250,7 +250,7 @@ impl LibraryDelegate {
         self.rows.iter().find(|row| row.id == id)
     }
 
-    pub fn set_health(&mut self, health: HashMap<String, String>) {
+    pub fn set_health(&mut self, health: HashMap<String, RowHealth>) {
         self.health = health;
         self.refresh_search_words();
     }

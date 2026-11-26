@@ -229,7 +229,7 @@ pub fn is_direct_protocol(protocol: &str) -> bool {
     Protocol::parse(protocol) == Some(Protocol::Direct)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OwningCore {
     Stock,
     Fork,
@@ -243,6 +243,42 @@ impl OwningCore {
             OwningCore::Fork => "fork",
             OwningCore::Xray => "xray",
         }
+    }
+
+    /// The slot `served`, `gens` and `backend_at` use.
+    fn index(self) -> usize {
+        match self {
+            OwningCore::Stock => 0,
+            OwningCore::Fork => 1,
+            OwningCore::Xray => 2,
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "stock" => Some(OwningCore::Stock),
+            "fork" => Some(OwningCore::Fork),
+            "xray" => Some(OwningCore::Xray),
+            _ => None,
+        }
+    }
+}
+
+/// A running sidecar. `Extra` is the slot index among active extra-core rows,
+/// the same index `extra_backends` and `served_extra` use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Shard {
+    Core(OwningCore),
+    Extra(usize),
+}
+
+fn shard_label(shard: Shard, extra_ids: &[String]) -> String {
+    match shard {
+        Shard::Core(core) => core.as_str().to_string(),
+        Shard::Extra(index) => extra_ids
+            .get(index)
+            .map(|id| format!("extra-{id}"))
+            .unwrap_or_else(|| format!("extra-{index}")),
     }
 }
 
@@ -1014,6 +1050,25 @@ fn params_object(
         .ok_or_else(|| EngineError::InvalidParamsJson {
             name: config.name.clone(),
         })
+}
+
+/// The one core that serves a row. Custom rows name it in `core`; everything
+/// else follows the xray and fork predicates. Only a custom row with bad
+/// params or a bad `core` value can fail, and `validate_activation` refuses
+/// those, so every active row classifies.
+fn core_of(config: &ProxyConfig) -> Result<OwningCore, EngineError> {
+    if is_custom_config_protocol(&config.protocol) || is_custom_outbound_protocol(&config.protocol)
+    {
+        let params = params_object(config)?;
+        return owning_core_of(&config.name, &params);
+    }
+    if needs_xray(config) {
+        return Ok(OwningCore::Xray);
+    }
+    if needs_fork(config) {
+        return Ok(OwningCore::Fork);
+    }
+    Ok(OwningCore::Stock)
 }
 
 fn json_port_from_value(value: &serde_json::Value) -> Option<u16> {
@@ -1912,6 +1967,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     let mut bridge_keys: Vec<String> = Vec::new();
     for config in configs {
         let params = params_object(config)?;
+        let core = core_of(config)?;
 
         if !is_custom_config_protocol(&config.protocol) {
             validate_listen_for_start(&config.name, &config.bind_ip, config.port)?;
@@ -1920,7 +1976,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             validate_extra_row(config)?;
             extras.push(config.clone());
         } else if is_custom_config_protocol(&config.protocol) {
-            let (core, document) = custom_full_config(&config.name, &params)?;
+            let (_, document) = custom_full_config(&config.name, &params)?;
             if replacements.iter().any(|(owned, _)| *owned == core) {
                 return Err(EngineError::BadCustom {
                     name: config.name.clone(),
@@ -1937,14 +1993,8 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             }
             replacements.push((core, document.to_string()));
             replacement_owner.push((core, config.name.clone()));
-        } else if is_xray_protocol(&config.protocol) || vless_needs_xray(&config.protocol, &params)
-        {
-            check_wrong_layer(&config.name, &config.protocol, &params)?;
-            validate_xray_row(&config.name, &params)?;
-            bridge_keys.push(config.id.clone());
-            main_rows.push(config.clone());
         } else if is_custom_outbound_protocol(&config.protocol) {
-            let (core, _) = validate_custom_outbound(&config.name, &params)?;
+            validate_custom_outbound(&config.name, &params)?;
             match core {
                 OwningCore::Stock => main_rows.push(config.clone()),
                 OwningCore::Fork => fork_rows.push(config.clone()),
@@ -1953,9 +2003,14 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                     main_rows.push(config.clone());
                 }
             }
+        } else if core == OwningCore::Xray {
+            check_wrong_layer(&config.name, &config.protocol, &params)?;
+            validate_xray_row(&config.name, &params)?;
+            bridge_keys.push(config.id.clone());
+            main_rows.push(config.clone());
         } else if is_chain_protocol(&config.protocol) {
             main_rows.push(config.clone());
-        } else if needs_fork(config) {
+        } else if core == OwningCore::Fork {
             check_wrong_layer(&config.name, &config.protocol, &params)?;
 
             let mut owned = params.clone();
@@ -6185,7 +6240,7 @@ pub struct EngineController {
 
     generation: u64,
 
-    crashed: HashSet<String>,
+    crashed: HashSet<Shard>,
 
     pending_crash: Option<String>,
 
@@ -6387,43 +6442,34 @@ impl EngineController {
     }
 
     pub fn crashed_shards(&self) -> Vec<String> {
-        let mut shards: Vec<String> = self.crashed.iter().cloned().collect();
+        let extra_ids = self.extra_ids();
+        let mut shards: Vec<String> = self
+            .crashed
+            .iter()
+            .map(|shard| shard_label(*shard, &extra_ids))
+            .collect();
         shards.sort();
         shards
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn is_shard_crashed(&self, core: &str) -> bool {
-        self.crashed.contains(core)
+    pub fn is_shard_crashed(&self, shard: Shard) -> bool {
+        self.crashed.contains(&shard)
     }
 
-    fn custom_core_of(row: &ProxyConfig) -> Option<OwningCore> {
-        params_object(row)
-            .ok()
-            .and_then(|params| owning_core_of(&row.name, &params).ok())
+    fn extra_ids(&self) -> Vec<String> {
+        self.active
+            .iter()
+            .filter(|row| is_extra_core_protocol(&row.protocol))
+            .map(|row| row.id.clone())
+            .collect()
     }
 
-    fn shard_of_row(&self, row: &ProxyConfig) -> String {
+    fn shard_of_row(&self, row: &ProxyConfig) -> Option<Shard> {
         if is_extra_core_protocol(&row.protocol) {
-            return format!("extra-{}", row.id);
+            return self.extra_slot_index(&row.id).map(Shard::Extra);
         }
-        if is_custom_config_protocol(&row.protocol) {
-            return Self::custom_core_of(row)
-                .map(|core| core.as_str().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-        }
-        if needs_xray(row) {
-            return OwningCore::Xray.as_str().to_string();
-        }
-        if is_custom_outbound_protocol(&row.protocol) {
-            return Self::custom_core_of(row)
-                .map(|core| core.as_str().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-        }
-        if needs_fork(row) {
-            return OwningCore::Fork.as_str().to_string();
-        }
-        OwningCore::Stock.as_str().to_string()
+        core_of(row).ok().map(Shard::Core)
     }
 
     pub fn ids_on_crashed_shards(&self) -> Vec<String> {
@@ -6432,7 +6478,10 @@ impl EngineController {
         }
         self.active
             .iter()
-            .filter(|row| self.crashed.contains(&self.shard_of_row(row)))
+            .filter(|row| {
+                self.shard_of_row(row)
+                    .is_some_and(|shard| self.crashed.contains(&shard))
+            })
             .map(|row| row.id.clone())
             .collect()
     }
@@ -6450,7 +6499,10 @@ impl EngineController {
     pub fn live_clash_targets(&self) -> Vec<ClashTarget> {
         self.clash
             .iter()
-            .filter(|target| !self.crashed.contains(&target.core))
+            .filter(|target| {
+                !OwningCore::from_label(&target.core)
+                    .is_some_and(|core| self.crashed.contains(&Shard::Core(core)))
+            })
             .cloned()
             .collect()
     }
@@ -6554,25 +6606,10 @@ impl EngineController {
         self.clash.clear();
     }
 
-    fn drop_crashed_served(&mut self, shard: &str) {
-        const SHARDS: [&str; 3] = ["stock", "fork", "xray"];
-        if let Some(index) = SHARDS.iter().position(|name| *name == shard) {
-            self.served[index] = None;
-            return;
-        }
-        if let Some(id) = shard.strip_prefix("extra-") {
-            let extra_ids: Vec<String> = self
-                .active
-                .iter()
-                .filter(|row| is_extra_core_protocol(&row.protocol))
-                .map(|row| row.id.clone())
-                .collect();
-
-            let index = extra_ids
-                .iter()
-                .position(|known| known == id)
-                .or_else(|| id.parse::<usize>().ok());
-            if let Some(index) = index {
+    fn drop_crashed_served(&mut self, shard: Shard) {
+        match shard {
+            Shard::Core(core) => self.served[core.index()] = None,
+            Shard::Extra(index) => {
                 if index < self.served_extra.len() {
                     self.served_extra[index] = None;
                 }
@@ -6580,33 +6617,21 @@ impl EngineController {
         }
     }
 
-    fn shard_of_row_exists(&self, shard: &str) -> bool {
+    fn shard_of_row_exists(&self, shard: Shard) -> bool {
         self.active
             .iter()
-            .any(|row| self.shard_of_row(row) == shard)
+            .any(|row| self.shard_of_row(row) == Some(shard))
     }
 
-    fn shard_backend_running(&self, shard: &str) -> bool {
-        if let Some(id) = shard.strip_prefix("extra-") {
-            let extra_ids: Vec<&String> = self
-                .active
-                .iter()
-                .filter(|row| is_extra_core_protocol(&row.protocol))
-                .map(|row| &row.id)
-                .collect();
-            let index = extra_ids
-                .iter()
-                .position(|known| known.as_str() == id)
-                .or_else(|| id.parse::<usize>().ok());
-            return index
-                .and_then(|index| self.extra_backends.get(index))
-                .is_some_and(|slot| slot.is_running());
-        }
+    fn shard_backend_running(&self, shard: Shard) -> bool {
         match shard {
-            "stock" => self.backend.is_running(),
-            "fork" => self.fork_backend.is_running(),
-            "xray" => self.xray_backend.is_running(),
-            _ => false,
+            Shard::Core(OwningCore::Stock) => self.backend.is_running(),
+            Shard::Core(OwningCore::Fork) => self.fork_backend.is_running(),
+            Shard::Core(OwningCore::Xray) => self.xray_backend.is_running(),
+            Shard::Extra(index) => self
+                .extra_backends
+                .get(index)
+                .is_some_and(|slot| slot.is_running()),
         }
     }
 
@@ -6616,11 +6641,13 @@ impl EngineController {
         if self.crashed.is_empty() {
             return;
         }
-        let recovered: Vec<String> = self
+        let recovered: Vec<Shard> = self
             .crashed
             .iter()
-            .filter(|shard| !self.shard_of_row_exists(shard) || self.shard_backend_running(shard))
-            .cloned()
+            .filter(|shard| {
+                !self.shard_of_row_exists(**shard) || self.shard_backend_running(**shard)
+            })
+            .copied()
             .collect();
         for shard in recovered {
             self.crashed.remove(&shard);
@@ -7209,13 +7236,14 @@ impl EngineController {
         let mut clash_holds: Vec<std::net::TcpListener> = Vec::new();
         let mut clash: Vec<ClashTarget> = Vec::new();
         for (core, gen, rows_present) in [
-            ("stock", &mut stock_gen, !plan.main_rows.is_empty()),
-            ("fork", &mut fork_gen, !plan.fork_rows.is_empty()),
+            (
+                OwningCore::Stock,
+                &mut stock_gen,
+                !plan.main_rows.is_empty(),
+            ),
+            (OwningCore::Fork, &mut fork_gen, !plan.fork_rows.is_empty()),
         ] {
-            let generated = match core {
-                "stock" => replacement(OwningCore::Stock).is_none() && rows_present,
-                _ => replacement(OwningCore::Fork).is_none() && rows_present,
-            };
+            let generated = replacement(core).is_none() && rows_present;
             let Some(json) = gen.as_mut() else {
                 continue;
             };
@@ -7226,17 +7254,17 @@ impl EngineController {
                 let error = EngineError::SharedPortUnavailable {
                     bind: "127.0.0.1".to_string(),
                     port: CLASH_PORT_START,
-                    name: format!("clash controller ({core}, range exhausted)"),
+                    name: format!("clash controller ({}, range exhausted)", core.as_str()),
                 };
                 self.last_error = Some(error.to_string());
                 error
             })?;
-            let secret = clash_secret(core);
+            let secret = clash_secret(core.as_str());
             *json = inject_clash_api(json, port, secret.expose()).inspect_err(|error| {
                 self.last_error = Some(error.to_string());
             })?;
             clash.push(ClashTarget {
-                core: core.to_string(),
+                core: core.as_str().to_string(),
                 port,
                 secret,
             });
@@ -7475,12 +7503,13 @@ impl EngineController {
         drop(clash_holds);
         drop(port_window_guard);
 
-        const SHARDS: [&str; 3] = ["stock", "fork", "xray"];
+        const CORES: [OwningCore; 3] = [OwningCore::Stock, OwningCore::Fork, OwningCore::Xray];
         let gens: [Option<String>; 3] = [stock_gen, fork_gen, xray_gen];
         let prev_served = self.served.clone();
         let prev_served_extra = self.served_extra.clone();
+        let extra_ids: Vec<String> = plan.extras.iter().map(|row| row.id.clone()).collect();
         let mut failures: Vec<(String, EngineError)> = Vec::new();
-        for index in 0..3 {
+        for (index, core) in CORES.into_iter().enumerate() {
             let json = gens[index].clone();
             match json {
                 Some(json) => {
@@ -7493,7 +7522,7 @@ impl EngineController {
                         Err(detail) => {
                             self.served[index] = None;
                             failures.push((
-                                SHARDS[index].to_string(),
+                                core.as_str().to_string(),
                                 EngineError::SpawnFailed { detail },
                             ));
                         }
@@ -7508,13 +7537,7 @@ impl EngineController {
         }
 
         for (index, gen) in extra_gens.iter().enumerate() {
-            let label = format!(
-                "extra-{}",
-                plan.extras
-                    .get(index)
-                    .map(|row| row.id.as_str())
-                    .unwrap_or("?")
-            );
+            let label = shard_label(Shard::Extra(index), &extra_ids);
             match gen {
                 Some(json) => {
                     let slot = &mut self.extra_backends[index];
@@ -7561,8 +7584,10 @@ impl EngineController {
                         Ok(()) => self.served[index] = Some(prev),
                         Err(error) => {
                             self.served[index] = None;
-                            rollback_errors
-                                .push(format!("rollback {} failed: {error}", SHARDS[index]));
+                            rollback_errors.push(format!(
+                                "rollback {} failed: {error}",
+                                CORES[index].as_str()
+                            ));
                         }
                     },
                     None => self.served[index] = None,
@@ -7583,8 +7608,10 @@ impl EngineController {
                                 if index < self.served_extra.len() {
                                     self.served_extra[index] = None;
                                 }
-                                rollback_errors
-                                    .push(format!("rollback extra-{index} failed: {error}"));
+                                rollback_errors.push(format!(
+                                    "rollback {} failed: {error}",
+                                    shard_label(Shard::Extra(index), &extra_ids)
+                                ));
                             }
                         },
                         None => {
@@ -7633,57 +7660,48 @@ impl EngineController {
     }
 
     pub fn poll_shards(&mut self) -> Vec<(String, String)> {
-        let mut crashes = Vec::new();
-        for (shard, backend) in [
-            ("stock", &mut self.backend),
-            ("fork", &mut self.fork_backend),
-            ("xray", &mut self.xray_backend),
+        let mut crashes: Vec<(Shard, String)> = Vec::new();
+        for (core, backend) in [
+            (OwningCore::Stock, &mut self.backend),
+            (OwningCore::Fork, &mut self.fork_backend),
+            (OwningCore::Xray, &mut self.xray_backend),
         ] {
             if let Some(cause) = backend.poll_exit() {
-                crashes.push((shard.to_string(), cause));
+                crashes.push((Shard::Core(core), cause));
             }
         }
-        let extra_ids: Vec<String> = self
-            .active
-            .iter()
-            .filter(|row| is_extra_core_protocol(&row.protocol))
-            .map(|row| row.id.clone())
-            .collect();
+        let extra_ids = self.extra_ids();
         for (index, slot) in self.extra_backends.iter_mut().enumerate() {
             if let Some(cause) = slot.poll_exit() {
-                let shard = extra_ids
-                    .get(index)
-                    .map(|id| format!("extra-{id}"))
-                    .unwrap_or_else(|| format!("extra-{index}"));
-                crashes.push((shard, cause));
+                crashes.push((Shard::Extra(index), cause));
             }
         }
-        if crashes.is_empty() || self.active.is_empty() {
-            return crashes;
+        let labelled: Vec<(String, String)> = crashes
+            .iter()
+            .map(|(shard, cause)| (shard_label(*shard, &extra_ids), cause.clone()))
+            .collect();
+        if labelled.is_empty() || self.active.is_empty() {
+            return labelled;
         }
 
         for (shard, _) in &crashes {
-            self.drop_crashed_served(shard);
-            self.crashed.insert(shard.clone());
+            self.drop_crashed_served(*shard);
+            self.crashed.insert(*shard);
         }
         self.totals_stale = true;
         self.clear_clash_secrets();
         self.sync_clash_from_served();
-        let cause = if crashes.len() == 1 {
-            crashes.first().expect("one crash").1.clone()
+        let cause = if labelled.len() == 1 {
+            labelled[0].1.clone()
         } else {
-            crashes
-                .iter()
-                .map(|(shard, cause)| format!("{shard}: {cause}"))
-                .collect::<Vec<_>>()
-                .join("; ")
+            Self::crash_detail(&labelled)
         };
         self.status = EngineStatus::Crashed {
             cause: cause.clone(),
         };
         self.last_error = Some(format!("engine crashed ({cause})"));
-        self.pending_crash = Some(Self::crash_detail(&crashes));
-        crashes
+        self.pending_crash = Some(Self::crash_detail(&labelled));
+        labelled
     }
 
     /// T-30: `(shard label, pid)` per shard slot, named exactly like
@@ -7693,24 +7711,23 @@ impl EngineController {
     /// here enumerates foreign processes.
     pub fn shard_processes(&self) -> Vec<(String, Option<u32>)> {
         let mut out = vec![
-            ("stock".to_string(), self.backend.process_id()),
-            ("fork".to_string(), self.fork_backend.process_id()),
-            ("xray".to_string(), self.xray_backend.process_id()),
+            (Shard::Core(OwningCore::Stock), self.backend.process_id()),
+            (
+                Shard::Core(OwningCore::Fork),
+                self.fork_backend.process_id(),
+            ),
+            (
+                Shard::Core(OwningCore::Xray),
+                self.xray_backend.process_id(),
+            ),
         ];
-        let extra_ids: Vec<String> = self
-            .active
-            .iter()
-            .filter(|row| is_extra_core_protocol(&row.protocol))
-            .map(|row| row.id.clone())
-            .collect();
+        let extra_ids = self.extra_ids();
         for (index, slot) in self.extra_backends.iter().enumerate() {
-            let shard = extra_ids
-                .get(index)
-                .map(|id| format!("extra-{id}"))
-                .unwrap_or_else(|| format!("extra-{index}"));
-            out.push((shard, slot.process_id()));
+            out.push((Shard::Extra(index), slot.process_id()));
         }
-        out
+        out.into_iter()
+            .map(|(shard, pid)| (shard_label(shard, &extra_ids), pid))
+            .collect()
     }
 
     pub fn crash_detail(crashes: &[(String, String)]) -> String {
@@ -7736,8 +7753,18 @@ impl EngineController {
         lines
     }
 
-    pub fn running_ids(&self) -> Vec<String> {
+    /// The rows the engine was asked to serve. A crashed shard stays here.
+    pub fn active_ids(&self) -> Vec<String> {
         self.active.iter().map(|row| row.id.clone()).collect()
+    }
+
+    /// The rows actually alive: active and served by a running shard.
+    pub fn live_ids(&self) -> Vec<String> {
+        self.active
+            .iter()
+            .filter(|row| self.is_running(&row.id))
+            .map(|row| row.id.clone())
+            .collect()
     }
 
     pub fn running_count(&self) -> usize {
@@ -7755,14 +7782,13 @@ impl EngineController {
     }
 
     fn sync_clash_from_served(&mut self) {
-        const CORES: [&str; 2] = ["stock", "fork"];
-        self.clash = CORES
+        self.clash = [OwningCore::Stock, OwningCore::Fork]
             .into_iter()
             .zip(self.served.iter().take(2))
             .filter_map(|(core, served)| {
                 served
                     .as_deref()
-                    .and_then(|json| clash_target_from_served(core, json))
+                    .and_then(|json| clash_target_from_served(core.as_str(), json))
             })
             .collect();
     }
@@ -7778,33 +7804,12 @@ impl EngineController {
                 .and_then(|index| self.extra_backends.get(index))
                 .is_some_and(|slot| slot.is_running());
         }
-        if is_custom_config_protocol(&row.protocol) {
-            let Some(core) = Self::custom_core_of(row) else {
-                return false;
-            };
-            return match core {
-                OwningCore::Stock => self.backend.is_running(),
-                OwningCore::Fork => self.fork_backend.is_running(),
-                OwningCore::Xray => self.xray_backend.is_running(),
-            };
+        match core_of(row) {
+            Ok(OwningCore::Stock) => self.backend.is_running(),
+            Ok(OwningCore::Fork) => self.fork_backend.is_running(),
+            Ok(OwningCore::Xray) => self.xray_backend.is_running(),
+            Err(_) => false,
         }
-        if needs_xray(row) {
-            return self.xray_backend.is_running();
-        }
-        if is_custom_outbound_protocol(&row.protocol) {
-            let Some(core) = Self::custom_core_of(row) else {
-                return false;
-            };
-            return match core {
-                OwningCore::Stock => self.backend.is_running(),
-                OwningCore::Fork => self.fork_backend.is_running(),
-                OwningCore::Xray => self.xray_backend.is_running(),
-            };
-        }
-        if needs_fork(row) {
-            return self.fork_backend.is_running();
-        }
-        self.backend.is_running()
     }
 
     pub fn status(&self) -> &EngineStatus {
@@ -8647,7 +8652,7 @@ mod tests {
         assert!(controller.stop_one("2"));
         assert_eq!(controller.running_count(), 2);
         assert_eq!(
-            controller.running_ids(),
+            controller.active_ids(),
             vec!["1".to_string(), "3".to_string()]
         );
         let live: serde_json::Value =
@@ -9162,7 +9167,7 @@ mod tests {
         stock.fail_check("t32 boom");
         assert!(controller.stop_one("1"), "row was active");
         assert_eq!(
-            controller.running_ids(),
+            controller.active_ids(),
             vec!["1".to_string(), "2".to_string()],
             "membership snapshot restored"
         );
@@ -9172,7 +9177,7 @@ mod tests {
         assert!(error.contains("t32 boom"), "error recorded, got {error}");
         stock.clear_failures();
         assert!(controller.stop_one("1"), "stop succeeds once healthy");
-        assert_eq!(controller.running_ids(), vec!["2".to_string()]);
+        assert_eq!(controller.active_ids(), vec!["2".to_string()]);
     }
 
     #[test]
@@ -11098,7 +11103,7 @@ mod tests {
             "got {error}"
         );
         assert_eq!(
-            controller.running_ids(),
+            controller.active_ids(),
             vec!["1".to_string()],
             "membership restored"
         );
@@ -12203,8 +12208,8 @@ Active Connections\r
         assert_eq!(crashes.len(), 1);
         assert_eq!(crashes[0].0, "fork");
         assert_eq!(controller.crashed_shards(), vec!["fork".to_string()]);
-        assert!(controller.is_shard_crashed("fork"));
-        assert!(!controller.is_shard_crashed("stock"));
+        assert!(controller.is_shard_crashed(Shard::Core(OwningCore::Fork)));
+        assert!(!controller.is_shard_crashed(Shard::Core(OwningCore::Stock)));
         assert!(controller.totals_stale(), "totals stale after crash");
         controller.clear_totals_stale();
         assert!(!controller.totals_stale(), "marker clears");
@@ -12637,7 +12642,7 @@ Active Connections\r
                 &EngineStatus::Stopped,
                 "start_one must not restore Running"
             );
-            assert_eq!(controller.running_ids(), vec!["1".to_string()]);
+            assert_eq!(controller.active_ids(), vec!["1".to_string()]);
         }
 
         {
@@ -12656,7 +12661,7 @@ Active Connections\r
                 &EngineStatus::Stopped,
                 "start_all must not restore Running"
             );
-            assert_eq!(controller.running_ids(), vec!["1".to_string()]);
+            assert_eq!(controller.active_ids(), vec!["1".to_string()]);
         }
 
         {
@@ -12674,7 +12679,7 @@ Active Connections\r
                 &EngineStatus::Stopped,
                 "start_all_subset must not restore Running"
             );
-            assert_eq!(controller.running_ids(), vec!["1".to_string()]);
+            assert_eq!(controller.active_ids(), vec!["1".to_string()]);
         }
 
         {
@@ -12694,7 +12699,7 @@ Active Connections\r
                 "stop_one_result must not restore Running"
             );
             assert_eq!(
-                controller.running_ids(),
+                controller.active_ids(),
                 vec!["1".to_string(), "2".to_string()],
                 "membership is still restored"
             );
@@ -12776,7 +12781,7 @@ Active Connections\r
         );
         assert_eq!(outcome.applied, vec!["3".to_string()], "{outcome:?}");
         assert_eq!(
-            controller.running_ids(),
+            controller.active_ids(),
             vec!["3".to_string()],
             "the dead row is not claimed as serving"
         );
@@ -15198,6 +15203,175 @@ Active Connections\r
                 .all(|(_, pid)| pid.is_none()),
             "stopping every shard clears the whole cohort"
         );
+    }
+
+    #[test]
+    fn c4_shard_type_matches_crash_state_and_liveness() {
+        let (mut controller, _stock, fork, _xray, _extra) = EngineController::fake_quartet();
+        controller.set_fork_probe(|| Ok(PathBuf::from("test-fork-bin")));
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        controller.set_extra_probe(|_| Ok(PathBuf::from("test-extra-exe")));
+        let rows = vec![
+            fixture(
+                "1",
+                "StockOne",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            noise_fixture("2", "ForkOne", 10802),
+            xray_fixture("3", "XrayOne", 10803),
+            extra_fixture("4", "ExtraOne", 10804),
+            custom_fixture(
+                "5",
+                "CustomFork",
+                json!({"core": "fork", "type": "vless", "server": "203.0.113.5",
+                       "server_port": 443, "uuid": T08_UUID}),
+                10805,
+            ),
+            custom_fixture(
+                "6",
+                "CustomXray",
+                json!({"core": "xray", "protocol": "vless", "server": "203.0.113.6",
+                       "server_port": 443, "uuid": T08_UUID}),
+                10806,
+            ),
+        ];
+        controller.start_all(&rows).expect("every shard starts");
+
+        let mut shards = HashSet::new();
+        for row in &rows {
+            let shard = controller
+                .shard_of_row(row)
+                .expect("every active row classifies to a shard");
+            assert!(
+                controller.shard_backend_running(shard),
+                "{} is served by {shard:?}, which must be live",
+                row.name
+            );
+            assert!(
+                controller.is_running(&row.id),
+                "{} reads as running",
+                row.name
+            );
+            shards.insert(shard);
+        }
+        assert_eq!(
+            shards,
+            [
+                Shard::Core(OwningCore::Stock),
+                Shard::Core(OwningCore::Fork),
+                Shard::Core(OwningCore::Xray),
+                Shard::Extra(0),
+            ]
+            .into_iter()
+            .collect(),
+            "one typed shard per serving backend"
+        );
+
+        fork.inject_crash("signal: killed");
+        assert!(!controller.poll_shards().is_empty(), "the fork crash lands");
+        assert_eq!(
+            controller.crashed_shards(),
+            vec!["fork".to_string()],
+            "the crashed shard keeps its display label"
+        );
+        assert!(controller.is_shard_crashed(Shard::Core(OwningCore::Fork)));
+        assert_eq!(
+            controller.ids_on_crashed_shards(),
+            vec!["2".to_string(), "5".to_string()],
+            "exactly the fork-served rows are dead"
+        );
+        for row in &rows {
+            assert_eq!(
+                !controller.is_running(&row.id),
+                controller.ids_on_crashed_shards().contains(&row.id),
+                "{}: dead exactly when its shard crashed",
+                row.name
+            );
+        }
+
+        let replacement = fixture(
+            "7",
+            "CustomStock",
+            "custom-config",
+            json!({"core": "stock",
+                   "config": {"outbounds": [{"type": "direct", "tag": "direct"}]}}),
+            "127.0.0.1",
+            10807,
+        );
+        let (mut replacement_controller, _, _, _, _) = EngineController::fake_quartet();
+        replacement_controller
+            .start_all(std::slice::from_ref(&replacement))
+            .expect("the replacement starts");
+        assert_eq!(
+            replacement_controller
+                .shard_of_row(&replacement)
+                .expect("a custom full config classifies"),
+            Shard::Core(OwningCore::Stock),
+            "a full config runs on the core it names"
+        );
+    }
+
+    #[test]
+    fn c6_live_ids_are_exactly_the_alive_rows() {
+        let (mut controller, _stock, fork, _xray, _extra) = EngineController::fake_quartet();
+        controller.set_fork_probe(|| Ok(PathBuf::from("test-fork-bin")));
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        let rows = vec![
+            fixture(
+                "1",
+                "StockOne",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            noise_fixture("2", "ForkOne", 10802),
+            xray_fixture("3", "XrayOne", 10803),
+        ];
+        controller.start_all(&rows).expect("every shard starts");
+
+        let all_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        assert_eq!(
+            controller.active_ids(),
+            all_ids,
+            "the requested set lists every started row"
+        );
+        assert_eq!(
+            controller.live_ids(),
+            all_ids,
+            "with every shard up, every row is alive"
+        );
+        for id in controller.active_ids() {
+            assert_eq!(
+                controller.live_ids().contains(&id),
+                controller.is_running(&id),
+                "{id}: live_ids and is_running agree"
+            );
+        }
+
+        fork.inject_crash("signal: killed");
+        assert!(!controller.poll_shards().is_empty(), "the fork crash lands");
+        assert_eq!(
+            controller.active_ids(),
+            all_ids,
+            "a crash never drops a row from the requested set"
+        );
+        assert_eq!(
+            controller.live_ids(),
+            vec!["1".to_string(), "3".to_string()],
+            "only the rows on live shards stay in the alive set"
+        );
+        for id in controller.active_ids() {
+            assert_eq!(
+                controller.live_ids().contains(&id),
+                controller.is_running(&id),
+                "{id}: live_ids and is_running still agree after the crash"
+            );
+        }
+        assert!(!controller.live_ids().contains(&"2".to_string()));
     }
 
     #[test]

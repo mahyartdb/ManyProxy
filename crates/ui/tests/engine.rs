@@ -201,6 +201,79 @@ fn tick_reprobe_skips_rows_on_crashed_shards(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn c6_health_map_omits_rows_on_crashed_shards(cx: &mut TestAppContext) {
+    use manyproxy_ui::engine::EngineController;
+    use manyproxy_ui::health::{FakeHealthProber, HealthKind, HealthSample, TestOutcome};
+
+    cx.update(gpui_kit::init);
+
+    let mut store = Store::open_in_memory().expect("in-memory store opens");
+    let alpha = store
+        .add(tick12_seed("Alpha", "10863"))
+        .expect("seed works");
+
+    let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+    let stash_for_window = stash.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| AppView::with_store(window, cx, store));
+        *stash_for_window.borrow_mut() = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let view = stash.borrow().clone().expect("AppView stashed");
+
+    let (prober, _handle) = FakeHealthProber::shared();
+    let stock = cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            let (engine, stock, _fork) = EngineController::fake_pair();
+            view.engine = engine;
+            view.engine.set_auto_restart(AutoRestartConfig {
+                enabled: false,
+                ..AutoRestartConfig::default()
+            });
+            view.prober = Box::new(prober);
+            stock
+        })
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.start_all_engines(window, cx));
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.health_store.record_outcome(&TestOutcome {
+                sample: HealthSample {
+                    config_id: alpha.id.clone(),
+                    at: 1,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: Some(21),
+                    error: None,
+                },
+                success: None,
+            });
+        });
+    });
+    assert!(
+        view.read_with(cx, |view, _| view.health_map().contains_key(&alpha.id)),
+        "a live row is in the health map"
+    );
+
+    stock.inject_crash("signal: segmentation fault");
+    let poll = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
+    assert!(poll.is_some(), "the crash is reported once");
+    let (active, running) = view.read_with(cx, |view, _| {
+        (
+            view.engine.active_ids().contains(&alpha.id),
+            view.engine.is_running(&alpha.id),
+        )
+    });
+    assert!(active, "the requested set still lists the crashed row");
+    assert!(!running, "but the row is not alive");
+    assert!(
+        !view.read_with(cx, |view, _| view.health_map().contains_key(&alpha.id)),
+        "the health map only carries alive rows"
+    );
+}
+
+#[gpui_kit::test]
 fn restart_restores_last_latency_and_dead_flags(cx: &mut TestAppContext) {
     use manyproxy_ui::engine::EngineController;
     use manyproxy_ui::health::FakeHealthProber;
@@ -3383,7 +3456,7 @@ fn ticket43_search_covers_sub_preset_state() {
     ctx.preset_names
         .insert("preset-1".to_string(), "Direct Out".to_string());
     ctx.running.insert("7".to_string());
-    ctx.health.insert("7".to_string(), "33ms".to_string());
+    ctx.health.insert("7".to_string(), row_health("33ms"));
     let alpha = row();
     assert!(library_row_matches_full(&alpha, "news", &ctx), "sub label");
     assert!(
@@ -5998,8 +6071,8 @@ fn t47_search_index_matches_full_with_context() {
     ctx.sub_labels
         .insert("s1".to_string(), "Nightly Sub".to_string());
     ctx.running.insert("1".to_string());
-    ctx.health.insert("1".to_string(), "87ms".to_string());
-    ctx.health.insert("2".to_string(), "dead".to_string());
+    ctx.health.insert("1".to_string(), row_health("87ms"));
+    ctx.health.insert("2".to_string(), row_health("dead"));
     let mut delegate = LibraryDelegate::new();
     delegate.set_rows(rows.clone());
     delegate.set_running(vec!["1".to_string()]);
@@ -6246,7 +6319,7 @@ fn t73_port_composes_with_facets() {
     query.set_search("port=10801:10803");
     delegate.set_running(vec!["3".to_string()]);
     delegate.set_health(
-        [("3".to_string(), "dead".to_string())]
+        [("3".to_string(), row_health("dead"))]
             .into_iter()
             .collect(),
     );
@@ -6378,8 +6451,8 @@ fn t44_facets_and_with_text_query() {
     delegate.set_rows(rows);
     delegate.set_running(vec!["1".to_string()]);
     let mut health = std::collections::HashMap::new();
-    health.insert("1".to_string(), "87ms".to_string());
-    health.insert("3".to_string(), "dead".to_string());
+    health.insert("1".to_string(), row_health("87ms"));
+    health.insert("3".to_string(), row_health("dead"));
     delegate.set_health(health);
 
     let ids = |delegate: &LibraryDelegate, query: &FilterQuery| {

@@ -363,7 +363,9 @@ impl AppView {
             Ok(Some(_)) => {}
         }
 
-        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
+        // Rows the engine still holds stay put: a crashed row's params must not
+        // change under the engine's copy before the next restart.
+        let running: HashSet<String> = self.engine.active_ids().into_iter().collect();
         match fetched {
             Ok(fetched) => {
                 match self
@@ -591,7 +593,9 @@ impl AppView {
             return;
         }
 
-        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
+        // Rows the engine still holds stay put: a crashed row's params must not
+        // change under the engine's copy before the next restart.
+        let running: HashSet<String> = self.engine.active_ids().into_iter().collect();
         match fetched {
             Ok(fetched) => {
                 match self

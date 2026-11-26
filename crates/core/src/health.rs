@@ -752,6 +752,36 @@ pub struct RowHealth {
     pub cause_kind: Option<HealthCause>,
 }
 
+impl RowHealth {
+    /// The compact list text: `123ms`, `live`, `dead`, or empty when untested.
+    pub fn summary(&self) -> String {
+        match self {
+            RowHealth {
+                state: RowState::Unknown,
+                ..
+            } => String::new(),
+            RowHealth {
+                state: RowState::Live,
+                latency_ms: Some(ms),
+                ..
+            } => format!("{ms}ms"),
+            RowHealth {
+                state: RowState::Live,
+                latency_ms: None,
+                ..
+            } => "live".to_string(),
+            RowHealth {
+                state: RowState::Dead,
+                ..
+            } => "dead".to_string(),
+        }
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.state == RowState::Dead
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrafficStats {
     pub rx_bytes: u64,
@@ -1641,26 +1671,11 @@ impl HealthStore {
     }
 
     pub fn row_summary(&self, config_id: &str) -> String {
-        match self.status(config_id) {
-            RowHealth {
-                state: RowState::Unknown,
-                ..
-            } => self.speed_summary(config_id).unwrap_or_default(),
-            RowHealth {
-                state: RowState::Live,
-                latency_ms: Some(ms),
-                ..
-            } => format!("{ms}ms"),
-            RowHealth {
-                state: RowState::Live,
-                latency_ms: None,
-                ..
-            } => "live".to_string(),
-            RowHealth {
-                state: RowState::Dead,
-                ..
-            } => "dead".to_string(),
+        let health = self.status(config_id);
+        if health.state == RowState::Unknown {
+            return self.speed_summary(config_id).unwrap_or_default();
         }
+        health.summary()
     }
 
     pub fn detail_line(&self, config_id: &str) -> String {

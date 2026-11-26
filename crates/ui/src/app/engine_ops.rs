@@ -36,12 +36,15 @@ impl AppView {
         let latency = self.latency_map(&rows);
         let data_traffic = self.data_traffic_map(&rows);
         let out_ips = self.out_ip_by_row.clone();
-        let running = self.engine.running_ids();
+        let active = self.engine.active_ids();
+        let live = self.engine.live_ids();
 
-        self.snapshot_running_set(&running);
-        self.sync_running_title(running.len(), cx);
+        // The snapshot replays intent, not current health: a row whose shard
+        // crashed must still come back on the next launch.
+        self.snapshot_running_set(&active);
+        self.sync_running_title(live.len(), cx);
         if let Some(tray) = &self.tray {
-            tray.set_running(running.len());
+            tray.set_running(live.len());
         }
 
         let traffic_result = self.store.traffic_totals();
@@ -98,8 +101,8 @@ impl AppView {
         let (running_same, settled_idle, unchanged) = {
             let libraries = self.libraries.read(cx);
             let delegate = libraries.delegate();
-            let running_same = delegate.running.len() == running.len()
-                && running.iter().all(|id| delegate.running.contains(id));
+            let running_same = delegate.running.len() == live.len()
+                && live.iter().all(|id| delegate.running.contains(id));
             let settled_idle = delegate.settled.is_none();
             let crashed_same = delegate.crashed.len() == crashed.len()
                 && crashed.iter().all(|id| delegate.crashed.contains(id));
@@ -128,7 +131,7 @@ impl AppView {
             delegate.set_health_tone(health_tones);
 
             if !running_same || !settled_idle {
-                delegate.set_running(running);
+                delegate.set_running(live);
             }
 
             delegate.set_crashed(crashed);
@@ -365,20 +368,20 @@ impl AppView {
         });
     }
 
-    pub fn health_map(&self) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        for id in self.engine.running_ids() {
-            let summary = self.health_store.row_summary(&id);
-            if !summary.is_empty() {
-                map.insert(id, summary);
-            }
-        }
-        map
+    pub fn health_map(&self) -> HashMap<String, RowHealth> {
+        self.engine
+            .live_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let status = self.health_store.status(&id);
+                (status.state != RowState::Unknown).then_some((id, status))
+            })
+            .collect()
     }
 
     pub fn health_tones(&self) -> HashMap<String, LatencyTone> {
         self.engine
-            .running_ids()
+            .live_ids()
             .iter()
             .filter(|id| !self.health_store.row_summary(id).trim().is_empty())
             .map(|id| (id.clone(), self.health_store.health_tone(id)))
@@ -386,7 +389,7 @@ impl AppView {
     }
 
     pub fn health_counts(&self) -> (usize, usize) {
-        self.health_store.counts(&self.engine.running_ids())
+        self.health_store.counts(&self.engine.live_ids())
     }
 
     pub fn probe_kind_in_flight(&self, ping: bool) -> bool {
@@ -435,7 +438,7 @@ impl AppView {
             self.settle_batch_test(&[]);
             return;
         };
-        if !self.engine.running_ids().contains(&config.id) {
+        if !self.engine.live_ids().contains(&config.id) {
             window.push_notification(
                 Notification::warning(t!("row-not-running", name = config.name)),
                 cx,
@@ -463,7 +466,7 @@ impl AppView {
             self.test_row(id, window, cx);
             return;
         }
-        let running = self.engine.running_ids();
+        let running = self.engine.live_ids();
         let rows: Vec<ProxyConfig> = ids
             .iter()
             .filter_map(|id| self.row_config(id))
@@ -849,18 +852,13 @@ impl AppView {
         if !self.ticks_enabled {
             return 0;
         }
-        let running = self.engine.running_ids();
-        let crashed: HashSet<String> = self.engine.ids_on_crashed_shards().into_iter().collect();
+        let live: HashSet<String> = self.engine.live_ids().into_iter().collect();
         let Ok(rows) = self.store.list() else {
             return 0;
         };
         let rows: Vec<ProxyConfig> = rows
             .into_iter()
-            .filter(|row| {
-                running.contains(&row.id)
-                    && self.engine.is_running(&row.id)
-                    && !crashed.contains(&row.id)
-            })
+            .filter(|row| live.contains(&row.id))
             .collect();
         if rows.is_empty() {
             return 0;

@@ -958,7 +958,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Vec<ProxyConfig>> {
-        let running = self.engine.running_ids();
+        let running = self.engine.live_ids();
         self.list_or_notify(window, cx).map(|rows| {
             rows.into_iter()
                 .filter(|row| running.contains(&row.id))
@@ -1106,7 +1106,7 @@ impl AppView {
     }
 
     pub fn running_names_for_close(&self) -> Vec<String> {
-        let running = self.engine.running_ids();
+        let running = self.engine.live_ids();
         if running.is_empty() {
             return Vec::new();
         }
@@ -1408,7 +1408,7 @@ impl AppView {
     }
 
     pub fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
-        let running = self.engine.running_ids();
+        let running = self.engine.live_ids();
         self.store
             .list()
             .unwrap_or_default()
@@ -1617,7 +1617,9 @@ impl AppView {
         }
         let editing = self.edit_form_open.clone();
         let batch_members = self.refresh.members.clone();
-        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
+        // The engine still holds every active row, crashed or not; deleting one
+        // would orphan its copy until the next launch.
+        let running: HashSet<String> = self.engine.active_ids().into_iter().collect();
         let mut skip = HashSet::new();
         let mut reasons_seen: HashSet<&'static str> = HashSet::new();
         for row in dead {
@@ -1679,7 +1681,7 @@ impl AppView {
             window.push_notification(Notification::warning(t!("already-removed")), cx);
             return;
         };
-        if !self.engine.running_ids().contains(&config.id) {
+        if !self.engine.live_ids().contains(&config.id) {
             window.push_notification(
                 Notification::warning(t!("row-not-running", name = config.name)),
                 cx,
@@ -1712,7 +1714,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let running = self.engine.running_ids();
+        let running = self.engine.live_ids();
         let rows: Vec<ProxyConfig> = ids
             .iter()
             .filter_map(|id| self.row_config(id))
@@ -2984,7 +2986,7 @@ impl AppView {
         if let Some(global) = self.store.test_url() {
             exclusions.push_url(&global);
         }
-        for id in self.engine.running_ids() {
+        for id in self.engine.live_ids() {
             if let Some(url) = self.store.row_test_url(&id) {
                 exclusions.push_url(&url);
             }
@@ -3374,7 +3376,7 @@ impl AppView {
 
     pub fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
-            || self.health_store.row_summary(&config.id).trim() == "dead"
+            || self.health_store.status(&config.id).is_dead()
     }
 }
 

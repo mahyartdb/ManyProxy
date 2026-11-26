@@ -486,7 +486,7 @@ fn batch_actions_snapshot_selection(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.click("batch-start", cx));
     cx.run_until_parked();
     paint_frame(cx);
-    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    let serving = view.read_with(cx, |view, _| view.engine.active_ids());
     assert!(serving.contains(&alpha.id) && serving.contains(&gamma.id));
     assert!(
         !serving.contains(&bravo.id),
@@ -507,7 +507,7 @@ fn batch_actions_snapshot_selection(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.click("batch-start", cx));
     cx.run_until_parked();
     paint_frame(cx);
-    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    let serving = view.read_with(cx, |view, _| view.engine.active_ids());
     assert!(serving.contains(&bravo.id), "the new snapshot starts Beta");
     assert!(
         serving.contains(&alpha.id) && serving.contains(&gamma.id),
@@ -702,7 +702,7 @@ fn row_hover_actions_start_stop_and_more(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.click(start, cx));
     cx.run_until_parked();
     paint_frame(cx);
-    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    let serving = view.read_with(cx, |view, _| view.engine.active_ids());
     assert!(
         serving.contains(&alpha.id),
         "the row's Start starts the row it belongs to"

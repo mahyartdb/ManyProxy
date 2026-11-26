@@ -308,7 +308,7 @@ fn endpoint_apply_on_a_running_row_restarts_and_closes(cx: &mut TestAppContext) 
         "the running row is restarted on the new endpoint"
     );
     assert!(
-        view.read_with(cx, |view, _| view.engine.running_ids().contains(&row.id)),
+        view.read_with(cx, |view, _| view.engine.active_ids().contains(&row.id)),
         "the row is still serving"
     );
 }

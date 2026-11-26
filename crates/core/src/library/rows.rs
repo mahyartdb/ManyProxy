@@ -101,7 +101,7 @@ pub fn library_row_lines(
 pub fn library_row_cells(
     row: &ProxyConfig,
     upstream: &str,
-    health: Option<&str>,
+    health: Option<&RowHealth>,
     is_running: bool,
     crashed: bool,
     traffic: Option<(u64, u64)>,
@@ -118,10 +118,10 @@ pub fn library_row_cells(
         "● Failed".to_string()
     } else if !is_running {
         String::new()
-    } else if health.is_some_and(|summary| summary.trim() == "dead") {
+    } else if health.is_some_and(RowHealth::is_dead) {
         "● Failed".to_string()
     } else {
-        match health.map(str::trim).filter(|summary| !summary.is_empty()) {
+        match health.map(RowHealth::summary).filter(|sum| !sum.is_empty()) {
             Some(summary) => format!("● Running · {summary}"),
             None => "● Running".to_string(),
         }
@@ -155,7 +155,7 @@ pub struct MatchContext {
     pub sub_labels: HashMap<String, String>,
     pub preset_names: HashMap<String, String>,
     pub running: HashSet<String>,
-    pub health: HashMap<String, String>,
+    pub health: HashMap<String, RowHealth>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -201,10 +201,9 @@ pub fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchConte
     if serve_word.contains(&q) {
         return true;
     }
-    let summary = ctx
-        .health
-        .get(&row.id)
-        .map(|summary| summary.trim().to_lowercase())
+    let status = ctx.health.get(&row.id);
+    let summary = status
+        .map(|status| status.summary().to_lowercase())
         .unwrap_or_default();
     if summary.is_empty() {
         return "untested".contains(&q);
@@ -212,7 +211,11 @@ pub fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchConte
     if summary.contains(&q) {
         return true;
     }
-    let health_word = if summary == "dead" { "dead" } else { "live" };
+    let health_word = if status.is_some_and(RowHealth::is_dead) {
+        "dead"
+    } else {
+        "live"
+    };
     health_word.contains(&q)
 }
 

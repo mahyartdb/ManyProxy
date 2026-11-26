@@ -18,6 +18,7 @@ pub use gpui_kit::{
 };
 pub use manyproxy_core::Secret;
 pub use manyproxy_ui::engine::AutoRestartConfig;
+pub use manyproxy_ui::health::{RowHealth, RowState};
 pub use manyproxy_ui::import::OpenWithKind;
 pub use manyproxy_ui::overlay_open;
 pub use manyproxy_ui::store::{
@@ -37,6 +38,26 @@ pub fn seed_input(name: &str) -> NewConfig {
         group: String::new(),
         bind_ip: String::new(),
         port: String::new(),
+    }
+}
+
+/// The tests' spelling of a probe verdict: `dead`, `live`, or `87ms`.
+pub fn row_health(text: &str) -> RowHealth {
+    let (state, latency_ms) = match text {
+        "dead" => (RowState::Dead, None),
+        "live" => (RowState::Live, None),
+        other => (
+            RowState::Live,
+            other
+                .strip_suffix("ms")
+                .and_then(|ms| ms.parse::<u64>().ok()),
+        ),
+    };
+    RowHealth {
+        state,
+        latency_ms,
+        cause: None,
+        cause_kind: None,
     }
 }
 

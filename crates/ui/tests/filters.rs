@@ -2826,7 +2826,7 @@ fn t64_no_switching_behavior_added(cx: &mut TestAppContext) {
                 monitor,
                 rows,
                 view.store.list_presets().expect("presets read"),
-                view.engine.running_ids().is_empty(),
+                view.engine.active_ids().is_empty(),
                 attached,
             )
         });
@@ -6799,7 +6799,7 @@ fn t69_sweep_clears_only_dead_excluding_running_and_editing(cx: &mut TestAppCont
             view.select_visible_row(0, cx);
         });
     });
-    let running = view.read_with(cx, |view, _| view.engine.running_ids());
+    let running = view.read_with(cx, |view, _| view.engine.active_ids());
     assert!(
         running.contains(&live.id) && running.contains(&failing.id),
         "Live and Fail run while Guarded/Followed/Free stay stopped: {running:?}"
@@ -7221,8 +7221,15 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     let upstream = manyproxy_ui::upstream_host_port(&row).expect("upstream reads");
     assert_eq!(upstream, "198.51.100.9:443");
     assert_no_canaries(&upstream, "upstream");
-    let cells =
-        manyproxy_ui::library_row_cells(&row, &upstream, Some("87ms"), true, false, None, false);
+    let cells = manyproxy_ui::library_row_cells(
+        &row,
+        &upstream,
+        Some(&row_health("87ms")),
+        true,
+        false,
+        None,
+        false,
+    );
     let route = manyproxy_ui::library_row_full_route(&row, &upstream);
     assert!(
         route.contains("127.0.0.1:10982"),
@@ -7349,7 +7356,7 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
             .delegate()
             .health
             .get(&seeded.id)
-            .cloned()
+            .map(RowHealth::summary)
             .unwrap_or_default();
         (summary, view.health_store.detail_line(&seeded.id))
     });
@@ -8511,7 +8518,7 @@ fn t77_sort_composes_with_facets_and_port_filter() {
     delegate.set_health(
         [("1", "20ms"), ("2", "30ms"), ("3", "dead")]
             .into_iter()
-            .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
+            .map(|(id, verdict)| (id.to_string(), row_health(verdict)))
             .collect(),
     );
     query.statuses.insert(manyproxy_ui::StatusFacet::Running);

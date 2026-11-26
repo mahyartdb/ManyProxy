@@ -293,7 +293,7 @@ fn k04_batch_start_button_uses_batch_path(cx: &mut TestAppContext) {
         1,
         "the button clicks into ONE batch apply"
     );
-    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    let serving = view.read_with(cx, |view, _| view.engine.active_ids());
     assert!(
         serving.contains(&alpha.id) && serving.contains(&gamma.id),
         "both selected rows serve: {serving:?}"
@@ -547,7 +547,7 @@ fn start_selected_is_additive(cx: &mut TestAppContext) {
         checks_before + 1,
         "one apply for the whole batch"
     );
-    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    let serving = view.read_with(cx, |view, _| view.engine.active_ids());
     for id in [&alpha.id, &beta.id, &gamma.id] {
         assert!(serving.contains(id), "{id} still serves: {serving:?}");
     }
@@ -653,7 +653,7 @@ fn bulk_start_skips_the_occupied_row_and_starts_the_rest(cx: &mut TestAppContext
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.start_selected_batch(window, cx));
     });
-    let serving = view.read_with(cx, |view, _| view.engine.running_ids());
+    let serving = view.read_with(cx, |view, _| view.engine.active_ids());
     assert_eq!(serving.len(), 2, "the two free rows serve: {serving:?}");
     assert!(
         serving.contains(&alpha.id) && serving.contains(&gamma.id),
@@ -722,7 +722,7 @@ fn t01_row_cells_carry_one_fact_each() {
     let cells = library_row_cells(
         &row,
         "a.example.com:443",
-        Some("87ms"),
+        Some(&row_health("87ms")),
         true,
         false,
         None,
@@ -742,7 +742,7 @@ fn t01_row_cells_carry_one_fact_each() {
     let busy = library_row_cells(
         &row,
         "a.example.com:443",
-        Some("87ms"),
+        Some(&row_health("87ms")),
         true,
         false,
         Some((1_048_782, 88)),
@@ -3105,8 +3105,8 @@ fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
                 delegate.running.insert(dead.id.clone());
                 delegate
                     .health
-                    .insert(running.id.clone(), "87ms".to_string());
-                delegate.health.insert(dead.id.clone(), "dead".to_string());
+                    .insert(running.id.clone(), row_health("87ms"));
+                delegate.health.insert(dead.id.clone(), row_health("dead"));
                 list_cx.notify();
             });
         });
@@ -3202,9 +3202,9 @@ fn t02_row_anatomy_stress_stays_uniform(cx: &mut TestAppContext) {
                         delegate.health.insert(
                             id.clone(),
                             if i == 21 {
-                                "dead".to_string()
+                                row_health("dead")
                             } else {
-                                "12ms".to_string()
+                                row_health("12ms")
                             },
                         );
                     }
@@ -6022,12 +6022,12 @@ fn library_health_tick_repaints_rows(cx: &mut TestAppContext) {
         view.libraries.read(cx).delegate().health.clone()
     });
     assert_eq!(
-        health.get(&first.id).map(String::as_str),
+        health.get(&first.id).map(RowHealth::summary).as_deref(),
         Some("33ms"),
         "live row summary refreshed: {health:?}"
     );
     assert_eq!(
-        health.get(&second.id).map(String::as_str),
+        health.get(&second.id).map(RowHealth::summary).as_deref(),
         Some("dead"),
         "dead row summary refreshed: {health:?}"
     );
@@ -6120,7 +6120,7 @@ fn library_row_cells_split_state_route_and_accounting() {
     let cells = library_row_cells(
         &row,
         "a.example.com:443",
-        Some("87ms"),
+        Some(&row_health("87ms")),
         true,
         false,
         Some((1_048_782, 88)),
@@ -10011,7 +10011,7 @@ fn t41_restart_crashed_recovers_and_idle_quiet(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         view.update(cx, |view, cx| view.commit_start_all(window, cx));
     });
-    let id = view.read_with(cx, |view, _| view.engine.running_ids()[0].clone());
+    let id = view.read_with(cx, |view, _| view.engine.active_ids()[0].clone());
     assert!(
         view.read_with(cx, |view, _| view.engine.is_running(&id)),
         "serving before the crash"
