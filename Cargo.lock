@@ -4633,10 +4633,12 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "interprocess",
+ "libc",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "windows 0.58.0",
  "zeroize",
 ]
 

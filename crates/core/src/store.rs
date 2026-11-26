@@ -542,7 +542,7 @@ pub fn subscription_fetch_policy_resolved(
     base
 }
 
-fn is_internal_host(host: &str) -> bool {
+pub(crate) fn is_internal_host(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
     let bare = lower.strip_suffix('.').unwrap_or(&lower);
     if bare == "localhost" || bare.ends_with(".localhost") {

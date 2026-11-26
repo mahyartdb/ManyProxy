@@ -672,42 +672,6 @@ pub fn decode_route_link(line: &str) -> Result<PresetImport, PresetError> {
     parse_preset_json(&inner, "")
 }
 
-fn is_internal_host(host: &str) -> bool {
-    let lower = host.trim().to_ascii_lowercase();
-    let bare = lower.strip_suffix('.').unwrap_or(&lower);
-    if bare == "localhost" || bare.ends_with(".localhost") {
-        return true;
-    }
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => return is_internal_v4(&v4),
-            std::net::IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    return is_internal_v4(&mapped);
-                }
-                let segments = v6.segments();
-                return v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (segments[0] & 0xffc0) == 0xfe80
-                    || (segments[0] & 0xfe00) == 0xfc00;
-            }
-        }
-    }
-    false
-}
-
-fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
-    let octets = v4.octets();
-    v4.is_loopback()
-        || v4.is_unspecified()
-        || v4.is_link_local()
-        || octets[0] == 10
-        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-        || (octets[0] == 192 && octets[1] == 168)
-        || octets[0] == 127
-}
-
 pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, PresetError> {
     let (command, payload) = split_throne_command(line)?;
     if !command.eq_ignore_ascii_case("remoteroute") {
@@ -766,7 +730,7 @@ pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, Prese
             "preset url must use http(s)",
         ));
     }
-    if is_internal_host(host) {
+    if crate::store::is_internal_host(host) {
         return Err(PresetError::new(
             PresetErrorKind::BadUrl,
             "preset url must not target internal hosts",
@@ -1123,6 +1087,10 @@ mod tests {
         let error = decode_remote_route_link(&format!("throne://remoteroute/{payload}"))
             .expect_err("loopback blocked");
         assert_eq!(error.kind, PresetErrorKind::BadUrl);
+        let payload = b64("http://100.64.0.1:8080/preset.json");
+        let error = decode_remote_route_link(&format!("throne://remoteroute/{payload}"))
+            .expect_err("carrier-grade NAT blocked");
+        assert_eq!(error.kind, PresetErrorKind::BadUrl);
     }
 
     #[test]
@@ -1321,11 +1289,11 @@ mod tests {
 
     #[test]
     fn internal_host_blocks_mapped_loopback_and_localhost() {
-        assert!(is_internal_host("::ffff:127.0.0.1"));
-        assert!(is_internal_host("app.localhost"));
-        assert!(is_internal_host("localhost."));
-        assert!(!is_internal_host("example.com"));
-        assert!(!is_internal_host("93.184.216.34"));
+        assert!(crate::store::is_internal_host("::ffff:127.0.0.1"));
+        assert!(crate::store::is_internal_host("app.localhost"));
+        assert!(crate::store::is_internal_host("localhost."));
+        assert!(!crate::store::is_internal_host("example.com"));
+        assert!(!crate::store::is_internal_host("93.184.216.34"));
     }
 
     #[test]

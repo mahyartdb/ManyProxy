@@ -4688,7 +4688,7 @@ pub fn probe_fork_version_with_timeout(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     crate::spawn_hidden(&mut cmd);
-    let mut child = cmd.spawn().map_err(|error| {
+    let mut child = crate::spawn_tied(&mut cmd).map_err(|error| {
         format!(
             "fork version probe failed for {} ({error})",
             binary.display()
@@ -4956,6 +4956,52 @@ pub fn parse_tasklist_table(output: &str) -> Vec<(String, u32)> {
     out
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_tcp_listeners(text: &str) -> Vec<(u16, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [_, local, _, state, ..] = fields.as_slice() else {
+            continue;
+        };
+        if *state != "0A" {
+            continue;
+        }
+        let Some(port) = local
+            .rsplit(':')
+            .next()
+            .and_then(|port| u16::from_str_radix(port, 16).ok())
+        else {
+            continue;
+        };
+        let Some(inode) = fields.get(9).and_then(|inode| inode.parse::<u64>().ok()) else {
+            continue;
+        };
+        if inode != 0 {
+            out.push((port, inode));
+        }
+    }
+    out
+}
+
+/// `/proc/net/tcp` names a socket by inode, not pid; the caller supplies the
+/// inode→pid lookup so the line parser stays testable off Linux.
+#[cfg(any(target_os = "linux", test))]
+fn proc_tcp_owners(text: &str, owner_of: &dyn Fn(u64) -> Option<u32>) -> Vec<(u16, u32)> {
+    parse_proc_net_tcp_listeners(text)
+        .into_iter()
+        .filter_map(|(port, inode)| owner_of(inode).map(|pid| (port, pid)))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_lsof_pids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReapReport {
     pub reaped_pids: Vec<u32>,
@@ -4968,14 +5014,14 @@ pub struct ReapReport {
 pub fn startup_reap_and_sweep(
     our_ports: &[u16],
     temp_dir: &Path,
-    netstat_output: &str,
+    owners: &[(u16, u32)],
     image_of: &dyn Fn(u32) -> Option<String>,
     kill: &dyn Fn(u32) -> bool,
 ) -> ReapReport {
     let mut report = ReapReport::default();
     if !our_ports.is_empty() {
         let mut seen: HashSet<u32> = HashSet::new();
-        for (port, pid) in parse_netstat_tcp_owners(netstat_output) {
+        for &(port, pid) in owners {
             if !our_ports.contains(&port) || !seen.insert(pid) {
                 continue;
             }
@@ -5000,61 +5046,168 @@ pub fn startup_reap_and_sweep(
 
 // Production-only: the sweep is exercised by `startup_reap_and_sweep` with
 // injected probes, so test builds never need these OS-tool wrappers.
-#[cfg(not(test))]
+#[cfg(all(not(test), windows))]
 fn system_tool(name: &str) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-        Path::new(&root).join("System32").join(name)
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    Path::new(&root).join("System32").join(name)
+}
+
+#[cfg(all(not(test), windows))]
+fn listening_owners() -> Vec<(u16, u32)> {
+    let mut cmd = std::process::Command::new(system_tool("netstat.exe"));
+    cmd.args(["-ano", "-p", "TCP"]);
+    crate::spawn_hidden(&mut cmd);
+    let output = cmd
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    parse_netstat_tcp_owners(&output)
+}
+
+#[cfg(all(not(test), windows))]
+fn image_of(pid: u32) -> Option<String> {
+    let mut cmd = std::process::Command::new(system_tool("tasklist.exe"));
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "TABLE", "/NH"]);
+    crate::spawn_hidden(&mut cmd);
+    let output = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    parse_tasklist_table(&text)
+        .into_iter()
+        .find(|(_, found)| *found == pid)
+        .map(|(image, _)| image)
+}
+
+#[cfg(all(not(test), windows))]
+fn kill_process(pid: u32) -> bool {
+    let mut cmd = std::process::Command::new(system_tool("taskkill.exe"));
+    cmd.args(["/PID", &pid.to_string(), "/F"]);
+    crate::spawn_hidden(&mut cmd);
+    cmd.output().is_ok_and(|output| output.status.success())
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn listening_owners() -> Vec<(u16, u32)> {
+    let owners = socket_owner_pids();
+    let mut out = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        out.extend(proc_tcp_owners(&text, &|inode| owners.get(&inode).copied()));
     }
-    #[cfg(not(windows))]
-    {
-        PathBuf::from(name)
+    out
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn socket_owner_pids() -> HashMap<u64, u32> {
+    let mut owners = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return owners;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(inode) = target
+                .to_str()
+                .and_then(|target| target.strip_prefix("socket:["))
+                .and_then(|target| target.strip_suffix(']'))
+                .and_then(|inode| inode.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            owners.insert(inode, pid);
+        }
     }
+    owners
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn image_of(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let image = comm.trim();
+    if image.is_empty() {
+        None
+    } else {
+        Some(image.to_string())
+    }
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn listening_owners(our_ports: &[u16]) -> Vec<(u16, u32)> {
+    let mut out = Vec::new();
+    for &port in our_ports {
+        let mut cmd = std::process::Command::new("/usr/sbin/lsof");
+        cmd.args(["-t", "-n", "-P"])
+            .arg(format!("-iTCP:{port}"))
+            .arg("-sTCP:LISTEN")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let Ok(output) = cmd.output() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        out.extend(parse_lsof_pids(&text).into_iter().map(|pid| (port, pid)));
+    }
+    out
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn image_of(pid: u32) -> Option<String> {
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-o", "comm=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let output = cmd.output().ok()?;
+    let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!image.is_empty()).then_some(image)
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn kill_process(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) reads only the pid and a signal number; the pid was
+    // resolved from a listening socket and its image matched ours.
+    unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
+}
+
+#[cfg(all(not(test), not(any(windows, target_os = "linux", target_os = "macos"))))]
+fn listening_owners(_our_ports: &[u16]) -> Vec<(u16, u32)> {
+    Vec::new()
+}
+
+#[cfg(all(not(test), not(any(windows, target_os = "linux", target_os = "macos"))))]
+fn image_of(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(all(not(test), not(any(windows, target_os = "linux", target_os = "macos"))))]
+fn kill_process(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(not(test))]
 pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
-    let netstat_output = if cfg!(windows) {
-        let mut cmd = std::process::Command::new(system_tool("netstat.exe"));
-        cmd.args(["-ano", "-p", "TCP"]);
-        crate::spawn_hidden(&mut cmd);
-        cmd.output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let image_of = |pid: u32| -> Option<String> {
-        if !cfg!(windows) {
-            return None;
-        }
-        let mut cmd = std::process::Command::new(system_tool("tasklist.exe"));
-        cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "TABLE", "/NH"]);
-        crate::spawn_hidden(&mut cmd);
-        let output = cmd.output().ok()?;
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        parse_tasklist_table(&text)
-            .into_iter()
-            .find(|(_, found)| *found == pid)
-            .map(|(image, _)| image)
-    };
-    let kill = |pid: u32| -> bool {
-        if !cfg!(windows) {
-            return false;
-        }
+    #[cfg(any(windows, target_os = "linux"))]
+    let owners = listening_owners();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let owners = listening_owners(our_ports);
 
-        let mut cmd = std::process::Command::new(system_tool("taskkill.exe"));
-        cmd.args(["/PID", &pid.to_string(), "/F"]);
-        crate::spawn_hidden(&mut cmd);
-        cmd.output().is_ok_and(|output| output.status.success())
-    };
     startup_reap_and_sweep(
         our_ports,
         &std::env::temp_dir(),
-        &netstat_output,
+        &owners,
         &image_of,
-        &kill,
+        &kill_process,
     )
 }
 
@@ -5854,9 +6007,14 @@ impl EngineBackend for RealEngineBackend {
         }
         let path = self.write_config(config_json)?;
         let mut cmd = std::process::Command::new(&binary);
-        cmd.arg("check").arg("-c").arg(&path);
+        cmd.arg("check")
+            .arg("-c")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         crate::spawn_hidden(&mut cmd);
-        let output = cmd.output();
+        let output = crate::spawn_tied(&mut cmd).and_then(|child| child.wait_with_output());
         self.remove_config_file();
         let output = output.map_err(|error| format!("engine check could not run ({error})"))?;
 
@@ -5882,7 +6040,7 @@ impl EngineBackend for RealEngineBackend {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         crate::spawn_hidden(&mut cmd);
-        let spawn = cmd.spawn();
+        let spawn = crate::spawn_tied(&mut cmd);
         let mut child = match spawn {
             Ok(child) => child,
 
@@ -12078,7 +12236,13 @@ Active Connections\r
         std::fs::write(dir.join("manyproxy-singbox-111-0.json"), "{}").expect("stale temp");
         std::fs::write(dir.join("notes.txt"), "keep").expect("other file");
         std::fs::write(dir.join("manyproxy-old.txt"), "keep").expect("wrong suffix kept");
-        let report = startup_reap_and_sweep(&[10801], &dir, netstat, &image_of, &kill);
+        let report = startup_reap_and_sweep(
+            &[10801],
+            &dir,
+            &parse_netstat_tcp_owners(netstat),
+            &image_of,
+            &kill,
+        );
         assert_eq!(report.reaped_pids, vec![111], "only ours: {report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.swept_files.len(), 1, "{report:?}");
@@ -12110,6 +12274,24 @@ Active Connections\r
         );
         assert!(parse_netstat_tcp_owners("").is_empty());
         assert!(parse_tasklist_table("").is_empty());
+    }
+
+    #[test]
+    fn t41_proc_net_tcp_finds_listener_owner() {
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:2A38 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0\n\
+   1: 0100007F:2A39 00000000:0000 01 00000000:00000000 00:00000000 00000000  1000        0 4343 1 0000000000000000 100 0 0 10 0\n";
+        let owners = proc_tcp_owners(text, &|inode| (inode == 4242).then_some(777));
+        assert_eq!(owners, vec![(10808, 777)]);
+        assert!(parse_proc_net_tcp_listeners("").is_empty());
+    }
+
+    #[test]
+    fn t41_lsof_t_parser_takes_bare_pids() {
+        assert_eq!(parse_lsof_pids("4242\n777\n"), vec![4242, 777]);
+        assert!(parse_lsof_pids("lsof: warning: something\n").is_empty());
+        assert!(parse_lsof_pids("").is_empty());
     }
 
     #[test]
