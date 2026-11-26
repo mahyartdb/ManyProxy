@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - "gpui-kit-0-11"
+      - "core-model"
 
 permissions: {}
 
